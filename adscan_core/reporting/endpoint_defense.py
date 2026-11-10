@@ -57,6 +57,46 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from adscan_core.reporting.endpoint_capability import (
+    CAPABILITY_SCOPE_NOTE,
+    CREDENTIAL_GUARD_CONFIGURED,
+    CREDENTIAL_GUARD_LABELS,
+    CREDENTIAL_GUARD_SCOPE_NOTE,
+    EDR_MODULE_UNCONFIRMED_NOTE,
+    HARDENING_NOT_CHECKED,
+    HARDENING_SCOPE_NOTE,
+    LSA_PROTECTION_ENABLED,
+    LSA_PROTECTION_LABELS,
+    LSASS_MEMORY_TECHNIQUE,
+    VALIDATED_HELD_UNDER_TEST,
+    VALIDATED_NOT_TESTED,
+    VALIDATED_OUTCOMES,
+    build_tier0_edr_recommendation,
+    capability_label,
+    capability_rows,
+    classify_host_capability,
+    derive_validated_outcome,
+    edr_module_unconfirmed,
+    empty_recommendation,
+    inactive_classes,
+    inactive_protection_label,
+    inactive_rows,
+    normalize_credential_guard,
+    normalize_lsa_protection,
+    product_activity_unconfirmed,
+    product_is_active,
+    product_names,
+    recommendation_text,
+    validated_outcome_label,
+    validated_outcome_rank,
+)
+from adscan_core.reporting.clock_frame import (
+    FRAME_MIXED,
+    FRAME_UNVERIFIED,
+    combine_window_frame,
+    resolve_frame_from_record,
+    summary_frame_label,
+)
 from adscan_core.reporting.privilege_tier_labels import (
     TIER0_TOKENS,
     TIER_RANK,
@@ -278,6 +318,11 @@ def classify_host_posture(products: Any, posture_assessed: Any) -> str:
         return POSTURE_ACTIVE
     if posture_assessed is not True:
         return POSTURE_UNDETERMINED
+    if any(product_activity_unconfirmed(p) for p in rows):
+        # A product was seen but its protection state was assumed, not read.
+        # That is neither "active" nor "installed, not active": reporting it
+        # either way would state a fact nobody observed.
+        return POSTURE_UNDETERMINED
     if rows:
         return POSTURE_INSTALLED_INACTIVE
     return POSTURE_NONE_DETECTED
@@ -286,21 +331,11 @@ def classify_host_posture(products: Any, posture_assessed: Any) -> str:
 def _product_is_active(product: Mapping[str, Any]) -> bool:
     """Whether one product entry reads as actively protecting the host.
 
-    Prefers the runtime's own derived ``active``. Falls back to the same rule
-    the runtime applies (``DetectedProduct.active``): process-running AND
-    real-time protection on, where running is either observed directly or
-    implied by an auto-start service.
+    The rule lives once in :func:`endpoint_capability.product_is_active`, so the
+    posture state and the capability class can never read the same product
+    differently.
     """
-    if "active" in product:
-        return bool(product.get("active"))
-    running = bool(product.get("running"))
-    installed = bool(product.get("installed"))
-    try:
-        svc_start = int(product.get("svc_start"))
-    except (TypeError, ValueError):
-        svc_start = -1
-    process_running = running or (installed and svc_start in (0, 1, 2))
-    return process_running and bool(product.get("realtime_protection", True))
+    return product_is_active(product)
 
 
 def _product_names(products: Any) -> list[str]:
@@ -313,6 +348,28 @@ def _product_names(products: Any) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _estate_known_from_block(block: Mapping[str, Any]) -> bool:
+    """``estate_known`` for a stamped block, inferred for one written before it.
+
+    An older block stored only the clamped total, so an estate larger than what
+    was examined is known, and an equal one is known only when the coverage
+    sentence itself said "computers in the directory".
+    """
+    stamped = block.get("estate_known")
+    if isinstance(stamped, bool):
+        return stamped
+    try:
+        estate = int(block.get("computers_in_estate") or 0)
+        examined = int(block.get("hosts_examined") or 0)
+    except (TypeError, ValueError):
+        return False
+    if examined <= 0:
+        return False
+    if estate > examined:
+        return True
+    return "computers in the directory" in str(block.get("coverage_statement") or "")
 
 
 def _coverage_statement(
@@ -571,6 +628,120 @@ def _order_observations(observations: list[dict[str, Any]]) -> None:
     observations.sort(key=_key)
 
 
+def _is_address(value: str) -> bool:
+    """Whether a host string is an IP literal (never short-split, see below)."""
+    text = str(value or "").strip()
+    if ":" in text:
+        return True
+    parts = text.split(".")
+    return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+def _host_keys(value: Any) -> set[str]:
+    """Every lower-cased form one host identifier can be matched under.
+
+    The inventory names a host by FQDN, a dump records whatever the operator
+    targeted (often an address resolved separately into ``host_name``), and a
+    collected node may carry only its short name. An address is never split on
+    its first dot: ``192`` abbreviates nothing and would match an unrelated
+    object.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return set()
+    keys = {text}
+    if not _is_address(text):
+        head = text.split(".", 1)[0]
+        if head:
+            keys.add(head)
+    return keys
+
+
+def _fold_host_outcomes(
+    hosts: list[dict[str, Any]], pairs: Iterable[dict[str, Any]]
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Join each technique-host row to its examined host and grade the HOST.
+
+    Stamps every host row with its validated outcome, and every technique row
+    with the hardening observed on its host plus that host's outcome, so the
+    "protection was enabled and the read completed anyway" context and the
+    outcome column read the same facts on every surface.
+
+    A technique row whose host is not in the inventory still gets an outcome,
+    from its own attempts, and is counted: a proven gap on a host the
+    inventory could not place must not fall out of the figures.
+    """
+    index: dict[str, int] = {}
+    for position, row in enumerate(hosts):
+        for key in row.get("_keys") or ():
+            index.setdefault(key, position)
+
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for pair in pairs:
+        probes = _host_keys(pair.get("host")) | _host_keys(pair.get("host_name"))
+        position = next((index[k] for k in sorted(probes) if k in index), None)
+        if position is not None:
+            row = hosts[position]
+            lsa = str(row.get("lsa_protection") or HARDENING_NOT_CHECKED)
+            guard = str(row.get("credential_guard") or HARDENING_NOT_CHECKED)
+            group_key: Any = ("host", position)
+        else:
+            lsa = guard = HARDENING_NOT_CHECKED
+            group_key = (
+                "attempt",
+                str(pair.get("host_name") or pair.get("host") or "").strip().lower(),
+            )
+        pair["lsa_protection"] = lsa
+        pair["lsa_protection_label"] = LSA_PROTECTION_LABELS.get(lsa, "")
+        pair["credential_guard"] = guard
+        pair["credential_guard_label"] = CREDENTIAL_GUARD_LABELS.get(guard, "")
+        grouped.setdefault(group_key, []).append(pair)
+
+    counts = {token: 0 for token in VALIDATED_OUTCOMES}
+    for row in hosts:
+        row["validated_outcome"] = VALIDATED_NOT_TESTED
+    for group_key, group in grouped.items():
+        outcome = derive_validated_outcome(group)
+        if group_key[0] == "host":
+            hosts[group_key[1]]["validated_outcome"] = outcome
+        else:
+            counts[outcome] += 1
+        for pair in group:
+            pair["host_validated_outcome"] = outcome
+            pair["host_validated_outcome_label"] = validated_outcome_label(outcome)
+    for row in hosts:
+        token = str(row["validated_outcome"])
+        row["validated_outcome_label"] = validated_outcome_label(token)
+        counts[token] = counts.get(token, 0) + 1
+
+    recommendation = build_tier0_edr_recommendation(hosts, is_tier0=_is_tier0)
+    return counts, recommendation
+
+
+def _host_fact_counts(hosts: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Per-host fact counts, in hosts. Counts only, never a rate."""
+    capability: dict[str, int] = {}
+    inactive: dict[str, int] = {}
+    lsa: dict[str, int] = {}
+    guard: dict[str, int] = {}
+    for row in hosts:
+        token = str(row.get("capability_class") or "")
+        if token:
+            capability[token] = capability.get(token, 0) + 1
+        for category in row.get("inactive_classes") or ():
+            inactive[str(category)] = inactive.get(str(category), 0) + 1
+        lsa_token = str(row.get("lsa_protection") or HARDENING_NOT_CHECKED)
+        lsa[lsa_token] = lsa.get(lsa_token, 0) + 1
+        guard_token = str(row.get("credential_guard") or HARDENING_NOT_CHECKED)
+        guard[guard_token] = guard.get(guard_token, 0) + 1
+    return {
+        "capability_counts": capability,
+        "inactive_class_counts": inactive,
+        "lsa_protection_counts": lsa,
+        "credential_guard_counts": guard,
+    }
+
+
 def build_endpoint_defense(
     *,
     posture_hosts: Iterable[Any] = (),
@@ -579,6 +750,7 @@ def build_endpoint_defense(
     attempts_recorded: bool = True,
     host_tiers: Mapping[str, str] | None = None,
     host_names: Mapping[str, str] | None = None,
+    clock_sync: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``endpoint_defense`` block for one domain.
 
@@ -610,6 +782,16 @@ def build_endpoint_defense(
             at all. ``False`` means a workspace predating the record, where
             "no attempts" is unknown rather than observed, so no efficacy
             claim is made.
+        clock_sync: Optional per-domain clock-sync record
+            (``domains_data[<domain>][CLOCK_SYNC_KEY]``), injected for the same
+            reason as ``host_tiers``: this module cannot reach the workspace.
+            Each attempt stamp is placed in its clock HERE, where the record is
+            available, and the frame then travels with the stamp into the
+            block. A renderer reading the block in a later process has no
+            ``variables.json`` in reach, so a frame it has to resolve itself is
+            a frame it will print without: the per-host appendix CSV asserted
+            UTC for stamps from two different clocks for exactly that reason.
+            Absent, every stamp is honestly unplaced rather than assumed.
 
     Returns:
         The block to persist. Always carries ``statement`` so the recorder
@@ -648,6 +830,16 @@ def build_endpoint_defense(
             record.get("dns_name") or record.get("host_object_id") or ""
         ).strip()
         host_tier = _tier_for(host_name)
+        # Axis 1 (capability class) is computed from ACTIVE products only; an
+        # idle product is named apart, never counted as capability. Neither is
+        # a protection grade: see adscan_core.reporting.endpoint_capability.
+        capability = classify_host_capability(products, state)
+        active_names, inactive_names = product_names(products)
+        unconfirmed = edr_module_unconfirmed(products, capability)
+        lsa = normalize_lsa_protection(
+            record.get("lsa_protection"), ppl_enabled=record.get("ppl_enabled")
+        )
+        guard = normalize_credential_guard(record.get("credential_guard"))
         hosts.append(
             {
                 "host": host_name,
@@ -655,6 +847,25 @@ def build_endpoint_defense(
                 "products": _product_names(products),
                 "privilege_tier": host_tier,
                 "privilege_tier_label": _tier_badge_label(host_tier),
+                "active_products": active_names,
+                "inactive_products": inactive_names,
+                "inactive_classes": inactive_classes(products),
+                "inactive_protection_label": inactive_protection_label(products),
+                "capability_class": capability,
+                "capability_label": capability_label(capability),
+                "edr_module_unconfirmed": unconfirmed,
+                "capability_note": EDR_MODULE_UNCONFIRMED_NOTE if unconfirmed else "",
+                "lsa_protection": lsa,
+                "lsa_protection_label": LSA_PROTECTION_LABELS[lsa],
+                "credential_guard": guard,
+                "credential_guard_label": CREDENTIAL_GUARD_LABELS[guard],
+                # Filled once the attempts are folded, below.
+                "validated_outcome": VALIDATED_NOT_TESTED,
+                "validated_outcome_label": validated_outcome_label(
+                    VALIDATED_NOT_TESTED
+                ),
+                "_keys": _host_keys(host_name)
+                | _host_keys(record.get("host_object_id")),
             }
         )
 
@@ -720,6 +931,13 @@ def build_endpoint_defense(
         pair["observations"].append(
             {
                 "observed_at": observed_at,
+                # Which clock that stamp came from, resolved where the record is
+                # in reach and carried from here on. A later process reading the
+                # block cannot resolve it, and a surface that cannot resolve a
+                # frame prints the stamp without one.
+                "observed_at_frame": resolve_frame_from_record(
+                    clock_sync, observed_at
+                ).frame,
                 "outcome": outcome,
                 "session_id": str(record.get("session_id") or ""),
                 "observed_monotonic": (
@@ -792,6 +1010,8 @@ def build_endpoint_defense(
         pair_tier = _tier_for(str(pair["host"]))
         pair["privilege_tier"] = pair_tier
         pair["privilege_tier_label"] = _tier_badge_label(pair_tier)
+
+    validated_counts, recommendation = _fold_host_outcomes(hosts, by_pair.values())
 
     by_technique: dict[str, dict[str, Any]] = {}
     attempts_total = 0
@@ -913,10 +1133,20 @@ def build_endpoint_defense(
         else ""
     )
 
+    for row in hosts:
+        row.pop("_keys", None)
+
     return {
+        **_host_fact_counts(hosts),
+        "validated_outcome_counts": validated_counts,
+        "tier0_edr_recommendation": recommendation,
         "present": bool(assessed or on_protected),
         "attempts_recorded": bool(attempts_recorded),
         "computers_in_estate": estate,
+        # Whether ``computers_in_estate`` is the directory's real total, the
+        # same gate the coverage sentence reads, so every surface that captions
+        # the figures says one thing (all examined, N of M, or total unknown).
+        "estate_known": bool(estate_known),
         "hosts_examined": assessed,
         "hosts_not_examined": counts[POSTURE_NOT_ASSESSED],
         "posture_counts": {state: counts.get(state, 0) for state in POSTURE_STATES},
@@ -938,6 +1168,85 @@ def build_endpoint_defense(
     }
 
 
+def _count_map(raw: Any) -> dict[str, int]:
+    """A token-to-count mapping, coerced; ``{}`` when the block predates it."""
+    out: dict[str, int] = {}
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            try:
+                number = max(0, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+            if number:
+                out[str(key)] = number
+    return out
+
+
+def _recommendation_view(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        return empty_recommendation()
+    hosts = [dict(h) for h in (raw.get("hosts") or ()) if isinstance(h, Mapping)]
+    try:
+        examined = max(0, int(raw.get("tier0_examined") or 0))
+    except (TypeError, ValueError):
+        examined = 0
+    return {
+        "hosts": hosts,
+        "count": len(hosts),
+        "tier0_examined": examined,
+        "text": str(raw.get("text") or "").strip(),
+    }
+
+
+def _empty_host_facts() -> dict[str, Any]:
+    return {
+        "capability_rows": [],
+        "inactive_rows": [],
+        "capability_counts": {},
+        "inactive_class_counts": {},
+        "validated_outcome_counts": {},
+        "lsa_protection_counts": {},
+        "credential_guard_counts": {},
+        "tier0_edr_recommendation": empty_recommendation(),
+        "has_capability": False,
+        "has_hardening": False,
+        "capability_scope_note": CAPABILITY_SCOPE_NOTE,
+        "credential_guard_scope_note": CREDENTIAL_GUARD_SCOPE_NOTE,
+        "hardening_scope_note": HARDENING_SCOPE_NOTE,
+    }
+
+
+def _view_host_facts(block: Mapping[str, Any]) -> dict[str, Any]:
+    """The per-host fact figures, passed through and never re-derived.
+
+    A block written before these fields existed yields empty maps, so it does
+    not suddenly claim every host was untested or ran no active product.
+    """
+    lsa = _count_map(block.get("lsa_protection_counts"))
+    guard = _count_map(block.get("credential_guard_counts"))
+    capability = _count_map(block.get("capability_counts"))
+    inactive = _count_map(block.get("inactive_class_counts"))
+    return {
+        **_empty_host_facts(),
+        # Render-ready rows so no surface keeps its own label map: the class
+        # names are authored once in endpoint_capability.
+        "capability_rows": capability_rows(capability),
+        "inactive_rows": inactive_rows(inactive),
+        "capability_counts": capability,
+        "inactive_class_counts": inactive,
+        "validated_outcome_counts": _count_map(block.get("validated_outcome_counts")),
+        "lsa_protection_counts": lsa,
+        "credential_guard_counts": guard,
+        "tier0_edr_recommendation": _recommendation_view(
+            block.get("tier0_edr_recommendation")
+        ),
+        "has_capability": bool(capability),
+        "has_hardening": any(
+            key != HARDENING_NOT_CHECKED for key in (*lsa.keys(), *guard.keys())
+        ),
+    }
+
+
 def endpoint_defense_view(block: Any) -> dict[str, Any]:
     """Return the render-ready view of a persisted ``endpoint_defense`` block.
 
@@ -956,6 +1265,7 @@ def endpoint_defense_view(block: Any) -> dict[str, Any]:
             "present": False,
             "attempts_recorded": False,
             "computers_in_estate": 0,
+            "estate_known": False,
             "hosts_examined": 0,
             "hosts_not_examined": 0,
             "posture_counts": {state: 0 for state in POSTURE_STATES},
@@ -976,6 +1286,7 @@ def endpoint_defense_view(block: Any) -> dict[str, Any]:
             "efficacy_statement": "",
             "has_efficacy": False,
             "single_posture_state": False,
+            **_empty_host_facts(),
             "verdict_lines": [],
         }
 
@@ -1011,6 +1322,7 @@ def endpoint_defense_view(block: Any) -> dict[str, Any]:
         "present": bool(block.get("present")),
         "attempts_recorded": bool(block.get("attempts_recorded")),
         "computers_in_estate": _int("computers_in_estate"),
+        "estate_known": _estate_known_from_block(block),
         "hosts_examined": _int("hosts_examined"),
         "hosts_not_examined": _int("hosts_not_examined"),
         "posture_counts": counts,
@@ -1035,6 +1347,7 @@ def endpoint_defense_view(block: Any) -> dict[str, Any]:
         # A state table showing one row of three declared states looks like an
         # omission. It is a positive finding, and saying so costs one line.
         "single_posture_state": sum(1 for v in counts.values() if v) == 1,
+        **_view_host_facts(block),
     }
     # Carried ON the view so the report, the free report and the platform all
     # read the SAME authored sentences. A surface deriving them itself is how
@@ -1100,6 +1413,66 @@ def endpoint_defense_verdict_lines(view: Any) -> list[str]:
         )
     elif completed:
         lines.append("No completed read came from a host that controls the domain.")
+    lines.extend(_hardening_context_lines(view))
+    return lines
+
+
+def _hardening_context_lines(view: Mapping[str, Any]) -> list[str]:
+    """Hardening stated as CONTEXT for a completed memory read, never a score.
+
+    Only an LSASS memory read is counted: LSA protection and Credential Guard
+    guard memory, not the registry, so stating that a SAM or LSA-secrets read
+    "completed despite LSA protection" would imply a protection that was never
+    in play. The one positive verdict, ``held_under_test``, is stated when it
+    exists and nowhere else.
+    """
+    ppl_hosts: set[str] = set()
+    guard_hosts: set[str] = set()
+    for row in view.get("observations") or ():
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("technique") or "").strip().lower() != LSASS_MEMORY_TECHNIQUE:
+            continue
+        if str(row.get("posture") or "") != POSTURE_ACTIVE:
+            continue
+        try:
+            completed = int(row.get(OUTCOME_COMPLETED) or 0) > 0
+        except (TypeError, ValueError):
+            completed = False
+        if not (completed or str(row.get("outcome") or "") == OUTCOME_COMPLETED):
+            continue
+        host = str(row.get("host_name") or row.get("host") or "").strip().lower()
+        if str(row.get("lsa_protection") or "") == LSA_PROTECTION_ENABLED:
+            ppl_hosts.add(host)
+        if str(row.get("credential_guard") or "") == CREDENTIAL_GUARD_CONFIGURED:
+            guard_hosts.add(host)
+
+    lines: list[str] = []
+    if ppl_hosts:
+        subject = "one host" if len(ppl_hosts) == 1 else f"{len(ppl_hosts):,} hosts"
+        lines.append(
+            f"On {subject} with LSA protection enabled, the memory read completed anyway."
+        )
+    if guard_hosts:
+        subject = "one host" if len(guard_hosts) == 1 else f"{len(guard_hosts):,} hosts"
+        lines.append(
+            f"On {subject} with Credential Guard configured, the memory read "
+            "completed anyway. Whether Credential Guard was running there was not "
+            "checked."
+        )
+    counts = view.get("validated_outcome_counts")
+    held = 0
+    if isinstance(counts, Mapping):
+        try:
+            held = max(0, int(counts.get(VALIDATED_HELD_UNDER_TEST) or 0))
+        except (TypeError, ValueError):
+            held = 0
+    if held:
+        subject = "one host" if held == 1 else f"{held:,} hosts"
+        lines.append(
+            f"On {subject} every realistic way of reading credential material was "
+            "attempted and every one was interrupted."
+        )
     return lines
 
 
@@ -1158,6 +1531,78 @@ def endpoint_defense_exception_rows(view: Any, *, limit: int = 40) -> dict[str, 
         "shown": len(rows),
         "total": len(exceptions),
         "truncated": len(exceptions) > len(rows),
+    }
+
+
+#: The capability classes that put a Tier 0 host in the coverage
+#: recommendation, mirrored for the attention test below.
+_RECOMMENDED_CLASSES = frozenset({"av_only", "none_detected"})
+
+
+def _host_needs_listing(host: Mapping[str, Any]) -> bool:
+    """Whether a host row carries an action or a validated result.
+
+    The good news (a product active, nothing tested, nothing idle, no
+    recommendation) is covered by the counts and named in the appendix.
+    """
+    if str(host.get("posture") or "") in POSTURE_EXCEPTION_STATES:
+        return True
+    if str(host.get("inactive_protection_label") or ""):
+        return True
+    if (
+        str(host.get("validated_outcome") or VALIDATED_NOT_TESTED)
+        != VALIDATED_NOT_TESTED
+    ):
+        return True
+    return _is_tier0(host.get("privilege_tier")) and (
+        str(host.get("capability_class") or "") in _RECOMMENDED_CLASSES
+    )
+
+
+def endpoint_defense_host_rows(view: Any, *, limit: int = 40) -> dict[str, Any]:
+    """The per-host table: every host carrying an action or a tested result.
+
+    The successor of :func:`endpoint_defense_exception_rows` for a surface that
+    shows the Capability and Outcome columns. A host with a product active is
+    listed when something was PROVEN on it (a gap, or a held test), when a
+    product sits idle on it, or when it is a Tier 0 host the coverage
+    recommendation names. Tier leads, then the worst validated outcome, then
+    the worst posture, so an administrator working top-down meets the Tier 0
+    gap first. Bounded on the same terms, and a surface states ``total``
+    whenever ``truncated``.
+    """
+    if not isinstance(view, Mapping):
+        return {"rows": [], "shown": 0, "total": 0, "truncated": False}
+    hosts = [
+        dict(h)
+        for h in (view.get("hosts") or ())
+        if isinstance(h, Mapping) and _host_needs_listing(h)
+    ]
+
+    def _posture_rank(host: Mapping[str, Any]) -> int:
+        posture = str(host.get("posture") or "")
+        return (
+            POSTURE_STATES.index(posture)
+            if posture in POSTURE_STATES
+            else len(POSTURE_STATES)
+        )
+
+    hosts.sort(
+        key=lambda h: (
+            _tier_rank(h.get("privilege_tier")),
+            validated_outcome_rank(h.get("validated_outcome")),
+            _posture_rank(h),
+            str(h.get("host") or "").lower(),
+        )
+    )
+    cap = max(0, int(limit))
+    rows = hosts[:cap]
+    return {
+        "rows": rows,
+        "shown": len(rows),
+        "total": len(hosts),
+        "truncated": len(hosts) > len(rows),
+        "any_ungraded": any(not str(r.get("privilege_tier") or "") for r in rows),
     }
 
 
@@ -1220,6 +1665,82 @@ def _format_observed_window(first: str, last: str) -> str:
     return f"{start} - {end} UTC"
 
 
+def host_attempt_window(view: Any, host: Any) -> dict[str, str]:
+    """Return one host's attempt window, with the clock its boundaries came from.
+
+    The SSOT for "when did ADscan work on this host", for every surface that
+    needs the window as DATA rather than as a sentence: the per-host appendix
+    CSV, and anything else tabulating a host's attempts.
+
+    Two rules, and each of them was broken by the obvious one-liner it replaces
+    (``min``/``max`` over the stamps):
+
+    * **The endpoints come from an order a clock step cannot invert.** ADscan
+      moves the host wall clock to the DC's mid-run, so two attempts either side
+      of that step carry stamps from two clocks and comparing their VALUES can
+      return the later attempt as the first. The attempts are already ordered by
+      :func:`_order_observations` (monotonic within a session, session by
+      session across them), so the window is simply that order's ends.
+    * **The frame is a value, not a caveat.** A column and a ``min()`` have
+      nowhere to put prose, so a window spanning two clocks has to be able to
+      SAY so. Each stamp's frame is baked at authorship by
+      :func:`build_endpoint_defense`; this folds the two boundaries' frames
+      through :func:`~adscan_core.reporting.clock_frame.combine_window_frame`.
+
+    Returns:
+        ``{"first_at", "last_at", "frame", "frame_label"}``. Every value is
+        ``""`` for a host with no recorded attempt, so an empty window never
+        acquires a clock label it has no stamp to describe.
+    """
+    empty = {"first_at": "", "last_at": "", "frame": "", "frame_label": ""}
+    if not isinstance(view, Mapping):
+        return empty
+    wanted = str(host or "").strip().lower()
+    if not wanted:
+        return empty
+
+    attempts: list[dict[str, Any]] = []
+    for pair in view.get("observations") or ():
+        if not isinstance(pair, Mapping):
+            continue
+        if str(pair.get("host") or "").strip().lower() != wanted:
+            continue
+        for observation in pair.get("observations") or ():
+            if isinstance(observation, Mapping) and str(
+                observation.get("observed_at") or ""
+            ).strip():
+                attempts.append(dict(observation))
+    if not attempts:
+        return empty
+
+    _order_observations(attempts)
+    first, last = attempts[0], attempts[-1]
+    first_at = str(first.get("observed_at") or "").strip()
+    last_at = str(last.get("observed_at") or "").strip()
+    # A block written before the frame was baked carries no frame at all, which
+    # is UNVERIFIED and not an absent window: the stamps exist, nothing places
+    # them, and a blank clock column next to a real window would read as "no
+    # clock problem here".
+    frame = combine_window_frame(
+        str(first.get("observed_at_frame") or FRAME_UNVERIFIED),
+        str(last.get("observed_at_frame") or FRAME_UNVERIFIED),
+    )
+    # A window whose end reads EARLIER than its start, in an order a clock step
+    # cannot invert, has provably crossed a clock change. That is worth stating
+    # separately because the recorded agreement instant cannot always see it: a
+    # step BACKWARD (a DC behind the assessment host) leaves the pre-step stamps
+    # reading LATER than the agreement, so each one passes the boundary test
+    # individually and the pair is the only place the crossing shows.
+    if first_at and last_at and last_at < first_at:
+        frame = FRAME_MIXED
+    return {
+        "first_at": first_at,
+        "last_at": last_at,
+        "frame": frame,
+        "frame_label": summary_frame_label(frame),
+    }
+
+
 def endpoint_defense_observation_rows(
     view: Any, *, limit: int = DEFAULT_OBSERVATION_ROWS
 ) -> dict[str, Any]:
@@ -1266,6 +1787,18 @@ def endpoint_defense_observation_rows(
                 "privilege_tier": str(record.get("privilege_tier") or ""),
                 "privilege_tier_label": str(record.get("privilege_tier_label") or ""),
                 "products": [str(n) for n in (record.get("products") or ())],
+                "lsa_protection": str(record.get("lsa_protection") or ""),
+                "lsa_protection_label": str(record.get("lsa_protection_label") or ""),
+                "credential_guard": str(record.get("credential_guard") or ""),
+                "credential_guard_label": str(
+                    record.get("credential_guard_label") or ""
+                ),
+                "host_validated_outcome": str(
+                    record.get("host_validated_outcome") or ""
+                ),
+                "host_validated_outcome_label": str(
+                    record.get("host_validated_outcome_label") or ""
+                ),
             }
         )
 
@@ -1382,6 +1915,7 @@ def merge_endpoint_defense(domain_entries: Any) -> dict[str, Any]:
     hosts: list[dict[str, Any]] = []
     by_technique: dict[str, dict[str, Any]] = {}
     estate = examined = not_examined = 0
+    estate_known = True
     on_protected = completed = interrupted = incomplete = 0
     pairs = attempts_total = mixed_hosts = 0
     tier0_completed = tier0_mixed = 0
@@ -1389,9 +1923,28 @@ def merge_endpoint_defense(domain_entries: Any) -> dict[str, Any]:
     coverage_statements: list[str] = []
     efficacy_statements: list[str] = []
     attempts_recorded = False
+    fact_maps: dict[str, dict[str, int]] = {
+        key: {}
+        for key in (
+            "capability_counts",
+            "inactive_class_counts",
+            "validated_outcome_counts",
+            "lsa_protection_counts",
+            "credential_guard_counts",
+        )
+    }
+    recommended: list[dict[str, Any]] = []
+    tier0_examined = 0
 
     for view in views:
+        for key, merged_map in fact_maps.items():
+            for token, number in (view.get(key) or {}).items():
+                merged_map[token] = merged_map.get(token, 0) + int(number or 0)
+        recommendation_view = view.get("tier0_edr_recommendation") or {}
+        recommended.extend(recommendation_view.get("hosts") or ())
+        tier0_examined += int(recommendation_view.get("tier0_examined") or 0)
         estate += int(view["computers_in_estate"])
+        estate_known = estate_known and bool(view.get("estate_known"))
         examined += int(view["hosts_examined"])
         not_examined += int(view["hosts_not_examined"])
         on_protected += int(view["hosts_attempted_on_protected"])
@@ -1486,6 +2039,7 @@ def merge_endpoint_defense(domain_entries: Any) -> dict[str, Any]:
         "present": True,
         "attempts_recorded": attempts_recorded,
         "computers_in_estate": estate,
+        "estate_known": bool(estate_known and views),
         "hosts_examined": examined,
         "hosts_not_examined": not_examined,
         "posture_counts": counts,
@@ -1511,6 +2065,13 @@ def merge_endpoint_defense(domain_entries: Any) -> dict[str, Any]:
         ),
         "coverage_statement": coverage_statement,
         "efficacy_statement": efficacy_statement,
+        **fact_maps,
+        "tier0_edr_recommendation": {
+            "hosts": recommended,
+            "count": len(recommended),
+            "tier0_examined": tier0_examined,
+            "text": recommendation_text(len(recommended), tier0_examined),
+        },
     }
     return endpoint_defense_view(merged)
 
@@ -1537,8 +2098,10 @@ __all__ = [
     "build_endpoint_defense",
     "classify_host_posture",
     "endpoint_defense_exception_rows",
+    "endpoint_defense_host_rows",
     "endpoint_defense_verdict_lines",
     "endpoint_defense_observation_rows",
+    "host_attempt_window",
     "endpoint_defense_view",
     "merge_endpoint_defense",
     "METHOD_EXPORTED",

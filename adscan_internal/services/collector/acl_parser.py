@@ -244,6 +244,19 @@ class ACLParser:
         # is not there, so every live fallback lookup is disabled after ONE
         # warning instead of failing once per ACL-bearing object.
         self._schema_base_available: bool | None = None
+        # Enumeration census for the ACL/ACE surface. One parser instance serves
+        # a whole collection run (the LDAP collector threads it into every
+        # object phase and into the ADCS collector), so these two counters ARE
+        # the surface denominator: how many directory objects had their security
+        # descriptor read, and how many access control entries were evaluated.
+        # They exist because "no delegated right was found" is only reportable
+        # as a positive control when the count of what WAS read is known — see
+        # ``adscan_core.reporting.enumerated_surface_evidence``. Counted only on
+        # a descriptor that actually parsed, so a winacl failure or an
+        # unreadable blob never inflates the denominator.
+        self.security_descriptors_parsed: int = 0
+        self.access_control_entries_examined: int = 0
+        self.security_descriptors_without_dacl: int = 0
 
     def parse_sd(
         self,
@@ -271,6 +284,12 @@ class ACLParser:
 
         dacl = getattr(sd, "Dacl", None)
         if not dacl:
+            # A descriptor that parsed but carries no DACL is NOT a clean read:
+            # under MS-DTYP a NULL DACL grants everyone full control, and this
+            # parser derives no edge from it either way. It therefore counts as
+            # an unresolved object rather than part of the cleared denominator,
+            # so the positive control cannot be greened over it.
+            self.security_descriptors_without_dacl += 1
             return []
 
         write_property_guid_map = self._build_property_guid_map(
@@ -284,7 +303,11 @@ class ACLParser:
         self_write_guid_map = {k: v for k, v in SELF_WRITE_GUID_TO_RELATION.items()}
         edges: list[CollectorEdge] = []
 
-        for ace in getattr(dacl, "aces", []) or []:
+        aces = getattr(dacl, "aces", []) or []
+        self.security_descriptors_parsed += 1
+        self.access_control_entries_examined += len(aces)
+
+        for ace in aces:
             ace_type = self._ace_type(ace)
             if ace_type not in (
                 _ACCESS_ALLOWED_ACE_TYPE,

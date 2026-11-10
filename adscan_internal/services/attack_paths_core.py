@@ -12,13 +12,22 @@ import time
 import os
 import re
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from adscan_core.reporting.attack_path_coverage import (
     AttackPathCoverage,
     REASON_DFS_ABORTED,
     REASON_PREDICTED_EXPLOSION,
+)
+from adscan_core.reporting.engagement_scope import (
+    META_BEYOND_SCOPE_KEY,
+    beyond_scope_continuation,
+    merge_beyond_scope_entries,
+    split_route_at_scope,
+    step_target_domain,
 )
 from adscan_core.reporting.attack_path_memory_gate import (
     _AttackPathMemoryBudgetExceeded,
@@ -33,6 +42,14 @@ from adscan_core.reporting.well_known_principals import (
 )
 from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
+from adscan_internal.services.group_member_index import (  # noqa: F401
+    _GROUP_MEMBER_INDEX_CACHE,
+    _canonical_membership_label,
+    _expand_group_ancestors,
+    _snapshot_memo_get,
+    _snapshot_memo_set,
+    build_group_member_index,
+)
 from adscan_internal.services import attack_graph_core
 from adscan_internal.services import attack_path_progress
 from adscan_internal.services.attack_path_explosion_predictor import (
@@ -149,12 +166,58 @@ class SampledDebugLogger:
         )
 
 
+@dataclass
+class EnumerationTruncation:
+    """Whether a computation's discovery stopped at its ``enumeration_cap``."""
+
+    truncated: bool = False
+
+
+#: The truncation record of the computation currently running, if a caller asked
+#: to track it (:func:`track_enumeration_truncation`). A mutable holder so every
+#: nested raw enumeration (each principal's start-node DFS) reports into the one
+#: record the caller reads.
+_ENUMERATION_TRUNCATION: ContextVar[EnumerationTruncation | None] = ContextVar(
+    "adscan_attack_path_enumeration_truncation", default=None
+)
+
+
+@contextmanager
+def track_enumeration_truncation() -> Iterator[EnumerationTruncation]:
+    """Record whether discovery inside the block hit its ``enumeration_cap``.
+
+    ``enumeration_cap`` is the resource bound on DISCOVERY (the raw candidate
+    routes the DFS emits), distinct from a listing cap, which only the service
+    layer applies to the final ordered listing. When it truncates, the listing
+    built from the bounded candidate set is a sample and must be declared as one.
+    """
+    holder = EnumerationTruncation()
+    token = _ENUMERATION_TRUNCATION.set(holder)
+    try:
+        yield holder
+    finally:
+        _ENUMERATION_TRUNCATION.reset(token)
+
+
+def _note_raw_enumeration(raw_count: int, enumeration_cap: int | None) -> None:
+    """Flag the tracked computation as truncated when discovery hit the cap."""
+    holder = _ENUMERATION_TRUNCATION.get()
+    if holder is None or enumeration_cap is None:
+        return
+    try:
+        cap = int(enumeration_cap)
+    except (TypeError, ValueError):
+        return
+    if cap > 0 and int(raw_count) >= cap:
+        holder.truncated = True
+
+
 # Per-worker state for principal parallelism.
 _PW_GRAPH: dict[str, Any] = {}
 _PW_DOMAIN: str = ""
 _PW_SNAPSHOT: dict[str, Any] | None = None
 _PW_MAX_DEPTH: int = 7
-_PW_MAX_PATHS: int | None = None
+_PW_ENUMERATION_CAP: int | None = None
 _PW_TARGET: str = "highvalue"
 _PW_TARGET_MODE: str = "domain"
 _PW_FILTER_SHORTEST: bool = True
@@ -177,47 +240,6 @@ _GROUP_MEMBERSHIP_INDEX_CACHE: dict[
     tuple[str, int],
     tuple[dict[str, Any], tuple[dict[str, int], dict[str, list[str]]]],
 ] = {}
-_GROUP_MEMBER_INDEX_CACHE: dict[
-    tuple[str, bool, bool],
-    tuple[
-        dict[str, Any],
-        tuple[dict[str, set[str]], dict[str, set[str]], bool],
-    ],
-] = {}
-
-_CachedT = TypeVar("_CachedT")
-
-
-def _snapshot_memo_get(
-    cache: dict[Any, tuple[dict[str, Any], _CachedT]],
-    key: Any,
-    snapshot: dict[str, Any],
-) -> _CachedT | None:
-    """Return the memoized value for ``key`` iff it came from THIS snapshot.
-
-    Identity, not ``id()``: the cached snapshot is compared with ``is`` against
-    the one in hand, so a freed snapshot's address cannot be mistaken for a live
-    snapshot's content.
-    """
-    entry = cache.get(key)
-    if entry is None:
-        return None
-    cached_snapshot, value = entry
-    if cached_snapshot is not snapshot:
-        return None
-    return value
-
-
-def _snapshot_memo_set(
-    cache: dict[Any, tuple[dict[str, Any], _CachedT]],
-    key: Any,
-    snapshot: dict[str, Any],
-    value: _CachedT,
-) -> _CachedT:
-    """Memoize ``value`` for ``key`` together with the snapshot that produced it."""
-    cache[key] = (snapshot, value)
-    return value
-
 
 def _log_phase_timing(
     *,
@@ -299,19 +321,19 @@ def _principal_worker_init(
     domain: str,
     snapshot: dict[str, Any] | None,
     max_depth: int,
-    max_paths: int | None,
+    enumeration_cap: int | None,
     target: str,
     target_mode: str,
     filter_shortest_paths: bool,
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer."""
     global _PW_GRAPH, _PW_DOMAIN, _PW_SNAPSHOT  # noqa: PLW0603
-    global _PW_MAX_DEPTH, _PW_MAX_PATHS, _PW_TARGET, _PW_TARGET_MODE, _PW_FILTER_SHORTEST  # noqa: PLW0603
+    global _PW_MAX_DEPTH, _PW_ENUMERATION_CAP, _PW_TARGET, _PW_TARGET_MODE, _PW_FILTER_SHORTEST  # noqa: PLW0603
     _PW_GRAPH = graph
     _PW_DOMAIN = domain
     _PW_SNAPSHOT = snapshot
     _PW_MAX_DEPTH = max_depth
-    _PW_MAX_PATHS = max_paths
+    _PW_ENUMERATION_CAP = enumeration_cap
     _PW_TARGET = target
     _PW_TARGET_MODE = target_mode
     _PW_FILTER_SHORTEST = filter_shortest_paths
@@ -328,7 +350,7 @@ def _compute_paths_for_principal_worker(username: str) -> list[dict[str, Any]]:
         snapshot=_PW_SNAPSHOT,
         username=username,
         max_depth=_PW_MAX_DEPTH,
-        max_paths=_PW_MAX_PATHS,
+        enumeration_cap=_PW_ENUMERATION_CAP,
         target=_PW_TARGET,
         target_mode=_PW_TARGET_MODE,
         filter_shortest_paths=_PW_FILTER_SHORTEST,
@@ -355,7 +377,7 @@ def _run_parallel_principals(
     domain: str,
     snapshot: dict[str, Any] | None,
     max_depth: int,
-    max_paths: int | None,
+    enumeration_cap: int | None,
     target: str,
     target_mode: str,
     filter_shortest_paths: bool,
@@ -385,7 +407,7 @@ def _run_parallel_principals(
                 domain,
                 snapshot,
                 max_depth,
-                max_paths,
+                enumeration_cap,
                 target,
                 target_mode,
                 filter_shortest_paths,
@@ -805,17 +827,6 @@ def _extract_node_sid(node: dict[str, Any]) -> str:
     return _extract_sid(object_id)
 
 
-def _canonical_membership_label(domain: str, value: str) -> str:
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if "@" in raw:
-        left, _, right = raw.partition("@")
-        if left and right:
-            return f"{left.strip().upper()}@{right.strip().upper()}"
-    return f"{raw.upper()}@{str(domain or '').strip().upper()}"
-
-
 def _membership_label_to_name(label: str) -> str:
     raw = str(label or "").strip()
     if "@" in raw:
@@ -1100,73 +1111,6 @@ def _ensure_group_node_id(
     return node_id
 
 
-def _expand_group_ancestors(
-    domain: str,
-    group_label: str,
-    group_to_parents: dict[str, Any],
-    cache: dict[str, set[str]],
-) -> set[str]:
-    """Expand recursive parent groups without Python recursion.
-
-    The previous recursive implementation could hit ``RecursionError`` in very
-    large/degenerate environments (deep nested groups or accidental cycles).
-    This iterative DFS keeps the same cache contract while avoiding call-stack
-    growth.
-    """
-    if group_label in cache:
-        return cache[group_label]
-
-    def _parent_labels(label: str) -> list[str]:
-        parents = group_to_parents.get(label, []) if group_to_parents else []
-        if not isinstance(parents, list):
-            return []
-        normalized: list[str] = []
-        for parent in parents:
-            parent_label = _canonical_membership_label(domain, parent)
-            if not parent_label:
-                continue
-            normalized.append(parent_label)
-        return normalized
-
-    stack: list[tuple[str, bool]] = [(group_label, False)]
-    resolving: set[str] = set()
-
-    while stack:
-        current, expanded = stack.pop()
-        if current in cache:
-            continue
-
-        if expanded:
-            results: set[str] = set()
-            for parent_label in _parent_labels(current):
-                if parent_label == current:
-                    continue
-                results.add(parent_label)
-                parent_cached = cache.get(parent_label)
-                if parent_cached:
-                    results.update(parent_cached)
-            results.discard(current)
-            cache[current] = results
-            resolving.discard(current)
-            continue
-
-        if current in resolving:
-            continue
-        resolving.add(current)
-        stack.append((current, True))
-
-        for parent_label in _parent_labels(current):
-            if (
-                parent_label in cache
-                or parent_label in resolving
-                or parent_label == current
-            ):
-                continue
-            stack.append((parent_label, False))
-
-    return cache.get(group_label, set())
-
-
 def build_group_membership_index(
     snapshot: dict[str, Any] | None,
     domain: str,
@@ -1228,7 +1172,8 @@ def build_group_membership_index(
                     domain, group_label, parents_map, ancestor_cache
                 )
             )
-            for counted_group in groups_to_count:
+            # Sorted: ``counts``/``samples`` key order is consumer-visible.
+            for counted_group in sorted(groups_to_count):
                 counts[counted_group] = counts.get(counted_group, 0) + 1
                 if sample_limit <= 0:
                     continue
@@ -1239,115 +1184,6 @@ def build_group_membership_index(
     result = (counts, samples)
     if principal_labels is None:
         _snapshot_memo_set(_GROUP_MEMBERSHIP_INDEX_CACHE, cache_key, snapshot, result)
-    return result
-
-
-def build_group_member_index(
-    snapshot: dict[str, Any] | None,
-    domain: str,
-    *,
-    exclude_tier0: bool = False,
-    include_computers: bool = True,
-) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
-    """Build inverted group-membership indices from the snapshot.
-
-    Args:
-        snapshot: Prepared membership snapshot (from ``prepare_membership_snapshot``).
-        domain: Canonical domain name used for label normalisation.
-        exclude_tier0: When True, tier-0 users are excluded from the user index.
-        include_computers: When True (default), also build a computer membership
-            index from ``computer_to_groups``.  Computers are kept separate from
-            users so that execution helpers (which resolve user credentials) are
-            not polluted with computer accounts.
-
-    Returns:
-        ``(user_group_members, computer_group_members, has_principals)`` where:
-        - ``user_group_members``     — ``{group_canonical: {user_labels}}``
-        - ``computer_group_members`` — ``{group_canonical: {computer_labels}}``
-        - ``has_principals``         — True when at least one user *or* computer
-          was found in the snapshot (guards against completely empty snapshots).
-    """
-    if not snapshot:
-        return {}, {}, False
-
-    user_to_groups = snapshot.get("user_to_groups")
-    computer_to_groups = snapshot.get("computer_to_groups")
-    group_to_parents = snapshot.get("group_to_parents")
-
-    has_users = isinstance(user_to_groups, dict) and bool(user_to_groups)
-    has_computers = (
-        include_computers
-        and isinstance(computer_to_groups, dict)
-        and bool(computer_to_groups)
-    )
-
-    if not has_users and not has_computers:
-        return {}, {}, False
-
-    cache_key = (
-        str(domain or "").strip().upper(),
-        bool(exclude_tier0),
-        bool(include_computers),
-    )
-    cached = _snapshot_memo_get(_GROUP_MEMBER_INDEX_CACHE, cache_key, snapshot)
-    if cached is not None:
-        return cached
-
-    user_group_members: dict[str, set[str]] = {}
-    computer_group_members: dict[str, set[str]] = {}
-    ancestor_cache: dict[str, set[str]] = {}
-    parents_map = group_to_parents if isinstance(group_to_parents, dict) else {}
-
-    tier0_users: set[str] = set()
-    if exclude_tier0:
-        tier0_from_snapshot = snapshot.get("tier0_users")
-        if isinstance(tier0_from_snapshot, list):
-            tier0_users.update(
-                _canonical_membership_label(domain, user)
-                for user in tier0_from_snapshot
-                if str(user or "").strip()
-            )
-
-    def _add_to_index(
-        index: dict[str, set[str]],
-        principal_label: str,
-        direct_groups: list[str],
-    ) -> None:
-        for group in direct_groups:
-            group_label = _canonical_membership_label(domain, group)
-            if not group_label:
-                continue
-            groups_to_add = {group_label}
-            groups_to_add.update(
-                _expand_group_ancestors(
-                    domain, group_label, parents_map, ancestor_cache
-                )
-            )
-            for ancestor in groups_to_add:
-                index.setdefault(ancestor, set()).add(principal_label)
-
-    if has_users:
-        for user_label, direct_groups in user_to_groups.items():  # type: ignore[union-attr]
-            if not isinstance(direct_groups, list):
-                continue
-            canonical_user = _canonical_membership_label(domain, user_label)
-            if not canonical_user:
-                continue
-            if exclude_tier0 and canonical_user in tier0_users:
-                continue
-            _add_to_index(user_group_members, canonical_user, direct_groups)
-
-    if has_computers:
-        for computer_label, direct_groups in computer_to_groups.items():  # type: ignore[union-attr]
-            if not isinstance(direct_groups, list):
-                continue
-            canonical_computer = _canonical_membership_label(domain, computer_label)
-            if not canonical_computer:
-                continue
-            _add_to_index(computer_group_members, canonical_computer, direct_groups)
-
-    result = (user_group_members, computer_group_members, has_users or has_computers)
-    _snapshot_memo_set(_GROUP_MEMBER_INDEX_CACHE, cache_key, snapshot, result)
     return result
 
 
@@ -1415,7 +1251,213 @@ def _strip_leading_relations(
     return new_record, strip_count
 
 
+def in_scope_segment(steps: list[Any]) -> tuple[list[Any], bool]:
+    """The steps a route is judged on, against the engagement scope.
+
+    Returns ``(segment, prefix_only)``. A route that leaves the engagement scope
+    and never comes back (its terminal is in the out-of-scope domain) is judged
+    on its in-scope PREFIX: everything from the boundary on is a mapped
+    continuation (``Not executed: outside the engagement scope``) that does not
+    downgrade what the in-scope steps proved, so an unsupported or unrun
+    cross-trust step cannot bury a proven child compromise.
+
+    The canonical domain listing never shows such a route whole: it is split at
+    the boundary (:func:`split_routes_at_engagement_scope`), the in-scope
+    segment counting where it ends and the continuation reported as reach
+    beyond the scope. A route that reaches a status derivation unsplit (a
+    principal-scoped listing) is not UPGRADED by its prefix: its terminal is the
+    out-of-scope domain and its last step never ran, so a fully proven prefix
+    makes it ``partial``, never ``exploited`` (the caller,
+    :func:`_derive_display_status_from_steps`, applies that cap). Release gate
+    14.0.0: two routes into an out-of-scope forest root rendered "successfully
+    exploited" and inflated the "validated end to end" headline.
+
+    A route that leaves the scope and comes BACK (its terminal is an in-scope
+    domain) is judged as a whole: its in-scope prefix may be proven, the rest
+    could not run, so it reads ``partial`` (or ``theoretical``), never
+    ``exploited``. The boundary reading is the shared SSOT
+    ``engagement_scope.split_route_at_scope``, which the step labels use too.
+    """
+    split = split_route_at_scope(steps)
+    if split.prefix_only:
+        return list(steps[: split.boundary]), True
+    return list(steps or ()), False
+
+
+def _segment_terminal_domain(steps: list[Any]) -> str:
+    """The domain the last real step of an in-scope segment lands in."""
+    for step in reversed(steps):
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("action") or "").strip().lower() in _CONTEXT_RELATIONS_LOWER:
+            continue
+        return step_target_domain(step)
+    return ""
+
+
+def _truncate_record_at(
+    record: dict[str, Any],
+    end: int,
+    *,
+    label_to_node: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """The record for the first ``end`` steps of ``record`` (its in-scope segment).
+
+    Rebuilt the way the minimizers rebuild a record (nodes, relations, steps,
+    signature, length, target, status), then re-classified for its own terminal.
+    ``None`` when the record's arrays are not aligned, so the caller keeps the
+    route unsplit rather than guessing.
+    """
+    nodes = record.get("nodes")
+    rels = record.get("relations")
+    steps = record.get("steps")
+    if (
+        not isinstance(nodes, list)
+        or not isinstance(rels, list)
+        or not isinstance(steps, list)
+        or len(rels) != len(steps)
+        or len(nodes) != len(rels) + 1
+        or end <= 0
+    ):
+        return None
+    new_record = copy.deepcopy(record)
+    new_nodes = [str(n) for n in nodes[: end + 1]]
+    new_rels = [str(r) for r in rels[:end]]
+    kept_steps = [copy.deepcopy(s) for s in steps[:end] if isinstance(s, dict)]
+    for idx, step in enumerate(kept_steps, start=1):
+        step["step"] = idx
+    new_record["nodes"] = new_nodes
+    new_record["relations"] = new_rels
+    new_record["_exact_signature"] = (tuple(new_nodes), tuple(new_rels))
+    new_record["length"] = sum(
+        1 for rel in new_rels if rel.strip().lower() not in _CONTEXT_RELATIONS_LOWER
+    )
+    new_record["target"] = new_nodes[-1]
+    new_record.pop("terminal_target_label", None)
+    new_record["steps"] = kept_steps
+    new_record["status"] = _derive_display_status_from_steps(kept_steps)
+    target_node = (label_to_node or {}).get(new_nodes[-1]) or {}
+    try:
+        apply_path_based_classification(new_record, target_node)
+        stamp_records_target_tier([new_record], label_to_node)
+        stamp_records_domain_compromise_tier([new_record], label_to_node)
+    except Exception:  # noqa: BLE001 - a stamp never loses the route
+        pass
+    return new_record
+
+
+def split_routes_at_engagement_scope(
+    records: list[dict[str, Any]],
+    *,
+    label_to_node: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Split every route that leaves the engagement scope at the boundary.
+
+    A route that compromises an in-scope domain and then continues into a domain
+    outside the scope (``split_route_at_scope(...).prefix_only``) is two facts:
+
+    * its IN-SCOPE SEGMENT is a route to the in-scope domain's compromise. It
+      replaces the original route in the listing, so it counts where it ends,
+      proven (``exploited``) when every step of it ran. When the listing already
+      holds the identical route (the engine keeps the route that stops at the
+      child: a trust-crossing super-path never dominates it), the segment merges
+      into it and is never counted twice;
+    * its CONTINUATION is reach beyond the scope. It never enters the in-scope
+      domain's figures or denominators; it is stamped on the segment's ``meta``
+      (``engagement_scope.META_BEYOND_SCOPE_KEY``) and aggregated into the "Reach
+      beyond your scope" block (``aggregate_beyond_scope_reach``), mapped and
+      never executed.
+
+    A route that crosses the scope and comes back, or that leaves it at its very
+    first step (no in-scope segment), is left as it is: the status derivation
+    reads it whole. Founder decision 2026-11-10, release gate 14.0.0.
+    Idempotent: a split listing carries no route that leaves the scope.
+    """
+    if not records:
+        return records
+    out: list[dict[str, Any]] = []
+    index_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        steps = record.get("steps")
+        split = split_route_at_scope(steps) if isinstance(steps, list) else None
+        if split is None or not split.prefix_only:
+            signature = _record_exact_signature(record)
+            if signature is not None and signature not in index_by_signature:
+                index_by_signature[signature] = len(out)
+            out.append(record)
+            continue
+        segment_steps = list(steps[: split.boundary])
+        if not any(
+            isinstance(step, dict)
+            and str(step.get("action") or "").strip().lower()
+            not in _CONTEXT_RELATIONS_LOWER
+            for step in segment_steps
+        ):
+            out.append(record)
+            continue
+        segment = _truncate_record_at(
+            record, int(split.boundary or 0), label_to_node=label_to_node
+        )
+        if segment is None:
+            out.append(record)
+            continue
+        boundary_step = steps[int(split.boundary or 0)]
+        from_domain = _segment_terminal_domain(segment["steps"]) or str(
+            ((boundary_step.get("details") or {}) if isinstance(boundary_step, dict) else {}).get(
+                "from"
+            )
+            or ""
+        )
+        continuation = beyond_scope_continuation(
+            from_domain=from_domain,
+            to_domain=split.out_domains[0] if split.out_domains else "",
+            technique=(boundary_step or {}).get("action") if isinstance(boundary_step, dict) else "",
+            from_compromised=str(segment.get("status") or "").strip().lower()
+            in _PROVEN_STATUSES,
+        )
+        pending.append((segment, continuation))
+
+    for segment, continuation in pending:
+        signature = _record_exact_signature(segment)
+        target_index = index_by_signature.get(signature) if signature is not None else None
+        if target_index is None:
+            meta = segment.get("meta") if isinstance(segment.get("meta"), dict) else {}
+            meta = dict(meta)
+            meta[META_BEYOND_SCOPE_KEY] = merge_beyond_scope_entries([continuation])
+            segment["meta"] = meta
+            if signature is not None:
+                index_by_signature[signature] = len(out)
+            out.append(segment)
+            continue
+        kept = out[target_index]
+        meta = kept.get("meta") if isinstance(kept.get("meta"), dict) else {}
+        meta = dict(meta)
+        meta[META_BEYOND_SCOPE_KEY] = merge_beyond_scope_entries(
+            meta.get(META_BEYOND_SCOPE_KEY) or (), [continuation]
+        )
+        kept = dict(kept)
+        kept["meta"] = meta
+        out[target_index] = kept
+    return out
+
+
 def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
+    # Engagement scope: a route is judged on its in-scope segment only. The
+    # out-of-scope continuation is mapped and never downgrades what the in-scope
+    # steps proved, but its last step never ran, so the route can at most be
+    # ``partial`` (capped below). A route that leaves the scope at its very
+    # first step proves nothing and stays mapped.
+    steps, crossed_scope = in_scope_segment(steps)
+    if crossed_scope and not any(
+        isinstance(step, dict)
+        and str(step.get("action") or "").strip().lower() not in _CONTEXT_RELATIONS_LOWER
+        for step in steps
+    ):
+        return "theoretical"
     # A pure coverage-declaration marker (the fallback floor's synthetic
     # ``reached_not_materialized`` step) is NOT a real attack step — it declares a
     # reachable target whose route was not materialised in the sample. Branch on it
@@ -1453,7 +1495,10 @@ def _derive_display_status_from_steps(steps: list[dict[str, Any]]) -> str:
             unproven_actions.append(action)
 
     if statuses and all(status == "success" for status in statuses):
-        return "exploited"
+        # A route cut at the engagement-scope boundary proved its in-scope
+        # segment only; the step into the out-of-scope domain never ran, so it
+        # was not walked end to end and never counts as fully executed.
+        return "partial" if crossed_scope else "exploited"
 
     # Use support registry (not a hardcoded list) for policy-blocked relations.
     from adscan_internal.services.attack_step_support_registry import (
@@ -3344,6 +3389,9 @@ def _minimize_display_record_by_redundant_memberof(
         return None
 
     truncated = dict(record)
+    # The truncated record no longer ends at the Domain object its "also
+    # reaches" note was computed for, so the note does not travel with it.
+    truncated.pop(attack_graph_core.ALSO_REACHES_DOMAINS_KEY, None)
     truncated["nodes"] = truncated_nodes
     truncated["relations"] = truncated_rels
     truncated["_exact_signature"] = (
@@ -3809,7 +3857,11 @@ def _inject_memberof_edges_from_snapshot(
     )
 
     injected = 0
-    for node_id in principal_node_ids:
+    # Iterate in a TOTAL order (sorted ids, then sorted group labels below), never
+    # in set order: this loop appends edges and may mint group nodes, and the
+    # node/edge insertion order is the DFS source and adjacency order, so a
+    # set-ordered walk made the computed paths a function of PYTHONHASHSEED.
+    for node_id in sorted(principal_node_ids):
         node = nodes_map.get(node_id)
         if not isinstance(node, dict):
             continue
@@ -3848,7 +3900,7 @@ def _inject_memberof_edges_from_snapshot(
                     )
                     group_labels.update(parents)
 
-        for group_label in group_labels:
+        for group_label in sorted(group_labels):
             gid = _ensure_group_node_id(
                 runtime_graph,
                 domain=domain,
@@ -3962,7 +4014,7 @@ def compute_display_paths_for_domain(
     domain: str,
     snapshot: dict[str, Any] | None,
     max_depth: int,
-    max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     expand_terminal_memberships: bool = True,
@@ -3971,6 +4023,15 @@ def compute_display_paths_for_domain(
     keep_longest: bool = True,
     force_perterminal: bool = False,
 ) -> list[dict[str, Any]]:
+    """Compute the domain-scope display paths over ``graph``.
+
+    ``enumeration_cap`` bounds DISCOVERY: the DFS stops after that many raw
+    candidate routes, before any collapse or filter runs, so it is a resource
+    bound and never a "top N" (post-processing routinely discards the capped
+    candidates). It is reported through :func:`track_enumeration_truncation`.
+    A cap on the listing a user sees is the service layer's ``max_paths``,
+    applied to the final ordered listing.
+    """
     pipeline_started_at = time.monotonic()
     runtime_graph: dict[str, Any] = dict(graph)
     runtime_graph["nodes"] = dict(
@@ -4038,7 +4099,7 @@ def compute_display_paths_for_domain(
     unfiltered = attack_graph_core.compute_display_paths_for_domain_unfiltered(
         runtime_graph,
         max_depth=max_depth,
-        max_paths=max_paths,
+        max_paths=enumeration_cap,
         target=target,
         target_mode=mode,
         start_node_ids=start_node_ids,
@@ -4051,6 +4112,7 @@ def compute_display_paths_for_domain(
         started_at=unfiltered_started_at,
         records=unfiltered,
     )
+    _note_raw_enumeration(len(unfiltered), enumeration_cap)
     # Re-expand gen-time-collapsed pivots at the RAW record boundary — before any
     # collapse/minimise — so every downstream stage sees the identical full set it
     # would in an OFF run. The RAM/OOM win is the SMALLER list the DFS held (see
@@ -4146,6 +4208,11 @@ def compute_display_paths_for_domain(
         started_at=filtered_started_at,
         records=filtered,
     )
+    # Engagement scope: a route that compromises an in-scope domain and then
+    # leaves the scope is split at the boundary, so the in-scope segment counts
+    # where it ends and the continuation is reported as reach beyond the scope.
+    # Last, after every collapse, so no later rule re-derives the original route.
+    filtered = split_routes_at_engagement_scope(filtered, label_to_node=_l2n)
     _log_phase_timing(
         scope="domain",
         phase="total_pipeline",
@@ -4162,7 +4229,7 @@ def compute_display_paths_for_start_node(
     snapshot: dict[str, Any] | None,
     start_node_id: str,
     max_depth: int,
-    max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     expand_start_memberships: bool = True,
@@ -4274,7 +4341,7 @@ def compute_display_paths_for_start_node(
         runtime_graph,
         start_node_id=start_node_id,
         max_depth=max_depth,
-        max_paths=max_paths,
+        max_paths=enumeration_cap,
         target=target,
         target_mode=mode,
         force_perterminal=force_perterminal,
@@ -4285,6 +4352,7 @@ def compute_display_paths_for_start_node(
         started_at=raw_started_at,
         records=records,
     )
+    _note_raw_enumeration(len(records), enumeration_cap)
 
     # Raw checkpoint reflects the SMALLER DFS output (the OOM-relevant peak); the
     # re-expansion restores the full set immediately after, before minimisation,
@@ -4367,7 +4435,7 @@ def compute_display_paths_for_user(
     snapshot: dict[str, Any] | None,
     username: str,
     max_depth: int,
-    max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     filter_shortest_paths: bool = True,
@@ -4383,7 +4451,7 @@ def compute_display_paths_for_user(
         snapshot=snapshot,
         start_node_id=start_node_id,
         max_depth=max_depth,
-        max_paths=max_paths,
+        enumeration_cap=enumeration_cap,
         target=target,
         target_mode=target_mode,
         filter_shortest_paths=filter_shortest_paths,
@@ -4399,7 +4467,7 @@ def compute_display_paths_for_principals(
     snapshot: dict[str, Any] | None,
     principals: list[str],
     max_depth: int,
-    max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     membership_sample_max: int = 3,
     target_mode: str = "object",
@@ -4438,7 +4506,7 @@ def compute_display_paths_for_principals(
     # When ADSCAN_ATTACK_PATH_WORKERS != 0 and there are enough principals,
     # dispatch each principal's DFS to a separate worker process.  The graph
     # and snapshot are sent via the pool initializer (once per worker).
-    # max_paths budget is not enforced per-principal in parallel mode (the
+    # enumeration_cap budget is not enforced per-principal in parallel mode (the
     # global cap is approximate); the post-processing pipeline handles it.
     all_records: list[dict[str, Any]] = []
     n_workers = _effective_principal_workers(len(normalized_principals))
@@ -4458,7 +4526,7 @@ def compute_display_paths_for_principals(
             domain,
             snapshot,
             max_depth,
-            max_paths,
+            enumeration_cap,
             target,
             target_mode,
             filter_shortest_paths,
@@ -4466,6 +4534,7 @@ def compute_display_paths_for_principals(
         )
         if parallel_result is not None:
             all_records = parallel_result
+            _note_raw_enumeration(len(all_records), enumeration_cap)
         else:
             print_info_debug(
                 "[principals-dfs] parallel failed, falling back to sequential"
@@ -4483,9 +4552,10 @@ def compute_display_paths_for_principals(
         for _principals_done, username in enumerate(normalized_principals):
             attack_path_progress.notify_principal(_principals_done, _principals_total)
             remaining = None
-            if isinstance(max_paths, int) and max_paths > 0:
-                remaining = max_paths - len(all_records)
+            if isinstance(enumeration_cap, int) and enumeration_cap > 0:
+                remaining = enumeration_cap - len(all_records)
                 if remaining <= 0:
+                    _note_raw_enumeration(len(all_records), enumeration_cap)
                     break
             records = compute_display_paths_for_user(
                 graph,
@@ -4493,7 +4563,7 @@ def compute_display_paths_for_principals(
                 snapshot=snapshot,
                 username=username,
                 max_depth=max_depth,
-                max_paths=remaining,
+                enumeration_cap=remaining,
                 target=target,
                 target_mode=target_mode,
                 filter_shortest_paths=filter_shortest_paths,

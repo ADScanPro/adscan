@@ -15,6 +15,8 @@ operator action is required and surfaces the exact remote path.
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -508,7 +510,7 @@ def cleanup_workspace_ligolo_artifacts(
         # registers the staged agent AT THE WRITE); register here only as a
         # legacy fallback for a tunnel staged before upload-time disclosure
         # existed, so a record is never double-registered.
-        ledger = getattr(shell, "environment_change_ledger", None)
+        ledger = ledger_or_warn(shell)
         _ledger_change_id: str | None = (
             str(record.get("remote_artifact_change_id") or "") or None
         )
@@ -545,9 +547,10 @@ def cleanup_workspace_ligolo_artifacts(
         if ledger is not None and _ledger_change_id:
             _unc_target = f"\\\\{pivot_host}\\{_unc_agent_path}"
             _native_rm = (
-                "Delete the staged pivot agent and confirm it is gone:\n"
+                "Delete the staged pivot agent, then confirm it is gone. The check "
+                "should print False.\n"
                 f'  Remove-Item -LiteralPath "{_unc_target}" -Force\n'
-                f'  Test-Path "{_unc_target}"   # must return False'
+                f'  Test-Path "{_unc_target}"'
             )
             if result.cleanup_succeeded:
                 ledger.mark_reverted_confirmed(

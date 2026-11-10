@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, NamedTuple
 
 from adscan_internal import telemetry
@@ -34,6 +34,20 @@ from adscan_internal.rich_output import (
     print_info_debug,
     print_info_verbose,
     print_warning_debug,
+)
+from adscan_internal.services.adcs.ca_registry_checks import (
+    CHECK_CERTIGHOST,
+    CHECK_ESC6,
+    CHECK_ESC11,
+    REGISTRY_FINDING_KEYS,
+    assess_registry_checks,
+    observe_registry_check,
+)
+from adscan_internal.services.adcs.esc12_detection import (
+    REASON_CA_HOST_UNKNOWN,
+    REASON_EXCLUDED_BY_POLICY,
+    REASON_NO_LOCAL_ADMIN,
+    REASON_READ_FAILED,
 )
 from adscan_internal.services.adcs_ca_registry_service import (
     ADCSCARegistryProbe,
@@ -48,6 +62,9 @@ from adscan_internal.services.collector.acl_parser import ACLParser
 from adscan_internal.services.collector.adcs_detectors import (
     detect_all_for_ca as _detect_adcs_ca_escalations,
     detect_all_for_template as _detect_adcs_escalations,
+)
+from adscan_internal.services.collector.collection_integrity import (
+    note_stage_exception,
 )
 from adscan_internal.services.collector.models import (
     CollectionResult,
@@ -269,6 +286,10 @@ _ENTERPRISE_CA_PROPERTY_KEYS = {
     "mspki-enrollment-servers": "mspki_enrollment_servers",
 }
 
+
+#: Why the registry probe was not even attempted when the collector was built
+#: without a credential builder (lab scripts, metadata-only detection).
+REASON_REGISTRY_PROBE_NOT_CONFIGURED = "registry_probe_not_configured"
 
 # Type alias for dependency-injected probe credential builder. Receives the
 # CA host (DNS or IP) and returns an SMBConfig already authenticated with
@@ -568,6 +589,8 @@ class ADCSCollector:
         smb_config_builder: SMBConfigBuilder | None = None,
         dc_binding_probe: DCBindingProbe | None = None,
         shell: Any = None,
+        directory_roles: Mapping[str, Any] | None = None,
+        defer_unresolved_registry: bool = False,
     ) -> None:
         self._connection = connection
         self._domain = domain
@@ -582,6 +605,19 @@ class ADCSCollector:
         # ``None`` (lab scripts / direct-unit-test construction) keeps CA-host
         # connections targeting the FQDN — byte-for-byte the pre-fix behaviour.
         self._shell = shell
+        # Administrative roles derived from the directory membership the caller
+        # already collected (``privilege_role.directory_admin_roles``). The
+        # attack graph does not exist yet while the collector runs, so this is
+        # the evidence that lets a scan starting as Domain Admin qualify its own
+        # credential for the CA-host reads (ESC12 here; the registry probe gets
+        # it through the injected ``smb_config_builder``).
+        self._directory_roles = dict(directory_roles or {})
+        # When True, a CA whose registry probe found no CA-host administrator
+        # is NOT recorded as not assessed here: it is handed to the caller on
+        # ``CollectionResult.adcs_registry_pending`` and the collection
+        # orchestrator re-runs it once the persisted graph resolves roles
+        # (``adcs.ca_registry_rerun``), recording the outcome exactly once.
+        self._defer_unresolved_registry = bool(defer_unresolved_registry)
         # Set once a PKI-container search returns ``noSuchObject`` so the whole
         # domain reports "no ADCS" as a single quiet line, not per-container.
         self._adcs_absent = False
@@ -663,7 +699,7 @@ class ADCSCollector:
         # ESC13 precondition: issuance-policy OIDs that map to a group via
         # ``msDS-OIDToGroupLink``. The map is consumed by ``detect_esc13`` to
         # enrich edge notes with the linked group DN.
-        oid_links = self._collect_oid_to_group_links(pks_base)
+        oid_links = self._collect_oid_to_group_links(pks_base, result=result)
 
         self._detect_escalations(result, oid_links=oid_links)
 
@@ -714,6 +750,7 @@ class ADCSCollector:
                 return
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, f"adcs.{label}", exc)
             print_info_debug(
                 f"[adcs-collector] {label} search failed at {search_base}: {exc}"
             )
@@ -745,7 +782,9 @@ class ADCSCollector:
     # Phase 2/3 escalation detection (sync entry-point with async probe phase)
     # ------------------------------------------------------------------
 
-    def _collect_oid_to_group_links(self, pks_base: str) -> _OidToGroupLinks:
+    def _collect_oid_to_group_links(
+        self, pks_base: str, result: CollectionResult | None = None
+    ) -> _OidToGroupLinks:
         """Return the issuance-policy OID → linked group DN map for ESC13.
 
         Queries ``msPKI-Enterprise-Oid`` objects under the OID container.
@@ -780,6 +819,8 @@ class ADCSCollector:
                 return _OidToGroupLinks(links={}, resolved=True)
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            if result is not None:
+                note_stage_exception(result, "adcs.oid_links", exc)
             print_info_debug(
                 f"[adcs-collector] OID-to-group link query failed at {oid_base}: {exc}"
             )
@@ -1018,55 +1059,14 @@ class ADCSCollector:
                     "CA host name could not be resolved or reached (data gap) — "
                     "web enrollment status is UNKNOWN, not disabled"
                 )
-            # Safe default: when registry probe failed or was unavailable,
-            # treat enforce_encrypt as True so ESC11 is NOT emitted.
-            # ESC11 requires CONFIRMED absence of encryption enforcement — if
-            # we couldn't probe the registry we have no evidence of the
-            # vulnerability and should not generate a false positive.
-            # The relay execution path confirms this: a failed probe on
-            # Retro.vl caused ESC11 to be emitted, but the relay returned
-            # rpc_s_access_denied, proving the CA does enforce encryption.
-            enforce_encrypt = (
-                probe.registry.enforce_encrypt_icertrequest
-                if probe is not None and probe.registry is not None
-                else True
-            )
-            # Certighost (CVE-2026-54121) read-only inputs: the chase-fallback
-            # EditFlags bit + the CA host OS build/UBR. Defaults (flag unset,
-            # EditFlags unreadable, build/UBR None) emit no edge, so a CA with
-            # no registry probe stays a data gap, never a false positive.
             registry = probe.registry if probe is not None else None
-            certighost_chase = bool(
-                registry.editf_enablechaseclientdc_enabled
-                if registry is not None
-                else False
-            )
-            certighost_editf_readable = bool(
-                registry.edit_flags_readable if registry is not None else False
-            )
-            certighost_build = (
-                registry.os_build_number if registry is not None else None
-            )
-            certighost_ubr = registry.os_ubr if registry is not None else None
-            certighost_major = (
-                registry.os_major_version if registry is not None else None
-            )
-            certighost_minor = (
-                registry.os_minor_version if registry is not None else None
-            )
             try:
                 new_edges = _detect_adcs_ca_escalations(
                     ca_node=ca,
                     ca_acl_edges=ca_edges,
                     domain=self._domain,
                     web_enrollment_enabled=web_enabled,
-                    enforce_encrypt_icertrequest=enforce_encrypt,
-                    certighost_chase_enabled=certighost_chase,
-                    certighost_edit_flags_readable=certighost_editf_readable,
-                    certighost_os_build_number=certighost_build,
-                    certighost_os_ubr=certighost_ubr,
-                    certighost_os_major_version=certighost_major,
-                    certighost_os_minor_version=certighost_minor,
+                    **registry_ca_detector_kwargs(registry),
                 )
             except Exception as exc:
                 telemetry.capture_exception(exc)
@@ -1078,6 +1078,39 @@ class ADCSCollector:
             for edge in new_edges:
                 result.add_edge(edge)
                 ca_added += 1
+
+            # ESC6 / ESC11 / Certighost: record what the registry probe could
+            # decide for THIS CA. A check whose input was not read is NOT
+            # ASSESSED with its reason, never clear by absence. A CA that only
+            # lacked a CA-host administrator is deferred to the orchestrator's
+            # re-run instead, which records it once (see the constructor).
+            pending = self._pending_registry_probe(ca, probe)
+            if pending is not None:
+                result.adcs_registry_pending.append(pending)
+            else:
+                self._observe_registry_checks(
+                    ca=ca,
+                    probe=probe,
+                    ca_edge_relations={e.relation for e in new_edges},
+                    result=result,
+                    templates=templates,
+                )
+
+            # ESC12: emitted only for a confirmed read-only check.
+            esc12_result = probe.esc12 if probe is not None else None
+            if esc12_result is not None and getattr(esc12_result, "confirmed", False):
+                from adscan_internal.services.collector.adcs_detectors.esc12 import (
+                    detect_esc12,
+                )
+
+                host_sid = self._resolve_ca_host_object_id(
+                    str(ca.properties.get("dns_hostname") or "")
+                )
+                for edge in detect_esc12(
+                    ca_node=ca, check_result=esc12_result, ca_host_object_id=host_sid
+                ):
+                    result.add_edge(edge)
+                    ca_added += 1
 
         total_added = added + pki_added + ca_added
         if total_added:
@@ -1121,11 +1154,15 @@ class ADCSCollector:
             }
         )
 
+        from adscan_internal.services.adcs.esc12_detection import ESC12_RELATION
+
         esc_targets: set[str] = set()
         for edge in result.edges:
             if (
                 edge.relation in _TEMPLATE_ESC_RELATIONS
                 or edge.relation in _CA_ESC_RELATIONS
+                # ESC12's raw edge always targets the EnterpriseCA node.
+                or edge.relation == ESC12_RELATION
             ):
                 esc_targets.add(edge.target_object_id)
 
@@ -1385,6 +1422,62 @@ class ADCSCollector:
             str(domain),
         )
 
+    def _registry_checks_allowed(self) -> bool:
+        """Whether the scan policy lets any registry-fed check run (ESC6/ESC11/Certighost)."""
+        if self._shell is None:
+            return True
+        from adscan_core.scan_policy import gate
+
+        allowed = {key: gate.finding_allowed(self._shell, key) for key in REGISTRY_FINDING_KEYS}
+        skipped = [key for key, ok in allowed.items() if not ok]
+        if skipped:
+            from adscan_internal.services.scan_policy_notice import notify_policy_skip
+
+            notify_policy_skip(
+                self._shell,
+                [f"finding:{key}" for key in skipped],
+                subject="AD CS registry checks",
+                key="adcs_registry_checks",
+            )
+        return any(allowed.values())
+
+    def _pending_registry_probe(
+        self, ca: CollectorNode, probe: "_CAProbeBundle | None"
+    ) -> "PendingCARegistryProbe | None":
+        """Return the deferral record for a CA that only lacked an administrator."""
+        if not self._defer_unresolved_registry or probe is None:
+            return None
+        if probe.registry is not None or probe.registry_skip_reason != REASON_NO_LOCAL_ADMIN:
+            return None
+        return PendingCARegistryProbe(
+            ca_object_id=ca.object_id,
+            ca_host=str(ca.properties.get("dns_hostname") or "").strip(),
+            ca_name=ca.name.split("@", 1)[0] if ca.name else "",
+        )
+
+    def _observe_registry_checks(
+        self,
+        *,
+        ca: CollectorNode,
+        probe: "_CAProbeBundle | None",
+        ca_edge_relations: set[str],
+        result: CollectionResult,
+        templates: list[CollectorNode],
+    ) -> None:
+        """Record the ESC6 / ESC11 / Certighost observation of one CA."""
+        observe_ca_registry_checks(
+            self._shell,
+            domain=self._domain,
+            ca=ca,
+            registry=probe.registry if probe is not None else None,
+            skip_reason=(
+                probe.registry_skip_reason if probe is not None else REASON_NO_LOCAL_ADMIN
+            ),
+            ca_edge_relations=ca_edge_relations,
+            result=result,
+            templates=templates,
+        )
+
     def _resolve_ca_connect_and_spn(self, ca_host: str) -> tuple[str, str]:
         """Split a CA FQDN into ``(connect_ip, spn_fqdn)`` via the reachable-IP SSOT.
 
@@ -1402,33 +1495,72 @@ class ADCSCollector:
         ``(ca_host, ca_host)`` unchanged, so a working environment never
         regresses to a worse address.
         """
-        from adscan_internal.services._kerberos_spn import is_ip_address
-
-        if self._shell is None or not ca_host or is_ip_address(ca_host):
-            return ca_host, ca_host
+        from adscan_internal.services.adcs.ca_host_access import (
+            resolve_ca_connect_and_spn,
+        )
 
         config = getattr(self._connection, "config", None)
         dc_ip = getattr(config, "dc_ip", None) if config else None
-        try:
-            from adscan_internal.services.host_address_resolver import (
-                resolve_connect_and_spn,
-            )
+        return resolve_ca_connect_and_spn(
+            self._shell,
+            domain=self._domain,
+            dc_ip=str(dc_ip) if dc_ip else None,
+            ca_host=ca_host,
+        )
 
-            connect_ip, spn_fqdn = resolve_connect_and_spn(
+    def _ca_host_verdict(self, ca_host: str) -> Any:
+        """The collection-host verdict for a CA host (``None`` when unknown).
+
+        The ownership rule is the engagement-scope SSOT
+        (``engagement_scope.collection_host_verdict``): this collector contacts
+        only hosts its own domain owns, and a host of another domain is never
+        contacted from here, in scope or not.
+        """
+        if not ca_host:
+            return None
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            collection_host_verdict,
+        )
+
+        return collection_host_verdict(
+            self._shell, host=ca_host, collecting_domain=self._domain
+        )
+
+    def _ca_host_not_contacted(
+        self, *, ca_name: str, ca_host: str, verdict: Any
+    ) -> "_CAProbeBundle":
+        """Record every host-level CA check as not checked, with the reason."""
+        from adscan_internal.services.adcs import esc12_detection as esc12  # noqa: PLC0415
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            note_collection_host_skipped,
+        )
+
+        if self._shell is not None:
+            note_collection_host_skipped(
                 self._shell,
-                host=ca_host,
-                domain=self._domain,
-                resolver_ip=str(dc_ip) if dc_ip else None,
-                spn_hostname=ca_host,
+                verdict,
+                what=f"Certification authority {ca_name or ca_host} host checks",
             )
-            return str(connect_ip), str(spn_fqdn)
-        except Exception as exc:  # noqa: BLE001 — best-effort; keep the FQDN
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            return ca_host, ca_host
+        else:
+            print_info_debug(
+                f"[adcs-collector] CA host {mark_sensitive(ca_host, 'host')} not "
+                f"contacted: {verdict.reason}"
+            )
+        esc12_result = esc12.not_checked(ca_name, ca_host, verdict.reason)
+        if self._shell is not None and ca_name:
+            esc12.observe_esc12_result(
+                self._shell, domain=self._domain, result=esc12_result
+            )
+        return _CAProbeBundle(
+            registry=None,
+            web=None,
+            ca_security_edges=[],
+            esc12=esc12_result,
+            registry_skip_reason=verdict.reason,
+        )
 
     async def _fetch_ca_security_edges(
-        self, ca: CollectorNode
+        self, ca: CollectorNode, *, host_verdict: Any = None
     ) -> list[CollectorEdge]:
         """Read the CA's authoritative security descriptor and parse ESC7 edges.
 
@@ -1447,6 +1579,7 @@ class ADCSCollector:
         import rich.markup
 
         from adscan_internal.services._kerberos_spn import is_ip_address
+        from adscan_internal.services.adcs.ca_host_access import ca_host_smb_realms
         from adscan_internal.services.collector.adcs_detectors._ca_security import (
             parse_ca_security_edges,
         )
@@ -1461,6 +1594,13 @@ class ADCSCollector:
         if not ca_host or not ca_name:
             return []
         _register_ca_identity(ca_name, ca_host)
+        verdict = host_verdict if host_verdict is not None else self._ca_host_verdict(ca_host)
+        if verdict is not None and not verdict.allowed:
+            print_info_debug(
+                f"adcs GetCASecurity skipped for {mark_sensitive(ca_name, 'hostname')}: "
+                f"CA host not contacted from this domain ({verdict.reason})"
+            )
+            return []
         if is_ip_address(ca_host):
             print_info_debug(
                 f"adcs GetCASecurity skipped for {mark_sensitive(ca_name, 'hostname')}: "
@@ -1475,7 +1615,8 @@ class ADCSCollector:
         # Recover the NTLM/PtH secret (may be None) as the posture-pruned
         # fallback leg. Kerberos-ccache stays primary.
         credential = self._build_ca_security_credential()
-        username = password = nt_hash = domain = None
+        username = password = nt_hash = None
+        domain: str | None = None
         if credential is not None:
             username, password, nt_hash, domain = credential
         # ccache-only scan: no NTLM secret recovered, but the ccache still
@@ -1499,6 +1640,18 @@ class ADCSCollector:
 
         posture_snapshot = getattr(config, "posture_snapshot", None) if config else None
         dc_ip = getattr(config, "dc_ip", None) if config else None
+        # Two realms (CLAUDE.md, auth vs target domain): the credential's own
+        # domain mints the TGT at ITS KDC, while the CA host belongs to the
+        # domain being collected, whose DC is the referral target. Collapsing
+        # both onto the credential domain asked the credential's KDC for the
+        # CA host's service ticket, which hands back the cross-realm referral
+        # TGT, and the CA host rejects it as STATUS_WRONG_PASSWORD.
+        realms = ca_host_smb_realms(
+            host_domain=self._domain,
+            credential_domain=str(domain),
+            auth_kdc=(getattr(config, "auth_kdc", None) if config else None) or dc_ip,
+            target_kdc=dc_ip,
+        )
 
         # Recover the CA host's reachable IP so a DC-DNS gap on the member CA's
         # FQDN does not dead-end the DCOM connect. IP for the CONNECT, FQDN kept
@@ -1516,15 +1669,13 @@ class ADCSCollector:
         smb_config = SMBConfig(
             target_ip=connect_ip,
             target_hostname=spn_fqdn,
-            domain=str(domain),
-            auth_domain=str(domain),
             username=str(username),
             password=password,
             nt_hash=nt_hash,
             ccache_path=ccache_path,
-            kdc_ip=str(dc_ip) if dc_ip else None,
             use_kerberos=bool(ccache_path),
             posture_snapshot=posture_snapshot,
+            **realms,
         )
 
         source = (
@@ -1595,6 +1746,99 @@ class ADCSCollector:
             )
         return edges
 
+    async def _check_esc12(
+        self, *, ca_host: str, ca_name: str, host_verdict: Any = None
+    ) -> Any:
+        """Run the read-only ESC12 check for one CA and record its observation.
+
+        The credential gate is the local-admin SSOT
+        (``esc12_detection.resolve_esc12_credential``), never the collection
+        credential: on the first low-privilege collection the check reads
+        ``not_checked``, and the privileged refresh a domain compromise triggers
+        (``post_da.run_audit_post_da_graph_refresh``) re-runs this collector
+        with a proven administrator. Returns ``None`` when there is no shell
+        (lab scripts, direct construction): no check, no observation.
+        """
+        if self._shell is None:
+            return None
+        from adscan_core.scan_policy import gate
+        from adscan_internal.services.adcs import esc12_detection as esc12
+        from adscan_internal.services.async_bridge import run_sync_off_loop
+
+        if not gate.finding_allowed(self._shell, esc12.ESC12_FINDING_KEY):
+            from adscan_internal.services.scan_policy_notice import notify_policy_skip
+
+            notify_policy_skip(
+                self._shell,
+                f"finding:{esc12.ESC12_FINDING_KEY}",
+                subject="ESC12 check",
+                key="adcs_esc12",
+                target=ca_name or "",
+            )
+            result = esc12.not_checked(ca_name, ca_host, esc12.REASON_EXCLUDED_BY_POLICY)
+        elif not ca_host or not ca_name:
+            result = esc12.not_checked(ca_name, ca_host, esc12.REASON_CA_HOST_UNKNOWN)
+        elif (
+            verdict := host_verdict if host_verdict is not None else self._ca_host_verdict(ca_host)
+        ) is not None and not verdict.allowed:
+            result = esc12.not_checked(ca_name, ca_host, verdict.reason)
+        else:
+            connect_ip, spn_fqdn = run_sync_off_loop(
+                self._resolve_ca_connect_and_spn, ca_host
+            )
+            config = getattr(self._connection, "config", None)
+            dc_ip = getattr(config, "dc_ip", None) if config is not None else None
+            credential = run_sync_off_loop(
+                esc12.resolve_esc12_credential,
+                self._shell,
+                domain=self._domain,
+                ca_host=ca_host,
+                connect_ip=connect_ip,
+                spn_fqdn=spn_fqdn,
+                kdc_ip=str(dc_ip) if dc_ip else None,
+                directory_roles=self._directory_roles,
+                host_domain=self._domain,
+            )
+            result = await esc12.check_esc12(
+                ca_name=ca_name, ca_host=ca_host, credential=credential
+            )
+        esc12.observe_esc12_result(self._shell, domain=self._domain, result=result)
+        return result
+
+    def _resolve_ca_host_object_id(self, ca_host: str) -> str:
+        """Return the SID of the CA host's computer object, ``""`` when unknown.
+
+        One ``dNSHostName`` lookup in the domain partition, run only for a CA
+        whose ESC12 check was confirmed. Best-effort: a failure leaves the edge
+        anchored on the CA node (``detect_esc12``), never dropped.
+        """
+        host = str(ca_host or "").strip()
+        base = str(getattr(self._connection, "domain_dn", "") or "").strip()
+        if not host or not base:
+            return ""
+        escaped = "".join(
+            f"\\{ord(ch):02x}" if ch in "*()\\\x00" else ch for ch in host
+        )
+        try:
+            self._connection.search(
+                search_base=base,
+                search_filter=f"(&(objectCategory=computer)(dNSHostName={escaped}))",
+                attributes=["objectSid"],
+                search_scope="SUBTREE",
+            )
+            for entry in list(self._connection.entries):
+                raw = _first(_attrs(entry), "objectSid")
+                if isinstance(raw, (bytes, bytearray)):
+                    from winacl.dtyp.sid import SID
+
+                    return str(SID.from_bytes(bytes(raw)))
+                if raw:
+                    return str(raw).strip()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        return ""
+
     async def _run_probes(
         self, cas: list[CollectorNode]
     ) -> tuple[dict[str, "_CAProbeBundle"], tuple[int, bool] | None]:
@@ -1616,6 +1860,19 @@ class ADCSCollector:
             _register_ca_identity(ca_name, ca_host)
             registry_result: CARegistryProbeResult | None = None
             web_result: WebEnrollmentProbeResult | None = None
+
+            # Host-level reads belong to the collection of the domain that OWNS
+            # the CA host. An enterprise CA lives in the forest-wide
+            # Configuration NC, so a child domain's LDAP legitimately returns a
+            # CA hosted in the parent: it stays mapped from that directory data,
+            # and its host (web enrollment, registry, CA security descriptor,
+            # ESC12) is never contacted from here.
+            host_verdict = self._ca_host_verdict(ca_host)
+            if host_verdict is not None and not host_verdict.allowed:
+                ca_probes[ca.object_id] = self._ca_host_not_contacted(
+                    ca_name=ca_name, ca_host=ca_host, verdict=host_verdict
+                )
+                continue
 
             # Web probe — host-only, no credentials needed. Recover the CA
             # host's reachable IP so a DC-DNS gap on its FQDN does not read as
@@ -1648,22 +1905,38 @@ class ADCSCollector:
                         f"{mark_sensitive(ca_host, 'host')}: {exc}"
                     )
 
-            # Registry probe — needs SMB creds via builder callback.
-            if ca_host and ca_name and self._smb_config_builder is not None:
+            # Registry probe (ESC6 / ESC11 / Certighost inputs) — needs a CA-host
+            # administrator via the builder callback. Every way it can fail to
+            # run is kept as a reason: the checks are then recorded NOT
+            # ASSESSED, never cleared by absence.
+            registry_skip_reason = REASON_REGISTRY_PROBE_NOT_CONFIGURED
+            if not ca_host or not ca_name:
+                registry_skip_reason = REASON_CA_HOST_UNKNOWN
+            elif not self._registry_checks_allowed():
+                registry_skip_reason = REASON_EXCLUDED_BY_POLICY
+            elif self._smb_config_builder is not None:
+                registry_skip_reason = REASON_NO_LOCAL_ADMIN
                 try:
                     smb_config = await self._smb_config_builder(ca_host)
                     if smb_config is not None:
                         registry_result = await registry_probe.probe(
                             config=smb_config, ca_name=ca_name
                         )
+                        registry_skip_reason = ""
                     else:
                         print_info_debug(
-                            "[adcs-collector] no SMB credentials available for "
-                            f"{mark_sensitive(ca_host, 'host')}; skipping registry probe"
+                            "[adcs-collector] no CA-host administrator credential for "
+                            f"{mark_sensitive(ca_host, 'host')}; "
+                            + (
+                                "registry probe deferred until roles resolve"
+                                if self._defer_unresolved_registry
+                                else "registry checks not assessed"
+                            )
                         )
                 except Exception as exc:  # noqa: BLE001
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
+                    registry_skip_reason = REASON_READ_FAILED
                     print_info_debug(
                         f"[adcs-collector] registry probe failed for "
                         f"{mark_sensitive(ca_host, 'host')}: {exc}"
@@ -1675,7 +1948,9 @@ class ADCSCollector:
             # Best-effort: a failure here must never abort ADCS collection.
             ca_security_edges: list[CollectorEdge] = []
             try:
-                ca_security_edges = await self._fetch_ca_security_edges(ca)
+                ca_security_edges = await self._fetch_ca_security_edges(
+                    ca, host_verdict=host_verdict
+                )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
@@ -1684,10 +1959,28 @@ class ADCSCollector:
                     f"{mark_sensitive(ca_host, 'host')}: {exc}"
                 )
 
+            # ESC12 (YubiHSM KSP password in the CA host registry). Read-only,
+            # and only with a credential PROVEN to administer the CA host; every
+            # outcome is recorded in the run's observation record. Best-effort.
+            esc12_result = None
+            try:
+                esc12_result = await self._check_esc12(
+                    ca_host=ca_host, ca_name=ca_name, host_verdict=host_verdict
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_info_debug(
+                    "[adcs-collector] ESC12 check failed for "
+                    f"{mark_sensitive(ca_host, 'host')}: {type(exc).__name__}"
+                )
+
             ca_probes[ca.object_id] = _CAProbeBundle(
                 registry=registry_result,
                 web=web_result,
                 ca_security_edges=ca_security_edges,
+                esc12=esc12_result,
+                registry_skip_reason=registry_skip_reason,
             )
 
         # DC binding probe — single per-domain call for ESC10 inputs.
@@ -1706,9 +1999,217 @@ class ADCSCollector:
         return ca_probes, domain_binding
 
 
+class PendingCARegistryProbe(NamedTuple):
+    """A CA whose registry probe found no CA-host administrator on the first pass."""
+
+    ca_object_id: str
+    ca_host: str
+    ca_name: str
+
+
+def registry_ca_detector_kwargs(
+    registry: CARegistryProbeResult | None,
+) -> dict[str, Any]:
+    """The CA-level detector inputs the registry probe decides (ESC11, Certighost).
+
+    Safe defaults when the probe did not run or a value was not read:
+    ``enforce_encrypt_icertrequest=True`` (ESC11 needs a CONFIRMED absence of
+    the enforcement bit; a failed probe on a CA that enforces encryption once
+    produced a false ESC11 the relay then disproved with
+    ``rpc_s_access_denied``), and the Certighost inputs unset (flag off, EditFlags
+    unreadable, build/UBR unknown), so a CA with no registry data stays a data
+    gap, never a false positive. One definition for the first pass and the
+    orchestrator's re-run.
+    """
+    if registry is None:
+        return {
+            "enforce_encrypt_icertrequest": True,
+            "certighost_chase_enabled": False,
+            "certighost_edit_flags_readable": False,
+            "certighost_os_build_number": None,
+            "certighost_os_ubr": None,
+            "certighost_os_major_version": None,
+            "certighost_os_minor_version": None,
+        }
+    return {
+        "enforce_encrypt_icertrequest": (
+            registry.enforce_encrypt_icertrequest
+            if registry.interface_flags_readable
+            else True
+        ),
+        "certighost_chase_enabled": bool(registry.editf_enablechaseclientdc_enabled),
+        "certighost_edit_flags_readable": bool(registry.edit_flags_readable),
+        "certighost_os_build_number": registry.os_build_number,
+        "certighost_os_ubr": registry.os_ubr,
+        "certighost_os_major_version": registry.os_major_version,
+        "certighost_os_minor_version": registry.os_minor_version,
+    }
+
+
+def _published_template_ids(
+    ca: CollectorNode, templates: Iterable[CollectorNode]
+) -> set[str]:
+    """Object ids of the templates ``ca`` publishes, matched on ``cn``."""
+    published = ca.properties.get("certificate_templates") or []
+    if not isinstance(published, (list, tuple)):
+        published = [published]
+    published_norm = {str(t).strip().casefold() for t in published if t}
+    return {
+        t.object_id
+        for t in templates
+        if str(t.properties.get("cn") or "").strip().casefold() in published_norm
+    }
+
+
+def observe_ca_registry_checks(
+    shell: Any,
+    *,
+    domain: str,
+    ca: CollectorNode,
+    registry: CARegistryProbeResult | None,
+    skip_reason: str,
+    ca_edge_relations: set[str],
+    result: CollectionResult,
+    templates: list[CollectorNode],
+) -> None:
+    """Record the ESC6 / ESC11 / Certighost observation of one CA. Never raises."""
+    if shell is None:
+        return
+    _share_ca_host_patch_level(shell, domain=domain, ca=ca, registry=registry)
+    assessments = assess_registry_checks(
+        registry, skip_reason=skip_reason or REASON_READ_FAILED
+    )
+    template_ids = _published_template_ids(ca, templates)
+    esc6_found = any(
+        e.relation == "ADCSESC6" and e.target_object_id in template_ids
+        for e in result.edges
+    )
+    found_by_check = {
+        CHECK_ESC6: esc6_found,
+        CHECK_ESC11: "ADCSESC11" in ca_edge_relations,
+        CHECK_CERTIGHOST: "certighost" in ca_edge_relations,
+    }
+    for check_id, assessment in assessments.items():
+        observe_registry_check(
+            shell,
+            domain=domain,
+            check_id=check_id,
+            assessment=assessment,
+            found=found_by_check[check_id],
+        )
+
+
+def _share_ca_host_patch_level(
+    shell: Any, *, domain: str, ca: CollectorNode, registry: CARegistryProbeResult | None
+) -> None:
+    """Hand the CA host's build / UBR (Certighost's read) to the patch-level cache.
+
+    The registry probe reads them with a proven administrator of the CA host, so
+    the patch-level CVE checks reuse that read instead of reading the host again.
+    """
+    if registry is None or registry.os_build_number is None:
+        return
+    from adscan_internal.services.cve_scanner.checks._os_patch_level import (  # noqa: PLC0415
+        ACCESS_ADMINISTRATIVE,
+    )
+    from adscan_internal.services.cve_scanner.host_patch_level import (  # noqa: PLC0415
+        record_host_patch_level,
+    )
+
+    props = getattr(ca, "properties", None) or {}
+    record_host_patch_level(
+        shell,
+        domain=domain,
+        hosts=(registry.target_host, props.get("dnshostname") if isinstance(props, dict) else None),
+        build=registry.os_build_number,
+        ubr=registry.os_ubr,
+        access=ACCESS_ADMINISTRATIVE,
+    )
+
+
+def registry_dependent_edges(
+    *,
+    ca: CollectorNode,
+    registry: CARegistryProbeResult | None,
+    templates: list[CollectorNode],
+    result: CollectionResult,
+    domain: str,
+) -> list[CollectorEdge]:
+    """The edges a late registry read adds for one CA: ESC6, ESC11, Certighost.
+
+    Used by the orchestrator's re-run, after the first pass emitted every other
+    ADCS edge for this CA without registry data (those first-pass detectors,
+    given no registry, emit none of these three, so nothing is duplicated). The
+    detectors are the same ones the first pass calls; ESC6 is emitted only for
+    templates this CA publishes and that carry no ESC6 edge yet (another CA
+    may already have raised it).
+    """
+    if registry is None:
+        return []
+    from adscan_internal.services.collector.adcs_detectors.certighost_detector import (  # noqa: PLC0415
+        detect_certighost,
+    )
+    from adscan_internal.services.collector.adcs_detectors.esc6 import (  # noqa: PLC0415
+        detect_esc6,
+    )
+    from adscan_internal.services.collector.adcs_detectors.esc11 import (  # noqa: PLC0415
+        detect_esc11,
+    )
+
+    kwargs = registry_ca_detector_kwargs(registry)
+    edges: list[CollectorEdge] = []
+    try:
+        edges.extend(
+            detect_esc11(
+                ca_node=ca,
+                domain=domain,
+                enforce_encrypt_icertrequest=kwargs["enforce_encrypt_icertrequest"],
+            )
+        )
+        edges.extend(
+            detect_certighost(
+                ca_node=ca,
+                domain=domain,
+                editf_enablechaseclientdc_enabled=kwargs["certighost_chase_enabled"],
+                edit_flags_readable=kwargs["certighost_edit_flags_readable"],
+                os_build_number=kwargs["certighost_os_build_number"],
+                os_ubr=kwargs["certighost_os_ubr"],
+                os_major_version=kwargs["certighost_os_major_version"],
+                os_minor_version=kwargs["certighost_os_minor_version"],
+            )
+        )
+        if registry.editf_attributesubjectaltname2_enabled:
+            published = _published_template_ids(ca, templates)
+            already = {e.target_object_id for e in result.edges if e.relation == "ADCSESC6"}
+            acl_by_target: dict[str, list[CollectorEdge]] = {}
+            for edge in result.edges:
+                acl_by_target.setdefault(edge.target_object_id, []).append(edge)
+            for template in templates:
+                if template.object_id not in published or template.object_id in already:
+                    continue
+                edges.extend(
+                    detect_esc6(
+                        template_node=template,
+                        template_acl_edges=acl_by_target.get(template.object_id, []),
+                        domain=domain,
+                        ca_editf_san2_enabled=True,
+                    )
+                )
+    except Exception as exc:  # noqa: BLE001 - a detector failure never aborts the re-run
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return edges
+
+
 # Internal probe-result aggregate. Not exported.
 class _CAProbeBundle:
-    __slots__ = ("registry", "web", "ca_security_edges")
+    __slots__ = (
+        "registry",
+        "web",
+        "ca_security_edges",
+        "esc12",
+        "registry_skip_reason",
+    )
 
     def __init__(
         self,
@@ -1716,7 +2217,13 @@ class _CAProbeBundle:
         registry: CARegistryProbeResult | None,
         web: WebEnrollmentProbeResult | None,
         ca_security_edges: list["CollectorEdge"] | None = None,
+        esc12: Any = None,
+        registry_skip_reason: str = "",
     ) -> None:
         self.registry = registry
         self.web = web
         self.ca_security_edges: list["CollectorEdge"] = ca_security_edges or []
+        # ESC12 read-only check result (``Esc12CheckResult``) or ``None`` when
+        # the collector has no shell to resolve a local-admin credential with.
+        self.esc12 = esc12
+        self.registry_skip_reason = registry_skip_reason

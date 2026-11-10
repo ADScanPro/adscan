@@ -15,6 +15,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from adscan_core.credential_origins import (  # noqa: F401 - NON_COMPROMISE_ORIGINS is re-exported
+    NON_COMPROMISE_ORIGINS,
+    NOT_RECOVERED_ORIGINS,
+)
 
 SESSION_COMPROMISE_STATUS_UNKNOWN = "unknown"
 SESSION_COMPROMISE_STATUS_NONE = "none"
@@ -45,8 +49,9 @@ DOMAIN_AUTH_STATE_PWNED = "pwned"
 # compromised-credential counters, the live scan panel, telemetry, and PostHog
 # while remaining fully owned principals for attack-path discovery. The origin
 # is the existing ``credentials_meta[user]["credential_origin"]`` provenance
-# field — there is no parallel flag.
-NON_COMPROMISE_ORIGINS = frozenset({"authenticated_scan", "user_provided"})
+# field — there is no parallel flag. ``NON_COMPROMISE_ORIGINS`` lives in
+# ``adscan_core.credential_origins`` (imported above) so the workspace secret
+# purge and the web backend read the same set.
 
 
 def _ensure_session_compromise_state(shell: Any) -> None:
@@ -103,6 +108,42 @@ def mark_session_domain_compromised(shell: Any) -> None:
     setattr(shell, "_session_compromise_status", SESSION_COMPROMISE_STATUS_DOMAIN)
 
 
+def adscan_created_accounts_for_shell(shell: Any) -> dict[str, frozenset[str]]:
+    """``{domain_lower: {account_lower}}`` of the accounts ADscan created this session.
+
+    Read from the session's environment-change ledger through the shared SSOT
+    (:func:`adscan_core.credential_origins.adscan_created_accounts`). Pure read;
+    never raises, and an absent ledger answers ``{}``.
+    """
+    try:
+        from adscan_core.credential_origins import adscan_created_accounts  # noqa: PLC0415
+
+        from adscan_internal.services.ledger_guard import active_ledger  # noqa: PLC0415
+
+        ledger = active_ledger(shell)
+        get_changes = getattr(ledger, "get_changes", None)
+        if not callable(get_changes):
+            return {}
+        return adscan_created_accounts(get_changes())
+    except Exception:  # noqa: BLE001 - pure read, never breaks callers
+        return {}
+
+
+def is_adscan_created_account_for_shell(shell: Any, domain: str, username: str) -> bool:
+    """True when the live change ledger records that ADscan created ``username``.
+
+    Pure read; never raises, and an absent ledger answers False.
+    """
+    try:
+        from adscan_core.credential_origins import is_adscan_created_account  # noqa: PLC0415
+
+        return is_adscan_created_account(
+            adscan_created_accounts_for_shell(shell), domain=domain, account=username
+        )
+    except Exception:  # noqa: BLE001 - pure read, never breaks callers
+        return False
+
+
 def is_self_introduced_credential(shell: Any, domain: str, username: str) -> bool:
     """Return True when ``username``'s credential was self-introduced.
 
@@ -129,7 +170,9 @@ def is_self_introduced_credential(shell: Any, domain: str, username: str) -> boo
         if not isinstance(meta, dict):
             return False
         origin = str(meta.get("credential_origin") or "").strip().lower()
-        return origin in NON_COMPROMISE_ORIGINS
+        # The credential of an account ADscan itself created (origin
+        # ``adscan_provisioned``) is not a compromise either: ADscan chose it.
+        return origin in NOT_RECOVERED_ORIGINS
     except Exception:  # noqa: BLE001 - pure read, never breaks callers
         return False
 

@@ -204,6 +204,7 @@ class HostIntelligenceCache:
             "_cached_at": time.time(),
             "target_ip": fp.target_ip,
             "defender_rtp": fp.defender_rtp,
+            "defender_rtp_state": getattr(fp, "defender_rtp_state", "unknown"),
             "elapsed_s": fp.elapsed_s,
             "error": fp.error,
             "products": [asdict(p) for p in fp.products],
@@ -229,16 +230,28 @@ class HostIntelligenceCache:
                     target_ip=raw.get("target_ip", ""),
                     products=products,
                     defender_rtp=bool(raw.get("defender_rtp", True)),
+                    defender_rtp_state=str(raw.get("defender_rtp_state") or "unknown"),
                     elapsed_s=float(raw.get("elapsed_s", 0.0)),
                     error=raw.get("error"),
-                    ppl_enabled=bool(raw.get("ppl_enabled") or False),
-                    ppl_level=int(raw.get("ppl_level") or 0),
+                    # Unknown stays unknown: a cached None is a read that did
+                    # not happen, never a cached "PPL off".
+                    ppl_enabled=(
+                        None
+                        if raw.get("ppl_enabled") is None
+                        else bool(raw.get("ppl_enabled"))
+                    ),
+                    ppl_level=(
+                        None
+                        if raw.get("ppl_level") is None
+                        else int(raw.get("ppl_level"))
+                    ),
                     lsass_pid=raw.get("lsass_pid"),
                 )
         return HostFingerprint(
             target_ip=raw.get("target_ip", ""),
             products=products,
             defender_rtp=bool(raw.get("defender_rtp", True)),
+            defender_rtp_state=str(raw.get("defender_rtp_state") or "unknown"),
             elapsed_s=float(raw.get("elapsed_s", 0.0)),
             error=raw.get("error"),
         )

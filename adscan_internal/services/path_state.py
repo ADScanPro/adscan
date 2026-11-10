@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from adscan_core.reporting.execution_status import FULLY_EXECUTED_PATH_STATUSES
+
 #: Statuses that count as PROVEN domain compromise — the single source of truth
 #: for "is this path proven?". Strict on purpose: only a demonstrably-reached
 #: Tier-0 target counts, so a failed post-ex is NOT presented as proven. The set
@@ -30,9 +32,10 @@ from enum import Enum
 #: ordering ``attack_path_presentation`` imported by the web backend — get a
 #: MINIMAL closure and do not drag ``exposure_score_service`` into it.
 #: ``exposure_score_service`` re-exports this name for full backward compat.
-_PROVEN_STATUSES: frozenset[str] = frozenset(
-    {"success", "exploited", "domain_compromised"}
-)
+#: The set itself is declared once, in ``adscan_core.reporting.execution_status``
+#: (stdlib only), so the web ingestion that stores a path's execution status reads
+#: the very same tokens.
+_PROVEN_STATUSES: frozenset[str] = FULLY_EXECUTED_PATH_STATUSES
 
 #: Display-status token for a pure COVERAGE-DECLARATION record — the synthetic
 #: single-step record the bounded fallback engine emits (``notes["coverage"] ==
@@ -43,7 +46,9 @@ _PROVEN_STATUSES: frozenset[str] = frozenset(
 #: the report / CTEM / KPIs). It rolls up into the sampled-coverage declaration
 #: block, not into the per-path status buckets. See
 #: :func:`adscan_internal.services.attack_paths_core.is_coverage_marker_step`.
-COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
+from adscan_core.reporting.posture_inputs import (  # noqa: E402
+    COVERAGE_SAMPLE_STATUS,
+)
 
 #: Display/edge-status token for a finding ADscan actively proved is NOT
 #: exploitable. Emitted today only by the ESC15 (EKUwu / CVE-2024-49019)
@@ -57,74 +62,17 @@ COVERAGE_SAMPLE_STATUS: str = "coverage_sample"
 #: member of :data:`NO_EXPOSURE_STATUSES` below. The matching GREEN compliance
 #: evidence is persisted separately as a positive control
 #: (``esc15_application_policy_injection_mitigated``).
-NOT_VULNERABLE_STATUS: str = "not_vulnerable"
-
-#: Statuses that describe NO client exposure, and therefore may never be counted
-#: into a risk figure or offered to a client as something to remediate.
-#:
-#: * ``closed_by_configuration`` — the POSITIVE bucket. The client's own
-#:   configuration already closed this avenue and ADscan observed it with
-#:   certainty ("Attack Surface Reduced — Hardening Observed"). Billing them to
-#:   fix hardening they already did inverts what the report is for.
-#: * ``unsupported`` / ``unavailable`` — an ADscan data gap: no reachable surface
-#:   to walk, so the absence of a result says nothing about the client.
-#: * ``coverage_sample`` — a synthetic coverage-declaration record from the
-#:   bounded fallback (a reachable target represented without its route). It
-#:   states coverage, not exposure, so it is excluded exactly like a data gap.
-#: * ``not_vulnerable`` — a finding ADscan actively proved absent (e.g. ESC15
-#:   confirm-mode observed a patched CA). The weakness does not exist, so the
-#:   path is a dismissed finding, not exposure; the positive is carried by a
-#:   compliance control instead.
-#:
-#: This is the same set as the ``None`` entries of
-#: ``exposure_score_service._PROOF_WEIGHT`` — that table builds them from here,
-#: so the exposure score and every remediation ranking exclude exactly the same
-#: paths and cannot drift apart. The token spelling is locked against
-#: ``relay_status_constants.CONFIGURATION_CLOSE_STATUS`` by
-#: ``tests/unit/services/test_remediation_status_filter.py`` (a test-only import,
-#: which keeps this module the stdlib-only leaf its closure depends on).
-NO_EXPOSURE_STATUSES: frozenset[str] = frozenset(
-    {
-        "closed_by_configuration",
-        "unsupported",
-        "unavailable",
-        COVERAGE_SAMPLE_STATUS,
-        NOT_VULNERABLE_STATUS,
-    }
+from adscan_core.reporting.posture_inputs import (  # noqa: E402
+    NOT_VULNERABLE_STATUS,
 )
 
-
-def carries_client_exposure(raw: object) -> bool:
-    """Return True when a path's status describes exposure worth remediating.
-
-    The inclusion filter every client-facing count applies before it reports a
-    number as exposure: the exposure score, the remediation rankings, the
-    report's Compromise Reach cards, and the page-2 executive headline. Three
-    statuses answer "no", each for a reason the client would recognise:
-
-    * ``closed_by_configuration`` — their own configuration already closed this
-      avenue and ADscan observed it. It is the report's POSITIVE bucket, and
-      counting it as exposure bills them for hardening they already did.
-    * ``unsupported`` / ``unavailable`` — ADscan had no reachable surface to
-      walk. That is a gap in our coverage, not an exposure in their directory.
-
-    Everything else counts, including ``attempted`` and ``blocked``: ADscan
-    failing to land a technique, or withholding a destructive one, says nothing
-    about whether the avenue is open (CLAUDE.md § Exposure Validation).
-
-    Declared on this stdlib-only leaf, beside the set it reads, so any consumer
-    can apply the SAME filter without dragging a heavier module into its import
-    closure. ``technique_priority`` re-exports it for its existing callers.
-
-    Args:
-        raw: A path's raw ``status`` token, in any casing.
-
-    Returns:
-        ``False`` only for the three statuses above. An unknown or missing token
-        counts as exposure — the safe direction, since the alternative is
-        dropping a real route from the client's fix list.
-    """
-    return str(raw or "").strip().lower() not in NO_EXPOSURE_STATUSES
+# NO_EXPOSURE_STATUSES and carries_client_exposure live in the dependency-light
+# SSOT ``adscan_core.reporting.posture_inputs`` (the web worker computes the
+# posture score with no engine on its path); re-exported here unchanged.
+from adscan_core.reporting.posture_inputs import (  # noqa: E402,F401
+    NO_EXPOSURE_STATUSES,
+    carries_client_exposure,
+)
 
 
 #: Statuses that mean "ADscan had no way to assess this avenue" — a gap in OUR
@@ -173,8 +121,41 @@ _NONPROVEN_CLIENT_STATUS_LABELS: dict[str, str] = {
     "safety_blocked": "Not Executed for Safety",
     "closed_by_configuration": "Attack Surface Reduced",
     COVERAGE_SAMPLE_STATUS: "Reachable (route sampled)",
+    NOT_VULNERABLE_STATUS: "Not Vulnerable",
     "theoretical": "Theoretical",
 }
+
+#: The semantic TONE of every status, shared by the LITE report (a CSS class)
+#: and the web CTEM (served beside the label, mapped to a colour there). A
+#: safety-withheld route is ``safety`` (a confirmed exposure ADscan chose not to
+#: run), never a remediated green; ``hardening`` is the one positive tone.
+_CLIENT_STATUS_TONES: dict[str, str] = {
+    "partial": "partial",
+    "attempted": "attempted",
+    "failed": "attempted",
+    "error": "attempted",
+    "post_ex_failed": "attempted",
+    "unavailable": "gap",
+    "unsupported": "gap",
+    NOT_ASSESSED_BUCKET: "gap",
+    "blocked": "safety",
+    "safety_blocked": "safety",
+    "closed_by_configuration": "hardening",
+    NOT_VULNERABLE_STATUS: "hardening",
+    "theoretical": "theoretical",
+}
+
+
+def client_status_tone(status: object) -> str:
+    """Return the semantic tone of a path or step status.
+
+    ``proven`` for :data:`_PROVEN_STATUSES`, else the shared tone map; an
+    unknown token falls back to ``theoretical``, the most conservative claim.
+    """
+    token = str(status or "").strip().lower()
+    if token in _PROVEN_STATUSES:
+        return "proven"
+    return _CLIENT_STATUS_TONES.get(token, "theoretical")
 
 
 def is_not_assessed(raw: object) -> bool:

@@ -45,6 +45,8 @@ This service provides a transport-agnostic cache layer:
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import json
 import os
 import time
@@ -150,7 +152,6 @@ def decide_loot_cache_reuse(
     loot_dir: str,
     meta_path: str,
     phase_label: str,
-    workspace_type: str,
     transport_label: str = "WinRM",
 ) -> bool:
     """Decide whether to reuse existing local loot instead of re-fetching.
@@ -189,7 +190,9 @@ def decide_loot_cache_reuse(
     else:
         age_label = f"{age_hours:.1f}h old"
 
-    is_ctf = workspace_type == "ctf"
+    # Labs are reset between runs, so their loot ages faster (genuinely
+    # environment: the scan policy's).
+    is_ctf = policy_settings.is_lab(shell)
     max_age = LOOT_CACHE_MAX_AGE_CTF if is_ctf else LOOT_CACHE_MAX_AGE_AUDIT
     cache_fresh = age_seconds <= max_age.total_seconds()
 
@@ -204,7 +207,7 @@ def decide_loot_cache_reuse(
         f"Loot cache check: transport={transport_label} "
         f"host={marked_host} phase={marked_phase} "
         f"file_count={cached_file_count} age_seconds={age_seconds:.0f} "
-        f"cache_fresh={cache_fresh} workspace_type={workspace_type}"
+        f"cache_fresh={cache_fresh} lab={is_ctf}"
     )
 
     # Non-interactive (CI / pipe / auto): auto-reuse in CTF (stable env), skip in audit.
@@ -240,7 +243,6 @@ def decide_mapping_cache_reuse(
     *,
     manifest_path: str,
     entry_count: int,
-    workspace_type: str,
     transport_label: str = "WinRM",
 ) -> bool:
     """Decide whether to reuse a cached filesystem mapping (file-tree enumeration).
@@ -255,7 +257,7 @@ def decide_mapping_cache_reuse(
     if age_seconds is None:
         return False
 
-    is_ctf = workspace_type == "ctf"
+    is_ctf = policy_settings.is_lab(shell)
     max_age = MAPPING_CACHE_MAX_AGE_CTF if is_ctf else MAPPING_CACHE_MAX_AGE_AUDIT
     cache_fresh = age_seconds <= max_age.total_seconds()
 
@@ -273,7 +275,7 @@ def decide_mapping_cache_reuse(
     print_info_debug(
         f"Mapping cache check: transport={transport_label} "
         f"entries={entry_count} age_seconds={age_seconds:.0f} "
-        f"cache_fresh={cache_fresh} workspace_type={workspace_type}"
+        f"cache_fresh={cache_fresh} lab={is_ctf}"
     )
 
     # Non-interactive (CI / pipe / auto): auto-reuse in CTF, skip in audit.
@@ -309,7 +311,6 @@ def try_use_mapping_cache(
     shell: Any,
     *,
     manifest_path: str,
-    workspace_type: str,
     transport_label: str,
     loader: Callable[[], "tuple[int, Any] | None"],
 ) -> Any | None:
@@ -341,7 +342,6 @@ def try_use_mapping_cache(
         cached = try_use_mapping_cache(
             shell,
             manifest_path=manifest_path,
-            workspace_type=workspace_type,
             transport_label="WinRM",
             loader=_load,
         )
@@ -370,7 +370,6 @@ def try_use_mapping_cache(
         shell,
         manifest_path=manifest_path,
         entry_count=entry_count,
-        workspace_type=workspace_type,
         transport_label=transport_label,
     ):
         return None

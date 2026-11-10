@@ -7,6 +7,7 @@ from importlib import import_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from adscan_core.workspace_freeze import write_blocked
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
 from adscan_internal.workspaces import domain_subpath
 
@@ -123,7 +124,7 @@ def prepared_runtime_graph_metadata_path(shell: object, domain: str) -> Path:
 def invalidate_attack_path_artifacts(shell: object, domain: str) -> None:
     """Best-effort delete of materialized attack-path artifacts for a domain."""
     cache_dir = attack_path_cache_dir(shell, domain)
-    if not cache_dir.exists():
+    if not cache_dir.exists() or write_blocked(cache_dir):
         return
     for path in cache_dir.iterdir():
         try:
@@ -279,6 +280,8 @@ def persist_materialized_attack_path_artifacts(
 ) -> None:
     """Persist derived artifacts to disk using Parquet when available."""
     cache_dir = attack_path_cache_dir(shell, domain)
+    if write_blocked(cache_dir):
+        return
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     node_rows = [
@@ -351,6 +354,8 @@ def persist_materialized_prepared_runtime_graph(
 ) -> None:
     """Persist a prepared runtime graph using Parquet when available."""
     cache_dir = attack_path_cache_dir(shell, domain)
+    if write_blocked(cache_dir):
+        return
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     graph = dict(prepared_graph.graph)
@@ -541,6 +546,8 @@ def persist_attack_path_results_to_disk(
         return False
     key_hash = attack_path_results_key_hash(cache_key)
     results_dir = _attack_path_results_dir(shell, domain)
+    if write_blocked(results_dir):
+        return False
     path = results_dir / f"{key_hash}.json"
     try:
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -578,6 +585,8 @@ def unlink_attack_path_results_for_domain(
     deleted — the safe direction (never serve a possibly-stale set). Best-effort:
     returns the count deleted, never raises.
     """
+    if write_blocked(_attack_path_results_dir(shell, domain)):
+        return 0
     results_dir = _attack_path_results_dir(shell, domain)
     current = _epoch_token(current_epoch) if current_epoch is not None else None
     removed = 0
@@ -619,6 +628,8 @@ def _prune_attack_path_results_dir(shell: object, domain: str) -> None:
     the oldest files by mtime until the count is within budget. Never raises.
     """
     results_dir = _attack_path_results_dir(shell, domain)
+    if write_blocked(results_dir):
+        return
     try:
         files = [p for p in results_dir.iterdir() if p.is_file() and p.suffix == ".json"]
     except OSError:

@@ -16,6 +16,21 @@ Why raw SMBv1 (rather than aiosmb or SMB transport service):
 
 The probe never sends the EternalBlue payload — only the detection
 session-setup that classifies the host.
+
+UNVALIDATED POSITIVE PATH (read before trusting a VULNERABLE verdict). A
+VULNERABLE result grades the ``ms17-010`` finding Critical, because the
+answer is treated as a definitive probe confirmation (founder decision
+2026-11-05: a CVE confirmed by a non-disruptive probe is Critical). That
+confirmation path has NEVER been observed against a vulnerable host: the lab
+case ``tests/lab/cases/cve/goad_ms17_010.py`` only ever saw patched GOAD
+images answer NotVulnerable. The request is also not the canonical detection
+pair: the widely used signature sends SESSION_SETUP_ANDX, TREE_CONNECT to
+``IPC$`` and a TRANSACTION PeekNamedPipe on FID 0, while this probe sends a
+Trans2 SESSION_SETUP straight after NEGOTIATE with the negotiate's UID/TID.
+Until a known-vulnerable host (a retired HTB box such as Blue, run by the coordinator)
+confirms this probe answers ``STATUS_INSUFF_SERVER_RESOURCES`` there and
+something else on a patched one, treat a VULNERABLE result as unverified.
+Tracked in ``BACKLOG.md`` (MS17-010 positive-path lab validation).
 """
 
 from __future__ import annotations

@@ -30,8 +30,12 @@ LITE build and the appliance backend without pulling PRO reporting code.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
+from adscan_internal.services.attack_step_catalog import (
+    finding_refs_for_technique,
+    get_attack_step_entry,
+)
 from adscan_internal.services.technique_priority import (
     compute_technique_priorities,
     domain_affected_user_total,
@@ -83,9 +87,22 @@ _CONTAINMENT_KIND_RANK = {kind: i for i, kind in enumerate(CONTAINMENT_KIND_ORDE
 #: Membership here is about what the technique EXTRACTS, never about how severe it
 #: is: a technique that only grants access creates no containment obligation
 #: because nothing left the directory. And the obligation only exists when ADscan
-#: actually RAN it (see ``_containment_kind_for``) — a mapped-but-unexecuted
+#: actually RAN it (see ``containment_kind_for_technique``) — a mapped-but-unexecuted
 #: route removed nothing, so asking the client to reset krbtgt for it would be
 #: the same overclaim the Exposure-Validation doctrine forbids everywhere else.
+#:
+#: The discriminator, so a new technique does not have to re-derive it: did
+#: executing this technique take credential material OUT of the directory, such
+#: that a copy now exists where the client cannot reach it? A guessed or granted
+#: credential is not an extraction. ``useraspass``, ``blankpassword``,
+#: ``passwordspray`` and ``computerpre2k`` recover a working credential by trying
+#: it, and their exposure fix (set a real password, enforce the policy) IS the
+#: rotation, so a separate containment row would ask for the same work twice.
+#: The access relations (``adminto``, ``canrdp``, ``canpsremote``, ``sqladmin``,
+#: ``readshare``) take nothing away at all. A reuse pivot
+#: (``domainpassreuse``, ``localadminpassreuse``, ``localcredtodomainreuse``)
+#: spends material another technique already recovered, and that technique
+#: carries the obligation.
 _CONTAINMENT_TECHNIQUES: dict[str, str] = {
     # Directory replication hands over every secret in the domain, krbtgt
     # included, which is the one key an ordinary reset cannot evict.
@@ -108,6 +125,7 @@ _CONTAINMENT_TECHNIQUES: dict[str, str] = {
     "adcsesc9": "certificate",
     "adcsesc10": "certificate",
     "adcsesc11": "certificate",
+    "adcsesc12": "certificate",
     "adcsesc13": "certificate",
     "adcsesc14": "certificate",
     "adcsesc15": "certificate",
@@ -116,11 +134,52 @@ _CONTAINMENT_TECHNIQUES: dict[str, str] = {
     "certifried": "certificate",
     "shadowcredentials": "certificate",
     "addkeycredentiallink": "certificate",
+    # Relaying a coerced NTLMv1 authentication into a written key credential
+    # plants the same artifact ``addkeycredentiallink`` does, so it carries the
+    # same kind rather than a third classification for one material family.
+    "ntlmv1relayshadowcreds": "certificate",
+    # The per-RODC krbtgt secret is krbtgt material: a ticket forged from it
+    # survives every password reset until that key is reset twice, exactly like
+    # the writable domain's own. Only the EXTRACTION is mapped, never the
+    # downstream ``forgerodcgoldenticket``: the forge consumes material the
+    # extraction already took out, and two rows asking for one krbtgt reset
+    # would double the block for a single obligation.
+    "extractrodckrbtgtsecret": "krbtgt",
     # Host credential material: cleared by the rotation the client runs anyway.
     "dumplsa": "credential",
     "dumpsam": "credential",
     "dumplsass": "credential",
     "dumpdpapi": "credential",
+    # Backup Operators turns SeBackupPrivilege into a read of the domain
+    # controller's SAM, SECURITY and SYSTEM hives, which yields the local
+    # account database, the LSA secrets and the DC's own machine-account key.
+    # That is an extraction by any reading, and leaving it unmapped is what put
+    # a real engagement's work order in the wrong order: the ranked list led
+    # with an exposure fix while the custody ledger already recorded two
+    # obligations for the material that read took out.
+    "backupoperatorescalation": "credential",
+    # Key List data returns the long-term keys the KDC holds for an account, so
+    # it is the same material a roast recovers without the crack.
+    "kerberoskeylist": "credential",
+    # An existing key credential on the target lets ADscan authenticate and
+    # retrieve the account's NT hash. ADscan did not plant the key credential,
+    # so what it took away is the hash, not a certificate it holds.
+    "hasshadowcredentials": "credential",
+    # Credential material read out of a directory attribute, a share or a host
+    # artifact. The same shape as the LAPS and gMSA reads below: the password is
+    # now outside the directory, and deleting it from where it was found does
+    # not take the copy back.
+    "userdescription": "credential",
+    "passwordinshare": "credential",
+    "passwordinfile": "credential",
+    "gpppassword": "credential",
+    "synclapspassword": "credential",
+    # Captured authentication material recovered in cleartext by an offline
+    # crack. The capture alone is a challenge and response and is not reusable,
+    # which is why ``mssql_ntlmv2_theft`` and the bare coercion relations are
+    # deliberately absent: the crack is the step that produces a credential.
+    "crackntlmv1": "credential",
+    "poisoncapturentlmv2crack": "credential",
     # Both spellings of each roast are carried: the derivation keeps a technique
     # key as the literal edge token the record used, so two spellings of one
     # technique are two rows, and a containment obligation must not depend on
@@ -296,6 +355,12 @@ def compute_remediation_priorities(
                 "mitre_id": entry.mitre_technique_id,
                 "mitre_name": entry.mitre_technique_name,
                 "impact_score": score,
+                # The finding(s) this fix is reported as, one per domain. Every
+                # surface points the reader there for the steps and commands
+                # instead of repeating them on the ranked row.
+                "finding_refs": finding_refs_for_technique(
+                    entry.technique, entry.domains
+                ),
             }
         )
 
@@ -409,6 +474,42 @@ def _break_ties_by_remediation_effort(results: list[dict[str, Any]]) -> None:
         i = j
 
 
+def _row_action_text(entry: Mapping[str, Any]) -> str:
+    """The one action a ranked row prints: the holder change, else the technique fix.
+
+    Same precedence every surface renders (the SAR row, the web's
+    ``rowActionLine``), so "has an action" is decided once.
+    """
+    return str(entry.get("remediability_verb") or entry.get("remediation_effort") or "").strip()
+
+
+def compute_by_design_notes(domains_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the techniques the work order leaves out because no change is needed.
+
+    The inherent techniques of the shared derivation
+    (:func:`~adscan_internal.services.technique_priority.compute_inherent_techniques`),
+    kept only when the report ALSO lists them as a finding: that is when a reader
+    meets the technique in Technical Findings and asks why the work order skips
+    it. Scaffolding with no finding of its own (a domain controller's membership
+    of its own group) is not worth a line.
+
+    Returns:
+        ``[{"technique", "label", "why_not", "paths", "domains", "finding_refs"}]``.
+    """
+    from adscan_internal.services.technique_priority import (  # noqa: PLC0415
+        compute_inherent_techniques,
+    )
+
+    notes: list[dict[str, Any]] = []
+    for entry in compute_inherent_techniques(iter_domain_tagged_paths(domains_data)):
+        catalog_entry = get_attack_step_entry(entry["technique"])
+        if catalog_entry is None or not str(catalog_entry.vuln_key or "").strip():
+            continue
+        refs = finding_refs_for_technique(entry["technique"], entry.get("domains") or [])
+        notes.append({**entry, "finding_refs": refs})
+    return notes
+
+
 def _resolve_row_choke_identifier(top_choke_point: Any) -> str | None:
     """Return the node identifier a priority row's remediation maps to, or None.
 
@@ -433,6 +534,62 @@ def _resolve_row_choke_identifier(top_choke_point: Any) -> str | None:
     return None
 
 
+def proven_step_technique_keys(paths: Any) -> set[str]:
+    """Technique keys ADscan proved AT LEAST ONE STEP of, across ``paths``.
+
+    Per STEP, not per path: a technique proven as a step inside a partial route
+    (its chain not walked end to end) counts, which the end-to-end
+    ``exploited_paths`` counter misses. A step whose own status is theoretical
+    never counts. Keys are the lower-cased edge tokens the technique ranking
+    uses. ``paths`` is a list of display records, or ``[{"attack_paths": [...]}]``
+    domain entries.
+    """
+    from adscan_internal.services.path_state import _PROVEN_STATUSES  # noqa: PLC0415
+
+    proven: set[str] = set()
+    for item in paths or ():
+        if not isinstance(item, Mapping):
+            continue
+        nested = item.get("attack_paths")
+        records = nested if isinstance(nested, list) else [item]
+        for path in records:
+            if not isinstance(path, Mapping):
+                continue
+            steps = path.get("steps")
+            if not isinstance(steps, list):
+                continue
+            for step in steps:
+                if not isinstance(step, Mapping):
+                    continue
+                if str(step.get("status") or "").strip().lower() not in _PROVEN_STATUSES:
+                    continue
+                for key in ("action", "relation", "type"):
+                    value = step.get(key)
+                    if isinstance(value, str) and value.strip():
+                        proven.add(value.strip().lower())
+                        break
+    return proven
+
+
+def _kpi_card_row_index(rows: Sequence[Mapping[str, Any]]) -> int:
+    """Which ranked row the headline card names: chosen by PROOF, not by rank.
+
+    The card is titled "most proven fix", so it names the first row (in the
+    order the section prints) whose routes ADscan executed end to end; failing
+    that, the first whose own attack step ADscan executed; failing that, the top
+    row, which the card then words as mapped. Ranking order alone named a mapped
+    fix under the "validated" title while the proven one sat lower (release gate
+    14.0.0, Production-sensitive SAR).
+    """
+    for index, row in enumerate(rows):
+        if row.get("executed"):
+            return index
+    for index, row in enumerate(rows):
+        if row.get("proven_step"):
+            return index
+    return 0
+
+
 def build_remediation_start_here(
     priorities: list[dict[str, Any]],
     *,
@@ -440,8 +597,18 @@ def build_remediation_start_here(
     total_mapped_paths: int,
     node_cardinality: dict[str, int],
     bounded: bool,
+    by_design: Sequence[Mapping[str, Any]] | None = None,
+    proven_step_techniques: Sequence[str] | set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Build the "Start here" render model led by the paths-broken ranking.
+
+    Two kinds of technique never become a ranked action, and both are carried in
+    ``by_design`` instead (see :func:`compute_by_design_notes`): a technique that
+    needs no change because it is how Active Directory works for its holder, and
+    a ranked row that has no concrete change to name (no holder-specific verb
+    and no technique guidance). A row that cannot say what to change is not a
+    work item, and printing it as one is how "Remove the configuration on
+    robb.stark that lets robb.stark reach it" reached a paid work order.
 
     The prioritised-remediation section leads with the technique ranking ADscan
     already computes (:func:`compute_remediation_priorities` /
@@ -501,18 +668,46 @@ def build_remediation_start_here(
         priorities to lead with.
     """
     from adscan_core.reporting.chokepoint_copy import (  # noqa: PLC0415
+        NO_CONCRETE_CHANGE_REASON,
         REMEDIATION_ORDER_CLAUSE,
         STRUCTURAL_CHOKE_BADGE,
+        by_design_note_lead,
         containment_block_note,
         is_structural_choke,
         reach_uniform_note,
         remediation_chain_note,
         remediation_item_line,
+        remediation_kpi_eyebrow,
         remediation_kpi_lines,
         remediation_order_sentence,
         remediation_start_here_headline,
     )
 
+    if not priorities:
+        return None
+
+    by_design_entries: list[dict[str, Any]] = [
+        dict(entry) for entry in by_design or () if isinstance(entry, Mapping)
+    ]
+    # A row with nothing concrete to change leaves the work order for the note.
+    actionable: list[dict[str, Any]] = []
+    for entry in priorities:
+        if not isinstance(entry, dict):
+            continue
+        if _row_action_text(entry):
+            actionable.append(entry)
+            continue
+        by_design_entries.append(
+            {
+                "technique": str(entry.get("action") or ""),
+                "label": str(entry.get("action_label") or entry.get("action") or ""),
+                "why_not": NO_CONCRETE_CHANGE_REASON,
+                "paths": int(entry.get("paths_affected") or 0),
+                "domains": list(entry.get("domains") or []),
+                "finding_refs": list(entry.get("finding_refs") or []),
+            }
+        )
+    priorities = actionable
     if not priorities:
         return None
 
@@ -552,6 +747,7 @@ def build_remediation_start_here(
                 _uniform_reach_total = int(entry.get("reach_total") or 0)
                 break
 
+    proven_steps = {str(k).strip().lower() for k in (proven_step_techniques or ()) if k}
     rows: list[dict[str, Any]] = []
     for entry in priorities:
         if not isinstance(entry, dict):
@@ -580,6 +776,11 @@ def build_remediation_start_here(
         # true. A technique that only appears in theoretical paths (executed
         # count 0) is worded as "mapped" and never claims execution.
         row_executed = exploited_paths > 0
+        # Its own step proven on a partial route: not "never run", and a
+        # candidate for the "most proven fix" card when no route was walked.
+        row_proven_step = row_executed or (
+            str(entry.get("action") or "").strip().lower() in proven_steps
+        )
         item_line = remediation_item_line(
             paths_broken=exploited_paths if row_executed else paths_affected,
             total_validated_paths=(
@@ -587,6 +788,7 @@ def build_remediation_start_here(
             ),
             executed=row_executed,
             mapped=not row_executed,
+            proven_step=row_proven_step and not row_executed,
             # For an executed row, also state the broader mapped blast radius so
             # a high-leverage fix (few executed, many mapped) does not read as
             # narrower than a lower mapped row (MED-1).
@@ -618,6 +820,7 @@ def build_remediation_start_here(
                 "paths_affected": paths_affected,
                 "exploited_paths": exploited_paths,
                 "executed": row_executed,
+                "proven_step": row_proven_step,
                 "chain_tie_size": chain_tie_size,
                 "reach_users": row_reach_users,
                 "reach_total": row_reach_total,
@@ -647,6 +850,15 @@ def build_remediation_start_here(
                 "holder_label": str(entry.get("holder_label") or ""),
                 "remediability_kind": str(entry.get("remediability_kind") or ""),
                 "remediability_verb": str(entry.get("remediability_verb") or ""),
+                # The raw technique and the finding(s) it is reported as. The
+                # finding is the ONE place a reader gets the steps, commands and
+                # verification; the ranked row names the action and points there.
+                "technique": str(entry.get("action") or ""),
+                "finding_refs": [
+                    dict(ref)
+                    for ref in entry.get("finding_refs") or []
+                    if isinstance(ref, dict) and ref.get("key")
+                ],
             }
         )
 
@@ -664,6 +876,18 @@ def build_remediation_start_here(
     top_reach_users = int(rows[0].get("reach_users") or 0)
     top_reach_total = int(rows[0].get("reach_total") or 0)
     top_reach_pct = float(rows[0].get("reach_pct") or 0.0)
+    # The headline card names the most PROVEN fix (``_kpi_card_row_index``),
+    # which need not be the top-ranked one.
+    card_row = rows[_kpi_card_row_index(rows)]
+    card_executed = bool(card_row["executed"])
+    card_proven_step = bool(card_row.get("proven_step")) and not card_executed
+    card_paths_broken = (
+        card_row["exploited_paths"] if card_executed else card_row["paths_affected"]
+    )
+    card_denominator = total_executed_paths if card_executed else total_mapped_paths
+    card_reach_users = int(card_row.get("reach_users") or 0)
+    card_reach_total = int(card_row.get("reach_total") or 0)
+    card_reach_pct = float(card_row.get("reach_pct") or 0.0)
     # Containment leads the whole section, so the headline states that and why
     # before it states the ordering rule for the fixes below it.
     containment_count = sum(1 for row in rows if row["block"] == CONTAINMENT_BLOCK)
@@ -686,22 +910,23 @@ def build_remediation_start_here(
     # a theoretical-only top fix, worded "mapped, not yet executed". The node
     # total-cut (E3 cardinality) is no longer the KPI headline.
     kpi_card = remediation_kpi_lines(
-        top_paths_broken=top_paths_broken,
-        total_validated_paths=top_denominator,
-        executed=top_executed,
-        mapped=not top_executed,
+        top_paths_broken=card_paths_broken,
+        total_validated_paths=card_denominator,
+        executed=card_executed,
+        mapped=not card_executed,
+        proven_step=card_proven_step,
         bounded=bounded,
-        # For an executed top fix, also carry the broader all-status blast radius
+        # For an executed fix, also carry the broader all-status blast radius
         # so the headline card states BOTH breadths (executed + total), matching
         # the Start-Here row it summarises and never reading narrower than it.
-        mapped_breadth=rows[0]["paths_affected"] if top_executed else None,
-        total_mapped=total_mapped_paths if top_executed else None,
+        mapped_breadth=card_row["paths_affected"] if card_executed else None,
+        total_mapped=total_mapped_paths if card_executed else None,
         # The affected-USER reach LEAD for the KPI card (falls back to the path
         # count when the workspace carries no user population, or when reach is
         # uniform — a non-discriminating 100% must not headline the card).
-        reach_users=top_reach_users,
-        reach_total=top_reach_total,
-        reach_pct=top_reach_pct,
+        reach_users=card_reach_users,
+        reach_total=card_reach_total,
+        reach_pct=card_reach_pct,
         reach_is_uniform=reach_is_uniform,
     )
     # A single linear attack chain leaves the leading rows tied on the exact
@@ -747,10 +972,26 @@ def build_remediation_start_here(
                 uniform_reach_pct,
                 reach_users=_uniform_reach_users,
                 reach_total=_uniform_reach_total,
+                # With containment leading, the rows are not all ordered by
+                # route volume, so this note defers to the stated order rather
+                # than spelling a second one on the same page.
+                containment_count=containment_count,
+                # Derived from the rows, so the note can never claim "every fix
+                # below" over rows that each say no ordinary account runs
+                # through them.
+                reach_fixes=_reach_bearing_fixes,
+                foothold_fixes=sum(
+                    1 for row in rows if int(row.get("reach_users") or 0) <= 0
+                ),
             )
             if reach_is_uniform
             else ""
         ),
+        # Techniques the work order deliberately leaves out, each with the
+        # client-facing reason: how Active Directory works for that holder, or
+        # no concrete change to name. Rendered as one note under the table.
+        "by_design": by_design_entries,
+        "by_design_note": by_design_note_lead(len(by_design_entries)),
         "total_executed_paths": total_executed_paths,
         "total_mapped_paths": total_mapped_paths,
         "rows": rows,
@@ -758,17 +999,145 @@ def build_remediation_start_here(
             # The NAMED fix the card is about — the #1 row's technique label — so
             # the hero can say WHICH fix is the highest-confidence one, not just a
             # bare count. Within the exposure block the order is routes closed,
-            # so the #1 exposure fix IS the widest; a containment action leads
+            # so the #1 exposure fix IS the widest; a containment fix leads
             # the whole list when the assessment produced one.
-            "label": str(rows[0].get("label") or ""),
+            "label": str(card_row.get("label") or ""),
+            # The card's title, worded from the proof the named fix carries, so
+            # "validated" never sits over routes that were only mapped.
+            "eyebrow": remediation_kpi_eyebrow(
+                executed=card_executed, proven_step=card_proven_step
+            ),
             "big": kpi_card["big"],
             "ratio": kpi_card["ratio"],
             "context": kpi_card["context"],
-            "top_paths_broken": int(top_paths_broken),
-            "total_validated_paths": int(top_denominator),
-            "executed": bool(top_executed),
-            "reach_users": int(top_reach_users),
-            "reach_total": int(top_reach_total),
-            "reach_pct": float(top_reach_pct),
+            "top_paths_broken": int(card_paths_broken),
+            "paths_affected": int(card_row["paths_affected"]),
+            "total_validated_paths": int(card_denominator),
+            "executed": card_executed,
+            "proven_step": card_proven_step,
+            "reach_users": int(card_reach_users),
+            "reach_total": int(card_reach_total),
+            "reach_pct": float(card_reach_pct),
         },
     }
+
+
+def attach_finding_xrefs(
+    start_here: dict[str, Any] | None,
+    findings: Sequence[Mapping[str, Any]],
+) -> None:
+    """Stamp each ranked row with the document finding(s) it points to.
+
+    The report prints the fix's steps, commands and verification on the
+    finding, once. The ranked row names the action and refers the reader to
+    that finding by its document id and title (``finding_xrefs``:
+    ``[{"fid", "anchor", "title", "domain", "key"}]``), in the order the findings
+    appear. ``findings`` is the document's finding list in print order, each
+    carrying ``key``, ``domain`` and ``title``. A reference with no printed
+    finding is dropped, so a row never points at nothing.
+    """
+    if not isinstance(start_here, dict):
+        return
+    index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
+    for position, finding in enumerate(findings, 1):
+        key = str(finding.get("key") or "").strip().lower()
+        domain = str(finding.get("domain") or "").strip().lower()
+        if key and (domain, key) not in index:
+            index[(domain, key)] = (position, finding)
+    # The by-design note points at its finding the same way a ranked row does.
+    for row in [*(start_here.get("rows") or []), *(start_here.get("by_design") or [])]:
+        if not isinstance(row, dict):
+            continue
+        xrefs: list[dict[str, str]] = []
+        for ref in row.get("finding_refs") or []:
+            if not isinstance(ref, Mapping):
+                continue
+            hit = index.get(
+                (
+                    str(ref.get("domain") or "").strip().lower(),
+                    str(ref.get("key") or "").strip().lower(),
+                )
+            )
+            if hit is None:
+                continue
+            position, finding = hit
+            xrefs.append(
+                {
+                    "fid": f"F-{position:03d}",
+                    "anchor": f"finding-f-{position:03d}",
+                    "title": str(finding.get("title") or ""),
+                    "domain": str(finding.get("domain") or ""),
+                    "key": str(finding.get("key") or ""),
+                }
+            )
+        xrefs.sort(key=lambda x: x["fid"])
+        row["finding_xrefs"] = xrefs
+
+
+def count_mapped_and_executed_paths(
+    domains_data: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Return ``(mapped, executed)`` path totals over a per-domain listing.
+
+    Mapped is every path record; executed is the proven bucket
+    (``path_state._PROVEN_STATUSES``), the same set the PRO PDF and the free
+    report use for "executed end to end", so the "N of M executed" figure is
+    equal by construction wherever it is printed.
+    """
+    from adscan_internal.services.path_state import _PROVEN_STATUSES  # noqa: PLC0415
+
+    mapped = 0
+    executed = 0
+    for domain_data in domains_data or ():
+        if not isinstance(domain_data, Mapping):
+            continue
+        for path in domain_data.get("attack_paths") or ():
+            if not isinstance(path, Mapping):
+                continue
+            mapped += 1
+            if str(path.get("status") or "").strip().lower() in _PROVEN_STATUSES:
+                executed += 1
+    return mapped, executed
+
+
+def build_start_here_for_domains(
+    domains_data: list[dict[str, Any]],
+    *,
+    node_cardinality: dict[str, int],
+    bounded: bool,
+) -> dict[str, Any] | None:
+    """Build the "Start here" model over one or more domains' attack paths.
+
+    The composition the Security Assessment Report uses for its workspace-wide
+    "Start here" section, named so every seam that persists a "Start here" model
+    makes the SAME two calls: :func:`compute_remediation_priorities` over the
+    concatenated, domain-tagged listing, then :func:`build_remediation_start_here`
+    with the mapped/executed totals of that listing. Over one domain it is the
+    per-domain stamp; over every assessed domain it is the SAR's section.
+
+    Args:
+        domains_data: ``[{"name", "attack_paths"}, ...]`` in the order the
+            domains are iterated (ties keep traversal order).
+        node_cardinality: The node total-cut map for the structural-choke badge.
+        bounded: Whether route discovery was bounded anywhere in scope.
+
+    Returns:
+        The render model, or ``None`` when there is nothing to rank.
+    """
+    total_mapped_paths, total_executed_paths = count_mapped_and_executed_paths(
+        domains_data
+    )
+    if total_mapped_paths == 0:
+        return None
+    priorities = compute_remediation_priorities(domains_data, total_mapped_paths)
+    if not priorities:
+        return None
+    return build_remediation_start_here(
+        priorities,
+        total_executed_paths=total_executed_paths,
+        total_mapped_paths=total_mapped_paths,
+        node_cardinality=node_cardinality,
+        bounded=bounded,
+        by_design=compute_by_design_notes(domains_data),
+        proven_step_techniques=proven_step_technique_keys(domains_data),
+    )

@@ -776,34 +776,28 @@ async def _ca_backup_native_impl(
     finally:
         # ----- Cleanup: remove BOTH transient artifacts, then VERIFY ------
         # The service and the temp PFX are genuinely reversible, so we actively
-        # remove them (with retries, since certutil can briefly hold the file)
-        # and re-read to confirm. Only a verified removal marks the ledger
-        # reverted-confirmed; a survived or unconfirmable artifact lands as
-        # manual_required. Cleanup never raises into the caller — a failed
-        # cleanup must not fail the exploit or the scan; the ledger carries the
-        # truth either way. Order: PFX first (it may need the service to delete
-        # it), then the service.
-        pfx_gone = await _remove_temp_pfx_verified(
-            conn, scm, service_name, service_created, unc_subpath, cleanup_cmd
-        )
-        service_gone: Optional[bool] = None
-        if scm is not None and service_created:
-            service_gone = await _remove_service_verified(scm, service_name)
-        # Resolve the write-ahead disclosure records honestly.
-        _esc_cleanup.resolve_ca_backup_service(
-            shell,
-            service_change_id,
-            created=service_created,
-            verified_gone=service_gone,
+        # remove them and re-read to confirm, through the shared revert
+        # precedence (client cleanup account, verified privileged credential,
+        # then the account that made the backup). Only a verified removal marks
+        # the ledger reverted-confirmed; a survived or unconfirmable artifact
+        # lands as manual_required. Cleanup never raises into the caller: a
+        # failed cleanup must not fail the exploit or the scan; the ledger
+        # carries the truth either way. Order: PFX first (it may need the
+        # service to delete it), then the service.
+        await _cleanup_ca_backup_artifacts(
+            config,
+            shell=shell,
+            domain=ledger_domain,
+            conn=conn,
+            scm=scm,
             service_name=service_name,
-            ca_host=config.target_host,
-        )
-        _esc_cleanup.resolve_ca_backup_temp_pfx(
-            shell,
-            pfx_change_id,
-            observed=pfx_observed,
-            gone=pfx_gone,
-            unc_path=remote_pfx_path,
+            service_created=service_created,
+            service_change_id=service_change_id,
+            pfx_change_id=pfx_change_id,
+            pfx_observed=pfx_observed,
+            unc_subpath=unc_subpath,
+            cleanup_cmd=cleanup_cmd,
+            remote_pfx_path=remote_pfx_path,
         )
         # Tear down.
         if conn is not None:
@@ -811,6 +805,170 @@ async def _ca_backup_native_impl(
                 await conn.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _live_session_candidate(config: CABackupConfig) -> Any:
+    """The account the backup ran as, as a revert candidate (the live connection)."""
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        KIND_CCACHE,
+        KIND_NT_HASH,
+        KIND_PASSWORD,
+        ROLE_CREATOR,
+        RevertCandidate,
+    )
+
+    if config.ccache_path:
+        secret, kind = config.ccache_path, KIND_CCACHE
+    elif config.password:
+        secret, kind = config.password, KIND_PASSWORD
+    else:
+        secret, kind = config.nt_hash or "", KIND_NT_HASH
+    return RevertCandidate(
+        role=ROLE_CREATOR,
+        username=config.username,
+        domain=config.effective_auth_domain,
+        secret=secret,
+        kind=kind,
+    )
+
+
+def _principal_key(username: str) -> str:
+    return str(username or "").strip().lower().split("@", 1)[0].split("\\")[-1]
+
+
+async def _cleanup_ca_backup_artifacts(
+    config: CABackupConfig,
+    *,
+    shell: Any,
+    domain: str,
+    conn: Any,
+    scm: Any,
+    service_name: str,
+    service_created: bool,
+    service_change_id: Optional[str],
+    pfx_change_id: Optional[str],
+    pfx_observed: bool,
+    unc_subpath: str,
+    cleanup_cmd: str,
+    remote_pfx_path: str,
+) -> None:
+    """Remove the temp key file and the transient service, then settle the ledger.
+
+    The record-backed removal runs through the shared revert precedence. The
+    account that made the backup acts over the LIVE connection (it can also run
+    the service-driven cleanup of a non-empty working directory); every other
+    candidate (the client cleanup account, a verified privileged credential)
+    removes the file and the service over its own SMB / service-control session.
+    A record is settled ``reverted_confirmed`` only by a re-read that finds the
+    object absent. Never raises.
+    """
+    from adscan_internal.services import smb_transport as _smb
+    from adscan_internal.services.adcs import esc_cleanup as _esc_cleanup
+
+    if conn is None:
+        return
+    loop = asyncio.get_running_loop()
+    live = _live_session_candidate(config)
+    live_key = _principal_key(live.username)
+    host = config.target_host
+    spn_host = _resolve_target_fqdn(config) or host
+    unc_file = f"\\\\{host}\\C$\\{unc_subpath}"
+    dir_subpath = unc_subpath[:-4] if unc_subpath.lower().endswith(".pfx") else None
+    unc_dir = f"\\\\{host}\\C$\\{dir_subpath}" if dir_subpath else None
+
+    def _smb_config(candidate: Any) -> Any:
+        return candidate.smb_config(
+            target_ip=host, target_hostname=spn_host, kdc_ip=config.kdc_ip
+        )
+
+    def _on_live(coro: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+    def _verdict(gone: Optional[bool], what: str) -> tuple[bool, Optional[str]]:
+        if gone is True:
+            return True, None
+        if gone is False:
+            return False, f"the {what} is still present on the CA host"
+        return False, f"ADscan could not confirm the {what} was removed"
+
+    def _remove_pfx(candidate: Any) -> tuple[bool, Optional[str]]:
+        if _principal_key(candidate.username) == live_key:
+            return _verdict(
+                _on_live(
+                    _remove_temp_pfx_verified(
+                        conn, scm, service_name, service_created, unc_subpath, cleanup_cmd
+                    )
+                ),
+                "temporary CA key file",
+            )
+        cfg = _smb_config(candidate)
+        ok, reason = _smb.remove_unc_path_confirmed(cfg, unc_file, directory=False)
+        if ok and unc_dir:
+            ok, reason = _smb.remove_unc_path_confirmed(cfg, unc_dir, directory=True)
+        return ok, reason
+
+    def _remove_service(candidate: Any) -> tuple[bool, Optional[str]]:
+        if _principal_key(candidate.username) == live_key and scm is not None:
+            return _verdict(
+                _on_live(_remove_service_verified(scm, service_name)),
+                "temporary service",
+            )
+        return _smb.delete_service_confirmed(_smb_config(candidate), service_name)
+
+    try:
+        # --- temporary key file ------------------------------------------
+        if pfx_change_id and not pfx_observed:
+            # Never seen on the host: re-read once; absent means nothing to revert.
+            gone = await _remove_temp_pfx_verified(
+                conn, scm, service_name, service_created, unc_subpath, cleanup_cmd
+            )
+            if gone is True:
+                _esc_cleanup.discard_ca_backup_record(shell, pfx_change_id)
+            else:
+                await asyncio.to_thread(
+                    _esc_cleanup.revert_ca_backup_temp_pfx,
+                    shell,
+                    pfx_change_id,
+                    domain=domain,
+                    unc_path=remote_pfx_path,
+                    revert_and_confirm=_remove_pfx,
+                    extra_before_creator=[live],
+                )
+        elif pfx_change_id:
+            await asyncio.to_thread(
+                _esc_cleanup.revert_ca_backup_temp_pfx,
+                shell,
+                pfx_change_id,
+                domain=domain,
+                unc_path=remote_pfx_path,
+                revert_and_confirm=_remove_pfx,
+                extra_before_creator=[live],
+            )
+        else:
+            # No ledger: still remove the artifact, there is just no record.
+            await _remove_temp_pfx_verified(
+                conn, scm, service_name, service_created, unc_subpath, cleanup_cmd
+            )
+
+        # --- transient service -------------------------------------------
+        if not service_created:
+            _esc_cleanup.discard_ca_backup_record(shell, service_change_id)
+        elif service_change_id:
+            await asyncio.to_thread(
+                _esc_cleanup.revert_ca_backup_service,
+                shell,
+                service_change_id,
+                domain=domain,
+                service_name=service_name,
+                revert_and_confirm=_remove_service,
+                extra_before_creator=[live],
+                ca_host=config.target_host,
+            )
+        elif scm is not None:
+            await _remove_service_verified(scm, service_name)
+    except Exception as exc:  # noqa: BLE001 - cleanup never fails the caller
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 async def _smb_delete_path(conn, share: str, unc_subpath: str) -> None:

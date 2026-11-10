@@ -70,6 +70,7 @@ from adscan_internal.services.exploitation.rodc_krbtgt import (
     resolve_mimikatz_for_rodc,
 )
 from adscan_internal.services.rodc_host_access import parse_rodc_host_access_outcome
+from adscan_internal.services.execution_credential_scope import SCOPE_LOCAL
 from adscan_internal.services.rodc_followup_planner import (
     RodcKrbtgtKeyPlan,
     classify_rodc_target,
@@ -117,13 +118,144 @@ class FollowupExecutionOption:
 
 @dataclass(frozen=True, slots=True)
 class FollowupAction:
-    """A suggested follow-up action for an executed step."""
+    """A suggested follow-up action for an executed step.
+
+    ``relation`` names the attack-step technique the follow-up executes, so the
+    scan policy can refuse it (spec 2026-11-04 § 7.2 S4). Left empty, it is
+    resolved from :data:`FOLLOWUP_KEY_RELATIONS` by ``key``.
+    """
 
     key: str
     title: str
     description: str
     handler: Callable[[], None]
     execution_options_factory: Callable[[], list[FollowupExecutionOption]] | None = None
+    relation: str = ""
+
+
+#: ``FollowupAction.key -> attack-step relation`` it executes. The SSOT the
+#: scan-policy gate resolves a follow-up through; every follow-up key built in
+#: this module is either here, in :data:`FOLLOWUP_KEY_CHECKS`, or in
+#: :data:`FOLLOWUPS_NOT_CHECKS` (structural test).
+FOLLOWUP_KEY_RELATIONS: dict[str, str] = {
+    "dcsync_domain": "dcsync",
+    "dcsync": "dcsync",
+    "dump_lsa": "dumplsa",
+    "dump_lsa_via_rbcd": "dumplsa",
+    "dump_dpapi": "dumpdpapi",
+    "dump_dpapi_via_rbcd": "dumpdpapi",
+    "forge_rodc_golden_ticket": "forgerodcgoldenticket",
+    "run_rodc_kerberos_key_list": "kerberoskeylist",
+    "extract_rodc_krbtgt_secret": "extractrodckrbtgtsecret",
+    "prepare_rodc_credential_caching": "preparerodccredentialcaching",
+    "winrm_post_exploitation": "canpsremote",
+    "rdp_access_workflow": "canrdp",
+    "mssql_access_workflow": "sqladmin",
+    # "Check MSSQL Impersonation" runs ask_for_mssql_impersonate, which is the
+    # SeImpersonate -> SYSTEM takeover (run_mssql_takeover: uploads a helper,
+    # loads a CLR assembly, mints an admin account). It is NOT EXECUTE AS LOGIN
+    # (``mssql_impersonate_login``, which ADscan never executes), so it is gated
+    # by the check that declares those writes.
+    "mssql_impersonation_workflow": "mssql_seimpersonate_escalation",
+    "shadow_credentials": "addkeycredentiallink",
+    "addmember": "addmember",
+    "writedacl": "writedacl",
+}
+
+_NEW_CREDENTIAL_SHARE_ACCESS = "module:new_credential.share_access"
+
+#: Follow-ups that run a non-technique check, the ``new_credential`` family:
+#: what ADscan does as each account it obtains. Host access signs in on every
+#: host; share access re-runs the share collection as that account (it also
+#: needs ``module:domain_collection.shares``, which owns the listing itself).
+FOLLOWUP_KEY_CHECKS: dict[str, str] = {
+    "check_new_host_access": "module:new_credential.host_access",
+    "enumerate_host_access": "module:new_credential.host_access",
+    "enumerate_smb_shares": "module:new_credential.share_access",
+    "enumerate_shares": "module:new_credential.share_access",
+}
+
+#: Follow-ups that are not checks, each with the reason it sends nothing of its
+#: own or is not a separate action. A key here must not reach the network beyond
+#: what an already-gated check sends (structural test
+#: ``tests/unit/scan_policy/test_network_actions_are_checks.py``).
+FOLLOWUPS_NOT_CHECKS: dict[str, str] = {
+    "refresh_ticket": (
+        "requests a new Kerberos ticket for an account ADscan just added to a group, "
+        "with its verified credential, so the next checks see the new membership; "
+        "it reads nothing and is part of the step that changed the membership"
+    ),
+    "review_rbcd_ticket": "renders the prepared delegation context locally; sends nothing",
+    "review_rodc_krbtgt_material": "renders material already held locally; sends nothing",
+    "review_rodc_final_validation_plan": "renders a plan locally; sends nothing",
+}
+
+
+def followup_relation(item: FollowupAction) -> str:
+    """The attack-step relation a follow-up executes (``""`` when none)."""
+    explicit = str(getattr(item, "relation", "") or "").strip()
+    if explicit:
+        return explicit
+    return FOLLOWUP_KEY_RELATIONS.get(str(item.key or "").strip(), "")
+
+
+def followup_excluded_by_scan_policy(shell: Any, item: FollowupAction) -> bool:
+    """True when the active scan policy refuses this follow-up (S4)."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        check_excluded,
+        relation_excluded,
+    )
+
+    relation = followup_relation(item)
+    if relation:
+        return relation_excluded(shell, relation)
+    check_id = FOLLOWUP_KEY_CHECKS.get(str(item.key or "").strip(), "")
+    if check_id:
+        return check_excluded(shell, check_id)
+    return False
+
+
+def _followup_default_yes(shell: Any, item: FollowupAction) -> bool:
+    """Default answer of the run-this-follow-up question.
+
+    A follow-up bound to a ``new_credential`` check (``FOLLOWUP_KEY_CHECKS``)
+    defaults to yes only when a scan policy is in force, so an unattended run
+    signs in on hosts or maps shares as a new account only under a policy that
+    turns the check on (the excluded case never reaches the question). Every
+    other follow-up keeps its yes default.
+    """
+    if not FOLLOWUP_KEY_CHECKS.get(str(item.key or "").strip(), ""):
+        return True
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        policy_active,
+    )
+
+    return policy_active(shell)
+
+
+def _refuse_followup(shell: Any, item: FollowupAction) -> None:
+    from adscan_internal.services.scan_policy_enforcement import refuse  # noqa: PLC0415
+
+    relation = followup_relation(item)
+    refuse(
+        shell,
+        "" if relation else FOLLOWUP_KEY_CHECKS.get(str(item.key or "").strip(), ""),
+        surface="followup",
+        relation=relation,
+    )
+
+
+def filter_followups_by_scan_policy(
+    shell: Any, followups: list[FollowupAction]
+) -> list[FollowupAction]:
+    """Drop the follow-ups the scan policy excludes, refusing each once."""
+    kept: list[FollowupAction] = []
+    for item in followups or []:
+        if followup_excluded_by_scan_policy(shell, item):
+            _refuse_followup(shell, item)
+            continue
+        kept.append(item)
+    return kept
 
 
 def execute_guided_followup_actions(
@@ -134,6 +266,8 @@ def execute_guided_followup_actions(
     followups: list[FollowupAction],
 ) -> None:
     """Render follow-ups and execute them via guided confirm prompts."""
+    # An excluded follow-up is never offered (spec 2026-11-04 § 7.2 S4).
+    followups = filter_followups_by_scan_policy(shell, followups)
     if not followups:
         return
 
@@ -146,12 +280,15 @@ def execute_guided_followup_actions(
     selector = getattr(shell, "_questionary_select", None)
     for item in followups:
         prompt = f"Do you want to run follow-up '{item.title}' now?"
+        default_yes = _followup_default_yes(shell, item)
         if callable(confirmer):
-            should_run = bool(confirmer(prompt, default=True))
+            should_run = bool(confirmer(prompt, default=default_yes))
         elif callable(selector):
-            should_run = selector(prompt, ["Yes", "No"], default_idx=0) == 0
+            should_run = (
+                selector(prompt, ["Yes", "No"], default_idx=0 if default_yes else 1) == 0
+            )
         else:
-            should_run = Confirm.ask(prompt, default=True)
+            should_run = Confirm.ask(prompt, default=default_yes)
         if should_run:
             _execute_followup_action(shell, item)
         else:
@@ -162,6 +299,9 @@ def execute_guided_followup_actions(
 
 def _execute_followup_action(shell: Any, item: FollowupAction) -> None:
     """Execute one follow-up action, optionally resolving a richer UX choice first."""
+    if followup_excluded_by_scan_policy(shell, item):
+        _refuse_followup(shell, item)
+        return
     options_factory = item.execution_options_factory
     if not callable(options_factory):
         item.handler()
@@ -381,7 +521,14 @@ def _run_user_share_followup(
     Uses the native aiosmb stack via :func:`run_native_shares_view` — no nxc.
     """
     from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
 
+    # Execution seam of module:new_credential.share_access (needs the share
+    # collection check too): off, nothing is sent.
+    if not gate_check_runner(shell, _NEW_CREDENTIAL_SHARE_ACCESS):
+        return
     marked_user = mark_sensitive(username, "user")
     marked_domain = mark_sensitive(domain, "domain")
     print_info(
@@ -651,6 +798,12 @@ def _run_rbcd_share_followup(
     ticket_path: str,
 ) -> None:
     """Enumerate SMB shares using a delegated CIFS ticket."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, _NEW_CREDENTIAL_SHARE_ACCESS):
+        return
     print_info(
         "Enumerating SMB shares via prepared RBCD ticket for "
         f"{mark_sensitive(delegated_user, 'user')}."
@@ -2823,6 +2976,20 @@ def build_followups_for_execution_outcome(
         ).strip()
         credential = str(outcome.get("credential") or "").strip()
         if not target_domain or not compromised_user or not credential:
+            return []
+        credential_scope = str(outcome.get("credential_scope") or "").strip().lower()
+        if credential_scope == SCOPE_LOCAL:
+            # A LOCAL account's secret (e.g. a LAPS password for a host's local
+            # Administrator) is not the same-named DOMAIN account's password.
+            # The domain follow-ups below authenticate as the domain principal,
+            # so running them would send a wrong password for a real domain
+            # account on every host: an account-lockout hazard.
+            print_info_verbose(
+                "Skipping domain-wide follow-ups for "
+                f"{mark_sensitive(compromised_user, 'user')}: the recovered secret "
+                "belongs to a local account on one host, not to the domain account "
+                "of the same name."
+            )
             return []
         return _build_user_credential_followups(
             shell,

@@ -26,8 +26,11 @@ from typing import Any, MutableMapping, Optional
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.models.domain import Domain, resolve_ci
+from adscan_core.dc_topology import host_match_keys as _core_host_match_keys
+from adscan_core.dc_topology import hosts_match as _core_hosts_match
 from adscan_core.rich_output import print_exception
 from adscan_core.sensitive import strip_sensitive_markers
+from adscan_internal.services.credential_routing import same_secret
 
 
 @dataclass
@@ -397,12 +400,23 @@ class CredentialStoreService(BaseService):
             credential_changed = False
             stored_is_hash = current_is_hash
             stored_strength = current_strength
-        elif (not current_is_hash) and is_hash:
-            # Equal provenance: a stored plaintext is the more usable secret.
+        elif (
+            (not current_is_hash)
+            and is_hash
+            and same_secret(current_cred, credential) is not False
+        ):
+            # Equal provenance, same secret (or undecidable): the stored
+            # plaintext is the more usable FORMAT of it.
             credential_changed = False
             stored_is_hash = False
             stored_strength = current_strength
         else:
+            # Equal provenance and the incoming secret is either the more usable
+            # format or a provably DIFFERENT secret (the password's NT hash does
+            # not match it): the newer observation is the current one. Keeping a
+            # superseded password active is how a stale secret for the domain
+            # Administrator stayed in front of the hash a replication had just
+            # proven current. The loser is retained below, as history.
             credential_changed = True
 
         if credential_changed:
@@ -414,6 +428,16 @@ class CredentialStoreService(BaseService):
                     secret=current_cred,
                     is_hash=current_is_hash,
                 )
+            # One current secret per principal: when this principal is also the
+            # domain's configured account, its ``password`` mirrors the store,
+            # so no reader can pick the superseded one through the active pair.
+            active_user = strip_sensitive_markers(
+                str(domain_data.get("username") or "")
+            ).strip()
+            if active_user and _normalize_marker_user(active_user) == _normalize_marker_user(
+                username
+            ):
+                domain_data["password"] = credential
         elif current_cred is not None and current_cred != credential:
             retained_secret_kind = self._retain_superseded_secret(
                 domain_data,
@@ -1380,50 +1404,15 @@ def _spn_host(spn: str) -> str:
 def host_match_keys(value: str) -> set[str]:
     """Return the alias-aware comparison keys for one host identifier.
 
-    Service-ticket ``target_host`` (an SPN host, usually an FQDN) and the host a
-    follow-up step resolves to (FQDN, short name, IP, ``HOST$``, or the attack
-    graph's own ``HOST$@REALM`` node label) must compare equal when they denote
-    the same machine.  This produces a normalised set so a match is
-    ``keys(a) & keys(b)`` being non-empty:
-
-    - lowercased, trailing dot and trailing ``$`` stripped
-    - the full value (FQDN or IP)
-    - the short hostname (label before the first dot) for non-IP values
-
-    A graph node label (``BRAAVOS$@ESSOS.LOCAL``) is folded into the FQDN it
-    denotes (``braavos.essos.local``), so a host identifier read off an
-    attack-path step compares equal to the same host stored by a credential or
-    ticket writer.  Keeping the realm rather than reducing the label to its
-    short name means the FQDN form matches directly.
-
-    IPs are preserved verbatim (no short-name split).  Empty/blank input yields
-    an empty set so it never matches anything.
+    Delegates to the dependency-light SSOT ``adscan_core.dc_topology`` (shared
+    with the web backend); see there for the rule.
     """
-    raw = str(value or "").strip().strip(".").lower()
-    if "@" in raw:
-        # Attack-graph node label: ``<samaccountname>@<realm>``.
-        name, _, realm = raw.partition("@")
-        name = name.rstrip("$").strip()
-        realm = realm.strip().strip(".")
-        raw = f"{name}.{realm}" if name and realm else name
-    raw = raw.rstrip("$")
-    if not raw:
-        return set()
-    keys = {raw}
-    # IPv4 literal -> keep as-is, do not derive a "short name".
-    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", raw):
-        return keys
-    short = raw.split(".", 1)[0].strip()
-    if short:
-        keys.add(short)
-    return keys
+    return _core_host_match_keys(value)
 
 
 def hosts_match(a: str, b: str) -> bool:
     """Return whether two host identifiers denote the same machine (alias-aware)."""
-    keys_a = host_match_keys(a)
-    keys_b = host_match_keys(b)
-    return bool(keys_a and keys_b and (keys_a & keys_b))
+    return _core_hosts_match(a, b)
 
 
 def username_is_host_identifier(username: str, host: str) -> bool:
@@ -2189,6 +2178,216 @@ def get_stored_domain_credential_for_user(
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Principal ↔ secret pairing SSOT (account-lockout protection)
+# --------------------------------------------------------------------------- #
+#
+# A username is only ever sent with THAT principal's own secret. Pairing a
+# username from one source (a credential object, a function argument, a
+# compromised-user outcome) with a secret from another (the domain's ACTIVE
+# ``domains_data[domain]["username"/"password"]`` pair) sends a wrong password
+# for a real account on every attempt — each one a ``badPwdCount`` increment on
+# the DC. Five of them locked a real account in the lab (2026-11-04: the ESC15 /
+# ESC9 confirmations and the certificate-binding read authenticated as the
+# refresh principal with the domain's active password). The rule is enforced
+# here, once, and every call site that needs "the secret for this username"
+# routes through :func:`resolve_principal_credential`; a structural test forbids
+# the per-field ``x or domain_data["password"]`` fallback anywhere else.
+
+
+@dataclass(frozen=True)
+class PrincipalCredential:
+    """A username paired ONLY with material that belongs to that principal.
+
+    Attributes:
+        username: The principal the material belongs to.
+        secret: Its password or NT hash, or ``None`` when ADscan holds no secret
+            for it (the caller must then skip honestly, never borrow one).
+        ccache_path: A Kerberos ccache stored for this principal, if any.
+        source: Where the secret came from: ``explicit`` (the caller's own
+            credential object), ``credential_store`` (the principal's own stored
+            credential, preferred), ``active_pair`` (the domain's configured
+            username/password pair, when the store has no entry), or ``none``.
+    """
+
+    username: str
+    secret: Optional[str]
+    ccache_path: Optional[str]
+    source: str
+
+    @property
+    def has_secret(self) -> bool:
+        """``True`` when a password / NT hash for this principal is available."""
+        return bool(self.secret)
+
+
+def _domain_entry_ci(domains_data: Any, domain: str) -> dict[str, Any]:
+    """Return ``domains_data[domain]`` with a case-insensitive fallback."""
+    if not isinstance(domains_data, dict):
+        return {}
+    entry = domains_data.get(domain)
+    if isinstance(entry, dict):
+        return entry
+    target = str(domain or "").strip().lower()
+    for key, value in domains_data.items():
+        if str(key or "").strip().lower() == target and isinstance(value, dict):
+            return value
+    return {}
+
+
+def _looks_like_ccache_value(value: str) -> bool:
+    return str(value or "").strip().lower().endswith(".ccache")
+
+
+def resolve_principal_credential(
+    domains_data: Any,
+    *,
+    domain: str,
+    username: Optional[str] = None,
+    secret: Optional[str] = None,
+) -> Optional[PrincipalCredential]:
+    """Return a username together with a secret that belongs to that username.
+
+    The single answer to "what may I send as the password for this account".
+
+    * ``username`` empty: the domain's ACTIVE pair, read together (both fields
+      from ``domains_data[domain]``), so the two can never come from different
+      principals. A ``secret`` passed without a username is ignored, since its
+      owner is unknown. Returns ``None`` when no active username is configured.
+    * ``username`` given with an explicit ``secret``: the caller's own credential
+      object vouches for the pair; it is returned as-is.
+    * ``username`` given without a secret: the principal's own entry in
+      ``credentials`` (its current secret), else the active pair's password ONLY
+      when the active username IS this principal. NEVER another principal's
+      password. A ccache stored for the principal is surfaced separately in
+      ``ccache_path``.
+
+    Args:
+        domains_data: The shell's ``domains_data`` mapping.
+        domain: Domain whose credential store is consulted (the principal's
+            auth domain).
+        username: Principal to authenticate as, or ``None`` for the active pair.
+        secret: The password / NT hash the caller already holds FOR ``username``.
+
+    Returns:
+        A :class:`PrincipalCredential` (whose ``secret`` may be ``None`` when the
+        principal has no stored secret), or ``None`` when no principal resolves.
+    """
+    domain_data = _domain_entry_ci(domains_data, domain)
+    requested = strip_sensitive_markers(str(username or "")).strip()
+    explicit_secret = str(secret or "").strip() or None
+    active_user = strip_sensitive_markers(str(domain_data.get("username") or "")).strip()
+    active_password = str(domain_data.get("password") or "").strip() or None
+
+    if not requested:
+        # No principal named: the active pair, read together. A secret handed in
+        # WITHOUT its username has no known owner, so it is never paired with the
+        # active username (that would be the very mismatch this resolver exists
+        # to prevent).
+        if not active_user:
+            return None
+        requested = active_user
+        explicit_secret = None
+
+    ccache = _stored_ccache_for(domains_data, domain=domain, username=requested)
+    if explicit_secret is not None:
+        if _looks_like_ccache_value(explicit_secret):
+            return PrincipalCredential(
+                username=requested,
+                secret=None,
+                ccache_path=explicit_secret,
+                source="explicit",
+            )
+        return PrincipalCredential(
+            username=requested,
+            secret=explicit_secret,
+            ccache_path=ccache,
+            source="explicit",
+        )
+
+    target = _normalize_marker_user(requested)
+    # The principal's own store entry is its CURRENT secret (the store ranks
+    # every write and keeps one active secret per principal). The active pair's
+    # ``password`` is a copy that an older workspace may hold stale, so it is
+    # only the fallback when the store has nothing for this principal.
+    credentials = domain_data.get("credentials")
+    if isinstance(credentials, dict):
+        for stored_user, stored_credential in credentials.items():
+            if _normalize_marker_user(str(stored_user)) != target:
+                continue
+            value = str(stored_credential or "").strip() if isinstance(stored_credential, str) else ""
+            if value and not _looks_like_ccache_value(value):
+                return PrincipalCredential(
+                    username=requested,
+                    secret=value,
+                    ccache_path=ccache,
+                    source="credential_store",
+                )
+            if value and _looks_like_ccache_value(value):
+                ccache = ccache or value
+            break
+
+    if active_password and active_user and _normalize_marker_user(active_user) == target:
+        return PrincipalCredential(
+            username=requested,
+            secret=active_password,
+            ccache_path=ccache,
+            source="active_pair",
+        )
+
+    return PrincipalCredential(
+        username=requested,
+        secret=None,
+        ccache_path=ccache,
+        source="none",
+    )
+
+
+def resolve_principal_secret_pair(
+    domains_data: Any,
+    *,
+    domain: str,
+    username: Optional[str] = None,
+    secret: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return ``(username, secret)`` as strings, both from the same principal.
+
+    Convenience form of :func:`resolve_principal_credential` for call sites that
+    take an optional username / secret override and otherwise use the domain's
+    active credential. Either value is ``""`` when unavailable; the secret is
+    ``""`` (skip) rather than another principal's password when the requested
+    username has none of its own.
+    """
+    resolved = resolve_principal_credential(
+        domains_data, domain=domain, username=username, secret=secret
+    )
+    if resolved is None:
+        return "", ""
+    return str(resolved.username or ""), str(resolved.secret or "")
+
+
+def _stored_ccache_for(domains_data: Any, *, domain: str, username: str) -> Optional[str]:
+    """Return a ccache stored for *username* (capability-bearing first), or ``None``."""
+    target = _normalize_marker_user(username)
+    if not target:
+        return None
+    capability = get_capability_bearing_ccache(
+        domains_data if isinstance(domains_data, dict) else {},
+        domain=domain,
+        username=target,
+    )
+    if capability:
+        return capability
+    tickets = _domain_entry_ci(domains_data, domain).get("kerberos_tickets")
+    if isinstance(tickets, dict):
+        for stored_user, ticket_path in tickets.items():
+            if _normalize_marker_user(str(stored_user)) != target:
+                continue
+            text = str(ticket_path or "").strip() if isinstance(ticket_path, str) else ""
+            return text or None
+    return None
+
+
 __all__ = [
     "CredentialStoreService",
     "DomainCredentialUpdateResult",
@@ -2215,4 +2414,7 @@ __all__ = [
     "mark_capability_bearing_ccache",
     "get_capability_bearing_ccache",
     "get_stored_domain_credential_for_user",
+    "PrincipalCredential",
+    "resolve_principal_credential",
+    "resolve_principal_secret_pair",
 ]

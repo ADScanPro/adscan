@@ -16,6 +16,11 @@ from adscan_core.outbound_links import cta_markup, cta_url
 from adscan_core.lab_context import (
     build_lab_telemetry_fields,
     build_workspace_telemetry_fields,
+    scan_policy_base_of,
+)
+from adscan_core.reporting.framework_provenance import (
+    framework_display_name,
+    framework_version,
 )
 from adscan_core.paths import get_workspaces_dir
 from adscan_internal.path_utils import get_adscan_state_dir
@@ -59,17 +64,43 @@ _FRAMEWORK_KEY_MAP: dict[str, str] = {
     # 311/2022 art. 40.1), is derived from the client's own declared dimension
     # levels, and is resolved per workspace by the declared-scope machinery in
     # ``adscan_core.reporting.ens_applicability``.
+    # The versioned part of every label comes from the provenance record, so a
+    # new edition renames the menu entry by the same edit that renames the
+    # report section.
     "ENS — Spain / CCN-CERT (recommended)": "ens",
     "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
-    "ISO 27001:2022 — International ISMS standard": "iso27001",
+    f"{framework_display_name('iso27001')} — International ISMS standard": "iso27001",
     "DORA — EU 2022/2554 (financial sector)": "dora",
-    "PCI DSS v4.0.1 — Payment Card Industry": "pci_dss",
+    f"{framework_display_name('pci_dss')} — Payment Card Industry": "pci_dss",
     # CIS is technical hardening config best-practice, NOT a regulation — the
     # label says so explicitly so the operator never confuses it with a legal
     # obligation (see the compliance report's non-regulatory framing).
-    "CIS Microsoft Windows Server Benchmark v4.0.0 — technical hardening (not a regulation)": "cis",
+    f"{framework_display_name('cis')} v{framework_version('cis')}"
+    " — technical hardening (not a regulation)": "cis",
 }
 _VALID_FRAMEWORK_KEYS: tuple[str, ...] = tuple(_FRAMEWORK_KEY_MAP.values())
+
+
+def log_into_workspace(workspace_dir: Path | None) -> bool:
+    """Send this process's log lines into the workspace a command operates on.
+
+    A standalone command that works on a kept workspace without loading it as
+    a session (``adscan deliver``) would otherwise log outside any workspace,
+    into the global outside-workspace log, which outlives the workspace delete.
+    A process that already logs into a workspace (the shell, ``ci``) is left
+    alone.
+
+    Returns:
+        True when the log files now point at ``workspace_dir``.
+    """
+    from adscan_core import logging_config  # noqa: PLC0415
+
+    if workspace_dir is None or not Path(workspace_dir).is_dir():
+        return False
+    if getattr(logging_config, "_active_workspace_dir", None) is not None:
+        return False
+    logging_config.update_workspace_logging(Path(workspace_dir))
+    return getattr(logging_config, "_active_workspace_dir", None) is not None
 
 
 def _resolve_workspace(args: argparse.Namespace) -> Path | None:
@@ -335,7 +366,10 @@ def build_workspace_attribution_fields(shell: Any) -> dict[str, Any]:
     """
     fields: dict[str, Any] = {}
     fields.update(
-        build_workspace_telemetry_fields(workspace_type=getattr(shell, "type", None))
+        build_workspace_telemetry_fields(
+            workspace_type=getattr(shell, "type", None),
+            scan_policy_base=scan_policy_base_of(shell),
+        )
     )
     workspace_id_hash = compute_workspace_id_hash(shell)
     if workspace_id_hash:
@@ -930,6 +964,14 @@ def redact_command_for_log(command_name: str, args_list: list[str]) -> str:
         cleartext, with only the secret positional(s) ``mark_sensitive``-wrapped.
     """
     cmd = (command_name or "").lower()
+
+    # ``workspace delete <name>``: the echo is logged inside the workspace that
+    # is open, which outlives the delete. From this line on, this process logs
+    # a token for that name (see ``telemetry.forget_workspace_name``).
+    if cmd == "workspace" and len(args_list) >= 2 and str(args_list[0]).lower() == "delete":
+        from adscan_core.telemetry import forget_workspace_name  # noqa: PLC0415
+
+        forget_workspace_name(str(args_list[1]))
 
     # Resolve which POSITIONAL indices (counted over non-flag tokens) are secret.
     secret_positional_indices: tuple[int, ...] = _SECRET_POSITIONAL_INDICES.get(cmd, ())

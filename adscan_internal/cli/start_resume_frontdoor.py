@@ -157,7 +157,9 @@ def _incomplete_resume_phase(shell: Any, domain: str) -> str | None:
         if not sp.is_incomplete(shell, domain):
             return None
         record = sp.read_scan_progress(shell, domain)
-        scan_type = str(record.get("scan_type") or getattr(shell, "type", "") or "audit")
+        from adscan_core.scan_policy.settings import scan_phase_family  # noqa: PLC0415
+
+        scan_type = str(record.get("scan_type") or scan_phase_family(shell))
         phase_id = sp.resume_phase_id(shell, domain, scan_type)
         if not phase_id:
             return None

@@ -33,6 +33,7 @@ Patch A — global realm skew cache + ``AIOKerberosClient.__init__`` pre-seeding
 
 from __future__ import annotations
 
+import contextvars
 import datetime
 import logging
 from typing import Any, Callable
@@ -302,6 +303,8 @@ def install() -> None:
     _install_kerbad_with_clock_skew()
     _install_patch_a_init()
     _install_sync_kerbad_patches()
+    _install_auth_attempt_guard()
+    _install_ntlm_auth_guard()
 
 
 # ---------------------------------------------------------------------------
@@ -764,5 +767,283 @@ def _install_sync_kerbad_patches() -> None:
         setattr(sync_with_clock_skew, _PATCH_MARKER, True)
         KerbrosClient.with_clock_skew = sync_with_clock_skew
 
+
+# ---------------------------------------------------------------------------
+# Lockout guard — every AS exchange that carries a secret
+# ---------------------------------------------------------------------------
+#
+# ``get_TGT`` is the one place in the native stack where a password, NT hash or
+# AES key is proven against the KDC: aiosmb, badldap and aardwolf call it through
+# badauth, and ADscan's own transports call it directly or through
+# ``with_clock_skew``. Wrapping it here makes the lockout guard
+# (``adscan_core.auth_attempt_guard``) a property of the Kerberos seam itself,
+# so no caller can send an AS exchange the guard has not seen.
+#
+# Only an exchange that can count against ``badPwdCount`` is judged: a secret is
+# present, no certificate (PKINIT), pre-authentication not disabled (AS-REP
+# roasting sends no secret), and the client's ccache does not already hold the
+# TGT (``get_TGT`` then returns without touching the wire). The outcome is
+# classified by ``adscan_core.auth_outcome.classify_kerberos_as``: only
+# ``KDC_ERR_PREAUTH_FAILED`` counts, so an etype, clock, realm or salt problem
+# never withholds the correct secret from the retry that fixes it.
+#
+# kerbad retries pre-authentication ONCE inside ``get_TGT`` when the first
+# rejection may be a salt mismatch, so one ``get_TGT`` call can cost the account
+# two failed sign-ins. ``do_preauth`` is wrapped to count the rejections the KDC
+# actually sent, and the failure is recorded with that weight.
+
+#: The guard's OWN patch marker. It must differ from ``_PATCH_MARKER``: the
+#: clock-skew recovery above auto-wraps ``get_TGT`` and stamps that marker on its
+#: wrapper, so reusing it made the guard believe it was already installed and
+#: left every async AS exchange unguarded.
+_GUARD_MARKER = "_adscan_auth_guard_patched"
+
+_PREAUTH_REJECTIONS: "contextvars.ContextVar[list[int] | None]" = contextvars.ContextVar(
+    "adscan_kerberos_preauth_rejections", default=None
+)
+
+
+def _guarded_as_target(client: Any) -> "tuple[str, str, str] | None":
+    """``(realm, principal, secret)`` when this AS exchange sends a secret.
+
+    A credential whose only "secret" is an empty password returns ``""`` so the
+    guard refuses it (or, inside ``allow_empty_secret``, judges it).
+    """
+    credential = getattr(client, "credential", None)
+    if credential is None:
+        return None
+    if getattr(credential, "certificate", None) is not None:
+        return None
+    if getattr(credential, "nopreauth", False):
+        return None
+    secret = None
+    for attr in (
+        "password",
+        "nt_hash",
+        "kerberos_key_aes_256",
+        "kerberos_key_aes_128",
+        "kerberos_key_rc4",
+    ):
+        value = getattr(credential, attr, None)
+        if value is not None and value != "":
+            secret = value.hex() if isinstance(value, (bytes, bytearray)) else str(value)
+            break
+    if secret is None and getattr(credential, "password", None) == "":
+        secret = ""  # an empty password is still a sign-in the domain counts
+    if secret is None:
+        return None
+    principal = str(getattr(credential, "username", "") or "")
+    realm = str(getattr(credential, "domain", "") or "")
+    if not principal or not realm:
+        return None
+    return realm, principal, secret
+
+
+def _ccache_already_holds_tgt(client: Any) -> bool:
+    try:
+        _, err = client.tgt_from_ccache()
+    except Exception:  # noqa: BLE001
+        return False
+    return err is None
+
+
+def _kerberos_error_code(exc: "BaseException | None") -> Any:
+    if exc is None:
+        return None
+    code = getattr(exc, "errorcode", None)
+    if code is not None:
+        return getattr(code, "name", code)
+    getter = getattr(exc, "getErrorCode", None)  # impacket KerberosError
+    if callable(getter):
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _is_preauth_rejection(exc: BaseException) -> bool:
+    code = _kerberos_error_code(exc)
+    return code in ("KDC_ERR_PREAUTH_FAILED", 24)
+
+
+def _record_as_outcome(
+    target: "tuple[str, str, str]", exc: "BaseException | None", *, rejections: int = 1
+) -> None:
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+    from adscan_core.auth_outcome import SUCCESS, classify_kerberos_as  # noqa: PLC0415
+
+    realm, principal, secret = target
+    verdict = SUCCESS if exc is None else classify_kerberos_as(_kerberos_error_code(exc))
+    auth_attempt_guard.record_verdict(
+        realm, principal, secret, verdict, weight=max(1, rejections)
+    )
+
+
+def _make_counting_do_preauth_async(original: Callable[..., Any]) -> Callable[..., Any]:
+    async def counting_do_preauth(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await original(self, *args, **kwargs)
+        except BaseException as exc:
+            counter = _PREAUTH_REJECTIONS.get()
+            if counter is not None and _is_preauth_rejection(exc):
+                counter[0] += 1
+            raise
+
+    setattr(counting_do_preauth, _GUARD_MARKER, True)
+    return counting_do_preauth
+
+
+def _make_counting_do_preauth_sync(original: Callable[..., Any]) -> Callable[..., Any]:
+    def counting_do_preauth(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return original(self, *args, **kwargs)
+        except BaseException as exc:
+            counter = _PREAUTH_REJECTIONS.get()
+            if counter is not None and _is_preauth_rejection(exc):
+                counter[0] += 1
+            raise
+
+    setattr(counting_do_preauth, _GUARD_MARKER, True)
+    return counting_do_preauth
+
+
+def _make_guarded_get_tgt_async(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap an async ``get_TGT`` with the lockout guard."""
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+
+    async def guarded_get_tgt(self: Any, *args: Any, **kwargs: Any) -> Any:
+        target = _guarded_as_target(self)
+        if target is None or _ccache_already_holds_tgt(self):
+            return await original(self, *args, **kwargs)
+        auth_attempt_guard.check_attempt(*target)
+        counter = [0]
+        token = _PREAUTH_REJECTIONS.set(counter)
+        try:
+            result = await original(self, *args, **kwargs)
+        except BaseException as exc:
+            _record_as_outcome(target, exc, rejections=counter[0])
+            raise
+        finally:
+            _PREAUTH_REJECTIONS.reset(token)
+        _record_as_outcome(target, None)
+        return result
+
+    setattr(guarded_get_tgt, _GUARD_MARKER, True)
+    return guarded_get_tgt
+
+
+def _make_guarded_get_tgt_sync(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a sync ``get_TGT`` (PKINIT / shadow-credential client) the same way."""
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+
+    def guarded_get_tgt_sync(self: Any, *args: Any, **kwargs: Any) -> Any:
+        target = _guarded_as_target(self)
+        if target is None or _ccache_already_holds_tgt(self):
+            return original(self, *args, **kwargs)
+        auth_attempt_guard.check_attempt(*target)
+        counter = [0]
+        token = _PREAUTH_REJECTIONS.set(counter)
+        try:
+            result = original(self, *args, **kwargs)
+        except BaseException as exc:
+            _record_as_outcome(target, exc, rejections=counter[0])
+            raise
+        finally:
+            _PREAUTH_REJECTIONS.reset(token)
+        _record_as_outcome(target, None)
+        return result
+
+    setattr(guarded_get_tgt_sync, _GUARD_MARKER, True)
+    return guarded_get_tgt_sync
+
+
+def _install_auth_attempt_guard() -> None:
+    """Wrap async and sync ``get_TGT`` / ``do_preauth`` with the lockout guard. Idempotent."""
+    try:
+        from kerbad.aioclient import AIOKerberosClient  # noqa: PLC0415
+    except ImportError:
+        AIOKerberosClient = None  # type: ignore[assignment]  # noqa: N806
+    if AIOKerberosClient is not None:
+        if not getattr(AIOKerberosClient.get_TGT, _GUARD_MARKER, False):
+            AIOKerberosClient.get_TGT = _make_guarded_get_tgt_async(AIOKerberosClient.get_TGT)
+        if not getattr(AIOKerberosClient.do_preauth, _GUARD_MARKER, False):
+            AIOKerberosClient.do_preauth = _make_counting_do_preauth_async(
+                AIOKerberosClient.do_preauth
+            )
+
+    try:
+        from kerbad.client import KerbrosClient  # noqa: PLC0415
+    except ImportError:
+        return
+    if not getattr(KerbrosClient.get_TGT, _GUARD_MARKER, False):
+        KerbrosClient.get_TGT = _make_guarded_get_tgt_sync(KerbrosClient.get_TGT)
+    if not getattr(KerbrosClient.do_preauth, _GUARD_MARKER, False):
+        KerbrosClient.do_preauth = _make_counting_do_preauth_sync(KerbrosClient.do_preauth)
+
+
+# ---------------------------------------------------------------------------
+# Lockout guard — every NTLM AUTHENTICATE the native stack builds (badauth)
+# ---------------------------------------------------------------------------
+#
+# aiosmb, badldap and aardwolf all build their NTLM AUTHENTICATE in
+# ``badauth.protocols.ntlm.client.native.NTLMClientNative.authenticate`` (the
+# second call, after the server CHALLENGE). Checking there means a sign-in that
+# bypasses the transport seams (a direct ``SMBConnectionFactory`` in an ADCS
+# enrollment, a CA backup read) is still refused when its secret is known bad,
+# its account unusable, its principal at its budget, or its secret empty. This
+# layer only CHECKS: the verdict arrives in the transport's reply, which the
+# transport seams (SMB session setup, LDAP bind, RDP CredSSP) classify and record.
+# A host-local logon (no domain, or ".") is left to the seam that knows the host,
+# and the deliberate guest probe (``Guest`` with no password) is not judged.
+
+
+def _ntlm_guard_target(credential: Any) -> "tuple[str, str, str] | None":
+    if credential is None:
+        return None
+    username = str(getattr(credential, "username", "") or "")
+    realm = str(getattr(credential, "domain", "") or "").strip()
+    if not username or not realm or realm == ".":
+        return None
+    secret_value = getattr(credential, "secret", None)
+    secret = (
+        secret_value.hex()
+        if isinstance(secret_value, (bytes, bytearray))
+        else str(secret_value or "")
+    )
+    if getattr(credential, "is_guest", False) or (
+        username.lower() == "guest" and not secret
+    ):
+        return None
+    return realm, username, secret
+
+
+def _make_guarded_ntlm_authenticate(original: Callable[..., Any]) -> Callable[..., Any]:
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+
+    async def guarded_authenticate(self: Any, authData: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: N803
+        if getattr(self, "iteration_cnt", 0) >= 1 and authData is not None:
+            target = _ntlm_guard_target(getattr(self, "credential", None))
+            if target is not None:
+                try:
+                    auth_attempt_guard.check_attempt(*target)
+                except auth_attempt_guard.AuthAttemptRefused as refused:
+                    return None, None, refused
+        return await original(self, authData, *args, **kwargs)
+
+    setattr(guarded_authenticate, _GUARD_MARKER, True)
+    return guarded_authenticate
+
+
+def _install_ntlm_auth_guard() -> None:
+    """Check every native NTLM AUTHENTICATE against the lockout guard. Idempotent."""
+    try:
+        from badauth.protocols.ntlm.client.native import NTLMClientNative  # noqa: PLC0415
+    except ImportError:
+        return
+    if not getattr(NTLMClientNative.authenticate, _GUARD_MARKER, False):
+        NTLMClientNative.authenticate = _make_guarded_ntlm_authenticate(
+            NTLMClientNative.authenticate
+        )
 
 install()

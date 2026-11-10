@@ -107,29 +107,58 @@ def _dc_set_signature(domain_data: dict, dc_ip: Optional[str]) -> str:
 
 
 def resolve_reading_credential(
-    shell: Any, domain: str, credential: Any
+    shell: Any,
+    domain: str,
+    credential: Any,
+    *,
+    auth_domain: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Return ``(username, secret)`` for the SCBE read (the shared resolver).
+    """Return ``(username, secret)`` for the SCBE read / ADCS confirmations.
 
-    ``secret`` is a password OR an NT hash (both authenticate over SMB/LDAP via the
-    canonical PtH path). A Kerberos/ccache-only credential yields no secret here, so
-    the confirmation is left a data gap (UNKNOWN) rather than guessed. Lifted from
-    the ESC14 phase so the ESC14 pre-check, the SCBE read and the ESC9 driver all
-    resolve the credential identically.
+    ``secret`` is a password OR an NT hash that belongs to ``username``: it comes
+    from the caller's credential object, or else from THAT principal's own entry
+    in the credential store (the pairing SSOT
+    :func:`~adscan_internal.services.credential_store_service.resolve_principal_credential`).
+    It is NEVER the domain's active password borrowed for a different username:
+    that pairing sends a wrong password for a real account on every attempt and
+    locked one out in the lab. When the principal has no secret of its own (a
+    ccache-only credential with nothing stored), ``secret`` is ``None`` and the
+    confirmation is left a data gap rather than guessed. Shared by the ESC14
+    pre-check, the SCBE read, the ESC9 driver and the ESC15 confirmation.
     """
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_credential,
+    )
+
+    domains_data = getattr(shell, "domains_data", {})
     username = getattr(credential, "username", None)
     secret = getattr(credential, "password", None)
-    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    if not isinstance(domain_data, dict):
-        domain_data = {}
-    if not username:
-        username = domain_data.get("username")
-    if not secret:
-        secret = domain_data.get("password") or domain_data.get("nt_hash")
-    return (
-        str(username).strip() if username else None,
-        str(secret) if secret else None,
-    )
+    store_domains: list[str] = []
+    for candidate in (auth_domain, domain):
+        text = str(candidate or "").strip()
+        if text and text.lower() not in {d.lower() for d in store_domains}:
+            store_domains.append(text)
+
+    resolved = None
+    for store_domain in store_domains:
+        resolved = resolve_principal_credential(
+            domains_data,
+            domain=store_domain,
+            username=username,
+            secret=secret,
+        )
+        if resolved is not None and resolved.has_secret:
+            break
+    if resolved is None:
+        return None, None
+    if not resolved.has_secret:
+        print_info_debug(
+            "[adcs-credential] no password / NT hash of its own for "
+            f"{mark_sensitive(resolved.username, 'user')}; skipping rather than "
+            "pairing it with another principal's secret"
+        )
+        return resolved.username, None
+    return resolved.username, resolved.secret
 
 
 def observe_domain_scbe(
@@ -162,7 +191,9 @@ def observe_domain_scbe(
     if isinstance(cached, ScbeVerdict):
         return cached
 
-    username, secret = resolve_reading_credential(shell, domain, credential)
+    username, secret = resolve_reading_credential(
+        shell, domain, credential, auth_domain=auth_domain
+    )
     if not username or not secret:
         # Data gap, NOT hardening — never memoized, so the next caller re-probes.
         return ScbeVerdict(
@@ -246,9 +277,29 @@ def read_scbe_across_dcs(
             targets.append((fallback_fqdn, fallback_ip))
             total_dc_count = 1
 
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        collection_host_verdict,
+        note_collection_host_skipped,
+    )
+
     service = CertificateMappingService()
     readings: list[Esc14DcReading] = []
     for fqdn, ip in targets:
+        # The DCs of ``domain`` only. A record whose name sits under ANOTHER
+        # known domain is that domain's DC (a forest Configuration NC lists
+        # every DC of the forest, and older workspaces recorded them all under
+        # each domain): it is never contacted from here and is not one of the
+        # DCs this verdict has to cover.
+        verdict = collection_host_verdict(
+            shell, host=fqdn or ip, collecting_domain=domain
+        )
+        if not verdict.allowed:
+            note_collection_host_skipped(
+                shell, verdict, what="Certificate binding enforcement read"
+            )
+            if isinstance(total_dc_count, int) and total_dc_count > 1:
+                total_dc_count -= 1
+            continue
         readings.append(
             _read_scbe_for_dc(
                 service,
@@ -258,6 +309,7 @@ def read_scbe_across_dcs(
                 secret=secret,
                 auth_domain=auth_domain,
                 auth_kdc=auth_kdc,
+                dc_domain=domain,
             )
         )
     return readings, total_dc_count
@@ -272,6 +324,7 @@ def _read_scbe_for_dc(
     secret: str,
     auth_domain: str,
     auth_kdc: Optional[str],
+    dc_domain: Optional[str] = None,
 ) -> Esc14DcReading:
     """Read SCBE on one DC, preferring Kerberos (FQDN SPN) then NTLM (IP).
 
@@ -296,6 +349,8 @@ def _read_scbe_for_dc(
                 auth_domain=auth_domain,
                 use_kerberos=use_kerberos,
                 kdc_host=kdc,
+                target_domain=dc_domain or auth_domain,
+                target_kdc_host=ip,
             )
         except Exception as exc:  # noqa: BLE001 — try the next channel
             telemetry.capture_exception(exc)

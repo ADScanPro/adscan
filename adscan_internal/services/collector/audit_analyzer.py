@@ -1,6 +1,6 @@
 """Hygiene and misconfiguration audit findings for audit-mode workspaces.
 
-Only called when collection_scope == "audit". All analysis runs on already-
+Only called when the collection scope is a full assessment. All analysis runs on already-
 collected CollectionResult data — no additional LDAP queries.
 """
 
@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from adscan_internal.services.collector.models import (
+    COLLECTION_SCOPE_DOMAIN_COMPROMISE,
+    COLLECTION_SCOPE_FULL_ASSESSMENT,
     AuditFinding,
     CollectionResult,
     CollectorNode,
@@ -86,6 +88,11 @@ class RecoveredPasswordSummary:
     #: The enabled accounts, named, so the finding's affected assets are real.
     enabled_recovered_usernames: tuple[str, ...] = ()
     admin_like_recovered_usernames: tuple[str, ...] = ()
+    #: Recovered accounts OUTSIDE the enabled population (disabled accounts).
+    #: Not part of the ratio, but named, so the finding can state the population
+    #: it counts beside the Password Hygiene Report, which counts every
+    #: extracted account whether enabled or not.
+    not_enabled_recovered_usernames: tuple[str, ...] = ()
 
     @property
     def enabled_pct(self) -> float:
@@ -154,6 +161,7 @@ def build_recovered_password_summary(
         recovered_total=len(recovered),
         enabled_recovered_usernames=tuple(enabled_hits),
         admin_like_recovered_usernames=tuple(admin_hits),
+        not_enabled_recovered_usernames=tuple(sorted(recovered - enabled)),
     )
 
 
@@ -227,7 +235,7 @@ def analyze_audit_findings(
     krbtgt_age_days: int = 180,
 ) -> list[AuditFinding]:
     """Compute hygiene findings from CollectionResult. Returns [] for ctf scope."""
-    if result.collection_scope != "audit":
+    if result.collection_scope != COLLECTION_SCOPE_FULL_ASSESSMENT:
         return []
 
     findings: list[AuditFinding] = []
@@ -375,8 +383,10 @@ def analyze_audit_findings(
                         samaccountname=node.samaccountname,
                         object_id=node.object_id,
                         detail=f"Obsolete OS: {os_str}",
-                        # LOW baseline — MAQ > 0 is the AD default, an enabler not confirmed exploitation.
-                    severity="low",
+                        # MEDIUM baseline (a configuration finding), HIGH on a
+                        # Tier-0 / high-value host. Mirrors the catalog band and
+                        # the contextual overlay for ``obsolete_computers``.
+                        severity="high" if bool(node.highvalue) else "medium",
                         highvalue=bool(node.highvalue),
                     )
                 )
@@ -394,21 +404,9 @@ def analyze_audit_findings(
             )
 
     if domain_policy is not None:
-        maq = domain_policy.machine_account_quota
-        if maq is not None and maq > 0:
-            findings.append(
-                AuditFinding(
-                    category="machine_quota_risk",
-                    samaccountname="(domain)",
-                    object_id="",
-                    detail=(
-                        f"ms-DS-MachineAccountQuota = {maq} — "
-                        "any domain user can add computers"
-                    ),
-                    # LOW baseline — MAQ > 0 is the AD default, an enabler not confirmed exploitation.
-                    severity="low",
-                )
-            )
+        maq_finding = analyze_machine_account_quota(domain_policy)
+        if maq_finding is not None:
+            findings.append(maq_finding)
 
         wpp = _analyze_weak_password_policy(domain_policy)
         if wpp is not None:
@@ -421,6 +419,30 @@ def analyze_audit_findings(
     findings.extend(_password_compliance_findings(result))
 
     return findings
+
+
+def analyze_machine_account_quota(domain_policy: DomainPolicy) -> AuditFinding | None:
+    """Flag a domain where any user may add computer accounts (MAQ > 0).
+
+    Shared by the scan and the recheck ``observe`` read. ``None`` when the quota
+    is 0 or was not read (an unread value is never graded either way).
+    """
+    maq = domain_policy.machine_account_quota
+    if maq is None or maq <= 0:
+        return None
+    return AuditFinding(
+        category="machine_quota_risk",
+        samaccountname="(domain)",
+        object_id="",
+        detail=f"ms-DS-MachineAccountQuota = {maq} — any domain user can add computers",
+        # LOW baseline: MAQ > 0 is the AD default, an enabler, not confirmed exploitation.
+        severity="low",
+    )
+
+
+def analyze_weak_password_policy(domain_policy: DomainPolicy) -> AuditFinding | None:
+    """Public name of the weak password-policy detector (scan and recheck share it)."""
+    return _analyze_weak_password_policy(domain_policy)
 
 
 # CIS Microsoft Windows Server benchmark threshold for the
@@ -595,10 +617,10 @@ def _analyze_reversible_encryption(
         samaccountname="(domain)",
         object_id="",
         detail=detail,
-        # HIGH: cleartext-equivalent storage of every affected principal's
-        # password. Any read of the stored credential yields the plaintext
-        # directly, removing the offline-cracking step entirely.
-        severity="high",
+        # MEDIUM baseline (a configuration finding), HIGH when the Default
+        # Domain Password Policy sets it: that policy covers privileged
+        # accounts. Mirrors the catalog band and the contextual overlay.
+        severity="high" if domain_default_on else "medium",
         observed={
             "reversible_encryption_enabled": True,
             "default_domain_policy": domain_default_on,
@@ -677,9 +699,9 @@ def _registry_hardening_findings(node: Any) -> list[AuditFinding]:
                     "credential material (hashes, tickets, cleartext) can be "
                     "harvested from it."
                 ),
-                # HIGH: LSASS PPL is a primary credential-theft mitigation. Its
-                # absence directly enables offline credential dumping.
-                severity="high",
+                # MEDIUM baseline (a configuration finding), HIGH on a DC /
+                # high-value host, mirroring the catalog band and the overlay.
+                severity=_elevate("medium"),
                 highvalue=is_hv,
             )
         )
@@ -701,9 +723,9 @@ def _registry_hardening_findings(node: Any) -> list[AuditFinding]:
                     "interactive logon in LSASS memory, so a local-admin memory "
                     "read recovers plaintext credentials directly."
                 ),
-                # HIGH: cleartext credentials in memory — removes the offline
-                # cracking step entirely.
-                severity="high",
+                # MEDIUM baseline (a configuration finding), HIGH on a DC /
+                # high-value host, mirroring the catalog band and the overlay.
+                severity=_elevate("medium"),
                 highvalue=is_hv,
             )
         )
@@ -730,9 +752,9 @@ def _registry_hardening_findings(node: Any) -> list[AuditFinding]:
                     "the password; storing it undermines every account with a "
                     "password of 14 characters or fewer."
                 ),
-                # HIGH: LM hashes are trivially crackable and should never be
-                # stored on a modern estate.
-                severity="high",
+                # MEDIUM baseline (a configuration finding), HIGH on a DC /
+                # high-value host, mirroring the catalog band and the overlay.
+                severity=_elevate("medium"),
                 highvalue=is_hv,
             )
         )
@@ -853,7 +875,7 @@ def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
     property is ABSENT when the probe was inconclusive (error/timeout) — never
     assumed either way.
     """
-    if result.collection_scope != "audit":
+    if result.collection_scope != COLLECTION_SCOPE_FULL_ASSESSMENT:
         return []
 
     findings: list[AuditFinding] = []
@@ -896,8 +918,10 @@ def analyze_host_audit_findings(result: CollectionResult) -> list[AuditFinding]:
                     samaccountname=node.samaccountname,
                     object_id=node.object_id,
                     detail="SMBv1 (NT LM 0.12) protocol accepted by host",
-                    # HIGH — SMBv1 is deprecated, has known critical CVEs
-                    # (EternalBlue/MS17-010), and should never be enabled.
+                    # A hardening finding: MEDIUM, HIGH on a Tier-0 host
+                    # (catalog baseline 5.5; Tier-0 elevation 7.5). Never
+                    # CRITICAL from this key: a host proven vulnerable to
+                    # MS17-010 is its own finding, from the CVE probe.
                     severity="high" if node.highvalue else "medium",
                     highvalue=node.highvalue,
                 )
@@ -918,7 +942,7 @@ def analyze_duplicate_dns_findings(result: CollectionResult) -> list[AuditFindin
     ``node.properties['ip_address']`` (Phase 2 DNS), so it only fires when SMB/
     share collection ran. Best-effort: nodes without a resolved IP are skipped.
     """
-    if getattr(result, "collection_scope", None) == "ctf":
+    if getattr(result, "collection_scope", None) == COLLECTION_SCOPE_DOMAIN_COMPROMISE:
         return []
 
     by_ip: dict[str, list[CollectorNode]] = {}
@@ -974,7 +998,7 @@ def analyze_machine_rotation_finding(result: CollectionResult) -> list[AuditFind
     surface. Emitted once at domain level. No policy / default-and-enabled → no
     finding.
     """
-    if getattr(result, "collection_scope", None) == "ctf":
+    if getattr(result, "collection_scope", None) == COLLECTION_SCOPE_DOMAIN_COMPROMISE:
         return []
     policy = getattr(result, "machine_password_policy", None)
     if policy is None:

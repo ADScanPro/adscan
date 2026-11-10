@@ -52,6 +52,22 @@ def _looks_like_ntlm_hash(value: str | None) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{32}:[0-9a-fA-F]{32}", candidate))
 
 
+def _secret_fields(credential: str | None) -> dict[str, str | None]:
+    """Route one stored secret into the ``SMBConfig`` field that carries it.
+
+    The secret travels whatever the transport: a password stays a password
+    under Kerberos too (dropping it there sent the bind to the ambient ticket,
+    or out as an empty password), an NT hash goes to ``nt_hash`` and a ticket
+    path to ``ccache_path``.
+    """
+    value = str(credential or "").strip()
+    if value.lower().endswith(".ccache"):
+        return {"password": None, "nt_hash": None, "ccache_path": value}
+    if _looks_like_ntlm_hash(value):
+        return {"password": None, "nt_hash": value, "ccache_path": None}
+    return {"password": credential, "nt_hash": None, "ccache_path": None}
+
+
 def _extract_status_code(exc: Exception) -> str | None:
     """Return an NTSTATUS-like code from an SMB exception when available."""
     # aiosmb exceptions often carry the NTSTATUS in their string representation
@@ -422,14 +438,12 @@ class SMBPathAccessService(BaseService):
         marked_domain: str,
     ) -> SMBPathSecuritySnapshot:
         """Async implementation of collect_security_snapshot."""
-        is_hash = _looks_like_ntlm_hash(credential)
         config = SMBConfig(
             target_ip=host_clean,
             target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
-            password=None if is_hash or use_kerberos else credential,
-            nt_hash=credential if is_hash else None,
+            **_secret_fields(credential),
             auth_domain=domain_clean,
             kdc_ip=kdc_host,
             timeout=timeout_seconds,
@@ -589,8 +603,7 @@ class SMBPathAccessService(BaseService):
             target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
-            password=None if is_hash or use_kerberos else credential,
-            nt_hash=credential if is_hash else None,
+            **_secret_fields(credential),
             auth_domain=domain_clean,
             kdc_ip=kdc_host,
             timeout=timeout_seconds,
@@ -742,8 +755,7 @@ class SMBPathAccessService(BaseService):
             target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
-            password=None if is_hash or use_kerberos else credential,
-            nt_hash=credential if is_hash else None,
+            **_secret_fields(credential),
             auth_domain=domain_clean,
             kdc_ip=kdc_host,
             timeout=timeout_seconds,
@@ -870,8 +882,7 @@ class SMBPathAccessService(BaseService):
             target_hostname=spn_host or host_clean,
             domain=domain_clean,
             username=username_clean,
-            password=None if is_hash or use_kerberos else credential,
-            nt_hash=credential if is_hash else None,
+            **_secret_fields(credential),
             auth_domain=domain_clean,
             kdc_ip=kdc_host,
             timeout=timeout_seconds,

@@ -32,12 +32,32 @@ class ProductSignature:
             ``HKLM\\SYSTEM\\CurrentControlSet\\Services`` to probe.
         pipe_patterns: Substrings matched (case-insensitive) against
             IPC$ pipe names.
+        realtime_toggle: The product's activity also depends on Defender's
+            ``DisableRealtimeMonitoring`` value. Only the Defender antivirus
+            engine reads that value; applying it to anything else would mark a
+            running product inactive.
+        inbox_component: The service ships registered with Windows whether or
+            not the product was deployed, so its presence alone is not an
+            installed product. It is reported only once it runs or is set to
+            start automatically.
+        edr_module_indistinguishable: An ``"av"`` suite that also sells
+            endpoint detection and response as a licence on the same agent,
+            behind the same services this check reads. The report then states
+            that the EDR component could not be confirmed instead of reading
+            the host as antivirus-only.
+
+    ``category`` is read straight into the per-host capability class of the
+    client report, so one signature must never cover an antivirus and an EDR
+    sensor at once.
     """
 
     name: str
     category: str
     service_keys: tuple[str, ...]
     pipe_patterns: tuple[str, ...]
+    realtime_toggle: bool = False
+    inbox_component: bool = False
+    edr_module_indistinguishable: bool = False
 
 
 PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
@@ -61,6 +81,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Bitdefender",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             # Consumer edition
             "BDLDaemon",
@@ -102,6 +123,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Check Point Endpoint Security",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=("CPDA", "vsmon", "CPFileAnlyz", "EPClientUIService"),
         pipe_patterns=(),
     ),
@@ -141,6 +163,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="ESET",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "ekrn",
             "ekm",
@@ -158,6 +181,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="F-Secure / WithSecure",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "F-Secure Gatekeeper",
             "FSMA",
@@ -216,6 +240,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Kaspersky",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "AVP",
             "klif",
@@ -230,6 +255,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Malwarebytes",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=("MBAMService", "MBEndpointAgent"),
         pipe_patterns=("MBLG", "MBEA2_R", "MBEA2_W"),
     ),
@@ -259,14 +285,9 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
         ),
     ),
     ProductSignature(
-        name="Palo Alto Cortex",
-        category="edr",
-        service_keys=("cyserver", "cyvera"),
-        pipe_patterns=("cyserver",),
-    ),
-    ProductSignature(
         name="Panda Adaptive Defense 360",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=("PandaAetherAgent", "PSUAService", "NanoServiceMain"),
         pipe_patterns=("NNS_API_IPC_SRV_ENDPOINT", "PSANMSrvcPpal"),
     ),
@@ -295,6 +316,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Sophos Intercept X",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "SntpService",
             "Sophos Endpoint Defense Service",
@@ -319,6 +341,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Symantec / Norton",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "SepMasterService",
             "SepScanService",
@@ -331,6 +354,7 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
     ProductSignature(
         name="Trend Micro Endpoint Security",
         category="av",
+        edr_module_indistinguishable=True,
         service_keys=(
             "TmCCSF",
             "TMBMServer",
@@ -353,14 +377,81 @@ PRODUCT_CATALOG: tuple[ProductSignature, ...] = (
             "TrendMicro",
         ),
     ),
+    # Microsoft ships two products here, and the report must not fold them.
+    # The antivirus engine is the "Microsoft Defender Antivirus Service"
+    # (WinDefend, MsMpEng.exe), its Network Inspection Service (WdNisSvc) and
+    # its mini-filter driver (WdFilter). The EDR sensor is a separate service,
+    # "Sense" (display name "Windows Defender Advanced Threat Protection
+    # Service", MsSense.exe), the one Microsoft's onboarding troubleshooting
+    # checks with `sc qc sense`. It keeps running with the antivirus in passive
+    # mode beside a third-party product, so it is its own EDR signature, and
+    # the real-time-protection value belongs to the antivirus alone.
     ProductSignature(
-        name="Windows Defender",
+        name="Microsoft Defender Antivirus",
         category="av",
-        # Sense = Windows Defender ATP / MDE — when present, treat as EDR-grade.
-        service_keys=("WinDefend", "WdNisSvc", "WdFilter", "Sense"),
+        service_keys=("WinDefend", "WdNisSvc", "WdFilter"),
         pipe_patterns=("MsMpEng",),
+        realtime_toggle=True,
+    ),
+    ProductSignature(
+        name="Microsoft Defender for Endpoint",
+        category="edr",
+        service_keys=("Sense",),
+        pipe_patterns=(),
+        # Sense is registered on supported Windows releases with a demand start
+        # until the device is onboarded, which sets it to start automatically.
+        inbox_component=True,
     ),
 )
+
+#: Names a persisted record may carry from an older catalog. "Windows Defender"
+#: was one signature over both the antivirus AND the EDR sensor, so a record
+#: carrying it cannot be read as antivirus-only.
+_LEGACY_EDR_AMBIGUOUS_NAMES = frozenset({"windows defender"})
+
+
+#: What a legacy name was split into. Learned history (dump-method catches)
+#: recorded under the old name must keep matching the products it covered.
+_LEGACY_PRODUCT_SUCCESSORS: dict[str, frozenset[str]] = {
+    "windows defender": frozenset(
+        {"microsoft defender antivirus", "microsoft defender for endpoint"}
+    ),
+}
+
+
+def product_names_match(recorded: str, current: str) -> bool:
+    """Whether a product name recorded in history refers to a current product.
+
+    Case-insensitive equality, plus the one-way legacy mapping: a record under
+    the merged "Windows Defender" name matches either of the two products it
+    was split into, while a record under a new name matches only that name.
+    The Defender for Endpoint half is only asked about for a host where that
+    product is ACTIVE (callers iterate a host's active products), which is the
+    "only when Sense is active" rule.
+    """
+    left = str(recorded or "").strip().lower()
+    right = str(current or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return right in _LEGACY_PRODUCT_SUCCESSORS.get(left, frozenset())
+
+
+def product_edr_module_indistinguishable(name: str) -> bool:
+    """Whether a product NAME may hide an EDR component this check cannot see.
+
+    Looked up by name because that is what every persisted record carries; the
+    inventory writer stamps the answer onto each product so the report reads a
+    flag rather than a catalog it cannot import.
+    """
+    key = str(name or "").strip().lower()
+    if key in _LEGACY_EDR_AMBIGUOUS_NAMES:
+        return True
+    for product in PRODUCT_CATALOG:
+        if product.name.lower() == key:
+            return product.edr_module_indistinguishable
+    return False
 
 
 # Registry constants used by the fingerprint service.
@@ -371,6 +462,8 @@ DEFENDER_RTP_VAL = "DisableRealtimeMonitoring"
 
 __all__ = [
     "ProductSignature",
+    "product_edr_module_indistinguishable",
+    "product_names_match",
     "PRODUCT_CATALOG",
     "SERVICES_BASE",
     "DEFENDER_RTP_KEY",

@@ -1,8 +1,9 @@
-"""Domain-based inference for workspace type and lab context.
+"""Domain-based lab identification.
 
-Automatically determines ``workspace_type``, ``lab_provider``, ``lab_name``,
-and ``lab_name_whitelisted`` from a domain name — eliminating the need to ask
-the user these questions at workspace creation time.
+Determines ``lab_provider``, ``lab_name`` and ``lab_name_whitelisted`` from a
+domain name, for telemetry and wording. It never chooses or changes the scan
+policy, which alone decides how a scan behaves; the result's
+``workspace_type`` field only records that the signal points at a lab.
 
 Inference hierarchy (highest → lowest confidence)
 ---------------------------------------------------
@@ -23,7 +24,7 @@ Inference hierarchy (highest → lowest confidence)
 5. **Default fallback** — ``ctf`` workspace with no provider (confidence 0.10),
    reflecting that ≈95 % of real-world workspaces are CTF sessions.
 
-CTF-only supplementary rules (only invoked when ``type == "ctf"``)
+Lab-only supplementary rules (only invoked under a lab policy)
 -------------------------------------------------------------------
 5. **PDC hostname** — strip common DC suffixes from the PDC hostname label
    (e.g. ``FOREST-DC`` → ``forest``) and match against the catalog
@@ -485,7 +486,7 @@ def infer_from_pdc_hostname(
     Matches against the lab catalog via :func:`resolve_lab_from_text`.
 
     **Only safe for CTF workspaces.** The call site is responsible for gating
-    on ``shell.type == "ctf"`` before invoking this function.
+    on the scan policy being for a lab before invoking this function.
 
     Examples::
 
@@ -562,7 +563,7 @@ def infer_from_domain_sld(
     where the SLD encodes the machine name.
 
     **Only safe for CTF workspaces.** The call site is responsible for gating
-    on ``shell.type == "ctf"`` before invoking this function.
+    on the scan policy being for a lab before invoking this function.
 
     Examples::
 

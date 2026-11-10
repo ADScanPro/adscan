@@ -62,7 +62,7 @@ def render_host_intelligence_panel(
     fingerprint: HostFingerprint,
     cascade: list[ExecMethod],
     reason_lines: list[str],
-    workspace_type: str | None,
+    execution_preference: str | None,
     cache_ttl_remaining_s: int | None,
 ) -> None:
     """Render the host-intelligence panel.
@@ -73,7 +73,8 @@ def render_host_intelligence_panel(
         cascade: Ordered list of methods chosen by the selector.
         reason_lines: Human-readable bullet reasons (e.g. ``"active EDR
             detected, stealth bias applied"``).
-        workspace_type: Optional ``"ctf"`` / ``"audit"`` / ``"engagement"``.
+        execution_preference: The scan policy's remote-execution setting, as
+            its label (``Fastest first`` / ``Lowest footprint first``).
         cache_ttl_remaining_s: Seconds until cached entry expires; None
             for a fresh scan.
     """
@@ -117,10 +118,10 @@ def render_host_intelligence_panel(
         body.append("·   ", style=MUTED)
         body.append("  ·  ".join(reason_lines), style=border)
 
-    if workspace_type:
-        body.append("\n  Workspace            ", style=MUTED)
+    if execution_preference:
+        body.append("\n  Policy               ", style=MUTED)
         body.append("·   ", style=MUTED)
-        body.append(workspace_type, style=ICE_BLUE)
+        body.append(execution_preference, style=ICE_BLUE)
 
     footer = Text()
     footer.append(f"\n  {ADSCAN_SITE_HOST}  ·  ", style=MUTED)
@@ -137,9 +138,7 @@ def render_host_intelligence_panel(
     )
 
 
-def build_reason_lines(
-    fingerprint: HostFingerprint, workspace_type: str | None
-) -> list[str]:
+def build_reason_lines(fingerprint: HostFingerprint, prefer_speed: bool) -> list[str]:
     """Compose the short human-readable reason string for the panel."""
     reasons: list[str] = []
     if fingerprint.has_edr:
@@ -150,10 +149,8 @@ def build_reason_lines(
         reasons.append("Defender RTP off, speed bias applied")
     else:
         reasons.append("clean host, default cascade")
-    if workspace_type == "ctf":
-        reasons.append("CTF profile")
-    elif workspace_type == "engagement":
-        reasons.append("engagement profile")
+    if prefer_speed:
+        reasons.append("speed-first policy")
     return reasons
 
 

@@ -44,6 +44,12 @@ if TYPE_CHECKING:  # pragma: no cover
 
 CVE_ID = "ADSCAN-PRINTERBUG-SURFACE"
 AKA = "PrinterBugSurface"
+# ADscan's own grading, NOT a CVSS base score: no authority publishes
+# one (Microsoft treats this coercion primitive as by-design, so there
+# is no CVE). The vector describes the primitive itself and computes
+# 6.5; ADscan grades the exposure HIGH because its value to an attacker
+# is the NTLM relay chain it enables, which a Base score cannot express.
+# Allow-listed in tests/unit/services/cve_scanner/test_cvss_vector_agreement.py.
 CVSS_V3 = 7.5
 CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"
 
@@ -79,6 +85,11 @@ def _probe_printerbug_surface_sync(
     nt_hash: str | None,
 ) -> PrinterBugSurfaceProbeResult:
     """Synchronous MS-RPRN bind + OpenPrinter probe."""
+    from adscan_internal.services.impacket_auth_guard import (  # noqa: PLC0415
+        install_impacket_auth_guard,
+    )
+
+    install_impacket_auth_guard()
     try:
         from impacket.dcerpc.v5 import rprn, transport
         from impacket.dcerpc.v5.rpcrt import DCERPCException

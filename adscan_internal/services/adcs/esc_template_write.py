@@ -8,18 +8,20 @@ from adscan_internal.rich_output import print_error, print_info, print_success
 from adscan_internal.services.adcs.cert_request import CertRequestConfig, request_certificate_native
 from adscan_internal.services.adcs.cert_auth import CertAuthConfig, authenticate_with_cert_native
 from adscan_internal.services.adcs.template_modify import (
+    apply_template_snapshot,
     snapshot_template,
     make_template_esc1_vulnerable,
-    restore_template,
+    template_matches_snapshot,
     write_snapshot_to_disk,
 )
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
 from adscan_internal.services.adcs.esc_cleanup import (
+    esc_revert_ldap_change,
     esc_rollback_scope,
     register_ldap_change,
-    mark_reverted,
-    mark_revert_failed,
 )
+from adscan_internal.services.cleanup_verification import VERIFY_TEMPLATE
+from adscan_internal.services.ldap_transport_service import ADscanLDAPConnection
 
 
 def _output_dir(config: EscConfig) -> Path:
@@ -64,33 +66,39 @@ async def run_esc4(config: EscConfig) -> EscResult:
     )
 
     restored = False
+    restore_ran = False
 
     async with esc_rollback_scope() as rb:
 
         async def _restore() -> None:
-            nonlocal restored
+            nonlocal restored, restore_ran
+            if restore_ran:
+                return
+            restore_ran = True
             print_info(f"ESC4: restoring template {template}...")
-            ok, err = await asyncio.to_thread(
-                restore_template,
-                domain=config.auth_domain,
-                dc_ip=config.dc_ip,
-                username=config.username,
-                password=config.effective_secret or "",
-                snapshot=snap,
-                dc_fqdn=None,
+            ok = await asyncio.to_thread(
+                esc_revert_ldap_change,
+                config,
+                change_id=change_id,
+                purpose="template_mutated",
+                revert=lambda conn: apply_template_snapshot(conn, snap)[0],
+                verify=lambda conn: template_matches_snapshot(conn, snap),
+                verification_method=VERIFY_TEMPLATE,
+                manual_instructions=(
+                    f"Manually restore template {template} using snapshot at {snap_path}"
+                ),
+                object_dn=snap.template_dn,
+                description=f"Template {template} restore",
+                connect=lambda ldap_cfg: ADscanLDAPConnection(ldap_cfg),
             )
             if ok:
                 restored = True
-                mark_reverted(config.shell, change_id)
                 print_success(f"ESC4: template {template} restored.")
             else:
-                mark_revert_failed(
-                    config.shell,
-                    change_id,
-                    error=str(err),
-                    instructions=f"Manually restore template {template} using snapshot at {snap_path}",
+                print_error(
+                    f"ESC4: template {template} could not be restored with any credential "
+                    "this session holds (manual cleanup required)."
                 )
-                print_error(f"ESC4: template restore failed: {err}")
 
         rb.add(_restore)
 

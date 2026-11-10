@@ -68,10 +68,13 @@ async def filter_reachable_hosts(
     hosts: list[str],
     port: int,
     *,
-    timeout: float = 3.0,
-    max_concurrency: int = 50,
+    timeout: float | None = None,
+    max_concurrency: int | None = None,
 ) -> ReachabilityFilterResult:
     """Split ``hosts`` into reachable vs offline for ``port`` via TCP probe.
+
+    ``timeout`` / ``max_concurrency`` default to the scan pacing
+    (``probe.tcp_probe_hosts``: 3.0 s and 50 at the default level).
 
     Both ``closed`` (TCP RST) and ``filtered`` (timeout) collapse into
     ``offline`` here — for the auth-heavy callers the distinction does not
@@ -108,8 +111,8 @@ async def filter_reachable_hosts_for_service(
     hosts: list[str],
     service: str,
     *,
-    timeout: float = 3.0,
-    max_concurrency: int = 50,
+    timeout: float | None = None,
+    max_concurrency: int | None = None,
 ) -> ReachabilityFilterResult:
     """Service-aware variant — uses the canonical port from SERVICE_PROBE_PORTS.
 
@@ -173,8 +176,8 @@ def filter_reachable_hosts_sync(
     hosts: list[str],
     port: int,
     *,
-    timeout: float = 3.0,
-    max_concurrency: int = 50,
+    timeout: float | None = None,
+    max_concurrency: int | None = None,
 ) -> ReachabilityFilterResult:
     """Sync wrapper for callers that are not in an async context.
 

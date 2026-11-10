@@ -205,16 +205,56 @@ def resolve_client_logo_path(
     return ""
 
 
+#: Branding postures under which no assessed-client logo is ever drawn. The
+#: ``adscan`` posture is ADscan's own artefact (the published example, a lead
+#: magnet); a client's mark next to ours there is a third party's brand on our
+#: marketing. Kept as strings so this module stays free of report_branding.
+_NO_CLIENT_LOGO_POSTURES: frozenset[str] = frozenset({"adscan"})
+
+
+def client_logo_permitted(*, is_sample: bool = False, branding: str | None = None) -> bool:
+    """Return whether a render may carry the assessed client's logo at all.
+
+    The logo is persisted in the operator's ``config.json`` and every later
+    render picks it up, which is right for a run of client deliveries and wrong
+    for anything ADscan publishes. The published example kit once shipped with
+    the logo of the firm the operator was delivering for at the time, because
+    nothing on the sample path told the renderer to ignore the persisted value.
+
+    Args:
+        is_sample: The render is a public sample (the watermarked example kit
+            ``scripts/regenerate_samples.py`` produces).
+        branding: The resolved branding posture, when the caller has one. The
+            ``adscan`` posture never carries a client logo. ``None`` means the
+            caller expressed no posture (the LITE engagement report), which
+            keeps the co-brand.
+
+    Returns:
+        ``False`` for a sample or an ADscan-posture render, ``True`` otherwise.
+    """
+    if is_sample:
+        return False
+    return str(branding or "").strip().lower() not in _NO_CLIENT_LOGO_POSTURES
+
+
 def resolve_client_logo_data_uri(
-    explicit: str | None = None, *, config_path: Path | None = None
+    explicit: str | None = None,
+    *,
+    config_path: Path | None = None,
+    is_sample: bool = False,
+    branding: str | None = None,
 ) -> str:
     """Resolve the client logo and return it as a ``data:`` URI, or ``""``.
 
     The single call the report builders make: it resolves the path
     (:func:`resolve_client_logo_path`) and encodes it
     (:func:`encode_client_logo_data_uri`). ``""`` means "render only ADscan's
-    mark", which every template already handles.
+    mark", which every template already handles. A sample or ADscan-posture
+    render (:func:`client_logo_permitted`) always gets ``""``, whatever the
+    flag or the persisted config say.
     """
+    if not client_logo_permitted(is_sample=is_sample, branding=branding):
+        return ""
     return encode_client_logo_data_uri(
         resolve_client_logo_path(explicit, config_path=config_path)
     )
@@ -225,6 +265,7 @@ __all__ = (
     "CLIENT_LOGO_DIRNAME",
     "SUPPORTED_LOGO_SUFFIXES",
     "clear_client_logo_setting",
+    "client_logo_permitted",
     "encode_client_logo_data_uri",
     "is_supported_logo_suffix",
     "load_client_logo_setting",

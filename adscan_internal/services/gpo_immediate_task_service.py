@@ -55,11 +55,16 @@ from adscan_internal.services.ldap_transport_service import (
 from adscan_internal.services.smb_transport import (
     SMBConfig,
     create_unc_directory,
-    delete_unc_directory,
-    delete_unc_file,
     download_unc_file_to_local,
+    read_unc_file_bytes,
+    remove_unc_path_confirmed,
     smb_machine_with_fallback,
     upload_unc_file_bytes,
+)
+from adscan_internal.services.cleanup_verification import (
+    VERIFY_FILE_CONTENT,
+    VERIFY_GPO_VERSION,
+    VERIFY_SMB_PATH,
 )
 from adscan_core.rich_output import print_exception
 
@@ -246,6 +251,7 @@ class GPOExploitationMixin:
         task_name: str | None = None,
         principal_dn_for_guard: str | None = None,
         auto_rollback: bool = True,
+        shell: Any = None,
     ) -> GPOImmediateTaskResult:
         """Plant an Immediate Scheduled Task in ``gpo_dn`` and (optionally) roll back.
 
@@ -270,6 +276,10 @@ class GPOExploitationMixin:
             auto_rollback: When True (default), revert immediately after a
                 successful plant. The CLI wizard sets this to False when the
                 operator explicitly chose to leave the change in place.
+            shell: The session shell. Every revert goes through the shared
+                revert precedence (client cleanup account, verified privileged
+                credential, then this step's own account), which reads the
+                credential store and the collected graph through it.
 
         Returns:
             :class:`GPOImmediateTaskResult`.
@@ -324,6 +334,18 @@ class GPOExploitationMixin:
 
         masked_target = mark_sensitive(gpo_display_name or gpo_dn, "text")
         print_info(f"GPO immediate-task plant starting on {masked_target}")
+
+        reverter = _GpoReverter(
+            shell=shell,
+            ledger=ledger,
+            domain=domain,
+            dc_ip=dc_ip,
+            dc_fqdn=dc_fqdn,
+            auth_username=auth_username,
+            auth_password=auth_password,
+            auth_domain=auth_domain or domain,
+            ccache_path=ccache_path,
+        )
 
         try:
             # ---- 0. Pre-flight: Protected Users guard ----------------------
@@ -425,20 +447,17 @@ class GPOExploitationMixin:
                     except Exception as exc:  # noqa: BLE001
                         msg = str(exc)
                         if "OBJECT_NAME_COLLISION" in msg.upper():
-                            # Already exists — pop the ledger entry: nothing
-                            # to roll back (we did not create it).
+                            # Already exists: ADscan did not create it, so the
+                            # write-ahead record describes nothing and is dropped.
                             print_info_debug(
                                 f"[gpo-exploit] mkdir noop (already exists): {unc}"
                             )
-                            ledger.mark_reverted(cid)
+                            ledger.discard_change(cid)
                             change_ids.remove(cid)
                             return
                         raise
                     undo_stack.append(
-                        (
-                            f"mkdir {unc}",
-                            _make_dir_undo(smb_config, unc, cid, ledger),
-                        )
+                        (f"mkdir {unc}", _make_dir_undo(reverter, unc, cid))
                     )
 
                 for d in (machine_dir, prefs_dir, sched_dir):
@@ -461,7 +480,7 @@ class GPOExploitationMixin:
                 undo_stack.append(
                     (
                         f"delete {sched_xml_unc}",
-                        _make_file_undo(smb_config, sched_xml_unc, cid_xml, ledger),
+                        _make_file_undo(reverter, sched_xml_unc, cid_xml),
                     )
                 )
 
@@ -483,9 +502,7 @@ class GPOExploitationMixin:
                 undo_stack.append(
                     (
                         f"restore {gpt_ini_unc}",
-                        _make_gptini_undo(
-                            smb_config, gpt_ini_unc, original_gpt_ini, cid_gpt, ledger
-                        ),
+                        _make_gptini_undo(reverter, gpt_ini_unc, original_gpt_ini, cid_gpt),
                     )
                 )
 
@@ -514,12 +531,7 @@ class GPOExploitationMixin:
                 (
                     f"restore LDAP attrs on {gpo_dn}",
                     _make_ldap_undo(
-                        ldap_config,
-                        gpo_dn,
-                        current_version,
-                        current_extensions,
-                        cid_ldap,
-                        ledger,
+                        reverter, gpo_dn, current_version, current_extensions, cid_ldap
                     ),
                 )
             )
@@ -579,118 +591,267 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+class _GpoReverter:
+    """Runs each GPO undo through the shared revert precedence.
+
+    The client cleanup account, a verified privileged credential, then the
+    account that planted the task. Every undo authenticates as the candidate
+    over its own transport (SMB to SYSVOL, LDAP for the GPO object) and
+    re-reads what it restored; only that re-read settles the ledger entry
+    ``reverted_confirmed``, and each attempt is recorded with who ran it.
+    """
+
+    def __init__(
+        self,
+        *,
+        shell: Any,
+        ledger: Any,
+        domain: str,
+        dc_ip: str,
+        dc_fqdn: str,
+        auth_username: str,
+        auth_password: str | None,
+        auth_domain: str,
+        ccache_path: str | None,
+    ) -> None:
+        self.shell = shell
+        self.ledger = ledger
+        self.domain = domain
+        self.dc_ip = dc_ip
+        self.dc_fqdn = dc_fqdn
+        self.auth_username = auth_username
+        self.auth_password = auth_password
+        self.auth_domain = auth_domain
+        self.ccache_path = ccache_path
+
+    def smb_config(self, candidate: Any) -> SMBConfig:
+        return candidate.smb_config(
+            target_ip=self.dc_ip, target_hostname=self.dc_fqdn, kdc_ip=self.dc_ip
+        )
+
+    def ldap_config(self, candidate: Any) -> ADscanLDAPConfig:
+        return candidate.ldap_config(dc_ip=self.dc_ip, dc_fqdn=self.dc_fqdn)
+
+    async def run(
+        self,
+        *,
+        change_id: str,
+        purpose: str,
+        revert_and_confirm: Callable[[Any], tuple[bool, Optional[str]]],
+        verification_method: str,
+        manual_instructions: str,
+        object_dn: str,
+        description: str,
+    ) -> None:
+        """Revert one change; raise when no candidate confirmed it (already disclosed)."""
+        import asyncio  # noqa: PLC0415
+
+        from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+            KIND_CCACHE,
+            ROLE_CREATOR,
+            RevertCandidate,
+            run_revert_with_precedence,
+        )
+
+        extras = []
+        if self.ccache_path and not self.auth_password:
+            extras.append(
+                RevertCandidate(
+                    role=ROLE_CREATOR,
+                    username=self.auth_username,
+                    domain=self.auth_domain,
+                    secret=self.ccache_path,
+                    kind=KIND_CCACHE,
+                )
+            )
+        result = await asyncio.to_thread(
+            run_revert_with_precedence,
+            self.shell,
+            ledger=self.ledger,
+            change_id=change_id,
+            domain=self.domain,
+            purpose=purpose,
+            revert_and_confirm=revert_and_confirm,
+            verification_method=verification_method,
+            manual_instructions=manual_instructions,
+            object_dn=object_dn,
+            creator_username=self.auth_username if self.auth_password else "",
+            creator_secret=self.auth_password or "",
+            creator_domain=self.auth_domain,
+            extra_before_creator=extras,
+            description=description,
+        )
+        if not result.confirmed:
+            raise RuntimeError(f"{description} was not confirmed (disclosed for manual cleanup)")
+
+
+def _smb_remove_and_confirm(
+    reverter: _GpoReverter, candidate: Any, unc: str, *, directory: bool
+) -> tuple[bool, Optional[str]]:
+    """Delete ``unc`` as the candidate, then confirm it no longer exists."""
+    return remove_unc_path_confirmed(
+        reverter.smb_config(candidate), unc, directory=directory
+    )
+
+
 def _make_dir_undo(
-    smb_config: SMBConfig, unc: str, change_id: str, ledger: Any
+    reverter: _GpoReverter, unc: str, change_id: str
 ) -> Callable[[], Awaitable[None]]:
     async def _undo() -> None:
-        try:
-            async with smb_machine_with_fallback(smb_config) as machine:
-                await delete_unc_directory(machine, unc)
-            ledger.mark_reverted(change_id)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            ledger.mark_failed(
-                change_id,
-                error=str(exc),
-                manual_cleanup_instructions=(
-                    f"Manually remove the directory {unc} on the SYSVOL share. "
-                    "It was created by the GPO Immediate Scheduled Task abuse "
-                    "and should be empty after the file/file-subdirectory cleanups."
-                ),
-            )
-            raise
+        await reverter.run(
+            change_id=change_id,
+            purpose="gpo_sysvol_dir_created",
+            revert_and_confirm=lambda c: _smb_remove_and_confirm(
+                reverter, c, unc, directory=True
+            ),
+            verification_method=VERIFY_SMB_PATH,
+            manual_instructions=(
+                f"Manually remove the directory {unc} on the SYSVOL share. "
+                "It was created by the GPO Immediate Scheduled Task abuse "
+                "and should be empty after the file/file-subdirectory cleanups."
+            ),
+            object_dn=unc,
+            description="SYSVOL directory removal",
+        )
 
     return _undo
 
 
 def _make_file_undo(
-    smb_config: SMBConfig, unc: str, change_id: str, ledger: Any
+    reverter: _GpoReverter, unc: str, change_id: str
 ) -> Callable[[], Awaitable[None]]:
     async def _undo() -> None:
-        try:
-            async with smb_machine_with_fallback(smb_config) as machine:
-                await delete_unc_file(machine, unc)
-            ledger.mark_reverted(change_id)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            ledger.mark_failed(
-                change_id,
-                error=str(exc),
-                manual_cleanup_instructions=(
-                    f"Manually delete the file {unc} on SYSVOL. It was created "
-                    "by the GPO Immediate Scheduled Task abuse."
-                ),
-            )
-            raise
+        await reverter.run(
+            change_id=change_id,
+            purpose="gpo_sysvol_file_created",
+            revert_and_confirm=lambda c: _smb_remove_and_confirm(
+                reverter, c, unc, directory=False
+            ),
+            verification_method=VERIFY_SMB_PATH,
+            manual_instructions=(
+                f"Manually delete the file {unc} on SYSVOL. It was created "
+                "by the GPO Immediate Scheduled Task abuse."
+            ),
+            object_dn=unc,
+            description="SYSVOL file removal",
+        )
 
     return _undo
 
 
 def _make_gptini_undo(
-    smb_config: SMBConfig,
-    unc: str,
-    original_bytes: bytes,
-    change_id: str,
-    ledger: Any,
+    reverter: _GpoReverter, unc: str, original_bytes: bytes, change_id: str
 ) -> Callable[[], Awaitable[None]]:
-    async def _undo() -> None:
-        try:
-            async with smb_machine_with_fallback(smb_config) as machine:
-                await upload_unc_file_bytes(machine, unc, original_bytes)
-            ledger.mark_reverted(change_id)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            import base64
+    def _restore_and_confirm(candidate: Any) -> tuple[bool, Optional[str]]:
+        from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
 
-            ledger.mark_operator_required(
-                change_id,
-                manual_cleanup_instructions=(
-                    f"Failed to restore gpt.ini at {unc}. The original bytes "
-                    f"are recorded in the ledger as 'old_bytes_b64' (base64). "
-                    f"Decode and write back manually: "
-                    f"echo {base64.b64encode(original_bytes).decode('ascii')[:32]}... "
-                    f"| base64 -d > /tmp/gpt.ini && smbclient ..."
-                ),
-            )
-            raise
+        async def _run() -> tuple[bool, Optional[str]]:
+            async with smb_machine_with_fallback(reverter.smb_config(candidate)) as machine:
+                await upload_unc_file_bytes(machine, unc, original_bytes)
+                current = await read_unc_file_bytes(machine, unc)
+            if bytes(current) == bytes(original_bytes):
+                return True, None
+            return False, "the re-read gpt.ini differs from the original"
+
+        return run_async_sync(_run())
+
+    async def _undo() -> None:
+        await reverter.run(
+            change_id=change_id,
+            purpose="gpo_gpt_ini_modified",
+            revert_and_confirm=_restore_and_confirm,
+            verification_method=VERIFY_FILE_CONTENT,
+            manual_instructions=(
+                f"Restore gpt.ini at {unc} to its original content. The original "
+                "bytes are recorded in this entry as 'old_bytes_b64' (base64)."
+            ),
+            object_dn=unc,
+            description="gpt.ini restore",
+        )
 
     return _undo
 
 
 def _make_ldap_undo(
-    ldap_config: ADscanLDAPConfig,
+    reverter: _GpoReverter,
     gpo_dn: str,
     old_version: int,
     old_extensions: str | None,
     change_id: str,
-    ledger: Any,
 ) -> Callable[[], Awaitable[None]]:
-    async def _undo() -> None:
-        try:
+    def _restore_and_confirm(candidate: Any) -> tuple[bool, Optional[str]]:
+        from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
+
+        config = reverter.ldap_config(candidate)
+
+        async def _run() -> tuple[bool, Optional[str]]:
             await _ldap_modify_versions(
-                ldap_config=ldap_config,
+                ldap_config=config,
                 gpo_dn=gpo_dn,
                 version=old_version,
                 extensions=old_extensions,
             )
-            ledger.mark_reverted(change_id)
+            version, extensions = await _ldap_read_versions(
+                ldap_config=config, gpo_dn=gpo_dn
+            )
+            if version != old_version:
+                return False, f"versionNumber reads {version}, expected {old_version}"
+            if old_extensions is not None and (extensions or "") != old_extensions:
+                return False, "gPCMachineExtensionNames does not match the original"
+            return True, None
+
+        return run_async_sync(_run())
+
+    async def _undo() -> None:
+        await reverter.run(
+            change_id=change_id,
+            purpose="gpo_ldap_attribute_modified",
+            revert_and_confirm=_restore_and_confirm,
+            verification_method=VERIFY_GPO_VERSION,
+            manual_instructions=(
+                f"Restore versionNumber={old_version} and "
+                f"gPCMachineExtensionNames={old_extensions!r} on {gpo_dn}."
+            ),
+            object_dn=gpo_dn,
+            description="GPO version restore",
+        )
+
+    return _undo
+
+
+async def _ldap_read_versions(
+    *, ldap_config: ADscanLDAPConfig, gpo_dn: str
+) -> tuple[int | None, str | None]:
+    """Re-read ``versionNumber`` and ``gPCMachineExtensionNames`` of ``gpo_dn``."""
+    client, _ = await async_connect_with_ldap_fallback(ldap_config)
+    try:
+        async for entry, err in client.pagedsearch(
+            "(objectClass=*)",
+            ["versionNumber", "gPCMachineExtensionNames"],
+            tree=gpo_dn,
+            search_scope=0,  # BASE
+        ):
+            if err is not None or entry is None:
+                continue
+            attrs = entry.get("attributes", {}) if isinstance(entry, dict) else {}
+            raw_v = attrs.get("versionNumber")
+            if isinstance(raw_v, list):
+                raw_v = raw_v[0] if raw_v else None
+            raw_ext = attrs.get("gPCMachineExtensionNames")
+            if isinstance(raw_ext, list):
+                raw_ext = raw_ext[0] if raw_ext else None
+            try:
+                version = int(raw_v) if raw_v is not None else 0
+            except (TypeError, ValueError):
+                version = None
+            return version, (str(raw_ext) if raw_ext is not None else None)
+        return None, None
+    finally:
+        try:
+            await client.disconnect()
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
-            ledger.mark_operator_required(
-                change_id,
-                manual_cleanup_instructions=(
-                    f"Failed to restore versionNumber={old_version} and "
-                    f"gPCMachineExtensionNames={old_extensions!r} on {gpo_dn}. "
-                    "Restore manually via your AD admin tooling."
-                ),
-            )
-            raise
-
-    return _undo
 
 
 async def _ldap_modify_versions(

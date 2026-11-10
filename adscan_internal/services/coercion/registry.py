@@ -64,8 +64,10 @@ _FSRVP_PATHS = (
 _TECHNIQUE_META: dict[str, dict[str, Any]] = {
     "PetitPotam": {
         "cve_id": "CVE-2021-36942",
+        # MSRC publishes 7.5 at PR:N in this C:H/I:N shape (NIST scores the
+        # same 7.5 as C:N/I:H); PR:L computes 6.5 and contradicted the number.
         "cvss_v3": 7.5,
-        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+        "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
         "mitre": ("T1187",),
         "references": (
             "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-36942",
@@ -74,6 +76,12 @@ _TECHNIQUE_META: dict[str, dict[str, Any]] = {
     },
     "PrinterBug": {
         "cve_id": None,
+        # ADscan's own grading, NOT a CVSS base score: no authority publishes
+        # one (Microsoft treats this coercion primitive as by-design, so there
+        # is no CVE). The vector describes the primitive itself and computes
+        # 6.5; ADscan grades the exposure HIGH because its value to an attacker
+        # is the NTLM relay chain it enables, which a Base score cannot express.
+        # Allow-listed in tests/unit/services/cve_scanner/test_cvss_vector_agreement.py.
         "cvss_v3": 7.5,
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         "mitre": ("T1187",),
@@ -81,20 +89,28 @@ _TECHNIQUE_META: dict[str, dict[str, Any]] = {
     },
     "ShadowCoerce": {
         "cve_id": None,
-        "cvss_v3": 6.5,
+        # Derived from the vector below; stays in the MEDIUM band.
+        "cvss_v3": 5.4,
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
         "mitre": ("T1187",),
         "references": ("https://github.com/ShutdownRepo/ShadowCoerce",),
     },
     "MSEvenCoerce": {
         "cve_id": None,
-        "cvss_v3": 6.5,
+        # Derived from the vector below; stays in the MEDIUM band.
+        "cvss_v3": 5.4,
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N",
         "mitre": ("T1187",),
         "references": ("https://github.com/Wh04m1001/MS-EVEN",),
     },
     "DFSCoerce": {
         "cve_id": None,
+        # ADscan's own grading, NOT a CVSS base score: no authority publishes
+        # one (Microsoft treats this coercion primitive as by-design, so there
+        # is no CVE). The vector describes the primitive itself and computes
+        # 6.5; ADscan grades the exposure HIGH because its value to an attacker
+        # is the NTLM relay chain it enables, which a Base score cannot express.
+        # Allow-listed in tests/unit/services/cve_scanner/test_cvss_vector_agreement.py.
         "cvss_v3": 7.5,
         "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
         "mitre": ("T1187",),

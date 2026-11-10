@@ -18,6 +18,7 @@ again. ``adscan_core`` is importable by both the LITE renderer and the PRO rende
 from __future__ import annotations
 
 __all__ = [
+    "awaiting_approval_cause",
     "FULL_COMPROMISE_MAPPED_PHRASE",
     "FULL_COMPROMISE_VALIDATED_PHRASE",
     "full_compromise_reach_phrase",
@@ -47,40 +48,148 @@ FULL_COMPROMISE_MAPPED_PHRASE = (
 )
 
 
-def full_compromise_reach_phrase(end_to_end_proven: bool) -> str:
+#: How far an unproven route was executed, and why the rest did not run. Tokens
+#: are the ``compromise_verdict`` vocabulary (``REACH_*`` and the
+#: ``NOT_EXECUTED_*`` reasons), repeated here as literals so this leaf keeps no
+#: import. ``None`` evidence is the historical reading: entry step proven.
+_EVIDENCE_ENTRY_PROVEN = "entry_proven"
+_EVIDENCE_ATTEMPTED = "attempted"
+_EVIDENCE_MAPPED = "mapped"
+_REASON_OPERATOR = "operator_required"
+_REASON_EXCLUDED = "excluded_by_scan_policy"
+_REASON_DECLINED = "operator_declined"
+_REASON_OUTSIDE_SCOPE = "outside_engagement_scope"
+
+
+def awaiting_approval_cause(wait_seconds: int = 0) -> str:
+    """Why an approval was not given, from the recorded decision.
+
+    A relayed request that timed out recorded how long it waited (the step note
+    ``awaiting_timeout_seconds``): an operator was connected and did not answer
+    in time. Without a recorded wait nobody was there to ask. Minutes are
+    rounded like the step label (``execution.awaiting_approval_label``), so the
+    route sentence and the step it stopped at say the same thing.
+    """
+    try:
+        seconds = int(wait_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds > 0:
+        minutes = max(1, round(seconds / 60))
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"no answer came within {minutes} {unit}"
+    return "no operator was present to decide"
+
+
+def _not_executed_tail(reason: str, awaiting_wait_seconds: int = 0) -> str:
+    """Why a mapped route did not run, as a trailing clause (no leading comma).
+
+    The four reasons keep their own words (``compromise_verdict``): a step the
+    policy excludes, an approval nobody gave, an operator's "no", and a step
+    outside the engagement scope. The approval nobody gave names what happened
+    (:func:`awaiting_approval_cause`).
+    """
+    if reason == _REASON_OPERATOR:
+        return f"awaiting approval because {awaiting_approval_cause(awaiting_wait_seconds)}"
+    if reason == _REASON_EXCLUDED:
+        return "not executed because your scan policy excludes a step"
+    if reason == _REASON_DECLINED:
+        return "not executed because the operator chose not to run it"
+    if reason == _REASON_OUTSIDE_SCOPE:
+        return "not executed because a step on it is outside the engagement scope"
+    return "not executed in this assessment"
+
+
+def full_compromise_reach_phrase(
+    end_to_end_proven: bool,
+    *,
+    evidence: str | None = None,
+    reason: str = "",
+    awaiting_wait_seconds: int = 0,
+) -> str:
     """Return the noun phrase for "<principal> has ___" in a reach sentence.
 
     Args:
         end_to_end_proven: True when at least one route to full domain compromise
-            was walked end to end (a proven full compromise), False when the
-            reach is mapped with only its entry step proven.
+            was walked end to end (a proven full compromise).
+        evidence: How far the strongest unproven route was executed
+            (``entry_proven`` / ``attempted`` / ``mapped``). ``None`` keeps the
+            historical entry-step reading. A route nobody executed must pass
+            ``mapped``, or the phrase claims a proven entry step that never ran.
+        reason: Why mapped routes did not execute (``operator_required``,
+            ``excluded_by_scan_policy`` or ``""``).
     """
-    return (
-        FULL_COMPROMISE_VALIDATED_PHRASE
-        if end_to_end_proven
-        else FULL_COMPROMISE_MAPPED_PHRASE
-    )
+    if end_to_end_proven:
+        return FULL_COMPROMISE_VALIDATED_PHRASE
+    if evidence == _EVIDENCE_ATTEMPTED:
+        return "a mapped path to full domain compromise that was attempted and did not complete"
+    if evidence == _EVIDENCE_MAPPED:
+        return (
+            "a mapped path to full domain compromise, "
+            f"{_not_executed_tail(reason, awaiting_wait_seconds)}"
+        )
+    return FULL_COMPROMISE_MAPPED_PHRASE
 
 
-def reaches_full_compromise_clause(end_to_end_proven: bool, *, plural: bool) -> str:
+def reaches_full_compromise_clause(
+    end_to_end_proven: bool,
+    *,
+    plural: bool,
+    evidence: str | None = None,
+    reason: str = "",
+    entry_proven_routes: int = 0,
+    mapped_routes: int = 0,
+    awaiting_wait_seconds: int = 0,
+) -> str:
     """Return the verb clause for "N of M attack path(s) ___".
 
-    Proven: "reach(es) full domain compromise". Mapped-only: "whose route reaches
-    full domain compromise (entry step proven, not walked end to end)".
+    ``entry_proven_routes`` / ``mapped_routes`` are the per-route split the
+    verdict SSOT holds (``CompromiseVerdict.entry_proven`` / ``.not_executed``).
+    When routes of BOTH kinds exist, the clause counts each instead of stating
+    one reading for all of them: "entry step proven" was printed for seven routes
+    of which the report itself marked six as theoretical.
+
+    Proven: "reach(es) full domain compromise". Otherwise "whose route reaches
+    full domain compromise (...)", where the parenthesis states how far it was
+    executed: entry step proven, attempted, or mapped with the reason it did
+    not run (see :func:`full_compromise_reach_phrase`).
     """
     verb = "reach" if plural else "reaches"
     if end_to_end_proven:
         return f"{verb} full domain compromise"
-    # Mapped-only: the verb still agrees with the subject count
-    # ("route reaches" / "routes reach").
+    # The verb still agrees with the subject count ("route reaches" / "routes reach").
     route = "routes reach" if plural else "route reaches"
-    return f"whose {route} full domain compromise (entry step proven, not walked end to end)"
+    if evidence == _EVIDENCE_ATTEMPTED:
+        note = "attempted, did not complete"
+    elif evidence == _EVIDENCE_ENTRY_PROVEN and entry_proven_routes > 0 and mapped_routes > 0:
+        note = (
+            f"{entry_proven_routes} with the entry step proven, "
+            f"{mapped_routes} mapped and not executed"
+        )
+    elif evidence == _EVIDENCE_MAPPED:
+        note = f"mapped, {_not_executed_tail(reason, awaiting_wait_seconds)}"
+    else:
+        note = "entry step proven, not walked end to end"
+    return f"whose {route} full domain compromise ({note})"
 
 
-def tier0_reach_sub_phrase(end_to_end_proven: bool) -> str:
+def tier0_reach_sub_phrase(
+    end_to_end_proven: bool,
+    *,
+    evidence: str | None = None,
+    reason: str = "",
+    awaiting_wait_seconds: int = 0,
+) -> str:
     """Return the exposure-figure sub-line clause for the Tier-0 reach share."""
     if end_to_end_proven:
         return "have a path to Tier 0, confirmed by configuration"
+    if evidence == _EVIDENCE_ATTEMPTED:
+        return "have a mapped path to Tier 0 that was attempted and did not complete"
+    if evidence == _EVIDENCE_MAPPED:
+        return (
+            "have a mapped path to Tier 0, "
+            f"{_not_executed_tail(reason, awaiting_wait_seconds)}"
+        )
     return "have a mapped path to Tier 0 whose entry step is proven"
 
 

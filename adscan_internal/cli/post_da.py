@@ -6,6 +6,8 @@ relationship graph and re-runs attack-path analysis in audit mode.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -159,9 +161,9 @@ def run_audit_post_da_graph_refresh(
     username: str,
     password: str,
 ) -> None:
-    """Refresh graph collection and rerun path analysis after DA in audit mode."""
+    """Refresh graph collection and rerun path analysis after DA in a full assessment."""
 
-    if shell.type != "audit":
+    if not policy_settings.runs_full_assessment(shell):
         return
     if not _should_offer_privileged_refresh(shell, domain):
         return
@@ -325,7 +327,7 @@ def queue_audit_post_compromise(
     checkpoint. Whether the pipeline runs a full DCSync ("all") is decided
     STATE-driven at drain time (``is_full_ntds_replicated``), not here.
     """
-    if getattr(shell, "type", None) != "audit":
+    if not policy_settings.runs_full_assessment(shell):
         return
     if domain in _get_audit_dispatched(shell):
         return
@@ -360,7 +362,7 @@ def execute_audit_post_compromise(
           passed (speculative checkpoint drain).
         * Runs the full pipeline at most once per domain.
     """
-    if getattr(shell, "type", None) != "audit":
+    if not policy_settings.runs_full_assessment(shell):
         return
 
     pending = _get_audit_pending(shell)

@@ -152,6 +152,11 @@ class BackgroundJobRegistry:
             self.flush()
             return job
 
+    def has_active_jobs(self) -> bool:
+        """Whether any job of any kind is still running."""
+        with self._lock:
+            return any(str(rec.get("state")) not in _TERMINAL_STATES for rec in self._records())
+
     def find_active(self, kind: str, scope: str) -> Optional[BackgroundJob]:
         with self._lock:
             for rec in self._records():

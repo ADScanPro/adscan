@@ -60,7 +60,17 @@ class CLASS_INSTANCE:
         return self._string_bindings
     
     def get_auth_level(self):
-        """Get effective auth level, adjusting for auth type constraints"""
+        """Get effective auth level, adjusting for auth type constraints.
+
+        Mirrors impacket ``dcomrt.CLASS_INSTANCE.get_auth_level`` byte for byte:
+        a server ``authnHint`` below packet privacy is kept at packet INTEGRITY
+        for NTLM (``RPC_C_AUTHN_WINNT``) and raised to privacy for
+        Kerberos/Negotiate. Interfaces whose server requires an encrypted
+        binding regardless of the hint (the Certificate Services interfaces)
+        call :meth:`INTERFACE.require_packet_privacy`, which sets the level to
+        packet privacy explicitly, exactly as Certipy does with
+        ``get_cinstance().set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)``.
+        """
         if RPC_C_AUTHN_LEVEL_NONE < self._auth_level < RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
             if self._auth_type == RPC_C_AUTHN_WINNT:
                 return RPC_C_AUTHN_LEVEL_PKT_INTEGRITY
@@ -200,6 +210,34 @@ class INTERFACE:
     def set_cinstance(self, cinstance):
         self._cinstance = cinstance
     
+    def require_packet_privacy(self):
+        """Bind this object's OXID at RPC_C_AUTHN_LEVEL_PKT_PRIVACY.
+
+        Some DCOM servers refuse anything below an encrypted binding. The AD CS
+        server (certsrv, ``ICertRequestD`` / ``ICertAdminD`` / ``ICertAdminD2``)
+        is one: it advertises ``authnHint`` 5 (packet integrity), which
+        :meth:`CLASS_INSTANCE.get_auth_level` keeps at integrity under NTLM,
+        and then answers ``E_ACCESSDENIED`` (0x80070005) to every call, even
+        from a Domain Admin. Kerberos already lands on privacy, so this only
+        changes the NTLM wire level. Certipy sets the same level on the same
+        class instance right after activation.
+
+        Must run before the first request on the object: the binding level is
+        fixed when the OXID connection is opened, and an existing connection is
+        reused by alter-context, which cannot raise it.
+        """
+        if self._cinstance is None:
+            return
+        self._cinstance.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+        conn_info = self._manager.get_oxid_connection(self._target, self._oxid)
+        if conn_info is not None:
+            current = getattr(conn_info['dce'], 'auth_level', None)
+            if current is not None and current < RPC_C_AUTHN_LEVEL_PKT_PRIVACY:
+                logger.debug(
+                    'require_packet_privacy: OXID connection already open at '
+                    f'auth level {current}; the new level applies to the next connection only'
+                )
+
     def get_dce_rpc(self) -> DCERPC5Connection:
         """Get the DCE/RPC connection for this interface's OXID"""
         conn_info = self._manager.get_oxid_connection(self._target, self._oxid)

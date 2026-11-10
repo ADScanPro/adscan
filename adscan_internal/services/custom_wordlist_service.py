@@ -50,6 +50,10 @@ import re
 from typing import Any, Iterable, Literal, Sequence
 import unicodedata
 
+# The wordlist path layout is shared with the workspace delete (CLI, platform
+# and its worker), which cannot import this module, so it lives in adscan_core.
+from adscan_core.custom_wordlist_paths import custom_wordlist_dir
+
 from adscan_internal.services.password_year_variant_service import (
     epoch_seconds_to_year,
 )
@@ -905,32 +909,6 @@ def generate(
 # ---------------------------------------------------------------------------
 # I/O — output directory + workspace inventory loader (thin)
 # ---------------------------------------------------------------------------
-
-
-def custom_wordlist_dir(domain: str, *, base_dir: Path | None = None) -> Path:
-    """Resolve the per-domain custom wordlist asset directory.
-
-    Mirrors the asset-dir convention of ``KerberosUsernameWordlistService``:
-    host ``~/.adscan/wordlists/custom/<domain>/`` <-> container
-    ``/opt/adscan/wordlists/custom/<domain>/`` (both resolve via the paths
-    helper, so no path is hardcoded).
-
-    Args:
-        domain: Target domain.
-        base_dir: Override for tests (defaults to ``~/.adscan``).
-
-    Returns:
-        The resolved directory Path (not yet created).
-    """
-    if base_dir is None:
-        from adscan_core.paths import get_adscan_home_dir
-
-        base_dir = get_adscan_home_dir()
-    safe_domain = re.sub(r"[^A-Za-z0-9._-]", "_", str(domain or "unknown"))
-    # Collapse any ``..`` run so the domain can never form a path-traversal
-    # component, and trim leading/trailing dots.
-    safe_domain = re.sub(r"\.{2,}", "_", safe_domain).strip(".") or "unknown"
-    return base_dir / "wordlists" / "custom" / safe_domain
 
 
 def load_objects_from_inventory(workspace_dir: str | Path, domain: str) -> list[dict[str, Any]]:

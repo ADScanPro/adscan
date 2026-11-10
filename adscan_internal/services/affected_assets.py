@@ -23,10 +23,13 @@ into a finding's narrative and remediation — is product knowledge and stays in
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Any
 
+from adscan_core.adcs_relations import is_adcs_relation
+from adscan_core.graph_secret_refs import note_has_recovered_secret
+from adscan_core.reporting.client_secret_redaction import client_secret_display
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_STEP_RELATIONS
 from adscan_internal.services.adcs_path_display import extract_adcs_template_names
 from adscan_internal.services.affected_asset_rules import (
@@ -120,25 +123,6 @@ _IGNORED_KEYS: tuple[str, ...] = (
 )
 
 _SOURCE_RELEVANT_RELATIONS: tuple[str, ...] = ("hassession",)
-
-_ADCS_RELATIONS: tuple[str, ...] = (
-    "adcsesc1",
-    "adcsesc2",
-    "adcsesc3",
-    "adcsesc4",
-    "adcsesc5",
-    "adcsesc6",
-    "adcsesc7",
-    "adcsesc8",
-    "adcsesc9",
-    "adcsesc10",
-    "adcsesc11",
-    "adcsesc13",
-    "adcsesc14",
-    "adcsesc15",
-    "adcsesc16",
-    "adcsesc17",
-)
 
 _CONTEXT_DETAIL_KEYS_BY_RELATION: dict[str, tuple[str, ...]] = {
     "passwordinshare": (
@@ -763,7 +747,7 @@ def _extract_adcs_template_assets(step: dict[str, Any]) -> list[str]:
     """Return template/CA-focused affected assets for ADCS findings when available."""
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
     relation = _normalize_relation(step.get("action") or step.get("relation"))
-    if relation not in _ADCS_RELATIONS:
+    if not is_adcs_relation(relation):
         return []
 
     assets: list[str] = []
@@ -875,7 +859,7 @@ def _extract_assets_from_attack_graph_edges(
         if relation and relation not in relation_aliases:
             continue
         notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-        if relation in _ADCS_RELATIONS:
+        if is_adcs_relation(relation):
             _extend_unique(matches, _extract_strings(edge.get("source")))
             _extend_unique(matches, _extract_strings(edge.get("from")))
             adcs_assets = _adcs_template_and_ca_assets(notes)
@@ -1176,7 +1160,10 @@ def _password_redacted_assets(details: Mapping[str, Any]) -> list[str]:
     for key in ("password", "secret", "plaintext", "cleartext", "value"):
         value = details.get(key)
         if _is_non_empty_string(value):
-            return ["Password: [redacted]"]
+            return [f"Password: {client_secret_display()}"]
+    # A graph-sourced secret is recorded as a credential-store reference.
+    if note_has_recovered_secret(details, "password", "secret", "plaintext", "cleartext"):
+        return [f"Password: {client_secret_display()}"]
     return []
 
 
@@ -1333,7 +1320,7 @@ def _flat_assets_from_structured_entities(vuln_data: Any) -> list[str]:
             name = str(entry.get("identifier") or display).strip()
             _extend_unique(out, [f"{prefix}{name}"])
         elif asset_type == "credential":
-            _extend_unique(out, ["Password: [redacted]"])
+            _extend_unique(out, [f"Password: {client_secret_display()}"])
         else:
             _extend_unique(out, [display])
     return out
@@ -1499,7 +1486,19 @@ def _principal_original_name_index(vuln_data: Any) -> dict[str, str]:
             for entity in raw:
                 if not isinstance(entity, dict):
                     continue
-                original = str(entity.get("display") or "").strip()
+                # The entity ``display`` of a QUALIFIED record already carries
+                # its qualifier (``svc_legacy · description``). The value here
+                # is the PRINCIPAL name only: the humanizer splits the asset on
+                # the separator and re-appends the qualifier itself, so storing
+                # the qualified form made it render twice
+                # (``svc_legacy · description · description``, shipped on every
+                # directory-attribute-secret finding, and it also broke the
+                # per-row badge lookup, which keys on the rendered text).
+                original = (
+                    str(entity.get("display") or "")
+                    .partition(ACCOUNT_QUALIFIER_SEPARATOR)[0]
+                    .strip()
+                )
                 if not original:
                     continue
                 for token in (entity.get("display"), entity.get("identifier")):
@@ -1821,6 +1820,11 @@ def build_affected_asset_records(
                 # Roasting per-account crack status (``cracked`` / ``attempted`` /
                 # ``exposed``); ``""`` for every non-roasting asset.
                 "crack_status": meta.get("crack_status") or "",
+                # Directory-attribute secret: whether the leaked value
+                # authenticated as this object (``authenticated`` /
+                # ``unproven``); ``""`` when the finding's rows all share one
+                # state or it is not that family.
+                "secret_status": meta.get("secret_status") or "",
             }
         )
     return records
@@ -2003,7 +2007,7 @@ class AffectedAssetDisplayRow:
         kind: ``"bullet"`` (an asset row) or ``"paragraph"`` (the overflow line
             naming the bundled appendix), exactly as the tuple contract.
         text: The humanized display. For a PAIRING finding this is the composed
-            pair — a session renders ``logged-on-user @ host (IP)``, a control
+            pair — a session renders ``logged-on-user signed in to host (IP)``, a control
             pair renders ``holder → target``.
         tier_badge: The compact privilege-tier badge (``Tier 0`` / ``Tier 1`` /
             ``Tier 2``) read from the stamped entity's ``tier_label``, or ``None``
@@ -2032,7 +2036,7 @@ class AffectedAssetDisplayRow:
     # host), not a single pair badge. Ordered left-to-right as the ``text`` reads.
     # ``None``/empty for a non-pair row.
     pair_endpoints: tuple["AffectedAssetPairEndpoint", ...] = ()
-    # The connector between the two endpoints of a PAIRING row (`` @ `` for a
+    # The connector between the two endpoints of a PAIRING row (`` signed in to `` for a
     # session pair, `` → `` for a control pair), so a renderer can rebuild
     # ``<badge> left <connector> <badge> right``. Empty for a non-pair row.
     pair_connector: str = ""
@@ -2045,6 +2049,23 @@ class AffectedAssetDisplayRow:
     # per-account outcome — ``cracked`` / ``attempted`` / ``exposed`` — read from
     # the stamped entity's ``crack_status``. ``None`` for every other finding.
     crack_status: str | None = None
+    # For a DIRECTORY-ATTRIBUTE SECRET row whose finding carries BOTH states:
+    # ``authenticated`` when the leaked value opened this object,
+    # ``unproven`` when it did not, read from the stamped entity's
+    # ``secret_status``. ``None`` elsewhere, including when every row of the
+    # finding shares one state (its key and severity carry that).
+    secret_status: str | None = None
+    # For a BROAD built-in identity (Authenticated Users, Domain Users): how many
+    # accounts it covers, so it renders as one object with its reach explained.
+    scope_note: str | None = None
+    # The client-facing ROLE GROUP of the row on an attack-step finding
+    # (``exploit`` / ``exposed`` / ``weak_point``, from
+    # ``adscan_core.reporting.affected_asset_roles``) and its heading (``Who can
+    # exploit it`` ...). Rows arrive ordered by group, so a renderer emits the
+    # heading whenever it changes. ``None`` on a finding that is not an attack
+    # step, which keeps its single flat block.
+    role_group: str | None = None
+    role_group_label: str | None = None
 
 
 # Role labels that mark a per-edge pair as a SESSION pair (``user @ host``),
@@ -2098,11 +2119,13 @@ def _build_asset_display_meta_index(vuln_data: Any) -> dict[str, dict[str, str |
         role_label = str(entity.get("role_label") or "").strip() or None
         metric = str(entity.get("metric") or "").strip() or None
         crack_status = str(entity.get("crack_status") or "").strip() or None
+        secret_status = str(entity.get("secret_status") or "").strip() or None
         if (
             tier_badge is None
             and role_label is None
             and metric is None
             and crack_status is None
+            and secret_status is None
         ):
             continue
         meta: dict[str, str | None] = {
@@ -2112,6 +2135,7 @@ def _build_asset_display_meta_index(vuln_data: Any) -> dict[str, dict[str, str |
             "role_label": role_label,
             "metric": metric,
             "crack_status": crack_status,
+            "secret_status": secret_status,
         }
         tokens: list[Any] = [entity.get("display"), entity.get("identifier")]
         etype = str(entity.get("type") or "").strip().lower()
@@ -2189,7 +2213,7 @@ def _render_pair_row(
     """Compose one per-edge pair into a single display row.
 
     A SESSION pair (``session-host`` / ``logged-on-user`` roles) renders
-    user-first as ``logged-on-user @ host (IP)``; every other pair renders
+    user-first as ``logged-on-user signed in to host (IP)``; every other pair renders
     ``source → target`` so the client reads who-can-do-what-to-whom. When one side
     was dropped (e.g. a direct-domain-breaker target), the surviving side renders
     on its own. ``None`` when the pair composed no text.
@@ -2222,7 +2246,10 @@ def _render_pair_row(
             if str(e.get("role_label") or "").strip().lower() == "session-host"
         ] or sources
         left_entities, right_entities = users, hosts
-        connector = " @ "
+        # Words, not "@": the pair renders with a tier badge before each side,
+        # so "robb.stark @" sat alone beside a chip and read as a dangling
+        # address, and wrapped onto a line of its own in the roadmap.
+        connector = " signed in to "
         left, right = _joined(users), _joined(hosts)
         text = f"{left}{connector}{right}" if left and right else (left or right)
     else:
@@ -2284,6 +2311,8 @@ def _render_single_entity_row(
         role_label=str(entity.get("role_label") or "").strip() or None,
         metric=str(entity.get("metric") or "").strip() or None,
         crack_status=str(entity.get("crack_status") or "").strip() or None,
+        secret_status=str(entity.get("secret_status") or "").strip() or None,
+        scope_note=str(entity.get("scope_note") or "").strip() or None,
     )
 
 
@@ -2367,6 +2396,102 @@ def build_affected_assets_pair_rows(
     return _compose_pair_rows(vuln_data)
 
 
+#: Type prefixes a role-grouped row of a typed resource carries (the flat list's).
+_ROLE_ROW_TYPE_PREFIX: dict[str, str] = {
+    "template": "Template: ",
+    "ca": "CA: ",
+    "share": "Share: ",
+    "artifact": "Artifact: ",
+}
+
+
+def build_affected_assets_role_rows(
+    vuln_name: str, vuln_data: Any
+) -> list[AffectedAssetDisplayRow]:
+    """Return the UNCAPPED role-grouped rows of an attack-step finding, else ``[]``.
+
+    The role split (who can exploit it / what it exposes / where the weakness
+    lives) is the one in :mod:`adscan_core.reporting.affected_asset_roles`, read
+    from the engine-stamped entities, so the PDF report, the Playbook, the LITE
+    report and the web CTEM group the same objects the same way. Each row carries
+    its ``role_group`` and heading; rows are ordered by group and, inside a group,
+    Tier 0 first (CRACKED first for a roasting finding). The finding-specific
+    role tag (``holder``, ``roastable-target``) is kept beside the heading.
+
+    Returns ``[]`` for a PAIRING finding (its pairs already read who-to-whom),
+    for a finding that is not an attack step, and for an unstamped finding, so
+    the caller keeps its flat path.
+    """
+    from adscan_core.reporting.affected_asset_roles import (  # noqa: PLC0415
+        group_entities_by_role,
+        is_attack_step,
+        stamped_entities,
+    )
+
+    if rule_for(vuln_name).representation is Representation.PAIRING:
+        return []
+    # Display surface: the escalation's landing point (Domain Admins for ESC1)
+    # is shown under "What it exposes". It comes from the display-only key, so
+    # no count, score or command derived elsewhere ever sees it.
+    entities = stamped_entities(vuln_data, include_display_only=True)
+    if not entities or not is_attack_step(entities):
+        return []
+    rows: list[AffectedAssetDisplayRow] = []
+    for group in group_entities_by_role(entities):
+        ranked = sorted(
+            group.entities,
+            key=lambda e: (
+                _CRACK_ROW_SORT_RANK.get(
+                    str(e.get("crack_status") or "").strip().lower(), 3
+                ),
+                _entity_tier_rank(e),
+            ),
+        )
+        for entity in ranked:
+            row = _render_single_entity_row(entity)
+            if row is None:
+                continue
+            # A typed resource keeps the same ``Template: `` / ``CA: `` prefix
+            # the flat list prints, so "ESC1" never reads as an account name.
+            prefix = _ROLE_ROW_TYPE_PREFIX.get(str(entity.get("type") or "").lower(), "")
+            rows.append(
+                replace(
+                    row,
+                    text=f"{prefix}{row.text}" if prefix else row.text,
+                    role_group=group.key,
+                    role_group_label=group.label,
+                )
+            )
+    return rows
+
+
+def _cap_role_rows(
+    rows: list[AffectedAssetDisplayRow], inline_cap: int
+) -> list[AffectedAssetDisplayRow]:
+    """Cap each role group at ``inline_cap`` rows, with ONE shared overflow line.
+
+    Every group keeps its leading rows, so a long "what it exposes" list can
+    never push "who can exploit it" out of the deliverable.
+    """
+    kept: list[AffectedAssetDisplayRow] = []
+    per_group: dict[str, int] = {}
+    remaining = 0
+    for row in rows:
+        key = row.role_group or ""
+        if per_group.get(key, 0) >= inline_cap:
+            remaining += 1
+            continue
+        per_group[key] = per_group.get(key, 0) + 1
+        kept.append(row)
+    if remaining > 0:
+        kept.append(
+            AffectedAssetDisplayRow(
+                kind="paragraph", text=affected_assets_overflow_line(remaining)
+            )
+        )
+    return kept
+
+
 #: CRACKED leads, then attempted, then merely exposed — the proven recovery first.
 _CRACK_ROW_SORT_RANK: dict[str, int] = {"cracked": 0, "attempted": 1, "exposed": 2}
 
@@ -2405,7 +2530,7 @@ def build_affected_assets_display_rows(
     carries the asset's finding-specific ROLE label and its privilege TIER badge,
     and a PAIRING finding (HasSession, ForceChangePassword, shadow-creds, LAPS,
     gMSA, RBCD, NTLMv1-relay) renders its per-edge pairs as a pair
-    (``logged-on-user @ host (IP)``) rather than two flat lists.
+    (``logged-on-user signed in to host (IP)``) rather than two flat lists.
 
     Backward-compatible: a finding carrying no stamped entities (an older
     workspace, or a finding that resolved none) renders exactly the flat text with
@@ -2417,6 +2542,10 @@ def build_affected_assets_display_rows(
         pair_rows = _compose_pair_rows(vuln_data)
         if pair_rows:
             return _cap_display_rows(pair_rows, inline_cap)
+
+    role_rows = build_affected_assets_role_rows(vuln_name, vuln_data)
+    if role_rows:
+        return _cap_role_rows(role_rows, inline_cap)
 
     entries = build_affected_assets_display_entries(
         vuln_name, vuln_data, domain_name=domain_name, attack_paths=attack_paths
@@ -2438,6 +2567,7 @@ def build_affected_assets_display_rows(
                 role_label=meta.get("role_label"),
                 metric=meta.get("metric"),
                 crack_status=meta.get("crack_status"),
+                secret_status=meta.get("secret_status"),
             )
         )
     _sort_rows_cracked_first(rows)
@@ -2485,8 +2615,10 @@ def extract_affected_notes(finding_key: str, details: Any) -> dict[str, Any]:
     host where a secret was found, the SYSVOL artifact, the recovered password.
     This surfaces them as a structured block for the report's Notes rendering.
 
-    Sensitive values (password, host, user) are wrapped with
-    :func:`mark_sensitive` so the report sanitizer can mask them consistently.
+    Host values are wrapped with :func:`mark_sensitive` (telemetry scrubbing).
+    A recovered secret is NEVER carried: ``password`` holds its shape
+    (:func:`client_secret_display`), because this block renders into client
+    deliverables where ``mark_sensitive`` markers are invisible.
 
     Returns a dict with keys: ``templates``, ``ca``, ``wordlist_cracked``,
     ``wordlists_tried``, ``share_path``, ``host``, ``artifact``, ``password``.
@@ -2540,11 +2672,19 @@ def extract_affected_notes(finding_key: str, details: Any) -> dict[str, Any]:
         if artifacts:
             notes["artifact"] = artifacts[0]
     if Extra.PASSWORD_REDACTED in extras:
+        # This block is client-facing (SAR, Playbook, docx). A recovered secret
+        # is shown by its SHAPE, never its value: ``mark_sensitive`` would not
+        # hide it, its markers are invisible in a rendered page.
         for key in ("password", "secret", "plaintext", "cleartext"):
             value = view.get(key)
             if _is_non_empty_string(value):
-                notes["password"] = mark_sensitive(str(value), "password")
+                notes["password"] = client_secret_display(value)
                 break
+        else:
+            # Graph-sourced secrets are references, never values: state that one
+            # was recovered without carrying it into the deliverable.
+            if note_has_recovered_secret(view, "password", "secret", "plaintext", "cleartext"):
+                notes["password"] = client_secret_display()
 
     return notes
 
@@ -2596,5 +2736,13 @@ def build_affected_notes_display_entries(
         entries.append(("bullet", f"Artifact: {notes['artifact']}"))
     if notes.get("password"):
         entries.append(("bullet", f"Recovered credential: {notes['password']}"))
+    if finding_key == "recovered_account_passwords":
+        from adscan_core.reporting.password_hygiene import (  # noqa: PLC0415
+            recovered_password_population_note,
+        )
+
+        population = recovered_password_population_note(details)
+        if population:
+            entries.append(("bullet", population))
 
     return entries

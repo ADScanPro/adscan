@@ -247,13 +247,29 @@ def mark_scan_running(
     _best_effort_save(shell)
 
 
+def _notify_coverage(shell: Any, domain: str, phase_id: str) -> None:
+    recorder = getattr(shell, "_coverage_recorder", None)
+    if recorder is None:
+        return
+    try:
+        recorder.note_phase_completed(domain, phase_id)
+    except Exception:  # noqa: BLE001 - coverage must never break the checkpoint
+        pass
+
+
 def mark_phase_complete(shell: Any, domain: str, phase_id: str) -> None:
     """Append ``phase_id`` to the completed set (dedup) after the phase ran.
 
     Call ONLY after a phase's steps returned without an early-exit — a half-run
     phase must never be marked complete (the whole reliability point). Persists
     best-effort so the marker survives a crash inside the 5 s auto-save window.
+
+    Also tells the run's coverage recorder, when one is active, that the phase
+    completed IN THIS RUN: the checkpoint alone cannot say that, since it
+    carries phases completed by earlier runs too. Duck-typed (no import), so
+    this module stays dependency-light.
     """
+    _notify_coverage(shell, domain, phase_id)
     entry = _domain_data(shell, domain)
     if entry is None:
         return
@@ -281,6 +297,205 @@ def phase_already_complete(shell: Any, domain: str, phase_id: str) -> bool:
     """
     completed = read_scan_progress(shell, domain).get("phases_complete")
     return isinstance(completed, list) and phase_id in completed
+
+
+#: The phases an authenticated assessment of a domain cannot do without. Until
+#: both completed, the run has not looked at the domain's identities, ACLs and
+#: routes, so it can state the findings it has but not that the domain held.
+CORE_ASSESSMENT_PHASE_IDS: tuple[str, ...] = (
+    "domain_analysis",
+    "attack_paths_discovery",
+)
+
+
+def missing_core_assessment_phases(shell: Any, domain: str) -> tuple[str, ...]:
+    """Return the core phases ``domain`` never completed, in pipeline order.
+
+    The evidence is the persisted checkpoint, so a resumed scan whose earlier run
+    completed a phase is not reported as missing it. ``domain_analysis`` also
+    accepts the legacy ``phase1_complete`` flag, which ``run_enumeration`` writes
+    with the same guard (the collection outputs landed).
+
+    An empty tuple means the core assessment ran. Fail-open the other way would
+    be wrong here: an unreadable record reports every core phase as missing,
+    because this answer gates a "the domain held" verdict and only evidence may
+    support it.
+
+    Args:
+        shell: The session shell (reads ``domains_data``).
+        domain: The domain whose assessment is being judged.
+
+    Returns:
+        The ids from :data:`CORE_ASSESSMENT_PHASE_IDS` with no completion record.
+    """
+    completed = read_scan_progress(shell, domain).get("phases_complete")
+    done = set(completed) if isinstance(completed, list) else set()
+    try:
+        entry = (getattr(shell, "domains_data", None) or {}).get(domain)
+        if isinstance(entry, dict) and entry.get("phase1_complete") is True:
+            done.add("domain_analysis")
+    except Exception:  # noqa: BLE001 - a read must never break the scan
+        pass
+    return tuple(phase for phase in CORE_ASSESSMENT_PHASE_IDS if phase not in done)
+
+
+#: Phases whose RUN can be cut short while still "completing": the collector
+#: keeps going past a stage it could not read, so a phase that finished is not
+#: proof it read everything. A phase listed here and marked incomplete
+#: (:func:`mark_phase_incomplete`) counts as not completed for the verdict, in
+#: pipeline order.
+ASSESSMENT_INTEGRITY_PHASE_IDS: tuple[str, ...] = (
+    "domain_collection",
+    # The SQL Server authorization read (``collector.collection_integrity``). Its
+    # own mark, so it never clears, nor is cleared by, the directory read's.
+    "domain_collection.mssql",
+    *CORE_ASSESSMENT_PHASE_IDS,
+)
+#: Titles of the integrity ids that are not chapter-strip phases.
+_INTEGRITY_SUBPHASE_TITLES: dict[str, str] = {
+    "domain_collection.mssql": "SQL Server Collection",
+}
+
+#: Key, inside the ``scan_progress`` record, of the phases that ran but did not
+#: finish their work: ``{phase_id: {"reasons": [...], "detail": "..."}}``.
+PHASES_INCOMPLETE_KEY = "phases_incomplete"
+
+
+def _notify_coverage_incomplete(
+    shell: Any, domain: str, phase_id: str, reasons: tuple[str, ...]
+) -> None:
+    recorder = getattr(shell, "_coverage_recorder", None)
+    if recorder is None:
+        return
+    try:
+        if reasons:
+            recorder.note_phase_incomplete(domain, phase_id, reasons)
+        else:
+            recorder.clear_phase_incomplete(domain, phase_id)
+    except Exception:  # noqa: BLE001 - coverage must never break the checkpoint
+        pass
+
+
+def mark_phase_incomplete(
+    shell: Any,
+    domain: str,
+    phase_id: str,
+    *,
+    reasons: tuple[str, ...] | list[str],
+    detail: str = "",
+) -> None:
+    """Record that ``phase_id`` ran for ``domain`` but could not finish its work.
+
+    The single writer of the "ran but incomplete" verdict (a collection that lost
+    its domain controller mid-read is the case it exists for). It is read by
+    :func:`authenticated_assessment_gap`, so the end-of-scan panel, ``adscan
+    ci``'s exit status and the run's ``coverage.json`` all say the same thing.
+
+    Args:
+        shell: The session shell (writes ``domains_data``).
+        domain: The domain the phase ran for.
+        phase_id: The phase that did not finish.
+        reasons: Machine tokens (``reason:stage``) for ``coverage.json``.
+        detail: One operator-facing sentence saying what did not finish.
+    """
+    tokens = tuple(str(r) for r in reasons if str(r or "").strip()) or ("incomplete",)
+    _notify_coverage_incomplete(shell, domain, phase_id, tokens)
+    entry = _domain_data(shell, domain)
+    if entry is None:
+        return
+    record = entry.get(SCAN_PROGRESS_KEY)
+    if not isinstance(record, dict):
+        record = {"status": STATUS_RUNNING, "phases_complete": []}
+    incomplete = record.get(PHASES_INCOMPLETE_KEY)
+    if not isinstance(incomplete, dict):
+        incomplete = {}
+    incomplete[str(phase_id)] = {"reasons": list(tokens), "detail": str(detail or "")}
+    record[PHASES_INCOMPLETE_KEY] = incomplete
+    record["updated_at"] = _now_iso()
+    entry[SCAN_PROGRESS_KEY] = record
+    _best_effort_save(shell)
+
+
+def clear_phase_incomplete(shell: Any, domain: str, phase_id: str) -> None:
+    """Forget an earlier incomplete mark: ``phase_id`` is being run again."""
+    _notify_coverage_incomplete(shell, domain, phase_id, ())
+    entry = _domain_data(shell, domain)
+    if entry is None:
+        return
+    record = entry.get(SCAN_PROGRESS_KEY)
+    if not isinstance(record, dict):
+        return
+    incomplete = record.get(PHASES_INCOMPLETE_KEY)
+    if isinstance(incomplete, dict) and phase_id in incomplete:
+        incomplete.pop(phase_id, None)
+        record["updated_at"] = _now_iso()
+        _best_effort_save(shell)
+
+
+def incomplete_phases(shell: Any, domain: str) -> dict[str, dict[str, Any]]:
+    """Return ``{phase_id: {"reasons": [...], "detail": str}}`` for ``domain``."""
+    incomplete = read_scan_progress(shell, domain).get(PHASES_INCOMPLETE_KEY)
+    if not isinstance(incomplete, dict):
+        return {}
+    return {
+        str(phase): dict(value) if isinstance(value, dict) else {"reasons": [], "detail": ""}
+        for phase, value in incomplete.items()
+    }
+
+
+def authenticated_assessment_gap(
+    shell: Any, domain: str, *, verb: str | None = None
+) -> tuple[str, ...]:
+    """Return the phase ids an authenticated assessment of ``domain`` lacks.
+
+    A phase is lacking when it never completed (a core phase with no completion
+    record) or when it ran but could not finish its work
+    (:func:`mark_phase_incomplete`: a collection that lost its domain controller
+    mid-read). Empty when the run was not an authenticated assessment (an
+    unauthenticated scan never collects, and makes no "held" claim about the
+    directory) or when nothing is lacking. Used by the recap and by ``adscan
+    ci``'s exit status, so the panel and the exit code cannot disagree.
+
+    Args:
+        shell: The active pentest shell.
+        domain: The domain the outcome is about.
+        verb: The completed scan verb, when the caller knows it.
+
+    Returns:
+        Phase ids from :data:`ASSESSMENT_INTEGRITY_PHASE_IDS`, in pipeline order.
+    """
+    authenticated = verb == "start_auth" or getattr(shell, "scan_mode", None) == "auth"
+    if not authenticated or not domain:
+        return ()
+    missing = missing_core_assessment_phases(shell, domain)
+    if missing:
+        # A phase the scan policy or config switched off is a declared scope
+        # choice (stated by the policy-skip recap), not a scan that stopped early.
+        try:
+            from adscan_internal.services.scan_phases import phases_enabled_for_run
+
+            missing = tuple(phases_enabled_for_run(shell, missing))
+        except Exception:  # noqa: BLE001 - without the gate, judge every core phase
+            pass
+    # A phase marked incomplete RAN (it is never a scope choice), so no gate.
+    lacking = set(missing) | set(incomplete_phases(shell, domain))
+    return tuple(p for p in ASSESSMENT_INTEGRITY_PHASE_IDS if p in lacking)
+
+
+def phase_titles(phase_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the chapter-strip titles of ``phase_ids`` (readable id fallback)."""
+    try:
+        from adscan_internal.services.scan_phases import get_phase
+    except Exception:  # noqa: BLE001 - a title lookup must never break a verdict
+        get_phase = None  # type: ignore[assignment]
+    titles: list[str] = []
+    for phase_id in phase_ids:
+        phase = get_phase(phase_id) if get_phase is not None else None
+        title = str(getattr(phase, "title", "") or "").strip() or _INTEGRITY_SUBPHASE_TITLES.get(
+            str(phase_id), ""
+        )
+        titles.append(title or str(phase_id).replace("_", " ").capitalize())
+    return tuple(titles)
 
 
 def mark_scan_complete(shell: Any, domain: str) -> None:

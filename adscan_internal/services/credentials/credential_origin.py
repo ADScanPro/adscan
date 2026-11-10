@@ -102,6 +102,9 @@ ORIGIN_MSSQL_CREDS = "mssql_creds"
 ORIGIN_AUTHENTICATED_SCAN = "authenticated_scan"
 ORIGIN_USER_PROVIDED = "user_provided"
 ORIGIN_MANUAL = "manual"
+# The credential of an account ADscan itself created during the assessment
+# (adscan_core.credential_origins). Never a client credential.
+ORIGIN_ADSCAN_PROVISIONED = "adscan_provisioned"
 
 
 def _normalize_origin(origin: str) -> str:
@@ -161,13 +164,12 @@ _ESC_PRETTY: dict[str, str] = {
     "adcsesc9": "ADCS ESC9",
     "adcsesc10": "ADCS ESC10",
     "adcsesc11": "ADCS ESC11",
+    "adcsesc12": "ADCS ESC12",
     "adcsesc13": "ADCS ESC13",
     "adcsesc14": "ADCS ESC14",
     "adcsesc15": "ADCS ESC15",
     "adcsesc16": "ADCS ESC16",
     "adcsesc17": "ADCS ESC17",
-    # ESC12 is intentionally absent (no catalog entry); a future entry would
-    # render via the title-case fallback rather than being silently wrong.
 }
 
 
@@ -220,6 +222,7 @@ _ORIGIN_LABELS: dict[str, str] = {
     "hasshadowcredentials": "shadow credentials",
     "addkeycredentiallink": "shadow credentials",
     "hassession": "session credential harvest",
+    "scheduledtask": "session credential harvest",
     "localadminpassreuse": "password reuse",
     "domainpassreuse": "password reuse",
     "localcredtodomainreuse": "local→domain reuse",
@@ -268,6 +271,7 @@ _ORIGIN_LABELS: dict[str, str] = {
     "authenticatedscan": "authenticated scan",
     "userprovided": "user-provided",
     "manual": "manual save",
+    "adscanprovisioned": "account created by ADscan",
 }
 # Merge per-ESC labels (already normalized keys).
 _ORIGIN_LABELS.update(_ESC_PRETTY)

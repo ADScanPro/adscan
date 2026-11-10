@@ -256,6 +256,42 @@ def relation_authenticates_to_source_host(relation: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Steps that run INSIDE a host session — the actor is the access holder
+# --------------------------------------------------------------------------- #
+#
+# The rule (founder direction, release gate 14.0.0): a step that acts on a host
+# reached through an access step (AdminTo, CanPSRemote, CanRDP, ExecuteDCOM,
+# SQLAdmin, SQLAccess) runs with the credential of the principal that holds that
+# access in the path. Its formal graph source is the host's computer account,
+# but that account is never the actor, and the step never refuses because the
+# machine account is not owned.
+#
+# The relations below are the ones whose graph SOURCE is that host and which are
+# not ``EdgeKind.DERIVED`` (DERIVED relations already carry, see
+# ``source_ownership_bucket``): the source-host family (dumps + HasSession, an
+# ``AUTH`` edge) and ``PasswordInFile`` (a credential read off the host's own
+# filesystem through a WinRM / RDP / MSSQL session; the provenance service
+# sources it at the host for that reason). A relation whose computer source acts
+# as a DIRECTORY principal (``GenericAll`` / ``AllowedToDelegate`` /
+# ``WriteDacl`` from ``SRV01$``) is NOT here: the write is made by the machine
+# account itself, so the anti-wrong-principal gate keeps demanding it.
+_SOURCE_HOST_SESSION_RELATIONS: Final[frozenset[str]] = _HOST_AUTH_FROM_SOURCE | frozenset(
+    {"passwordinfile"}
+)
+
+
+def relation_runs_in_source_host_session(relation: str) -> bool:
+    """Return whether a non-derived step runs inside a session on its SOURCE host.
+
+    True for the relations whose acting credential is the access holder of the
+    host the step starts at (see the comment above), so the step-execution actor
+    SSOT carries that holder forward from the prior access step instead of
+    demanding ownership of the host's computer account.
+    """
+    return str(relation or "").strip().lower() in _SOURCE_HOST_SESSION_RELATIONS
+
+
+# --------------------------------------------------------------------------- #
 # Host-execution-read relations — the strict anti-wrong-principal gate carve-out
 # --------------------------------------------------------------------------- #
 #
@@ -478,6 +514,7 @@ __all__ = [
     "WITHHELD_NOT_HOST_AUTHENTICATING",
     "derive_carried_credential",
     "islocal_flag_for",
+    "relation_runs_in_source_host_session",
     "local_service_for_relation",
     "relation_authenticates_to_source_host",
     "relation_is_host_execution_read",

@@ -43,7 +43,7 @@ LITE runtime costs nothing and pulls in no engine or native stack.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 # ── Kit surfaces a datum can be rendered on ──────────────────────────────────
 SAR = "sar"  # Security Assessment Report
@@ -112,6 +112,184 @@ FN_FACT = object()
 #: returning (spec §2 #16 — a same-named KPI carrying two different numbers).
 FINDINGS_ON_PATH_LABEL = "Findings on a validated path"
 ACCOUNTS_ON_PATH_LABEL = "Accounts with a validated path"
+
+# ── Client-facing labels for the two POSITIVE compliance counts (#9 vs #10) ───
+#: The per-framework scorecard prints two POSITIVE counts side by side in one
+#: stat grid, and they count DIFFERENT universes. ``scorecard["conformant"]``
+#: counts this framework's assessed control codes whose conformity resolved
+#: conformant (its denominator is the neighbouring "Controls assessed" tile).
+#: ``scorecard["verified_clear_controls"]`` counts the coverage control AREAS a
+#: probe actively exercised and observed passing, which is the AD Control
+#: Coverage Report's universe and is the SAME figure that document prints.
+#:
+#: Both figures are correct and neither is derived from the other, so they can
+#: disagree in direction: real workspaces carry 0 conformant with 5 verified
+#: clear, and 1 conformant with 4 verified clear. Labelled with one shared noun
+#: ("controls") they read as a contradiction on the page an auditor pushes on,
+#: which is the defect commit ``6a2cd0644`` fixed for the two "first things to
+#: do" counts. So the verified-clear label names ITS unit, the check, and the
+#: conformance tiles keep the grid's own unit. Declaring both here, once, keeps
+#: the collision from returning.
+CONFORMANT_CONTROLS_LABEL = "Conformant"
+VERIFIED_CLEAR_LABEL = "Checks verified clear"
+
+#: The client label of every conformity status the engine assigns a control,
+#: as the report's compliance scorecard prints it. The web Compliance page
+#: serves the SAME labels (``compliance_service.web_status_labels``), so a
+#: control reads the same on the PDF and on the platform. None of them says
+#: "compliant": ADscan assesses conformance against a framework's measures, it
+#: does not certify compliance, and "Compliant" read as the certification.
+CONFORMITY_STATUS_LABELS: dict[str, str] = {
+    "non_conformant": "Non-conformant",
+    "partially_conformant": "Partial",
+    "conformant": CONFORMANT_CONTROLS_LABEL,
+    "pending_client_evidence": "Client evidence required",
+    "not_applicable": "Not applicable",
+    "compensatory_measure": "Compensatory measure",
+    "not_assessed": "Not assessed",
+}
+
+
+def conformity_status_label(status: object) -> str:
+    """Return the client label of an engine conformity status.
+
+    An unknown status is never read as a verdict: it renders "Not assessed".
+    """
+    key = str(status or "").strip().lower()
+    return CONFORMITY_STATUS_LABELS.get(key, CONFORMITY_STATUS_LABELS["not_assessed"])
+
+
+#: Why a control reads "Not assessed", when the engine knows a specific cause.
+#: The card on the PDF and the platform print the label beside the status, so a
+#: control the authorization kept out of scope never reads like one nobody
+#: thought to test. The key is the engine's ``not_assessed_reason``.
+#: The control's only evidence was observed on some of the hosts it covers and
+#: not confirmed on the rest. Neither a pass nor a gap.
+INCOMPLETE_EVIDENCE_NOT_ASSESSED_REASON = "evidence_not_confirmed_on_every_host"
+
+NOT_ASSESSED_REASON_LABELS: dict[str, str] = {
+    "excluded_by_scan_policy": "Not assessed, excluded by the scan policy",
+    INCOMPLETE_EVIDENCE_NOT_ASSESSED_REASON: (
+        "Not assessed, not confirmed on every host"
+    ),
+}
+
+
+def not_assessed_reason_label(reason: object) -> str:
+    """Return the client label for a ``not_assessed_reason`` (``""`` when unknown)."""
+    return NOT_ASSESSED_REASON_LABELS.get(str(reason or "").strip().lower(), "")
+
+#: The singular noun the verified-clear count is measured in. Rendered through
+#: :func:`verified_clear_phrase` so no surface spells the plural a second way.
+VERIFIED_CLEAR_NOUN = "check"
+
+#: The ONE sentence a reader who meets both counts needs. Without it the two
+#: positive totals invite an arithmetic a reader cannot complete, because they
+#: are over different sets and neither is a subset of the other.
+VERIFIED_CLEAR_SEPARATION_CLAUSE = (
+    "The two totals count different sets and do not add up."
+)
+
+#: The unit the codes beside a verified-clear count are measured in. A
+#: DIFFERENT unit from the count itself, which is the whole reason this constant
+#: exists beside :data:`VERIFIED_CLEAR_NOUN`.
+VERIFIED_CLEAR_CODE_NOUN = "control code"
+
+#: The noun for one entry of the AD Control Coverage Report's tested set, which
+#: is the SAME universe the verified-clear figure is drawn from. Declared here
+#: because the figure's unit was reconciled to the check in the Security
+#: Assessment Report while its destination document still headed its column
+#: "Controls tested", so a client following the pointer arrived at a different
+#: noun for the thing they had just been counting.
+CHECKS_RUN_LABEL = "Checks run"
+
+
+def checks_count_phrase(count: int) -> str:
+    """Return a bare count of checks, in the kit's one noun for them.
+
+    The smallest piece of this vocabulary, and the one every other phrase here
+    is built from, so a count of the coverage document's entries is spelled one
+    way wherever it appears: the cover snapshot, the ledger, a section eyebrow.
+    The eyebrows are why it exists. The totals were reconciled to the check
+    while the section headers over the SAME figures still read ``4 CONTROLS``
+    and ``27 CONTROLS``, so one page told a reader that 4 was a count of checks
+    in its body and a count of controls two inches above it, on exactly the
+    distinction this vocabulary was introduced to draw.
+
+    Args:
+        count: How many checks.
+
+    Returns:
+        ``"1 check"`` / ``"27 checks"``, thousands-separated.
+    """
+    noun = VERIFIED_CLEAR_NOUN if count == 1 else f"{VERIFIED_CLEAR_NOUN}s"
+    return f"{count:,} {noun}"
+
+
+def verified_clear_phrase(count: int) -> str:
+    """Return the client-facing phrase for a verified-clear count.
+
+    The SSOT for how the verified-clear figure is NAMED in prose on every
+    surface: the Security Assessment Report's compliance snapshot card, its
+    per-framework note, and the web CTEM's framework card. They used to spell it
+    "control", the same noun the conformance tiles beside them use for a
+    different universe.
+
+    Args:
+        count: How many checks came back verified clear.
+
+    Returns:
+        ``"1 check verified clear"`` / ``"5 checks verified clear"``. A zero
+        count is rendered rather than suppressed, because deciding whether to
+        show the figure at all belongs to the caller.
+    """
+    return f"{checks_count_phrase(count)} verified clear"
+
+
+def verified_clear_codes_phrase(codes: Any) -> str:
+    """Return the clause naming the control codes a verified-clear count sits under.
+
+    The SSOT for a defect that reads as arithmetic failure. The verified-clear
+    figure counts CHECKS and the codes beside it are the control codes those
+    checks were recorded under, so the two lists are different lengths by
+    construction: one real kit printed "4 checks verified clear (A.5.15,
+    A.8.20, A.5.17, A.8.9, A.8.3, A.8.5)", four followed by six, and the ENS,
+    NIS2 and DORA sections each printed four followed by three.
+
+    The figures were right and the presentation was not: a bare parenthetical
+    after a count reads as the enumeration OF that count. So the relationship
+    is stated in the words, here, and no surface can present the codes as a
+    list of the counted thing.
+
+    Args:
+        codes: The control codes, in the order the engine recorded them. A
+            non-iterable or empty value yields ``""``, which suppresses the
+            clause rather than printing an empty bracket.
+
+    Returns:
+        ``"recorded under 6 control codes (A.5.15, ...)"``, or ``""``.
+    """
+    if isinstance(codes, (str, bytes)) or not isinstance(codes, Iterable):
+        return ""
+    cited = [str(code).strip() for code in codes if str(code or "").strip()]
+    if not cited:
+        return ""
+    noun = (
+        VERIFIED_CLEAR_CODE_NOUN
+        if len(cited) == 1
+        else f"{VERIFIED_CLEAR_CODE_NOUN}s"
+    )
+    return f"recorded under {len(cited):,} {noun} ({', '.join(cited)})"
+
+
+def checks_run_phrase(count: int) -> str:
+    """Return the phrase for how many checks a coverage document reports.
+
+    Shares :data:`VERIFIED_CLEAR_NOUN` with :func:`verified_clear_phrase`, so
+    the AD Control Coverage Report's total and the Security Assessment Report's
+    verified-clear subset of it are measured in one noun.
+    """
+    return f"{checks_count_phrase(count)} run"
 
 #: Sentinel returned when a registered value is genuinely absent on the workspace
 #: (an older artifact, or a derived scalar not yet stamped). Distinct from ``None``
@@ -456,10 +634,13 @@ def recovered_secret_reconcile_clause(
     others = total - 1
     if others <= 0:
         return "This count includes the krbtgt account key."
-    account_word = "account" if others == 1 else "accounts"
+    # States the total AND the remainder, so the sentence adds up on its own:
+    # "alongside 16" beside a "16 accounts" chip read as 17 against a table
+    # whose rows the reader had to sum (release gate 14.0.0, SAR).
+    noun = "user or service account" if others == 1 else "user and service accounts"
     return (
-        f"This count includes the krbtgt account key alongside {others} user and "
-        f"service {account_word}."
+        f"This count includes the krbtgt account key and {others} {noun}, "
+        f"{total} in all."
     )
 
 
@@ -822,6 +1003,20 @@ __all__ = [
     "MISSING",
     "FINDINGS_ON_PATH_LABEL",
     "ACCOUNTS_ON_PATH_LABEL",
+    "CONFORMANT_CONTROLS_LABEL",
+    "CONFORMITY_STATUS_LABELS",
+    "conformity_status_label",
+    "NOT_ASSESSED_REASON_LABELS",
+    "not_assessed_reason_label",
+    "VERIFIED_CLEAR_LABEL",
+    "VERIFIED_CLEAR_NOUN",
+    "VERIFIED_CLEAR_SEPARATION_CLAUSE",
+    "VERIFIED_CLEAR_CODE_NOUN",
+    "CHECKS_RUN_LABEL",
+    "checks_count_phrase",
+    "verified_clear_codes_phrase",
+    "checks_run_phrase",
+    "verified_clear_phrase",
     "read_kit_fact",
     "build_kit_facts",
     "chain_reconcile_clause",

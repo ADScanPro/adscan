@@ -7,6 +7,8 @@ behaviour stable for the current CLI.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 import json
 import os
@@ -954,7 +956,7 @@ def check_pivot_reachability_via_winrm(
             f"{subnet_candidates} same-subnet, {routed_candidates} routed)."
         )
 
-        default_confirm = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        default_confirm = policy_settings.expands_scope_automatically(shell)
         if not Confirm.ask(
             (
                 f"Do you want to probe {len(selected_targets)} likely pivot target(s) from "
@@ -1591,6 +1593,8 @@ def check_dpapi(
         )
         pdc_ip = str(domain_data.get("pdc") or "").strip()
         ad_users = _load_dpapi_ad_users(shell, domain)
+        # The per-account attempt budget is the sign-in lockout guard's
+        # decision (scan policy margin + live badPwdCount), not this caller's.
         enriched = _run_native_async(
             process_dpapi_credentials(
                 dump_result.normalized_credentials,
@@ -2264,7 +2268,7 @@ def _is_ctf_domain_pwned(shell: Any, domain: str) -> bool:
                 return True
         except Exception:  # pragma: no cover - defensive
             return False
-    if str(getattr(shell, "type", "")).strip().lower() != "ctf":
+    if not policy_settings.aims_at_domain_compromise(shell):
         return False
     domains_data = getattr(shell, "domains_data", {}) or {}
     domain_data = domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
@@ -2302,7 +2306,7 @@ def _build_winrm_mapping_cache_metadata(
     host: str,
     domain: str,
     username: str,
-    workspace_type: str,
+    environment: str,
     root_strategy: str,
     excluded_path_prefixes: list[str],
     excluded_directory_names: list[str],
@@ -2313,7 +2317,7 @@ def _build_winrm_mapping_cache_metadata(
         "host": host,
         "domain": domain,
         "username": username,
-        "workspace_type": workspace_type,
+        "environment": environment,
         "root_strategy": root_strategy,
         "excluded_path_prefixes": list(excluded_path_prefixes),
         "excluded_directory_names": list(excluded_directory_names),
@@ -2488,7 +2492,7 @@ def _run_winrm_sensitive_scan_phase(
     phase_definition = get_sensitive_phase_definition(phase)
     phase_label = str(phase_definition.get("label", phase) or phase)
     phase_root_abs = os.path.join(run_root_abs, phase)
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    environment = str(policy_settings.policy_environment(shell) or "")
 
     # ── Loot cache resolution ─────────────────────────────────────────────────
     # When a loot_cache_base is provided, store fetched files there instead of
@@ -2587,7 +2591,6 @@ def _run_winrm_sensitive_scan_phase(
             loot_dir=loot_dir,
             meta_path=loot_meta_path,
             phase_label=phase_label,
-            workspace_type=workspace_type,
             transport_label="WinRM",
         )
     )
@@ -2607,7 +2610,7 @@ def _run_winrm_sensitive_scan_phase(
                 service=service,
                 selected_entries=selected_entries,
                 loot_dir=loot_dir,
-                workspace_type=workspace_type or None,
+                environment=environment or None,
             )
             if loot_meta_path:
                 _write_winrm_loot_cache_metadata(
@@ -2646,7 +2649,7 @@ def _fetch_winrm_phase_files(
     service: WinRMPSRPService,
     selected_entries: list[WinRMFileMapEntry],
     loot_dir: str,
-    workspace_type: str | None = None,
+    environment: str | None = None,
     batch_threshold: int = 8,
 ) -> WindowsArtifactAcquisitionResult:
     """Fetch WinRM candidates with batch staging when the candidate set is large."""
@@ -2687,7 +2690,7 @@ def _fetch_winrm_phase_files(
     result = WindowsArtifactAcquisitionService().acquire_files(
         file_targets=file_targets,
         download_dir=loot_dir,
-        workspace_type=workspace_type,
+        environment=environment,
         batch_threshold=batch_threshold,
         batch_fetcher=_batch_fetcher,
         file_fetcher=_file_fetcher,
@@ -2785,8 +2788,7 @@ def _run_winrm_ai_sensitive_data_scan(
                     ),
                     selected_entries=selected_entries,
                     loot_dir=loot_dir,
-                    workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
-                    or None,
+                    environment=policy_settings.policy_environment(shell),
                 )
             ),
             render_findings_table=lambda current_shell, candidate, findings, source_label: (
@@ -2851,7 +2853,7 @@ def run_winrm_sensitive_data_scan(
     )
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root_strategy = WINRM_ROOT_STRATEGY_AUTO
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
+    environment = str(policy_settings.policy_environment(shell) or "real")
     run_folder = f"{run_id}_{username}_{root_strategy}".replace("\\", "_").replace(
         "/", "_"
     )
@@ -2888,7 +2890,7 @@ def run_winrm_sensitive_data_scan(
         host=host,
         domain=domain,
         username=username,
-        workspace_type=workspace_type,
+        environment=environment,
         root_strategy=root_strategy,
         excluded_path_prefixes=excluded_path_prefixes,
         excluded_directory_names=excluded_directory_names,
@@ -2949,7 +2951,6 @@ def run_winrm_sensitive_data_scan(
         cached = try_use_mapping_cache(
             shell,
             manifest_path=cache_manifest_abs,
-            workspace_type=workspace_type,
             transport_label="WinRM",
             loader=_winrm_loader,
         )

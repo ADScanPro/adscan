@@ -86,8 +86,18 @@ def load_report_summary(scan_dir: Path) -> dict[str, Any] | None:
         return None
 
 
+def writes_evidence(result: CVEResult) -> bool:
+    """Return True when ``persist_report`` writes a per-finding file for ``result``."""
+    return result.status in (CVEStatus.VULNERABLE, CVEStatus.ERROR)
+
+
+def evidence_relpath(result: CVEResult) -> str:
+    """Return the per-finding evidence path, relative to the scan directory."""
+    return f"{_safe(result.cve_id)}/{_safe(result.host)}.json"
+
+
 def _persist_evidence(scan_dir: Path, result: CVEResult) -> None:
-    if result.status not in (CVEStatus.VULNERABLE, CVEStatus.ERROR):
+    if not writes_evidence(result):
         return
     cve_dir = scan_dir / _safe(result.cve_id)
     cve_dir.mkdir(parents=True, exist_ok=True)

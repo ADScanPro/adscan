@@ -27,8 +27,12 @@ Design: docs/superpowers/specs/2026-08-03-kerberos-coercion-capture-module.md
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 import secrets
 from typing import Any
+
+from rich.markup import escape as rich_markup_escape
 
 from adscan_core import telemetry
 from adscan_core.rich_output import (
@@ -47,7 +51,6 @@ from adscan_internal.services.adidns import ADIDNSConfig
 from adscan_internal.services.adspn import ADSPNConfig, adspn_scope
 from adscan_internal.services.credential_store_service import (
     CredentialStoreService,
-    get_stored_domain_credential_for_user,
 )
 from adscan_internal.services.cross_forest_tgt_delegation import (
     CrossOrgTgtDelegationResult,
@@ -80,7 +83,7 @@ def _classify_secret(secret: str) -> tuple[str | None, str | None, str | None]:
 def _register_env_change(shell: Any, **kwargs: Any) -> None:
     """Best-effort audit entry in the environment-change ledger (rollback)."""
     try:
-        ledger = getattr(shell, "environment_change_ledger", None)
+        ledger = ledger_or_warn(shell)
         if ledger is None:
             return
         ledger.register_change(**kwargs)
@@ -88,10 +91,6 @@ def _register_env_change(shell: Any, **kwargs: Any) -> None:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
 
-# Preferred writer principals (in the compromised TRUSTED forest) for the ADIDNS
-# A-record bind, most-privileged first. We hold at least one after compromising
-# that forest; the resolver falls back to any owned credential.
-_WRITER_CANDIDATES = ("Administrator", "administrator")
 
 
 def _hex_to_bytes(value: str | None) -> bytes | None:
@@ -167,42 +166,31 @@ def _resolve_writer_credential(
 ) -> tuple[str, str] | None:
     """Return ``(username, secret)`` to bind ADIDNS in the compromised forest.
 
-    We must be able to write an A record in the trusted forest's DNS. After
-    compromising that forest we hold a domain-admin credential; pick the most
-    privileged available, else any owned principal.
+    The writer is the credential the privilege SSOT grades as a domain-wide
+    administrator of that forest (Domain/Enterprise Admin, BUILTIN
+    Administrators, or the RID 500 account by its collected or replicated SID),
+    ranked by role then secret kind. Never a credential chosen by NAME, and
+    never "any owned principal": an arbitrary stored secret may be stale, and
+    binding with it is a failed logon on that account.
     """
-    domains_data = getattr(shell, "domains_data", {})
-    for candidate in _WRITER_CANDIDATES:
-        secret = get_stored_domain_credential_for_user(
-            domains_data, domain=service_domain, username=candidate
-        )
-        if secret:
-            return candidate, secret
-    domain_data = domains_data.get(service_domain, {}) or {}
-    credentials = domain_data.get("credentials", {})
-    if isinstance(credentials, dict):
-        for username in credentials:
-            secret = get_stored_domain_credential_for_user(
-                domains_data, domain=service_domain, username=str(username)
-            )
-            if secret:
-                return str(username), secret
-    return None
+    from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+        pick_credential_for_local_admin,
+    )
+
+    picked = pick_credential_for_local_admin(shell, domain=service_domain)
+    if not picked:
+        return None
+    username, secret, _kind = picked
+    if not str(username or "").strip() or not str(secret or "").strip():
+        return None
+    return str(username), str(secret)
 
 
 def _resolve_listener_host(shell: Any, coerce_dc_ip: str) -> str:
     """Our reachable IP the relay alias points at and the listener binds on."""
-    candidate = str(getattr(shell, "myip", "") or "").strip()
-    if candidate:
-        return candidate
-    import socket
+    from adscan_internal.services.listener_ip import resolve_listener_ip
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((coerce_dc_ip, 445))
-            return str(sock.getsockname()[0])
-    except OSError:
-        return ""
+    return resolve_listener_ip(shell, target=coerce_dc_ip).ip or ""
 
 
 async def run_cross_org_tgt_delegation_step(
@@ -227,18 +215,43 @@ async def run_cross_org_tgt_delegation_step(
     coerce/decode/DCSync is validated at L3 (DarkZero).
     """
     def _abort(error: str) -> CrossOrgTgtDelegationResult:
-        """Return a failed result AND log its reason to the debug sink.
+        """Return a failed result AND tell the operator why the step did not run.
 
-        Without this, an early-return capability gap ("no key material for the
-        trusted DC machine account") looked like "nothing happened" in the log.
-        Kept at debug level and vendor-neutral (a technique-narrative surface).
+        An early-return capability gap ("no key material for the trusted DC
+        machine account") used to reach only the debug sink, so an
+        operator-launched attack path stopped at this step with no visible
+        output. The reason is vendor-neutral, so it is shown at warning level;
+        the caller therefore must not print a second line for an abort result
+        (the post-run "did not complete" warning below only fires for a step
+        that actually ran).
         """
+        print_warning(
+            f"Cross-org TGT delegation did not run: {rich_markup_escape(error)}."
+        )
         print_info_debug(
             "cross-org TGT delegation: step did not run: "
             f"trusting={mark_sensitive(trusting_domain, 'domain')} "
             f"service={mark_sensitive(service_domain, 'domain')} reason={error}"
         )
         return CrossOrgTgtDelegationResult(success=False, error=error)
+
+    # Engagement scope is contractual: the trusting forest is acted on only when
+    # it is in scope, whoever asks (an attack-path step, the post-compromise
+    # drain or a manual command). The refusal prints its own line.
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        gate_cross_domain_technique,
+    )
+
+    if not gate_cross_domain_technique(
+        shell,
+        technique="CrossOrgTgtDelegation",
+        source_domain=service_domain,
+        target_domain=trusting_domain,
+        surface="cross_org_tgt_delegation",
+    ):
+        return CrossOrgTgtDelegationResult(
+            success=False, error="outside the engagement scope"
+        )
 
     domains_data = getattr(shell, "domains_data", {})
 

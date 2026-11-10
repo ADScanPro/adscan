@@ -39,7 +39,6 @@ class IsolatedToolsDeps:
     install_pyenv_python_and_venv: Callable[..., tuple[bool, str, str | None]]
     apply_effective_user_home_to_env: Callable[[Dict[str, str]], None]
     expand_effective_user_path: Callable[[str], str]
-    get_nxc_base_dir: Callable[[], str]
     sudo_validate: Callable[[], bool]
     telemetry_capture_exception: Callable[[BaseException], None]
     telemetry_capture: Callable[..., None]
@@ -448,7 +447,6 @@ def check_executable_help_works(
         [executable_path, "--help"],
         [executable_path, "-h"],
     ]
-    attempted_nxc_fix = False
     attempted_manspider_fix = False
     diagnosed_help_failure = False
     for cmd in help_variants:
@@ -589,83 +587,6 @@ def check_executable_help_works(
                     f"[check] Failed to auto-repair manspider permissions: {fix_e}"
                 )
 
-        if (
-            not attempted_nxc_fix
-            and "permissionerror" in combined.lower()
-            and ".nxc" in combined
-        ):
-            attempted_nxc_fix = True
-            nxc_dir = deps.get_nxc_base_dir()
-            deps.print_warning(
-                f"{tool_name} cannot write to its NetExec state directory ({nxc_dir})."
-            )
-            if not fix:
-                deps.print_info_verbose(
-                    "Run `adscan check --fix` to attempt automatic permission repairs."
-                )
-                continue
-            try:
-                current_name = current_user_name()
-                target_user = os.environ.get("SUDO_USER") or current_name
-                target_group = current_name
-
-                if effective_user_is_root():
-                    # Running as root: fix directly.
-                    deps.run_command(
-                        [
-                            "chown",
-                            "-R",
-                            f"{target_user}:{target_group or target_user}",
-                            nxc_dir,
-                        ],
-                        check=False,
-                        capture_output=True,
-                        timeout=15,
-                    )
-                else:
-                    # Validate sudo so we can prompt if needed, then fix permissions.
-                    if deps.sudo_validate():
-                        deps.run_command(
-                            [
-                                "sudo",
-                                "-n",
-                                "chown",
-                                "-R",
-                                f"{target_user}:{target_group or target_user}",
-                                nxc_dir,
-                            ],
-                            check=False,
-                            capture_output=True,
-                            timeout=30,
-                        )
-                # Retry same help command once after attempting the fix.
-                retry = deps.run_command(
-                    cmd,
-                    check=False,
-                    capture_output=True,
-                    env=env,
-                    timeout=timeout_seconds,
-                )
-                if retry.returncode == 0:
-                    deps.print_success(
-                        f"{tool_name} is now runnable after repairing permissions."
-                    )
-                    return True
-                # If retry failed, continue loop and log details below.
-                result = retry
-                returncode = retry.returncode
-                stdout_text = retry.stdout or ""
-                stderr_text = retry.stderr or ""
-                combined = (
-                    f"{(result.stdout or '').strip()}\n{(result.stderr or '').strip()}"
-                )
-            except Exception as fix_e:  # pragma: no cover - environment dependent
-                deps.telemetry_capture_exception(fix_e)
-                print_exception(exception=fix_e)
-                deps.print_info_debug(
-                    f"[check] Failed to auto-repair NetExec permissions: {fix_e}"
-                )
-
         output_preview = "\n".join(
             s for s in [(stdout_text or "").strip(), (stderr_text or "").strip()] if s
         )[:800]
@@ -691,7 +612,7 @@ def fix_isolated_python_tool_venv(
     This recreates the tool venv and reinstalls the tool spec defined in PipToolsConfig.
 
     Args:
-        tool_key: Key in PipToolsConfig (e.g., "manspider", "netexec").
+        tool_key: Key in PipToolsConfig (e.g., "manspider", "credsweeper").
         tool_venvs_base_dir: Base directory for tool venvs (e.g., ~/.adscan/tool_venvs)
         venv_path: Path to the main ADscan venv
         python_version: Pyenv Python version to use for venv creation.

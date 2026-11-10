@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from rich.box import ROUNDED, SIMPLE
 from rich.columns import Columns
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -249,6 +250,14 @@ class CollectionSummary:
     trustedby_edges: int
     elapsed_seconds: float
     credential_label: str = ""
+    # Parts of the directory the collection could not finish reading (operator
+    # labels). Non-empty means the panel must not read "Collection Complete".
+    unread_parts: tuple[str, ...] = ()
+
+    @property
+    def incomplete(self) -> bool:
+        """Return True when a part of the directory was not read."""
+        return bool(self.unread_parts)
 
     @property
     def total_nodes(self) -> int:
@@ -273,6 +282,8 @@ def format_collection_summary_text(summary: CollectionSummary) -> str:
     ]
     if summary.credential_label:
         lines.append(f"Credential: {summary.credential_label}")
+    if summary.incomplete:
+        lines.append(f"Not read: {', '.join(summary.unread_parts)}")
     return "\n".join(lines)
 
 
@@ -299,7 +310,12 @@ def print_collection_summary(summary: CollectionSummary) -> None:
     )
 
     # --- Status icon ---
-    if summary.total_nodes > 0:
+    if summary.total_nodes > 0 and summary.incomplete:
+        # A partial read is never presented as the directory.
+        status_icon = f"[bold {_AMBER}]◐[/]"
+        border = "yellow"
+        title_label = "Collection Incomplete"
+    elif summary.total_nodes > 0:
         status_icon = f"[bold {_SAGE}]◉[/]"
         border = "green"
         title_label = "Collection Complete"
@@ -372,7 +388,18 @@ def print_collection_summary(summary: CollectionSummary) -> None:
             f"[{_STEEL}]{summary.credential_label}[/]",
         )
 
-    body = Columns([left, right], equal=False, expand=False, padding=(0, 4))
+    body: Any = Columns([left, right], equal=False, expand=False, padding=(0, 4))
+    if summary.incomplete:
+        note = Text.assemble(
+            ("Not read: ", f"bold {_AMBER}"),
+            (", ".join(summary.unread_parts), ""),
+            (
+                ". The counts above cover only what was read before the "
+                "collection was cut off.",
+                _MUTED,
+            ),
+        )
+        body = Group(body, Text(""), note)
 
     title = Text.assemble(
         Text.from_markup(f"{status_icon} "),

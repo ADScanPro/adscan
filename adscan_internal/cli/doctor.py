@@ -30,16 +30,35 @@ Checks (each reuses an existing service — nothing is reimplemented here):
   lightweight posture PROBE (LDAP signing / CBT / LDAPS reachability) against the
   DC; it is a probe, never a collection.
 
+* **Trusted domains (opt-in)** — ``--trusts all|selected`` repeats a lightweight
+  subset of the above for each in-scope trust partner: locate its DC (the same
+  cross-domain discovery the scan uses), probe the AD ports, authenticate with
+  the SAME credential across the trust (auth domain = origin, target = trusted,
+  Kerberos cross-realm) and count its enabled users/computers. Never recurses
+  into the trusted domain's own trusts and never builds a graph. Default
+  (``origin_only``) touches no other domain and is byte-identical to before.
+  ``--trusts interactive`` asks which listed partners to validate (the scan's
+  trust-scope prompt, over the remote-interaction bridge); with no operator to
+  ask, or no answer in ``DOCTOR_DECISION_TIMEOUT_SECONDS``, it validates the
+  origin only. Partners the operator declined are reported as such.
+
 Non-interactive-safe: defaults to an ephemeral temp workspace and never blocks
-on a prompt. The exit code is ``0`` only when every applicable check passed
-(``"skip"`` and ``"info"`` rows never fail the run). Pass ``--json`` to emit one
-structured JSON object to stdout for the web backend instead of the human matrix.
+on a prompt. Pass ``--json`` to emit one structured JSON object to stdout for the
+web backend instead of the human matrix.
+
+Exit-code contract (``DoctorReport.exit_code``):
+
+* ``0`` — ready: every applicable check passed (``"skip"`` / ``"info"`` rows never
+  fail the run) and every in-scope trusted domain validated.
+* ``1`` — origin not ready: a runtime / origin-domain check failed.
+* ``2`` — partial: the origin is ready but at least one in-scope trusted domain
+  could not be reached or authenticated. The origin verdict is never turned red
+  by a trusted domain; scripts that only care about the origin treat ``2`` as ok.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -55,6 +74,57 @@ from adscan_internal.services.graph_queries.inventories import (
     ENABLED_REAL_USERS_LDAP_FILTER,
 )
 from adscan_core.rich_output import print_exception
+from adscan_internal.services.scan_config import (
+    TRUST_POLICY_ALL,
+    TRUST_POLICY_INTERACTIVE,
+    TRUST_POLICY_ORIGIN_ONLY,
+    TRUST_POLICY_SELECTED,
+)
+
+
+# Trust-validation scopes doctor accepts: the scan's ``trust_enumeration.policy``
+# vocabulary (scan_config.py) minus the ``skip`` alias. ``interactive`` is
+# "decide during validation": after the origin's trust partners are listed the
+# operator is asked which to validate, through the SAME remote-interaction bridge
+# the scan's trust-scope prompt uses. Mirrored by the web schema and locked by
+# tests/unit/test_cli_web_scan_config_contract.py.
+DOCTOR_TRUST_SCOPES: tuple[str, ...] = (
+    TRUST_POLICY_ORIGIN_ONLY,
+    TRUST_POLICY_ALL,
+    TRUST_POLICY_SELECTED,
+    TRUST_POLICY_INTERACTIVE,
+)
+
+# How long the decision prompt waits for an answer before resolving to the
+# origin only. A preflight must not hang for the scan prompt's one hour. The web
+# worker exports it as ``ADSCAN_INTERACTIVE_TIMEOUT_SECONDS`` for the doctor
+# process (the bridge reads its timeout from that variable) and sizes its own
+# subprocess budget as the trust budget plus this window.
+DOCTOR_DECISION_TIMEOUT_SECONDS = 180
+
+# Resolutions of the decision prompt (``DoctorReport.decision``).
+DECISION_ANSWERED = "answered"  # the operator chose (possibly the origin alone)
+DECISION_TIMEOUT = "timeout"  # nobody answered in time: origin only
+DECISION_AUTO = "auto"  # no operator channel (plain CLI / CI): origin only
+
+# Hard ceiling on how many trusted domains ``--trusts all`` validates in one run.
+# Each domain costs a DNS lookup, a port probe, a cross-realm bind and two paged
+# counts, sequentially, so an unbounded forest would blow the preflight budget.
+# Domains past the cap are reported "not validated" with the reason, never
+# silently dropped.
+MAX_TRUSTED_DOMAINS_VALIDATED = 16
+
+ROLE_ORIGIN = "origin"
+ROLE_TRUSTED = "trusted"
+
+# Per-domain validation states in the report's ``domains`` block.
+DOMAIN_STATE_READY = "ready"
+DOMAIN_STATE_NOT_READY = "not_ready"
+DOMAIN_STATE_NOT_VALIDATED = "not_validated"
+
+VERDICT_READY = "ready"
+VERDICT_PARTIAL = "partial"
+VERDICT_NOT_READY = "not_ready"
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +145,10 @@ class DoctorCheck:
             structured ``--json`` machine contract. ``None`` for non-numeric rows.
         items: Optional string list payload (e.g. trusted-domain names) for the
             structured ``--json`` machine contract. ``None`` when not applicable.
+        domain: The domain this row validates, or ``None`` for a runtime-level
+            row (the preflight) that belongs to no domain.
+        role: ``"origin"`` / ``"trusted"`` for a domain row, ``None`` otherwise.
+            A row with ``role != "trusted"`` decides the origin verdict.
     """
 
     name: str
@@ -82,6 +156,8 @@ class DoctorCheck:
     detail: str = ""
     value: int | None = None
     items: list[str] | None = None
+    domain: str | None = None
+    role: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize one row to the structured machine contract."""
@@ -91,6 +167,55 @@ class DoctorCheck:
             "detail": self.detail,
             "value": self.value,
             "items": list(self.items) if self.items is not None else None,
+            "domain": self.domain,
+            "role": self.role,
+        }
+
+
+@dataclass(frozen=True)
+class DomainValidation:
+    """Validation outcome of one domain, for the report's ``domains`` block.
+
+    Attributes:
+        domain: Domain name.
+        role: ``"origin"`` or ``"trusted"``.
+        state: ``ready`` / ``not_ready`` / ``not_validated``. ``not_validated``
+            means doctor deliberately did not look (outside the requested scope,
+            over the cap, or the origin bind needed to reach it failed): its
+            counts are unknown, not zero.
+        dc_ip: The DC doctor located for the domain, when it did.
+        enabled_users: Enabled user count, ``None`` when not measured.
+        enabled_computers: Enabled computer count, ``None`` when not measured.
+        reason: One-line human reason for any state other than ``ready``.
+        trust_listed: For trusted domains, whether the origin lists it as a
+            direct trust partner.
+        declined: ``True`` only for a domain the operator was asked about and
+            chose not to validate. Distinct from "outside the scope", which
+            nobody decided.
+    """
+
+    domain: str
+    role: str
+    state: str
+    dc_ip: str = ""
+    enabled_users: int | None = None
+    enabled_computers: int | None = None
+    reason: str = ""
+    trust_listed: bool | None = None
+    declined: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the structured machine contract."""
+        return {
+            "domain": self.domain,
+            "role": self.role,
+            "state": self.state,
+            "dc_ip": self.dc_ip,
+            "enabled_users": self.enabled_users,
+            "enabled_computers": self.enabled_computers,
+            "reason": self.reason,
+            "trust_listed": self.trust_listed,
+            "declined": self.declined,
         }
 
 
@@ -101,13 +226,36 @@ class DoctorReport:
     ``on_check`` is an optional callback fired with each :class:`DoctorCheck` the
     instant it is appended. The streaming web preflight wires it to emit one
     ``doctor_check`` structured event per row so the platform matrix fills in
-    live (DNS, then DC connectivity, then Authentication, …) instead of one batch
+    live (DNS, then DC connectivity, then Authentication, ...) instead of one batch
     at the end. It is a no-op for the plain CLI matrix path, so the human
     ``adscan doctor`` run is unaffected.
+
+    The multi-domain bookkeeping (``origin_domain``, ``scope_policy``, ...) is
+    filled by :func:`run_doctor`; a bare report (unit tests, origin-only callers)
+    leaves it empty and behaves exactly like the original single-domain report.
     """
 
     checks: list[DoctorCheck] = field(default_factory=list)
     on_check: Callable[[DoctorCheck], None] | None = None
+    origin_domain: str = ""
+    origin_dc_ip: str = ""
+    scope_policy: str = TRUST_POLICY_ORIGIN_ONLY
+    # Trust partners the origin lists (lower-cased), and the subset the operator
+    # asked to validate. ``scope_domains`` is the REQUESTED scope after
+    # resolution, before any cap or origin-auth gating.
+    partners: list[str] = field(default_factory=list)
+    scope_domains: list[str] = field(default_factory=list)
+    # Per trusted domain: located DC ip and, for domains doctor decided not to
+    # look at, the reason. Keys are lower-cased domain names.
+    trusted_dc_ip: dict[str, str] = field(default_factory=dict)
+    not_validated_reason: dict[str, str] = field(default_factory=dict)
+    # Interactive scope: how the decision prompt resolved (DECISION_*), and the
+    # partners the operator explicitly declined.
+    decision: str | None = None
+    declined_domains: list[str] = field(default_factory=list)
+    # Per partner: {"direction", "type"} from the origin's trust listing, so the
+    # decision prompt can draw the trust topology.
+    partner_meta: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def add(
         self,
@@ -117,6 +265,8 @@ class DoctorReport:
         *,
         value: int | None = None,
         items: list[str] | None = None,
+        domain: str | None = None,
+        role: str | None = None,
     ) -> None:
         """Append a check result and notify the streaming callback.
 
@@ -126,9 +276,17 @@ class DoctorReport:
             detail: One-line human-facing explanation.
             value: Optional numeric payload (counts) for the JSON contract.
             items: Optional string-list payload (trust domains) for the JSON contract.
+            domain: Domain the row belongs to (``None`` for runtime-level rows).
+            role: ``"origin"`` / ``"trusted"`` for a domain row.
         """
         check = DoctorCheck(
-            name=name, status=status, detail=detail, value=value, items=items
+            name=name,
+            status=status,
+            detail=detail,
+            value=value,
+            items=items,
+            domain=domain,
+            role=role,
         )
         self.checks.append(check)
         # Stream this row live (web preflight); best-effort so a broken sink can
@@ -140,30 +298,147 @@ class DoctorReport:
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
 
+    def scoped(self, domain: str | None, role: str | None) -> "ScopedReport":
+        """Return a view whose ``add`` stamps ``domain`` / ``role`` on every row.
+
+        Lets the per-domain checks stay domain-agnostic: they call ``add`` as
+        always and the view tags the row with the domain it validates.
+        """
+        return ScopedReport(self, domain, role)
+
+    @property
+    def origin_passed(self) -> bool:
+        """True when no runtime / origin-domain check failed.
+
+        Only ``"fail"`` flips a row red. ``"skip"`` (not applicable) and
+        ``"info"`` (informational sizing/inventory data) never fail. Rows of a
+        trusted domain are excluded: a trust partner that cannot be reached must
+        never turn the origin verdict red.
+        """
+        return all(c.status != "fail" for c in self.checks if c.role != ROLE_TRUSTED)
+
     @property
     def passed(self) -> bool:
-        """True when no applicable check failed.
+        """The origin verdict (kept as the gate the web scan form already uses)."""
+        return self.origin_passed
 
-        Only ``"fail"`` flips the run to unhealthy. ``"skip"`` (not applicable)
-        and ``"info"`` (informational sizing/inventory data) never fail.
+    def domain_results(self) -> list[DomainValidation]:
+        """Per-domain outcome: origin first, then every trust partner.
+
+        Trusted domains doctor validated are ``ready`` / ``not_ready`` from their
+        own rows; every listed partner it did not validate is ``not_validated``
+        (counts unknown, not zero) so origin-only numbers are never read as
+        forest-wide.
         """
-        return all(c.status != "fail" for c in self.checks)
+        results: list[DomainValidation] = []
+        origin = self.origin_domain
+        if origin:
+            rows = [c for c in self.checks if c.role == ROLE_ORIGIN]
+            fail = next((c for c in rows if c.status == "fail"), None)
+            ok = self.origin_passed
+            results.append(
+                DomainValidation(
+                    domain=origin,
+                    role=ROLE_ORIGIN,
+                    state=DOMAIN_STATE_READY if ok else DOMAIN_STATE_NOT_READY,
+                    dc_ip=self.origin_dc_ip,
+                    enabled_users=_row_value(rows, "Enabled users"),
+                    enabled_computers=_row_value(rows, "Enabled computers"),
+                    reason="" if ok else (fail.detail if fail else ""),
+                )
+            )
+        listed = {p.lower() for p in self.partners}
+        seen: set[str] = set()
+        for name in [*self.scope_domains, *self.partners]:
+            key = name.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows = [
+                c
+                for c in self.checks
+                if c.role == ROLE_TRUSTED and (c.domain or "").lower() == key
+            ]
+            if not rows:
+                results.append(
+                    DomainValidation(
+                        domain=key,
+                        role=ROLE_TRUSTED,
+                        state=DOMAIN_STATE_NOT_VALIDATED,
+                        reason=self.not_validated_reason.get(
+                            key, "Outside the validation scope."
+                        ),
+                        trust_listed=key in listed,
+                        declined=key in self.declined_domains,
+                    )
+                )
+                continue
+            auth = next((c for c in rows if c.name == "Authentication"), None)
+            fail = next((c for c in rows if c.status == "fail"), None)
+            blocked = fail or next((c for c in rows if c.status == "skip"), None)
+            ready = fail is None and auth is not None and auth.status == "pass"
+            results.append(
+                DomainValidation(
+                    domain=key,
+                    role=ROLE_TRUSTED,
+                    state=DOMAIN_STATE_READY if ready else DOMAIN_STATE_NOT_READY,
+                    dc_ip=self.trusted_dc_ip.get(key, ""),
+                    enabled_users=_row_value(rows, "Enabled users"),
+                    enabled_computers=_row_value(rows, "Enabled computers"),
+                    reason="" if ready else (blocked.detail if blocked else ""),
+                    trust_listed=key in listed,
+                )
+            )
+        return results
+
+    @property
+    def verdict(self) -> str:
+        """``ready`` / ``partial`` / ``not_ready``.
+
+        ``not_ready``: the origin (or runtime) failed. ``partial``: the origin is
+        ready but an in-scope trusted domain was reached for validation and did
+        not pass. ``ready`` otherwise. Domains deliberately not validated do not
+        degrade the verdict: they are unknown by the operator's own choice.
+        """
+        if not self.origin_passed:
+            return VERDICT_NOT_READY
+        trusted = [d for d in self.domain_results() if d.role == ROLE_TRUSTED]
+        if any(d.state == DOMAIN_STATE_NOT_READY for d in trusted):
+            return VERDICT_PARTIAL
+        if self.scope_policy != TRUST_POLICY_ORIGIN_ONLY and any(
+            d.state == DOMAIN_STATE_NOT_VALIDATED
+            and d.domain in {s.lower() for s in self.scope_domains}
+            for d in trusted
+        ):
+            # Asked for, but doctor could not even attempt it (origin bind failed
+            # earlier, or over the cap): an honest partial, not a clean ready.
+            return VERDICT_PARTIAL
+        return VERDICT_READY
 
     @property
     def exit_code(self) -> int:
-        """Process exit code: 0 when healthy, 1 when any check failed."""
-        return 0 if self.passed else 1
+        """Process exit code: 0 ready, 1 origin not ready, 2 partial (see module doc)."""
+        return {VERDICT_READY: 0, VERDICT_NOT_READY: 1}.get(self.verdict, 2)
 
     def to_dict(self, *, domain: str = "", dc_ip: str = "") -> dict[str, Any]:
         """Serialize the whole report to the structured machine contract.
 
         Single source of truth for the ``--json`` output the local web backend
         ingests. Counts and domain names stay as plain data (no telemetry path).
+        The pre-existing keys are unchanged; ``verdict`` / ``scope`` / ``domains``
+        are additive.
         """
         return {
             "domain": domain,
             "dc_ip": dc_ip,
             "passed": self.passed,
+            "verdict": self.verdict,
+            "scope": {
+                "policy": self.scope_policy,
+                "domains": list(self.scope_domains),
+                "decision": self.decision,
+            },
+            "domains": [d.to_dict() for d in self.domain_results()],
             "checks": [c.to_dict() for c in self.checks],
         }
 
@@ -172,6 +447,48 @@ class DoctorReport:
         import json  # noqa: PLC0415
 
         return json.dumps(self.to_dict(domain=domain, dc_ip=dc_ip), ensure_ascii=False)
+
+
+class ScopedReport:
+    """A :class:`DoctorReport` view that tags every added row with a domain."""
+
+    def __init__(self, report: DoctorReport, domain: str | None, role: str | None):
+        self._report = report
+        self._domain = domain
+        self._role = role
+
+    @property
+    def report(self) -> DoctorReport:
+        """The underlying report."""
+        return self._report
+
+    def add(
+        self,
+        name: str,
+        status: str,
+        detail: str = "",
+        *,
+        value: int | None = None,
+        items: list[str] | None = None,
+    ) -> None:
+        """Append a row stamped with this view's domain and role."""
+        self._report.add(
+            name,
+            status,
+            detail,
+            value=value,
+            items=items,
+            domain=self._domain,
+            role=self._role,
+        )
+
+
+def _row_value(rows: list[DoctorCheck], name: str) -> int | None:
+    """Return the numeric payload of the named row, ``None`` when absent."""
+    for row in rows:
+        if row.name == name:
+            return row.value
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -190,9 +507,28 @@ class DoctorConfig:
     password: Optional[str] = None
     workspace: Optional[str] = None
     interface: Optional[str] = None
-    keep_workspace: bool = False
     requested_pro: bool = False
     json_output: bool = False
+    # Trust-validation scope: ``origin_only`` (default, touches no other domain),
+    # ``all`` (every trust partner the origin lists) or ``selected`` (only
+    # ``trust_domains``). Same vocabulary as the scan's trust policy.
+    trust_scope: str = TRUST_POLICY_ORIGIN_ONLY
+    trust_domains: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TrustedTarget:
+    """A trusted domain doctor authenticates into with the ORIGIN credential.
+
+    ``domains_data`` is a private, transient map holding only this domain's
+    located DC, so the validation never writes a half-discovered domain into
+    the operator's (possibly named, persisted) workspace.
+    """
+
+    domain: str
+    auth_domain: str
+    auth_kdc: str
+    domains_data: dict
 
 
 @dataclass(frozen=True)
@@ -489,11 +825,14 @@ def _ensure_dc_fqdn(shell: Any, domain: str, pdc_ip: str) -> None:
         print_exception(exception=exc)
 
 
-def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
-    """TCP reachability of the DC's AD ports (route + port probe)."""
+def _check_connectivity(report: Any, shell: Any, dc_ip: str) -> bool:
+    """TCP reachability of the DC's AD ports (route + port probe).
+
+    Returns ``True`` only when at least one AD port answered.
+    """
     if not dc_ip:
         report.add("DC connectivity", "skip", "No DC IP resolved.")
-        return
+        return False
     try:
         from adscan_internal.services.network_preflight_service import (  # noqa: PLC0415
             DC_REACHABILITY_TCP_PORTS,
@@ -520,6 +859,7 @@ def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
                 f"{mark_sensitive(dc_ip, 'ip')} reachable on "
                 f"{', '.join(str(p) for p in open_ports)}.",
             )
+            return True
         else:
             report.add(
                 "DC connectivity",
@@ -527,13 +867,20 @@ def _check_connectivity(report: DoctorReport, shell: Any, dc_ip: str) -> None:
                 f"No AD ports open on {mark_sensitive(dc_ip, 'ip')} "
                 f"({probed_ports_label} all closed or filtered).",
             )
+            return False
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         report.add("DC connectivity", "fail", f"Reachability probe raised: {exc}")
+        return False
 
 
-def _build_doctor_ldap_config(shell: Any, config: DoctorConfig, dc_ip: str) -> Any:
+def _build_doctor_ldap_config(
+    shell: Any,
+    config: DoctorConfig,
+    dc_ip: str,
+    target: _TrustedTarget | None = None,
+) -> Any:
     """Build a posture-aware authed LDAP config for the doctor checks.
 
     Single source of truth for the authenticated LDAP transport doctor uses
@@ -543,6 +890,12 @@ def _build_doctor_ldap_config(shell: Any, config: DoctorConfig, dc_ip: str) -> A
     routes through ``add_credential`` / ``do_enum_authenticated`` and so never
     triggers the native collector, ADCS discovery, the reachability sweep, or
     an attack-path build.
+
+    With ``target`` the config points at a TRUSTED domain's DC while the
+    credential stays the origin's (``auth_domain`` / ``auth_kdc``), i.e. the
+    cross-realm Kerberos path the scan itself uses. No posture snapshot is
+    applied there: the origin's hardening says nothing about the trusted
+    forest, so the planner keeps its conservative chain.
     """
     from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
         build_ldap_config_for_domain,
@@ -551,9 +904,23 @@ def _build_doctor_ldap_config(shell: Any, config: DoctorConfig, dc_ip: str) -> A
         get_posture,
     )
 
-    domain = (config.domain or "").strip()
     user = (config.username or "").strip()
     password = config.password or ""
+
+    if target is not None:
+        return build_ldap_config_for_domain(
+            target.domains_data,
+            target.domain,
+            username=user,
+            password=password,
+            auth_domain=target.auth_domain,
+            auth_kdc=target.auth_kdc,
+            use_ldaps=True,
+            use_kerberos=True,
+            posture_snapshot=None,
+        )
+
+    domain = (config.domain or "").strip()
 
     # Ensure the domain entry carries the resolved DC IP so the canonical config
     # builder finds it (DNS discovery seeds this; the explicit --dc-ip may not).
@@ -577,7 +944,37 @@ def _build_doctor_ldap_config(shell: Any, config: DoctorConfig, dc_ip: str) -> A
     )
 
 
-def _check_auth(report: DoctorReport, shell: Any, config: DoctorConfig) -> bool:
+def _describe_auth_failure(exc: BaseException) -> str:
+    """Short, honest reason for a failed cross-trust bind (no secrets).
+
+    Maps the Kerberos / LDAP markers an operator can act on; falls back to the
+    exception type. Only used for trusted domains, where "the credential is
+    wrong" and "the trust does not carry this credential" need telling apart.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        ("wrong_realm", "the KDC rejected the realm (wrong KDC for that domain)"),
+        ("s_principal_unknown", "the DC's service principal was not found (SPN/FQDN mismatch)"),
+        ("skew", "clock skew between this host and the domain"),
+        ("client_not_trusted", "the KDC did not trust the client (certificate/clock)"),
+        ("c_principal_unknown", "the account is unknown to its home KDC"),
+        ("preauth_failed", "wrong password for the account"),
+        ("invalidcredentials", "the DC refused the credential across the trust"),
+        ("timeout", "the DC did not answer in time"),
+    )
+    for token, message in markers:
+        if token in text:
+            return message
+    return type(exc).__name__
+
+
+def _check_auth(
+    report: Any,
+    shell: Any,
+    config: DoctorConfig,
+    target: _TrustedTarget | None = None,
+    dc_ip: str = "",
+) -> bool:
     """Authentication — an ISOLATED, lightweight LDAP bind against the DC.
 
     A successful ``ADscanLDAPConnection`` ``__enter__`` IS the verification: it
@@ -601,9 +998,10 @@ def _check_auth(report: DoctorReport, shell: Any, config: DoctorConfig) -> bool:
             "No credentials supplied (-u/-p) — unauthenticated health check.",
         )
         return False
-    dc_ip = ((shell.domains_data or {}).get(domain, {}) or {}).get("pdc") or (
-        config.dc_ip or ""
-    )
+    if target is None:
+        dc_ip = ((shell.domains_data or {}).get(domain, {}) or {}).get("pdc") or (
+            config.dc_ip or ""
+        )
     if not dc_ip:
         report.add("Authentication", "skip", "No DC IP resolved.")
         return False
@@ -612,19 +1010,39 @@ def _check_auth(report: DoctorReport, shell: Any, config: DoctorConfig) -> bool:
             ADscanLDAPConnection,
         )
 
-        ldap_cfg = _build_doctor_ldap_config(shell, config, str(dc_ip))
+        ldap_cfg = (
+            _build_doctor_ldap_config(shell, config, str(dc_ip))
+            if target is None
+            else _build_doctor_ldap_config(shell, config, str(dc_ip), target)
+        )
         # Opening the connection performs the bind; success == authenticated.
         with ADscanLDAPConnection(ldap_cfg):
             pass
-        report.add(
-            "Authentication",
-            "pass",
-            f"Bound as {mark_sensitive(user, 'user')}.",
-        )
+        if target is not None:
+            report.add(
+                "Authentication",
+                "pass",
+                f"Bound as {mark_sensitive(user, 'user')}@"
+                f"{mark_sensitive(target.auth_domain, 'domain')} across the trust.",
+            )
+        else:
+            report.add(
+                "Authentication",
+                "pass",
+                f"Bound as {mark_sensitive(user, 'user')}.",
+            )
         return True
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+        if target is not None:
+            report.add(
+                "Authentication",
+                "fail",
+                "Credential did not authenticate across the trust "
+                f"({_describe_auth_failure(exc)}).",
+            )
+            return False
         report.add(
             "Authentication",
             "fail",
@@ -644,7 +1062,11 @@ def _check_auth(report: DoctorReport, shell: Any, config: DoctorConfig) -> bool:
 
 
 def _count_enabled_objects(
-    shell: Any, config: DoctorConfig, dc_ip: str, search_filter: str
+    shell: Any,
+    config: DoctorConfig,
+    dc_ip: str,
+    search_filter: str,
+    target: _TrustedTarget | None = None,
 ) -> int:
     """Paged LDAP count of enabled objects matching ``search_filter``.
 
@@ -657,7 +1079,11 @@ def _count_enabled_objects(
         ADscanLDAPConnection,
     )
 
-    ldap_cfg = _build_doctor_ldap_config(shell, config, dc_ip)
+    ldap_cfg = (
+        _build_doctor_ldap_config(shell, config, dc_ip)
+        if target is None
+        else _build_doctor_ldap_config(shell, config, dc_ip, target)
+    )
     # Minimal attribute set + paging keep this a counting query, not a load.
     with ADscanLDAPConnection(ldap_cfg) as conn:
         conn.search(
@@ -671,7 +1097,13 @@ def _count_enabled_objects(
 
 
 def _check_enabled_counts(
-    report: DoctorReport, shell: Any, config: DoctorConfig, dc_ip: str, *, authed: bool
+    report: Any,
+    shell: Any,
+    config: DoctorConfig,
+    dc_ip: str,
+    *,
+    authed: bool,
+    target: _TrustedTarget | None = None,
 ) -> None:
     """Count ENABLED users + ENABLED computers via a lightweight paged LDAP query.
 
@@ -693,7 +1125,9 @@ def _check_enabled_counts(
         ("Enabled computers", ENABLED_REAL_COMPUTERS_LDAP_FILTER),
     ):
         try:
-            count = _count_enabled_objects(shell, config, dc_ip, ldap_filter)
+            count = _count_enabled_objects(
+                shell, config, dc_ip, ldap_filter, target
+            )
             report.add(label, "info", detail=str(count), value=count)
         except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
             telemetry.capture_exception(exc)
@@ -702,8 +1136,8 @@ def _check_enabled_counts(
 
 
 def _check_trusts(
-    report: DoctorReport, shell: Any, config: DoctorConfig, dc_ip: str, *, authed: bool
-) -> None:
+    report: Any, shell: Any, config: DoctorConfig, dc_ip: str, *, authed: bool
+) -> list[str] | None:
     """List the source domain's trust partners via a single direct LDAP query.
 
     Doctor must stay a few-seconds preflight, so this issues ONE isolated
@@ -713,13 +1147,16 @@ def _check_trusts(
     NOT call ``DomainService.enumerate_trusts`` — that runs the full recursive
     topology enumeration (native collector, ADCS, reachability sweep, SMB
     enrichment, the trust-enum live widget). Emitted as an ``"info"`` row.
+
+    Returns the sorted partner list (also the ``--trusts all`` scope), or
+    ``None`` when the partners could not be listed.
     """
     if not authed:
         report.add("Trust relationships", "skip", "No authenticated LDAP bind available.")
-        return
+        return None
     if not dc_ip:
         report.add("Trust relationships", "skip", "No DC IP resolved.")
-        return
+        return None
 
     try:
         from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
@@ -739,6 +1176,16 @@ def _check_trusts(
                 if str(getattr(entry, "partner", "") or "").strip()
             }
         )
+        # Keep direction / type per partner for the decision prompt's topology.
+        meta = getattr(getattr(report, "report", report), "partner_meta", None)
+        if isinstance(meta, dict):
+            for entry in entries or []:
+                name = str(getattr(entry, "partner", "") or "").strip().lower()
+                if name:
+                    meta[name] = {
+                        "direction": str(getattr(entry, "direction", "") or ""),
+                        "type": str(getattr(entry, "trust_type", "") or ""),
+                    }
         count = len(partners)
         if count:
             detail = f"{count} ({', '.join(partners)})"
@@ -751,14 +1198,16 @@ def _check_trusts(
             value=count,
             items=partners,
         )
+        return partners
     except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         report.add("Trust relationships", "skip", f"Trust enumeration failed: {exc}")
+        return None
 
 
 def _check_posture(
-    report: DoctorReport, shell: Any, config: DoctorConfig, dc_ip: str
+    report: Any, shell: Any, config: DoctorConfig, dc_ip: str
 ) -> None:
     """Posture probe — the centralized ``ensure_posture_fresh`` guard."""
     domain = (config.domain or "").strip()
@@ -805,14 +1254,428 @@ def _check_posture(
 
 
 # --------------------------------------------------------------------------- #
+# Trusted-domain validation (opt-in via --trusts)
+# --------------------------------------------------------------------------- #
+
+
+def _normalize_domain_token(value: str) -> str:
+    """Lower-case a domain name and strip whitespace / the FQDN root dot."""
+    return str(value or "").strip().rstrip(".").lower()
+
+
+def resolve_trust_scope(
+    policy: str,
+    selected: tuple[str, ...] | list[str],
+    partners: list[str] | None,
+    *,
+    cap: int = MAX_TRUSTED_DOMAINS_VALIDATED,
+) -> tuple[list[str], list[str]]:
+    """Resolve the requested scope into the domains doctor will validate.
+
+    Pure function (the unit-tested scope SSOT).
+
+    Args:
+        policy: One of :data:`DOCTOR_TRUST_SCOPES`.
+        selected: Operator-picked domains (used by ``selected`` only).
+        partners: Trust partners the origin lists, ``None`` when unknown.
+        cap: Maximum domains validated in one run.
+
+    Returns:
+        ``(to_validate, over_cap)``. ``to_validate`` is the ordered, de-duplicated,
+        lower-cased list doctor will visit; ``over_cap`` holds the requested
+        domains dropped by the cap (reported "not validated", never silent).
+        ``origin_only`` always yields two empty lists.
+    """
+    if policy == TRUST_POLICY_ALL:
+        requested = list(partners or [])
+    elif policy == TRUST_POLICY_SELECTED:
+        requested = list(selected or [])
+    else:
+        return [], []
+    ordered: list[str] = []
+    for item in requested:
+        token = _normalize_domain_token(item)
+        if token and token not in ordered:
+            ordered.append(token)
+    return ordered[:cap], ordered[cap:]
+
+
+def _locate_trusted_dc(
+    report: Any,
+    shell: Any,
+    config: DoctorConfig,
+    domain: str,
+    *,
+    resolver_ip: str,
+) -> tuple[str, str]:
+    """Locate a trusted domain's DC the way the scan's trust walk does.
+
+    Uses ``find_pdc_with_selection(cross_domain=True)`` (which composes
+    ``select_reachable_dc_ip``): the origin DC / AD-zone DNS server is ONLY the
+    resolver for the trusted realm's SRV/A records and is never a DC candidate,
+    so the source realm's DC can not be substituted for a foreign realm's PDC
+    (that yields ``KDC_ERR_WRONG_REALM``). Records the DNS row on ``report``.
+
+    Returns:
+        ``(dc_ip, dc_fqdn)``; both ``""`` when no reachable DC was located.
+    """
+    marked = mark_sensitive(domain, "domain")
+    try:
+        service = shell._get_dns_discovery_service()  # noqa: SLF001
+        result = service.find_pdc_with_selection(
+            domain=domain,
+            resolver_ip=resolver_ip,
+            preferred_ips=[resolver_ip],
+            reference_ip=resolver_ip,
+            cross_domain=True,
+            return_selection=True,
+        )
+        if len(result) == 3:
+            selected_ip, hostname, selection = result
+        else:  # defensive: a stubbed service may ignore return_selection
+            selected_ip, hostname = result
+            selection = None
+    except Exception as exc:  # noqa: BLE001 — never crash doctor
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        report.add("DNS resolution", "fail", f"DC discovery for {marked} raised: {exc}")
+        return "", ""
+
+    hostname = str(hostname or "").strip().rstrip(".")
+    fqdn = ""
+    if hostname:
+        fqdn = hostname if "." in hostname else f"{hostname}.{domain}"
+    selected_ip = str(selected_ip or "").strip()
+    resolver_label = mark_sensitive(resolver_ip, "ip")
+    if selected_ip:
+        report.add(
+            "DNS resolution",
+            "pass",
+            f"Located a domain controller at {mark_sensitive(selected_ip, 'ip')} "
+            f"(resolved through {resolver_label}).",
+        )
+        return selected_ip, fqdn
+    if hostname:
+        seen_at = str(getattr(selection, "unreachable_dns_ip", "") or "").strip()
+        where = f" (advertised at {mark_sensitive(seen_at, 'ip')})" if seen_at else ""
+        report.add(
+            "DNS resolution",
+            "fail",
+            f"{marked} resolved, but none of its domain controllers is reachable "
+            f"from this network{where}.",
+        )
+    else:
+        report.add(
+            "DNS resolution",
+            "fail",
+            f"Could not resolve {marked} through {resolver_label}. The origin DC "
+            "may have no DNS forwarder for that domain.",
+        )
+    return "", ""
+
+
+def _validate_trusted_domain(
+    report: DoctorReport,
+    shell: Any,
+    config: DoctorConfig,
+    domain: str,
+    *,
+    origin_dc_ip: str,
+) -> None:
+    """Run the lightweight per-domain checks for ONE trusted domain.
+
+    DNS/DC location, AD-port connectivity, authentication with the origin
+    credential across the trust, and the enabled user/computer counts. No
+    collector, no posture probe, no recursion into the domain's own trusts. Every
+    failure becomes an honest per-domain row; nothing raises.
+    """
+    scoped = report.scoped(domain, ROLE_TRUSTED)
+    origin = (config.domain or "").strip()
+    resolver_ip = (config.dns_server or "").strip() or origin_dc_ip
+    try:
+        dc_ip, fqdn = _locate_trusted_dc(
+            scoped, shell, config, domain, resolver_ip=resolver_ip
+        )
+        if not dc_ip:
+            scoped.add("DC connectivity", "skip", "No DC located for this domain.")
+            scoped.add("Authentication", "skip", "No DC located for this domain.")
+            scoped.add("Enabled users", "skip", "No DC located for this domain.")
+            scoped.add("Enabled computers", "skip", "No DC located for this domain.")
+            return
+        report.trusted_dc_ip[domain] = dc_ip
+
+        if not fqdn:
+            # Kerberos needs a real FQDN for the DC's SPN (never the IP).
+            from adscan_internal.cli.dns import (  # noqa: PLC0415
+                resolve_pdc_hostname_best_effort,
+            )
+
+            short = resolve_pdc_hostname_best_effort(
+                shell, domain=domain, pdc_ip=dc_ip, dns_server=resolver_ip
+            )
+            short = str(short or "").strip().rstrip(".")
+            if short:
+                fqdn = short if "." in short else f"{short}.{domain}"
+
+        domain_data: dict[str, Any] = {"pdc": dc_ip}
+        if fqdn:
+            domain_data["pdc_hostname_fqdn"] = fqdn
+        target = _TrustedTarget(
+            domain=domain,
+            auth_domain=origin,
+            auth_kdc=origin_dc_ip,
+            domains_data={domain: domain_data},
+        )
+
+        if not _check_connectivity(scoped, shell, dc_ip):
+            scoped.add("Authentication", "skip", "Domain controller not reachable.")
+            scoped.add("Enabled users", "skip", "Domain controller not reachable.")
+            scoped.add("Enabled computers", "skip", "Domain controller not reachable.")
+            return
+        authed = _check_auth(scoped, shell, config, target=target, dc_ip=dc_ip)
+        _check_enabled_counts(
+            scoped, shell, config, dc_ip, authed=authed, target=target
+        )
+    except Exception as exc:  # noqa: BLE001 — a trusted domain never crashes doctor
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        scoped.add("Authentication", "fail", f"Validation raised: {exc}")
+
+
+def _decide_trusted_domains(
+    report: DoctorReport,
+    shell: Any,
+    config: DoctorConfig,
+    *,
+    origin_scoped: ScopedReport,
+    partners: list[str] | None,
+    origin_authed: bool,
+) -> list[str] | None:
+    """Resolve the ``interactive`` scope: ask which listed partners to validate.
+
+    The prompt is the scan's own trust-scope multiselect, sent through
+    ``shell._questionary_multiselect`` (the centralized prompt helper): over the
+    remote-interaction bridge when a web worker enabled it, otherwise the helper's
+    non-interactive path, which returns the default. So it can never hang:
+
+    * answered      -> the chosen partners (the origin is always kept);
+    * no answer in ``DOCTOR_DECISION_TIMEOUT_SECONDS`` (web) -> origin only;
+    * no operator channel (plain CLI / CI; doctor is non-interactive by
+      construction) -> origin only, and a row says so.
+
+    Returns:
+        The partners to validate (possibly empty), or ``None`` when no decision
+        was possible (the row explaining why is already recorded).
+    """
+    if not origin_authed:
+        for name in partners or []:
+            report.not_validated_reason[name] = (
+                "Needs an authenticated origin bind: the same credential is used "
+                "across the trust."
+            )
+        origin_scoped.add(
+            "Trust validation",
+            "skip",
+            "Needs an authenticated origin bind to validate trusted domains.",
+        )
+        return None
+    if partners is None:
+        origin_scoped.add(
+            "Trust validation", "skip", "The origin's trust partners could not be listed."
+        )
+        return None
+    if not partners:
+        origin_scoped.add("Trust validation", "info", "No trusted domains to choose from.")
+        return None
+
+    origin = _normalize_domain_token(config.domain or "")
+    options = [origin, *[p for p in partners if p != origin]]
+    context = {
+        "category": "trust_scope",
+        "purpose": "validate",
+        "origin_domain": origin,
+        "candidate_count": len(options),
+        "trust_matrix": [
+            {
+                "source": origin,
+                "partner": p,
+                "direction": (report.partner_meta.get(p) or {}).get("direction", ""),
+                "type": (report.partner_meta.get(p) or {}).get("type", ""),
+            }
+            for p in options[1:]
+        ],
+        "discovered_domains": [
+            {
+                "domain": d,
+                "is_origin": d == origin,
+                "trust_count": 1 if d != origin else len(options) - 1,
+            }
+            for d in options
+        ],
+        "remote_interaction": True,
+    }
+    chosen: list[str] = []
+    decision = DECISION_AUTO
+    try:
+        from adscan_internal.interactive_requests import (  # noqa: PLC0415
+            is_remote_interaction_enabled,
+            last_resolution,
+        )
+
+        selector = getattr(shell, "_questionary_multiselect", None)
+        remote = is_remote_interaction_enabled()
+        selected: list[str] | None = []
+        if callable(selector):
+            selected = selector(
+                "Select trusted domains to validate:",
+                options,
+                default_values=[origin],
+                timeout_values=[origin],
+                context=context,
+            )
+        if remote and callable(selector):
+            decision = (
+                DECISION_ANSWERED if last_resolution() == "answered" else DECISION_TIMEOUT
+            )
+        picked = {_normalize_domain_token(v) for v in (selected or [])}
+        chosen = [p for p in partners if p in picked]
+    except Exception as exc:  # noqa: BLE001 — a failed prompt means origin only
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        chosen, decision = [], DECISION_AUTO
+
+    report.decision = decision
+    declined = [p for p in partners if p not in chosen]
+    if decision == DECISION_ANSWERED:
+        report.declined_domains = declined
+        for name in declined:
+            report.not_validated_reason[name] = "Declined by the operator."
+        detail = (
+            f"Operator chose {len(chosen)} trusted domain"
+            f"{'s' if len(chosen) != 1 else ''}: {', '.join(chosen)}"
+            if chosen
+            else "Operator chose the origin domain only."
+        )
+    elif decision == DECISION_TIMEOUT:
+        for name in declined:
+            report.not_validated_reason[name] = (
+                "No decision in time: only the origin was validated."
+            )
+        detail = "No answer in time: validated the origin domain only."
+    else:
+        for name in declined:
+            report.not_validated_reason[name] = (
+                "No operator to ask in this run. Use --trusts selected to name domains."
+            )
+        detail = (
+            "No operator to ask in this run: validated the origin domain only. "
+            "Use --trusts selected to name domains."
+        )
+    if not chosen:
+        origin_scoped.add("Trust validation", "info", detail)
+        return None
+    report.scope_domains = list(chosen)
+    return chosen
+
+
+def _check_trusted_domains(
+    report: DoctorReport,
+    shell: Any,
+    config: DoctorConfig,
+    *,
+    origin_dc_ip: str,
+    partners: list[str] | None,
+    origin_authed: bool,
+) -> None:
+    """Validate the in-scope trusted domains (no-op for ``origin_only``).
+
+    The origin credential is the only credential in play, so an origin that did
+    not authenticate can not validate anything across the trust: those domains
+    are reported ``not_validated`` with that reason instead of burning a bind per
+    domain that is certain to fail (and risking lockout on a bad credential).
+    """
+    policy = config.trust_scope
+    if policy == TRUST_POLICY_ORIGIN_ONLY:
+        return
+    report.scope_policy = policy
+    origin_scoped = report.scoped((config.domain or "").strip(), ROLE_ORIGIN)
+    if policy == TRUST_POLICY_INTERACTIVE:
+        decided = _decide_trusted_domains(
+            report,
+            shell,
+            config,
+            origin_scoped=origin_scoped,
+            partners=partners,
+            origin_authed=origin_authed,
+        )
+        if decided is None:
+            return
+        to_validate, over_cap = resolve_trust_scope(
+            TRUST_POLICY_SELECTED, decided, partners
+        )
+    else:
+        to_validate, over_cap = resolve_trust_scope(
+            policy, config.trust_domains, partners
+        )
+    report.scope_domains = [*to_validate, *over_cap]
+    for name in over_cap:
+        report.not_validated_reason[name] = (
+            f"Over the limit of {MAX_TRUSTED_DOMAINS_VALIDATED} trusted domains "
+            "validated per run."
+        )
+    if not origin_authed:
+        for name in to_validate:
+            report.not_validated_reason[name] = (
+                "Needs an authenticated origin bind: the same credential is used "
+                "across the trust."
+            )
+        origin_scoped.add(
+            "Trust validation",
+            "skip",
+            "Needs an authenticated origin bind to validate trusted domains.",
+        )
+        return
+    if policy == TRUST_POLICY_ALL and partners is None:
+        origin_scoped.add(
+            "Trust validation",
+            "skip",
+            "The origin's trust partners could not be listed.",
+        )
+        return
+    if not to_validate:
+        origin_scoped.add("Trust validation", "info", "No trusted domains in scope.")
+        return
+    origin_scoped.add(
+        "Trust validation",
+        "info",
+        f"Validating {len(to_validate)} trusted domain"
+        f"{'s' if len(to_validate) != 1 else ''}: {', '.join(to_validate)}",
+        value=len(to_validate),
+        items=to_validate,
+    )
+    for name in to_validate:
+        _validate_trusted_domain(
+            report, shell, config, name, origin_dc_ip=origin_dc_ip
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+
+
+def _check_label(check: DoctorCheck) -> str:
+    """Matrix label: trusted-domain rows carry their domain, origin rows do not."""
+    if check.role == ROLE_TRUSTED and check.domain:
+        return f"{check.name} ({check.domain})"
+    return check.name
 
 
 def render_doctor_report(report: DoctorReport, *, domain: str = "") -> None:
     """Render the scannable per-check pass/fail matrix panel."""
     from rich.table import Table  # noqa: PLC0415
     from rich import box as _box  # noqa: PLC0415
+    from rich.markup import escape  # noqa: PLC0415
     from adscan_core.rich_output import print_panel  # noqa: PLC0415
 
     icons = {
@@ -827,23 +1690,73 @@ def render_doctor_report(report: DoctorReport, *, domain: str = "") -> None:
     table.add_column("Check", style="bold", no_wrap=True)
     table.add_column("Detail")
     for check in report.checks:
-        table.add_row(icons.get(check.status, "[dim]?[/]"), check.name, check.detail)
+        table.add_row(
+            icons.get(check.status, "[dim]?[/]"), escape(_check_label(check)), check.detail
+        )
 
-    healthy = report.passed
-    border = "green" if healthy else "red"
-    headline = (
-        "All checks passed — the environment is ready."
-        if healthy
-        else "One or more checks failed — resolve the red rows before scanning."
+    verdict = report.verdict
+    border = {VERDICT_READY: "green", VERDICT_PARTIAL: "yellow"}.get(verdict, "red")
+    headline = {
+        VERDICT_READY: "All checks passed — the environment is ready.",
+        VERDICT_PARTIAL: (
+            "The origin domain is ready, but one or more trusted domains could "
+            "not be validated — review the rows tagged with a domain."
+        ),
+    }.get(
+        verdict,
+        "One or more checks failed — resolve the red rows before scanning.",
     )
+    status_word = {
+        VERDICT_READY: "HEALTHY",
+        VERDICT_PARTIAL: "ORIGIN READY, TRUSTS PARTIAL",
+    }.get(verdict, "ISSUES FOUND")
     subtitle = f"target: {mark_sensitive(domain, 'domain')}" if domain else None
     print_panel(
         table,
-        title=f"ADscan Doctor · {'HEALTHY' if healthy else 'ISSUES FOUND'}",
+        title=f"ADscan Doctor · {status_word}",
         subtitle=subtitle,
         border_style=border,
     )
-    (print_info if healthy else print_error)(headline)
+    if report.scope_policy != TRUST_POLICY_ORIGIN_ONLY:
+        _render_domain_summary(report)
+    (print_info if verdict != VERDICT_NOT_READY else print_error)(headline)
+
+
+def _render_domain_summary(report: DoctorReport) -> None:
+    """Per-domain sizing table — shown only when trusted domains were in scope."""
+    from rich.table import Table  # noqa: PLC0415
+    from rich import box as _box  # noqa: PLC0415
+    from rich.markup import escape  # noqa: PLC0415
+    from adscan_core.rich_output import print_panel  # noqa: PLC0415
+
+    styles = {
+        DOMAIN_STATE_READY: "[bold green]ready[/]",
+        DOMAIN_STATE_NOT_READY: "[bold red]not ready[/]",
+        DOMAIN_STATE_NOT_VALIDATED: "[dim]not validated[/]",
+    }
+    declined = {d.domain for d in report.domain_results() if d.declined}
+    table = Table(box=_box.SIMPLE_HEAD, expand=True, show_edge=False)
+    table.add_column("Domain", style="bold", no_wrap=True)
+    table.add_column("State", no_wrap=True)
+    table.add_column("Users", justify="right")
+    table.add_column("Computers", justify="right")
+    table.add_column("Note")
+
+    def _num(value: int | None) -> str:
+        return "-" if value is None else f"{value:,}"
+
+    for item in report.domain_results():
+        name = escape(item.domain) + (" (origin)" if item.role == ROLE_ORIGIN else "")
+        table.add_row(
+            name,
+            "[dim]not validated (declined)[/]"
+            if item.domain in declined
+            else styles.get(item.state, item.state),
+            _num(item.enabled_users),
+            _num(item.enabled_computers),
+            escape(item.reason),
+        )
+    print_panel(table, title="Directory sizing by domain", border_style="cyan")
 
 
 def _make_check_emitter() -> Callable[[DoctorCheck], None]:
@@ -902,7 +1815,7 @@ def _maybe_emit_widget(report: DoctorReport, domain: str) -> None:
         tone = {"pass": "secure", "fail": "permissive", "skip": "unknown", "info": "neutral"}
         rows = [
             MatrixRow(
-                label=c.name,
+                label=_check_label(c),
                 state=c.status.upper(),
                 state_tone=tone.get(c.status, "neutral"),
                 detail=c.detail,
@@ -938,7 +1851,12 @@ def add_doctor_subparser(subparsers: Any) -> Any:
             "so you can confirm the environment works before a scan.\n\n"
             "Examples:\n"
             "  adscan doctor -d corp.local --dc-ip 10.0.0.1\n"
-            "  adscan doctor -d corp.local --dc-ip 10.0.0.1 -u alice -p Pass"
+            "  adscan doctor -d corp.local --dc-ip 10.0.0.1 -u alice -p Pass\n"
+            "  adscan doctor -d corp.local --dc-ip 10.0.0.1 -u alice -p Pass --trusts all\n"
+            "  adscan doctor -d corp.local --dc-ip 10.0.0.1 -u alice -p Pass "
+            "--trusts selected --trust-domains partner.local\n\n"
+            "Exit code: 0 ready, 1 origin not ready, 2 origin ready but a trusted "
+            "domain could not be validated."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -955,18 +1873,37 @@ def add_doctor_subparser(subparsers: Any) -> Any:
             "omitted."
         ),
     )
+    parser.add_argument(
+        "--trusts",
+        dest="trust_scope",
+        choices=DOCTOR_TRUST_SCOPES,
+        default=TRUST_POLICY_ORIGIN_ONLY,
+        help=(
+            "Which trusted domains to validate besides the origin (needs -u/-p): "
+            "origin_only (default, touches no other domain), all (every trust "
+            "partner the origin lists), selected (only --trust-domains) or "
+            "interactive (ask which partners to validate; a run with no operator "
+            "to ask validates the origin only). Each "
+            "gets DC discovery, connectivity, a cross-trust authentication with "
+            "the same credential and enabled user/computer counts."
+        ),
+    )
+    parser.add_argument(
+        "--trust-domains",
+        dest="trust_domains",
+        metavar="DOMAINS",
+        help="Comma-separated trusted domains to validate (with --trusts selected).",
+    )
     parser.add_argument("-u", "--username", help="Auth username (enables the auth check).")
     parser.add_argument("-p", "--password", help="Auth password or hash.")
     parser.add_argument(
         "-w", "--workspace",
-        help="Named workspace to use (default: ephemeral temp, auto-cleaned).",
+        help=(
+            "Named workspace to check from (kept). Omitted: a throwaway workspace "
+            "deleted when the check ends."
+        ),
     )
     parser.add_argument("-i", "--interface", help="Network interface (myip auto-config).")
-    parser.add_argument(
-        "--keep-workspace",
-        action="store_true",
-        help="Keep an auto-created ephemeral workspace on exit.",
-    )
     parser.add_argument(
         "--json",
         dest="json_output",
@@ -990,9 +1927,28 @@ def config_from_args(args: Any) -> DoctorConfig:
         password=getattr(args, "password", None),
         workspace=getattr(args, "workspace", None),
         interface=getattr(args, "interface", None),
-        keep_workspace=bool(getattr(args, "keep_workspace", False)),
         json_output=bool(getattr(args, "json_output", False)),
+        trust_scope=_normalize_trust_scope(getattr(args, "trust_scope", None)),
+        trust_domains=_parse_trust_domains(getattr(args, "trust_domains", None)),
     )
+
+
+def _normalize_trust_scope(value: Any) -> str:
+    """Return a canonical scope; the ``skip`` alias and unknowns mean origin only."""
+    scope = str(value or TRUST_POLICY_ORIGIN_ONLY).strip().lower()
+    return scope if scope in DOCTOR_TRUST_SCOPES else TRUST_POLICY_ORIGIN_ONLY
+
+
+def _parse_trust_domains(value: Any) -> tuple[str, ...]:
+    """Split a comma-separated ``--trust-domains`` value into normalized names."""
+    if not value:
+        return ()
+    out: list[str] = []
+    for item in str(value).split(","):
+        token = _normalize_domain_token(item)
+        if token and token not in out:
+            out.append(token)
+    return tuple(out)
 
 
 def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
@@ -1005,24 +1961,25 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "doctor"
     shell.auto = True
-    shell.type = getattr(shell, "type", None) or "audit"
     if config.interface:
         shell.interface = config.interface
+
+    from adscan_internal.workspaces.session import activate_workspace  # noqa: PLC0415
 
     shell.ensure_workspaces_dir()
     created = False
     if config.workspace:
         ws_dir = os.path.join(shell.workspaces_dir, config.workspace)
         os.makedirs(ws_dir, exist_ok=True)
-        shell.current_workspace = config.workspace
-        shell.current_workspace_dir = ws_dir
+        activate_workspace(
+            shell, workspaces_dir=shell.workspaces_dir, workspace_name=config.workspace
+        )
         shell.load_workspace_data(ws_dir)
     else:
         ws = f"doctor-{uuid.uuid4().hex[:6]}"
         ws_dir = os.path.join(shell.workspaces_dir, ws)
         os.makedirs(ws_dir, exist_ok=True)
-        shell.current_workspace = ws
-        shell.current_workspace_dir = ws_dir
+        activate_workspace(shell, workspaces_dir=shell.workspaces_dir, workspace_name=ws)
         shell.load_workspace_data(ws_dir)
         created = True
 
@@ -1042,7 +1999,17 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
                 "dns_server"
             ] = _doctor_dns_server
 
-    report = DoctorReport()
+    origin_domain = (config.domain or "").strip()
+    report = DoctorReport(
+        origin_domain=origin_domain,
+        scope_policy=config.trust_scope,
+        scope_domains=list(config.trust_domains)
+        if config.trust_scope == TRUST_POLICY_SELECTED
+        else [],
+    )
+    # Every origin-domain row is tagged with the origin; the runtime preflight
+    # belongs to no domain. Trusted-domain rows are tagged by their own view.
+    origin = report.scoped(origin_domain or None, ROLE_ORIGIN)
     # Stream each check live to the web preflight ONLY on the --json path. The
     # plain CLI human-matrix run leaves on_check None so it is unaffected. The
     # emitter is gated by ci_events._should_emit_events() (sink + ci session set
@@ -1057,9 +2024,9 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
         # path) and returns the EFFECTIVE (possibly PDC-corrected) DC IP. That
         # corrected IP flows into every downstream check so they probe the RIGHT
         # host — never the entered IP when it was not actually the PDC.
-        dc_ip = _check_dns(report, shell, config)
-        _check_connectivity(report, shell, dc_ip)
-        authed = _check_auth(report, shell, config)
+        dc_ip = _check_dns(origin, shell, config)
+        _check_connectivity(origin, shell, dc_ip)
+        authed = _check_auth(origin, shell, config)
         # Probe the domain security posture BEFORE the LDAP inventory so the
         # enabled-count and trust queries below build their transport config
         # posture-aware (Kerberos vs NTLM, AES etypes, LDAP signing, channel
@@ -1068,11 +2035,23 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
         # snapshot is populated, making the doctor's own enumeration as robust on
         # a hardened DC as a full scan. The auth-plan still falls back on its own;
         # this just prunes impossible combos up front (fewer attempts, cleaner OPSEC).
-        _check_posture(report, shell, config, dc_ip)
+        _check_posture(origin, shell, config, dc_ip)
         # Authenticated, fast, no-graph inventory checks (PoV sizing + trusts) —
         # now consume the posture snapshot the probe above persisted.
-        _check_enabled_counts(report, shell, config, dc_ip, authed=authed)
-        _check_trusts(report, shell, config, dc_ip, authed=authed)
+        _check_enabled_counts(origin, shell, config, dc_ip, authed=authed)
+        partners = _check_trusts(origin, shell, config, dc_ip, authed=authed)
+        report.origin_dc_ip = dc_ip
+        report.partners = list(partners or [])
+        # Opt-in: validate the in-scope trusted domains with the same credential.
+        # A no-op for the default ``origin_only`` scope (nothing else is touched).
+        _check_trusted_domains(
+            report,
+            shell,
+            config,
+            origin_dc_ip=dc_ip,
+            partners=partners,
+            origin_authed=authed,
+        )
     finally:
         domain = (config.domain or "").strip()
         if config.json_output:
@@ -1080,13 +2059,22 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
         else:
             render_doctor_report(report, domain=domain)
             _maybe_emit_widget(report, domain)
-        if created and not config.keep_workspace:
-            try:
-                if shell.current_workspace_dir:
-                    shutil.rmtree(shell.current_workspace_dir)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
+        # doctor is a health check: its throwaway workspace always goes (a
+        # failed check keeps only logs/), a named -w workspace always stays.
+        # Same disposal SSOT as ci/execute, silent so the matrix/JSON is the
+        # whole output.
+        from adscan_internal.workspaces.retention import (  # noqa: PLC0415
+            close_run_workspace,
+        )
+
+        close_run_workspace(
+            name=shell.current_workspace,
+            workspace_dir=shell.current_workspace_dir,
+            created=created,
+            ephemeral=created,
+            failed=int(getattr(report, "exit_code", 1) or 0) != 0,
+            announce=False,
+        )
         try:
             shell.do_exit(exit=False)
         except Exception:  # noqa: BLE001

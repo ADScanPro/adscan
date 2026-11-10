@@ -27,9 +27,18 @@ account. At that moment the leak IS proven exploitable, against a principal the
 leaking object never named. Without the source recorded, the hit arrives with a
 spray origin and nothing can say which attribute on which object to go and
 clear, which is worse than no attribution at all. :func:`find_rejected_secret_candidates`
-is the lookup that half of the promotion reads; the promotion itself is
-deliberately NOT built here (see
+is the lookup that half of the promotion reads, and
+:func:`record_cross_attributed_hit` is where the consumer that PROVED the string
+records against which principal it authenticated.
+
+The division of labour is deliberate. This module stores the two facts (the
+string leaked HERE, the string authenticated as THAT principal) and nothing
+else: it grades no finding and writes no report. Deciding what the pair MEANS
+belongs to the finding-reconciliation seam, which runs after every phase
+boundary and is called by both report tiers, so one promotion serves the free
+report, the paid kit and the web CTEM (see
 ``docs/superpowers/specs/2026-10-09-leaked-attribute-secret-cross-attribution.md``).
+A spray has no business deciding a finding's severity.
 """
 
 from __future__ import annotations
@@ -48,6 +57,16 @@ REJECTED_SECRET_POOL_KEY = "rejected_secret_candidates"
 #: Bounded so a pathological retry loop can never grow ``variables.json``
 #: without limit. A real engagement produces a handful of these.
 _MAX_POOL_ENTRIES = 64
+
+#: Persisted field holding the principals a later verification PROVED the
+#: string against. One record can carry several: the same leaked service
+#: password legitimately opens more than one account.
+CROSS_ATTRIBUTED_HITS_FIELD = "cross_attributed_hits"
+
+#: Bounded for the same reason as the pool itself. A spray that proves one
+#: string against hundreds of accounts is a password-reuse finding in its own
+#: right, not an attribution list worth growing without limit.
+_MAX_CROSS_ATTRIBUTED_HITS = 32
 
 
 @dataclass(frozen=True)
@@ -101,6 +120,33 @@ class AttributeDisclosureSource:
 
 
 @dataclass(frozen=True)
+class CrossAttributedHit:
+    """A principal a later verification PROVED this secret against.
+
+    The second half of the attribution pair. The first half (where the string
+    was read from) is :class:`AttributeDisclosureSource`; this one is "and it
+    opened THIS account", recorded by the consumer that authenticated with it.
+
+    Attributes:
+        compromised_principal: The principal the secret authenticated as. It is
+            never the record's own ``rejected_for``: that account is the one the
+            directory REFUSED the string for, so recording it here would claim a
+            proof the run does not hold.
+        at: ISO-8601 UTC timestamp of the proof.
+    """
+
+    compromised_principal: str
+    at: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        """Return the JSON-safe persisted shape."""
+        payload = {"compromised_principal": self.compromised_principal}
+        if self.at:
+            payload["at"] = self.at
+        return payload
+
+
+@dataclass(frozen=True)
 class RejectedSecretCandidate:
     """One secret a domain controller rejected for a named principal.
 
@@ -115,6 +161,10 @@ class RejectedSecretCandidate:
         at: ISO-8601 UTC timestamp of the rejection.
         source: Where the string was read from, as
             :class:`AttributeDisclosureSource`.
+        cross_attributed_hits: The principals a later verification proved the
+            string against. Empty for the normal case (the string was wrong for
+            its owner and wrong for everybody else), and non-empty exactly when
+            the leak became provably exploitable against a DIFFERENT principal.
     """
 
     secret: str
@@ -123,15 +173,16 @@ class RejectedSecretCandidate:
     origin: str = ""
     at: str = ""
     source: AttributeDisclosureSource = AttributeDisclosureSource()
+    cross_attributed_hits: tuple[CrossAttributedHit, ...] = ()
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         """Return the JSON-safe persisted shape.
 
         The five source fields are persisted FLAT rather than nested, so a
         reader written against the original shape keeps working and an entry
         written by an older build simply has them absent.
         """
-        payload = {
+        payload: dict[str, Any] = {
             "secret": self.secret,
             "rejected_for": self.rejected_for,
             "verdict": self.verdict,
@@ -147,6 +198,10 @@ class RejectedSecretCandidate:
         ):
             if value:
                 payload[key] = value
+        if self.cross_attributed_hits:
+            payload[CROSS_ATTRIBUTED_HITS_FIELD] = [
+                hit.to_dict() for hit in self.cross_attributed_hits
+            ]
         return payload
 
 
@@ -302,7 +357,34 @@ def _candidate_from_entry(entry: Any) -> RejectedSecretCandidate | None:
             finding_key=str(entry.get("finding_key") or "").strip(),
             evidence_path=str(entry.get("evidence_path") or "").strip(),
         ),
+        cross_attributed_hits=_hits_from_entry(entry),
     )
+
+
+def _hits_from_entry(entry: dict[str, Any]) -> tuple[CrossAttributedHit, ...]:
+    """Rebuild the cross-attributed hits of one persisted record.
+
+    An entry written before the field existed simply has none, and reads back
+    as an empty tuple — which is also the honest answer for every record whose
+    string never authenticated anywhere.
+    """
+    raw = entry.get(CROSS_ATTRIBUTED_HITS_FIELD)
+    if not isinstance(raw, list):
+        return ()
+    hits: list[CrossAttributedHit] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        principal = str(item.get("compromised_principal") or "").strip().lower()
+        if not principal:
+            continue
+        hits.append(
+            CrossAttributedHit(
+                compromised_principal=principal,
+                at=str(item.get("at") or "").strip(),
+            )
+        )
+    return tuple(hits)
 
 
 def iter_rejected_secret_candidates(
@@ -360,6 +442,91 @@ def find_rejected_secret_candidates(
     ]
 
 
+def record_cross_attributed_hit(
+    domains_data: MutableMapping[str, Any],
+    *,
+    domain: str,
+    leak: RejectedSecretCandidate,
+    compromised_principal: str,
+) -> bool:
+    """Record that *leak*'s secret authenticated as ``compromised_principal``.
+
+    The ONE call a consumer that just PROVED a string owes the pool, and the
+    whole of what it owes: it stores a fact and decides nothing. The promotion
+    this unlocks (an unproven "a readable attribute holds secret-shaped text"
+    observation becoming the confirmed "a secret in a directory attribute that
+    authenticates") is taken at the finding-reconciliation seam, where both
+    report tiers see it and where the severity decision belongs.
+
+    Two honesty guards, both of which make this a no-op rather than a record:
+
+    * the principal must DIFFER from the leak's own ``rejected_for``. That
+      account is the one the directory refused the string for, so attributing
+      the proof back to it would manufacture a contradiction out of two true
+      observations.
+    * the record must already exist in the pool. This never creates one, so a
+      hit can only ever be attached to a leak the run actually observed.
+
+    Idempotent on the principal, so a re-sprayed credential records once.
+    Best-effort — a failure here never propagates, because losing an
+    attribution must not break the flow that just captured a credential.
+
+    Args:
+        domains_data: Shared workspace domain mapping.
+        domain: Domain key in ``domains_data``.
+        leak: The record returned by :func:`find_rejected_secret_candidates`.
+        compromised_principal: The principal the secret authenticated as.
+
+    Returns:
+        ``True`` when a hit was appended, ``False`` when there was nothing to
+        record (no matching record, the same principal, or the bound reached).
+    """
+    try:
+        principal = str(compromised_principal or "").strip().lower()
+        wanted = strip_sensitive_markers(str(leak.secret or "")).strip()
+        rejected_for = str(leak.rejected_for or "").strip().lower()
+        if not principal or not wanted or principal == rejected_for:
+            return False
+        bucket = _domain_bucket(domains_data, domain)
+        if bucket is None:
+            return False
+        pool = bucket.get(REJECTED_SECRET_POOL_KEY)
+        if not isinstance(pool, list):
+            return False
+        for entry in pool:
+            if not isinstance(entry, dict):
+                continue
+            if strip_sensitive_markers(str(entry.get("secret") or "")).strip() != wanted:
+                continue
+            if str(entry.get("rejected_for") or "").strip().lower() != rejected_for:
+                continue
+            hits = entry.get(CROSS_ATTRIBUTED_HITS_FIELD)
+            if not isinstance(hits, list):
+                hits = []
+                entry[CROSS_ATTRIBUTED_HITS_FIELD] = hits
+            for hit in hits:
+                if (
+                    isinstance(hit, dict)
+                    and str(hit.get("compromised_principal") or "").strip().lower()
+                    == principal
+                ):
+                    return False
+            if len(hits) >= _MAX_CROSS_ATTRIBUTED_HITS:
+                return False
+            hits.append(
+                CrossAttributedHit(
+                    compromised_principal=principal,
+                    at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ).to_dict()
+            )
+            return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def rejected_secret_passwords(
     domains_data: MutableMapping[str, Any] | None, *, domain: str
 ) -> list[str]:
@@ -380,11 +547,14 @@ def rejected_secret_passwords(
 
 
 __all__ = [
+    "CROSS_ATTRIBUTED_HITS_FIELD",
     "REJECTED_SECRET_POOL_KEY",
     "AttributeDisclosureSource",
+    "CrossAttributedHit",
     "RejectedSecretCandidate",
     "find_rejected_secret_candidates",
     "iter_rejected_secret_candidates",
+    "record_cross_attributed_hit",
     "record_rejected_secret_candidate",
     "rejected_secret_passwords",
 ]

@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 if TYPE_CHECKING:
     from adscan_internal.services.collector.orchestrator import DomainScope
@@ -66,16 +66,39 @@ class ScopeResult:
         return [entry.to_domain_scope() for entry in self.entries if entry.in_scope]
 
 
-def save_scope(result: ScopeResult, path: str) -> None:
-    """Write a ScopeResult JSON artifact to disk."""
+def save_scope(
+    result: ScopeResult, path: str, *, extra: Mapping[str, Any] | None = None
+) -> None:
+    """Write a ScopeResult JSON artifact to disk.
+
+    ``extra`` carries the engagement-scope record
+    (``services.engagement_scope``): the origin domains, who decided the scope
+    and the cross-domain steps it kept from running. Readers of ``scope-1.0``
+    ignore the extra keys.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    payload = {
-        "schema_version": "scope-1.0",
+    payload: dict[str, Any] = {
+        "schema_version": "scope-1.1" if extra else "scope-1.0",
         "generated_at": result.generated_at,
         "entries": [asdict(entry) for entry in result.entries],
     }
+    for key, value in (extra or {}).items():
+        if key not in payload:
+            payload[key] = value
     with open(path, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
+
+
+def load_scope_payload(path: str) -> dict[str, Any] | None:
+    """The raw ``scope.json`` mapping (with the engagement-scope keys), or None."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as file:
+            payload = json.load(file)
+    except Exception:  # noqa: BLE001 - an unreadable file discloses nothing
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def load_scope(path: str) -> ScopeResult | None:

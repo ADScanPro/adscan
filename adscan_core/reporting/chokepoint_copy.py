@@ -311,6 +311,70 @@ CONTAINMENT_ORDER_CLAUSE = (
     "how long each exposure survives the response you would normally run"
 )
 
+#: The noun for a credential custody action: an item on the ledger of material
+#: the assessment took out of the client's control
+#: (``post_compromise_obligations``). It is DELIBERATELY not "containment
+#: action", because the ranked remediation list has a containment block of its
+#: own with a different cardinality, and one label over two counts is what made
+#: a report state two different numbers of first things to do. Rendered through
+#: :func:`custody_actions_phrase` so no surface spells it a second way.
+CUSTODY_ACTION_NOUN = "credential custody action"
+
+#: The ONE sentence reconciling the two. A reader who meets the ranked
+#: containment fixes and then the custody ledger has to be told how they relate,
+#: or the second list reads as a contradiction of the first.
+CUSTODY_SEPARATION_CLAUSE = (
+    "Taking that material back is separate work, listed as credential custody "
+    "actions, and closing a route does not revoke a copy that already left."
+)
+
+
+def custody_actions_phrase(count: int) -> str:
+    """Return the client-facing phrase for a credential custody action count.
+
+    The SSOT for how the custody ledger is NAMED on every surface: the paid
+    report's roadmap block and its timeline note, and the free report's
+    "what the proof obliges" section. They used to spell it "containment
+    action", the same words the ranked remediation list uses for its leading
+    FIXES, so the two sections printed different counts under one label.
+
+    Args:
+        count: How many custody actions the ledger holds.
+
+    Returns:
+        ``"1 credential custody action"`` / ``"2 credential custody actions"``.
+        A zero count is rendered rather than suppressed, because deciding
+        whether to show the block at all belongs to the caller.
+    """
+    noun = CUSTODY_ACTION_NOUN if count == 1 else f"{CUSTODY_ACTION_NOUN}s"
+    return f"{count:,} {noun}"
+
+
+def containment_fixes_clause(containment_count: int) -> str:
+    """Return the clause naming the leading containment FIXES and what they do.
+
+    One wording, so the paid report's subtitle, its Start Here crown, the free
+    report's lead and its "how to read this" note cannot describe the same rows
+    four ways. They are fixes: each one closes a route that took key material
+    out of the client's control. They do not take the material back, which is
+    the custody ledger's job (:data:`CUSTODY_SEPARATION_CLAUSE`).
+
+    Args:
+        containment_count: How many containment fixes lead the list, at least 1.
+
+    Returns:
+        A clause with no trailing period, agreeing in number.
+    """
+    if containment_count == 1:
+        return (
+            "the first 1 fix closes the route that took key material out of "
+            "your control during this assessment"
+        )
+    return (
+        f"the first {containment_count:,} fixes close the routes that took key "
+        "material out of your control during this assessment"
+    )
+
 
 def remediation_order_sentence(containment_count: int = 0) -> str:
     """Return the ONE sentence stating the order the ranked fixes are in.
@@ -320,22 +384,43 @@ def remediation_order_sentence(containment_count: int = 0) -> str:
     lead, and the roadmap that defers to it. Stating it once and in one wording
     is the point, so do not paraphrase it at a call site.
 
+    The containment clause speaks of FIXES, which is what these rows are: each
+    one closes the route that took the material out. Taking the material itself
+    back is a different list with a different cardinality (the credential
+    custody ledger, ``post_compromise_obligations``), so the two must not share
+    a noun. A report that gave both lists the same noun printed two different
+    counts under one label on the page where the client decides what to fund
+    first.
+
     Args:
-        containment_count: How many containment actions lead the list. Zero
+        containment_count: How many containment fixes lead the list. Zero
             yields the exposure rule alone.
 
     Returns:
         One or two human-grade English sentences. No em-dash.
     """
     if containment_count > 0:
-        actions_noun = "action" if containment_count == 1 else "actions"
+        clause = containment_fixes_clause(containment_count)
         return (
-            f"The first {containment_count:,} {actions_noun} contain key material "
-            f"that left your control during this assessment, ordered by "
+            f"{clause[0].upper()}{clause[1:]}, ordered by "
             f"{CONTAINMENT_ORDER_CLAUSE}. The fixes after them are ordered by "
             f"{REMEDIATION_ORDER_CLAUSE}."
         )
     return f"The fixes are ordered by {REMEDIATION_ORDER_CLAUSE}."
+
+
+def _uniform_order_tail(containment_count: int) -> str:
+    """Return how the uniform-reach note finishes its ordering clause.
+
+    With containment leading, the rows are NOT all ordered by route volume, so
+    restating the exposure clause alone would describe a list the page does not
+    have. The note defers to the stated order instead of spelling a second one:
+    the section subtitle and the Start Here lead already carry the full rule
+    from :func:`remediation_order_sentence`.
+    """
+    if containment_count > 0:
+        return "the one stated above."
+    return f"by {REMEDIATION_ORDER_CLAUSE}."
 
 
 def reach_uniform_note(
@@ -343,8 +428,19 @@ def reach_uniform_note(
     *,
     reach_users: int | None = None,
     reach_total: int | None = None,
+    containment_count: int = 0,
+    reach_fixes: int | None = None,
+    foothold_fixes: int = 0,
 ) -> str:
     """Return the ONE sentence shown above the table when reach is uniform.
+
+    The sentence is DERIVED from the rows, never a blanket claim. It once read
+    "10 of 10 affected users sit on an attack path that runs through every fix
+    below" above five rows that each said "No ordinary user account runs through
+    this technique". So the caller passes how many rows carry user reach
+    (``reach_fixes``) and how many carry none (``foothold_fixes``): with no
+    foothold rows the claim covers every fix; with some, it names the count it
+    covers and says what the others are.
 
     On a bridged domain every ordinary account funnels through the same chains, so
     the affected-user reach of the fixes that carry a user path is the identical
@@ -383,15 +479,31 @@ def reach_uniform_note(
         # paragraph on that made the reader parse an explanation before reaching
         # the numbers that actually rank the rows. The overlap caveat is not
         # repeated here: the headline SSOT states it once.
+        if foothold_fixes > 0 and reach_fixes:
+            others = (
+                "The other fix closes only routes that start from a computer or "
+                "group foothold, and its row says so."
+                if foothold_fixes == 1
+                else (
+                    f"The other {foothold_fixes:,} close only routes that start from "
+                    f"a computer or group foothold, and their rows say so."
+                )
+            )
+            tail = _uniform_order_tail(containment_count)
+            return (
+                f"{reach_users:,} of {reach_total:,} {users_noun} ({reach_pct:g}%) sit "
+                f"on an attack path that runs through each of {reach_fixes:,} fixes "
+                f"below. {others} The order is {tail}"
+            )
         return (
             f"{reach_users:,} of {reach_total:,} {users_noun} ({reach_pct:g}%) sit on "
-            f"an attack path that runs through every fix below, so the order is by "
-            f"{REMEDIATION_ORDER_CLAUSE}."
+            f"an attack path that runs through every fix below, so the order is "
+            f"{_uniform_order_tail(containment_count)}"
         )
     return (
         f"Ordinary-user exposure funnels through the same chains, so the fixes "
         f"that carry an ordinary-user path all reach the same share ({reach_pct:g}%). "
-        f"Fixes below are ordered by {REMEDIATION_ORDER_CLAUSE}."
+        f"The order of the fixes below is {_uniform_order_tail(containment_count)}"
     )
 
 
@@ -405,9 +517,10 @@ def _foothold_reach_sentence(paths_broken: int, *, executed: bool) -> str:
     """
     routes_noun = "attack path" if paths_broken == 1 else "attack paths"
     verb = "closes" if executed else "would close"
+    originate = "originates" if paths_broken == 1 else "originate"
     return (
         f"No ordinary user account runs through this technique; the "
-        f"{paths_broken:,} {routes_noun} it {verb} originate from computer or "
+        f"{paths_broken:,} {routes_noun} it {verb} {originate} from computer or "
         f"group footholds."
     )
 
@@ -508,12 +621,33 @@ def chokepoint_kpi_lines(
     return {"big": big, "ratio": ratio, "context": context}
 
 
+#: Title of the headline remediation card, by the proof the fix it names carries.
+KPI_EYEBROW_VALIDATED = "Most proven fix · validated in this environment"
+KPI_EYEBROW_STEP_PROVEN = "Most proven fix · its attack step was executed here"
+KPI_EYEBROW_MAPPED = "Top fix · mapped, not yet executed"
+
+
+def remediation_kpi_eyebrow(*, executed: bool, proven_step: bool = False) -> str:
+    """The headline card's title, never claiming more proof than the fix carries.
+
+    ``executed``: a route through the fix was walked end to end. ``proven_step``:
+    the fix's own attack step ran, the routes stay mapped. Neither: nothing was
+    proven, and the title says the fix is mapped.
+    """
+    if executed:
+        return KPI_EYEBROW_VALIDATED
+    if proven_step:
+        return KPI_EYEBROW_STEP_PROVEN
+    return KPI_EYEBROW_MAPPED
+
+
 def remediation_kpi_lines(
     *,
     top_paths_broken: int,
     total_validated_paths: int,
     executed: bool,
     mapped: bool = False,
+    proven_step: bool = False,
     bounded: bool = False,
     mapped_breadth: int | None = None,
     total_mapped: int | None = None,
@@ -599,6 +733,9 @@ def remediation_kpi_lines(
             )
             context = (
                 f"Across {top_paths_broken:,} of {total_validated_paths:,} "
+                f"{ctx_noun}, not yet walked end to end"
+                if proven_step
+                else f"Across {top_paths_broken:,} of {total_validated_paths:,} "
                 f"{ctx_noun}, not yet executed"
             )
         else:
@@ -636,7 +773,11 @@ def remediation_kpi_lines(
     elif mapped:
         big_noun = "path" if total_validated_paths == 1 else "paths"
         ratio = "Top fix breaks mapped attack paths"
-        context = "Mapped, not yet executed, closed by one fix"
+        context = (
+            "ADscan executed this technique; its routes are mapped, closed by one fix"
+            if proven_step
+            else "Mapped, not yet executed, closed by one fix"
+        )
     else:
         big_noun = "path" if total_validated_paths == 1 else "paths"
         ratio = "Top fix breaks attack paths in scope"
@@ -875,12 +1016,9 @@ def remediation_start_here_headline(
     # that left the client's control is still usable. The exposure ordering rule
     # follows for the rows below it.
     if containment_count > 0:
-        actions_noun = "action" if containment_count == 1 else "actions"
         lead = (
-            f"Start here: the first {containment_count:,} {actions_noun} contain "
-            "key material that left your control during this assessment, and "
-            "nothing else in this report is effective while they are "
-            f"outstanding. The fixes after them are ordered by "
+            f"Start here: {containment_fixes_clause(containment_count)}. "
+            f"{CUSTODY_SEPARATION_CLAUSE} The fixes after them are ordered by "
             f"{REMEDIATION_ORDER_CLAUSE}."
         )
         return f"{lead} {OVERLAP_CAVEAT}" if uniform_with_population else lead
@@ -931,16 +1069,16 @@ def remediation_start_here_headline(
 def containment_block_note(containment_count: int) -> str:
     """Return the note introducing the containment block, or ``""``.
 
-    Containment is the actions required because key material left the client's
-    control during the assessment: a replicated krbtgt key, an issued
+    The containment block holds the fixes that close the routes which took key
+    material out of the client's control: a replicated krbtgt key, an issued
     certificate, a dumped credential. It leads the section because it is an
-    incident clock rather than a planning exercise, and because the free report
-    already tells the client that nothing else is effective while it is
-    outstanding, which fought with a page-1 instruction to start closing
-    findings.
+    incident clock rather than a planning exercise. The note says so and then
+    names the boundary (:data:`CUSTODY_SEPARATION_CLAUSE`): closing the route is
+    not the same work as taking the copy back, and the ledger that tracks the
+    copy has its own count.
 
     Args:
-        containment_count: How many containment actions lead the list. ``0``
+        containment_count: How many containment fixes lead the list. ``0``
             yields ``""`` so a clean engagement shows no containment copy at all.
 
     Returns:
@@ -948,10 +1086,54 @@ def containment_block_note(containment_count: int) -> str:
     """
     if containment_count <= 0:
         return ""
+    if containment_count == 1:
+        lead = (
+            "The first row leads because it closes a route that took key "
+            "material out of your control during this assessment."
+        )
+    else:
+        lead = (
+            f"The first {containment_count:,} rows lead because each one closes "
+            "a route that took key material out of your control during this "
+            "assessment."
+        )
+    return f"{lead} {CUSTODY_SEPARATION_CLAUSE}"
+
+
+#: The reason a ranked technique leaves the work order when no change can be
+#: named for it: no holder-specific change and no technique guidance. A row that
+#: cannot say what to change is not a work item. Client-facing.
+NO_CONCRETE_CHANGE_REASON: str = (
+    "No single change to this step can be named from the assessment data. The "
+    "steps around it on each attack path carry the fix."
+)
+
+
+def by_design_note_lead(count: int) -> str:
+    """Return the sentence introducing the techniques the work order leaves out.
+
+    Each entry under it names a technique and why it is not a ranked fix: how
+    Active Directory works for that holder (a domain controller's replication
+    right, a child domain's reach into its forest root), or no concrete change to
+    name. Stating it keeps a reader who meets the technique in Technical Findings
+    from wondering whether the ranking forgot it.
+
+    Args:
+        count: How many techniques the note lists. ``0`` yields ``""``.
+
+    Returns:
+        One human-grade English sentence. No em-dash.
+    """
+    if count <= 0:
+        return ""
+    if count == 1:
+        return (
+            "One technique on these attack paths is not ranked above. The reason "
+            "is given below."
+        )
     return (
-        "Contain first: key material left your control during this assessment "
-        "and is still usable. Nothing else in this report is effective while "
-        "these are outstanding."
+        f"{count:,} techniques on these attack paths are not ranked above. The "
+        f"reason for each is given below."
     )
 
 

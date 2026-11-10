@@ -119,8 +119,13 @@ class netlm:
 		self.ClientResponse = None
 
 	def to_credential(self):
+		# ``domain`` passed through for the same reason as netntlm_ess below: a
+		# consumer attributing the captured principal to a domain reads
+		# ``cred.domain``, so a to_credential() that holds the domain and omits
+		# it from the Credential silently loses the attribution.
 		cred = Credential('netLM',
-							username = self.username, 
+							username = self.username,
+							domain = self.domain,
 							fullhash = '%s:$NETLM$%s$%s' % (self.username, self.ServerChallenge, self.ClientResponse)
 						)
 		return cred
@@ -172,6 +177,7 @@ class netlmv2:
 		cred = Credential(
 			'netLMv2',
 			username = self.username,
+			domain = self.domain,
 			fullhash = '$NETLMv2$%s$%s$%s$%s' % (self.username, self.ServerChallenge, self.ClientResponse, self.ChallengeFromClinet)
 		)
 		return cred
@@ -281,9 +287,19 @@ class netntlm_ess:
 		if isinstance(ntresponse, bytes):
 			ntresponse = ntresponse.hex()
 			
+		# ``domain`` is passed through to the Credential, not only interpolated
+		# into fullhash. Omitting it left ``cred.domain is None`` on every
+		# NetNTLMv1-ESS capture (the common v1 shape: ESS is negotiated by
+		# default, so the LM field carries the client challenge) while the hash
+		# string itself still carried the domain. A consumer reading
+		# ``cred.domain`` to decide WHICH domain the captured principal belongs
+		# to therefore got nothing, and the capture was filed under a
+		# placeholder instead of the domain the hash names. netntlm and
+		# netntlmv2 both pass it; this branch was the odd one out.
 		cred = Credential(
 			'netNTLMv1-ESS',
 			username = username,
+			domain = domain,
 			fullhash = '%s::%s:%s:%s:%s' % (username, domain, lmresponse, ntresponse, self.ServerChallenge.hex())
 		)
 		return cred

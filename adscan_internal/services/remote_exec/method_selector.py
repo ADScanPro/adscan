@@ -41,7 +41,7 @@ class RemoteExecMethodSelector:
         intel: EdrIntelligence,
         *,
         require_stdout: bool = True,
-        workspace_type: str | None = None,
+        prefer_speed: bool = False,
     ) -> list[RemoteExecMethodMeta]:
         """Return all methods sorted best-first.
 
@@ -50,8 +50,10 @@ class RemoteExecMethodSelector:
             intel: Per-host catch history.
             require_stdout: Filter out backends that cannot return
                 process output.
-            workspace_type: Optional ``"ctf"`` / ``"audit"`` /
-                ``"engagement"``. Adjusts a small bias term.
+            prefer_speed: The scan policy's ``remote_execution`` setting is
+                ``speed`` (:func:`adscan_core.scan_policy.settings.prefers_fast_remote_execution`):
+                a small bias towards the fastest, noisier methods. Off, the
+                ranking is by footprint and catch history alone.
 
         Returns:
             ``list[RemoteExecMethodMeta]`` ordered from best to worst.
@@ -97,9 +99,7 @@ class RemoteExecMethodSelector:
                 if intel.was_caught(method=meta.method.value, product=product.name):
                     score -= 40 if product.category == "edr" else 15
 
-            if workspace_type == "ctf" and meta.opsec_score <= 2:
-                score += 5
-            elif workspace_type == "engagement" and meta.opsec_score >= 3:
+            if prefer_speed and meta.opsec_score <= 2:
                 score += 5
 
             if meta.method == ExecMethod.WINRM:
@@ -121,13 +121,13 @@ class RemoteExecMethodSelector:
         intel: EdrIntelligence,
         *,
         require_stdout: bool = True,
-        workspace_type: str | None = None,
+        prefer_speed: bool = False,
     ) -> RemoteExecMethodMeta:
         return RemoteExecMethodSelector.rank(
             fp,
             intel,
             require_stdout=require_stdout,
-            workspace_type=workspace_type,
+            prefer_speed=prefer_speed,
         )[0]
 
 

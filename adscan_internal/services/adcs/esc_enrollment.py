@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from pathlib import Path
 from typing import Any, Optional
 
@@ -440,6 +442,35 @@ async def run_esc15_schannel(config: EscConfig) -> EscResult:
     LDAPS-only: when LDAPS is unavailable the Schannel bind cannot run, so this
     returns an honest data-gap failure and the caller falls back to method B.
     """
+    # Consent BEFORE any enrollment. Method A ends in a write to the DOMAIN
+    # object's DACL (replication rights for the controlled principal), which is
+    # a durable directory change, so it passes the same opt-in gate as every
+    # other such write: declined by default in an audit (unattended: refused),
+    # pre-approved in a CTF. Declining is not a failure of the technique: the
+    # caller falls back to method B, which changes no DACL.
+    shell = getattr(config, "shell", None)
+    if shell is not None:
+        from adscan_internal.services.directory_change_consent import (  # noqa: PLC0415
+            confirm_directory_change,
+        )
+
+        if not confirm_directory_change(
+            shell,
+            "ESC15 method A grants replication rights on the domain object "
+            "(reverted at cleanup). Proceed with this route?",
+            check_id="step:adcsesc15",
+        ):
+            print_info(
+                "ESC15 method A skipped: it would change the domain object's "
+                "permissions and was not approved."
+            )
+            return EscResult(
+                success=False,
+                esc=15,
+                error="schannel_grant_not_approved",
+                evidence={"method": "schannel", "consent": "declined"},
+            )
+
     out = _output_dir(config, "esc15_schannel")
 
     # Phase 1: enroll a client-authentication certificate for the target (SAN UPN).
@@ -534,9 +565,8 @@ async def _esc15_schannel_grant_dcsync(config: EscConfig, client: Any) -> EscRes
     Bound as the privileged target, add the GetChanges/GetChangesAll ACEs for the
     owned enrolling principal to the domain object's DACL (vendor
     ``MSLDAPClient.add_priv_dcsync``). The ACE is a durable AD change, so it is
-    disclosed in the environment-change ledger with a ``manual_required``
-    rollback (removing a replication ACE is done by hand / via the dacledit
-    remove path, never silently left behind).
+    recorded in the environment-change ledger and queued for verified removal
+    at exit (``manual_required`` when no credential can remove it).
     """
     owned_user = (config.username or "").split("\\", 1)[-1].split("@", 1)[0].strip()
     if not owned_user:
@@ -577,51 +607,22 @@ async def _esc15_schannel_grant_dcsync(config: EscConfig, client: Any) -> EscRes
             },
         )
 
-    # Disclose the replication-rights grant (durable ACL change on the DOMAIN
-    # object's DACL) in the environment-change ledger. Removing a replication ACE
-    # is not attempted automatically over the Schannel session, so it is recorded
-    # as the legal-critical manual_required terminal state with the native
-    # removal command the client runs.
+    # Record the replication-rights grant (durable ACE on the DOMAIN object) the
+    # same way the WriteDacl / Owns-on-domain peers do: a ``dacl_ace_added``
+    # ledger record plus an entry in the ACL cleanup queue. At exit the cleanup
+    # service removes the ACE and re-reads the DACL to confirm it is gone
+    # (fail-closed without the trustee SID); the enrolling principal cannot edit
+    # the domain DACL itself, so the revert escalates to a stored privileged
+    # credential on access denied, and lands in ``manual_required`` with the
+    # native removal command when none is available.
     domain_dn = str(getattr(client, "_tree", "") or "").strip()
-    try:
-        from adscan_internal.services.adcs.esc_cleanup import register_ldap_change
-        from adscan_internal.services.cleanup_taxonomy import (
-            MANUAL_REASON_NOT_ATTEMPTED,
-        )
-
-        change_id = register_ldap_change(
-            config.shell,
-            kind="dacl_grant_dcsync",
-            domain=config.domain,
-            target=domain_dn or config.domain,
-            detail={
-                "right": "DCSync (DS-Replication-Get-Changes[-All])",
-                "trustee": owned_user,
-                "object": "domain object DACL",
-                "technique": "ADCSESC15 method A (Schannel / PassTheCert)",
-            },
-            method="ADCSESC15 Schannel LDAPS cert bind",
-        )
-        ledger = getattr(config.shell, "environment_change_ledger", None)
-        if ledger is not None and change_id:
-            netbios = config.domain.split(".", 1)[0].upper()
-            ledger.mark_manual_required(
-                change_id,
-                reason=MANUAL_REASON_NOT_ATTEMPTED,
-                remediation_command=(
-                    f'dsacls "{domain_dn or "<domain DN>"}" /R "{netbios}\\{owned_user}"'
-                ),
-                remediation_object_dn=domain_dn or config.domain,
-                manual_cleanup_instructions=(
-                    "Remove the replication (DS-Replication-Get-Changes and "
-                    "DS-Replication-Get-Changes-All) access control entries granted "
-                    f"to {owned_user} on the domain object, then audit the domain "
-                    "DACL for any other unexpected replication grants."
-                ),
-            )
-    except Exception as exc:  # noqa: BLE001 — disclosure is best-effort
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+    trustee_sid = await _resolve_sid_over_client(client, owned_dn)
+    _register_esc15_dcsync_grant(
+        config,
+        owned_user=owned_user,
+        domain_dn=domain_dn,
+        trustee_sid=trustee_sid,
+    )
 
     print_success(
         f"ESC15 method A: DCSync granted to {owned_user} via Schannel "
@@ -637,6 +638,88 @@ async def _esc15_schannel_grant_dcsync(config: EscConfig, client: Any) -> EscRes
             "trustee": owned_user,
         },
     )
+
+
+def _register_esc15_dcsync_grant(
+    config: EscConfig,
+    *,
+    owned_user: str,
+    domain_dn: str,
+    trustee_sid: Optional[str],
+) -> Optional[str]:
+    """Record the ESC15 method A replication ACE for verified removal at exit."""
+    shell = config.shell
+    if shell is None:
+        return None
+    target_object = domain_dn or config.domain
+    change_id: Optional[str] = None
+    ledger = ledger_or_warn(shell)
+    if ledger is not None:
+        try:
+            change_id = ledger.register_change(
+                kind="dacl_ace_added",
+                domain=config.domain,
+                target=target_object,
+                detail={
+                    "target_domain": config.domain,
+                    "target_object": target_object,
+                    "target_dn": domain_dn or None,
+                    "trustee": owned_user,
+                    "trustee_sid": trustee_sid or "",
+                    "rights_type": "dcsync",
+                    "exec_username": owned_user,
+                    "executor_username": owned_user,
+                    "executor_auth_domain": config.domain,
+                    "credential_lookup_domain": config.domain,
+                    "technique": "ADCSESC15 method A",
+                },
+                method="ADCSESC15 Schannel LDAPS cert bind (replication rights grant)",
+            )
+        except Exception as exc:  # noqa: BLE001 - disclosure is best-effort
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    actions = getattr(shell, "acl_cleanup_actions", None)
+    if isinstance(actions, list):
+        actions.append(
+            {
+                "kind": "dacl_ace_added",
+                "domain": config.domain,
+                "target_domain": config.domain,
+                "target": target_object,
+                "target_dn": domain_dn or None,
+                "exec_username": owned_user,
+                "exec_password": config.effective_secret or "",
+                "trustee": owned_user,
+                "trustee_sid": trustee_sid or "",
+                "rights_type": "dcsync",
+                "_ledger_change_id": change_id,
+            }
+        )
+    return change_id
+
+
+async def _resolve_sid_over_client(client: Any, dn: Optional[str]) -> Optional[str]:
+    """Read a principal's objectSid (string form) via a bound badldap client."""
+    if not dn:
+        return None
+    try:
+        async for obj, err in client.pagedsearch(
+            "(objectClass=*)", attributes=["objectSid"], tree=dn
+        ):
+            if err is not None:
+                break
+            if not isinstance(obj, dict):
+                continue
+            attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else obj
+            sid = attrs.get("objectSid")
+            if isinstance(sid, (list, tuple)):
+                sid = sid[0] if sid else None
+            if sid:
+                return str(sid)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return None
 
 
 async def _resolve_dn_over_client(client: Any, sam_account_name: str) -> Optional[str]:

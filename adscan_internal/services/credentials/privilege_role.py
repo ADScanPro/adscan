@@ -32,7 +32,8 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, MutableMapping
+from collections.abc import Iterable, Mapping
+from typing import Any, MutableMapping, NamedTuple
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_exception
@@ -124,7 +125,11 @@ def _domain_data(shell: Any, domain: str) -> dict[str, Any] | None:
     domains = getattr(shell, "domains_data", None)
     if not isinstance(domains, MutableMapping):
         return None
-    bucket = domains.get(domain)
+    # Case-insensitive: an attack-path edge label carries the realm upper-case
+    # (DARKZERO.EXT) while domains_data keys the collected lower-case FQDN.
+    from adscan_internal.models.domain import resolve_ci  # noqa: PLC0415
+
+    bucket = resolve_ci(domains, domain)
     return bucket if isinstance(bucket, MutableMapping) else None
 
 
@@ -161,6 +166,28 @@ def _infer_secret_kind(secret: str) -> CredentialKind:
     if _looks_like_nt_hash(secret or ""):
         return CredentialKind.NT_HASH
     return CredentialKind.PASSWORD
+
+
+def resolve_secret_kind(stored_kind: Any, secret: str | None) -> CredentialKind:
+    """Return how to interpret ``secret``: the ONE reader of the stored label.
+
+    ``credentials_meta[user]["secret_kind"]`` is a label kept beside the secret,
+    keyed by username, and it can describe a different secret than the one
+    stored (a later capture replaced the secret, or a same-named local account
+    wrote the label). The credential store itself classifies a 32-hex value as
+    an NT hash on write, so a label of ``password`` on an NT-hash-shaped secret
+    is stale, and trusting it sends the hash as a password: a guaranteed failed
+    sign-in on a real account. The shape therefore overrides a ``password``
+    label; every other label is kept (an AES-128 key is also 32 hex, and only
+    the label tells it apart).
+    """
+    try:
+        kind = CredentialKind(stored_kind) if stored_kind else None
+    except ValueError:
+        kind = None
+    if kind is None or kind is CredentialKind.PASSWORD:
+        return _infer_secret_kind(secret or "")
+    return kind
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +775,30 @@ def _user_admin_to_host(
     return False
 
 
+def _replicated_rid(shell: Any, *, domain: str, username: str) -> int | None:
+    """The RID a directory replication recorded for ``username``, or ``None``.
+
+    Read from the key-material store DCSync fills (``kerberos_keys[...]["rid"]``).
+    Evidence, never a guess from the account NAME. Never raises.
+    """
+    try:
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            CredentialStoreService,
+        )
+
+        material = CredentialStoreService().get_kerberos_key_material(
+            domains_data=getattr(shell, "domains_data", {}) or {},
+            domain=domain,
+            username=username,
+        )
+        raw = str(getattr(material, "rid", "") or "").strip()
+        return int(raw) if raw.isdigit() else None
+    except Exception as exc:  # noqa: BLE001 - missing evidence, not an error
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
 def _resolve_privilege_role_from_graph(
     shell: Any,
     *,
@@ -757,13 +808,15 @@ def _resolve_privilege_role_from_graph(
     graph: dict[str, Any] | None = None,
     user_node: dict[str, Any] | None = None,
     risk_record: Any = None,
+    directory_role: CredentialPrivilegeRole | None = None,
 ) -> CredentialPrivilegeRole:
     """Compute the privilege role of ``username`` from canonical AD data.
 
     Sources, in order of evaluation:
 
-        1. RID == 500 from the user's SID in the attack graph
-           → :attr:`CredentialPrivilegeRole.BUILTIN_ADMINISTRATOR`.
+        1. RID == 500 from the user's SID in the attack graph (or, for an
+           account with no collected node, the RID a directory replication
+           recorded for it) → :attr:`CredentialPrivilegeRole.BUILTIN_ADMINISTRATOR`.
         2. RID == 502 → :attr:`CredentialPrivilegeRole.KRBTGT`.
         3. ADscan identity-risk-snapshot ``reasons``:
 
@@ -773,7 +826,13 @@ def _resolve_privilege_role_from_graph(
 
         4. ``AdminTo`` edge from this user to ``target_host`` (when
            ``target_host`` is provided) → ``LOCAL_ADMIN_VERIFIED``.
-        5. Otherwise → :attr:`CredentialPrivilegeRole.STANDARD`.
+        5. ``directory_role``: the role the caller already derived from the
+           directory membership it collected (see
+           :func:`directory_admin_roles`). This is the only source available
+           DURING a collection, before the attack graph and the identity-risk
+           snapshot exist; without it a run that starts as Domain Admin cannot
+           qualify its own credential for a CA-host read.
+        6. Otherwise → :attr:`CredentialPrivilegeRole.STANDARD`.
 
     Multiple matches resolve to the highest-priority via
     :data:`ROLE_PRIORITY`. Pure read; never raises (returns ``STANDARD``
@@ -785,9 +844,16 @@ def _resolve_privilege_role_from_graph(
                 shell, domain=domain, username=username
             )
         candidates: list[CredentialPrivilegeRole] = []
+        if directory_role is not None:
+            candidates.append(directory_role)
 
         sid = _node_object_id(user_node) if user_node else ""
         rid = _rid_from_sid(sid)
+        if rid is None:
+            # No collected node (a forest reached by replication and never
+            # collected): the RID the replication returned for this account is
+            # the same authoritative fact the graph would carry.
+            rid = _replicated_rid(shell, domain=domain, username=username)
         if rid == 500:
             candidates.append(CredentialPrivilegeRole.BUILTIN_ADMINISTRATOR)
         elif rid == 502:
@@ -868,6 +934,107 @@ def _resolve_is_enabled(
         return True
 
 
+class DirectoryPrincipal(NamedTuple):
+    """One collected account, as :func:`directory_admin_roles` needs it."""
+
+    samaccountname: str
+    sid: str
+    enabled: bool | None = True
+    primary_group_id: int | None = None
+
+
+def directory_admin_roles(
+    principals: Iterable[DirectoryPrincipal],
+    member_of: Iterable[tuple[str, str]],
+) -> dict[str, CredentialPrivilegeRole]:
+    """Return ``{normalized username: admin role}`` from collected membership.
+
+    The role evidence available while a collection is still running, before
+    the attack graph and the identity-risk snapshot exist. The membership is
+    the directory's own answer (``member`` of every group plus each account's
+    ``primaryGroupID``), closed transitively through the SID-space closure SSOT
+    (:func:`~adscan_internal.services.collector.share_ntfs_verification.build_sid_group_closure`)
+    and classified by the privileged-group SSOT
+    (:func:`~adscan_internal.services.privileged_group_classifier.classify_privileged_membership_from_group_sids`).
+
+    Only the domain-wide administrative roles the local-admin picker accepts
+    are returned: Domain Admins (RID 512), Enterprise Admins (RID 519),
+    BUILTIN\\Administrators (S-1-5-32-544) and the RID 500 account. A disabled
+    account never qualifies. Pure: no I/O, never raises on malformed rows.
+
+    Args:
+        principals: The accounts to classify (usually only those with a stored
+            credential, which keeps the work proportional to the credentials).
+        member_of: ``(member_sid, group_sid)`` pairs for the whole domain.
+    """
+    from adscan_internal.services.collector.share_ntfs_verification import (  # noqa: PLC0415
+        build_sid_group_closure,
+    )
+    from adscan_internal.services.privileged_group_classifier import (  # noqa: PLC0415
+        classify_privileged_membership_from_group_sids,
+    )
+
+    wanted: list[DirectoryPrincipal] = []
+    edges: list[tuple[str, str]] = [
+        (str(m or "").upper(), str(g or "").upper()) for m, g in member_of
+    ]
+    for principal in principals:
+        sid = str(principal.sid or "").strip().upper()
+        if not sid or not str(principal.samaccountname or "").strip():
+            continue
+        if principal.enabled is False:
+            continue
+        wanted.append(principal)
+        domain_sid, _sep, _rid = sid.rpartition("-")
+        if principal.primary_group_id and domain_sid.startswith("S-1-5-21-"):
+            # The primary group is implicit: it is never listed in the
+            # group's ``member`` attribute, so a closure over ``member`` alone
+            # misses it.
+            edges.append((sid, f"{domain_sid}-{int(principal.primary_group_id)}"))
+    if not wanted:
+        return {}
+
+    # Feed the closure only the edges reachable from the wanted accounts: at
+    # enterprise scale the domain has ~10^5 members and the caller needs a
+    # handful of them, so closing every member would be wasted work inside the
+    # collection.
+    parents: dict[str, list[str]] = {}
+    for member, group in edges:
+        if member and group:
+            parents.setdefault(member, []).append(group)
+    reachable: set[str] = set()
+    stack = [str(p.sid).strip().upper() for p in wanted]
+    while stack:
+        current = stack.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        stack.extend(parents.get(current, ()))
+    closure = build_sid_group_closure(
+        (member, group) for member, group in edges if member in reachable
+    )
+    roles: dict[str, CredentialPrivilegeRole] = {}
+    for principal in wanted:
+        sid = str(principal.sid).strip().upper()
+        candidates: list[CredentialPrivilegeRole] = []
+        if _rid_from_sid(sid) == 500:
+            candidates.append(CredentialPrivilegeRole.BUILTIN_ADMINISTRATOR)
+        membership = classify_privileged_membership_from_group_sids(
+            closure.get(sid, frozenset())
+        )
+        if membership.domain_admin:
+            candidates.append(CredentialPrivilegeRole.DOMAIN_ADMIN)
+        if membership.enterprise_admins:
+            candidates.append(CredentialPrivilegeRole.ENTERPRISE_ADMIN)
+        if membership.administrators:
+            candidates.append(CredentialPrivilegeRole.BUILTIN_ADMINISTRATOR)
+        if candidates:
+            roles[_normalize_user(principal.samaccountname)] = max(
+                candidates, key=lambda r: ROLE_PRIORITY.get(r, 0)
+            )
+    return roles
+
+
 # ---------------------------------------------------------------------------
 # Picker
 # ---------------------------------------------------------------------------
@@ -879,6 +1046,7 @@ def pick_credential_for_local_admin(
     domain: str,
     target_host: str | None = None,
     require_cleartext: bool = False,
+    directory_roles: Mapping[str, CredentialPrivilegeRole] | None = None,
 ) -> tuple[str, str, CredentialKind] | None:
     """Return the best ``(username, secret, secret_kind)`` for local admin.
 
@@ -906,6 +1074,11 @@ def pick_credential_for_local_admin(
         * If ``require_cleartext=True``, accounts whose only available
           secret is a hash / key / ccache are excluded.
         * KRBTGT is never returned (out of ``_LOCAL_ADMIN_TIERS``).
+
+    ``directory_roles`` (``{normalized username: role}``) is role evidence the
+    caller derived from directory membership it has ALREADY collected, for the
+    window in which the graph does not exist yet (the collector itself). It is
+    one more source for the same resolver, never a bypass of the filters above.
 
     Returns:
         ``(username, secret, kind)`` triple or ``None``.
@@ -950,6 +1123,7 @@ def pick_credential_for_local_admin(
             graph=graph_cache,
             user_node=user_node,
             risk_record=risk_record,
+            directory_role=(directory_roles or {}).get(_normalize_user(raw_user)),
         )
 
         host_specific_lav = (
@@ -969,16 +1143,8 @@ def pick_credential_for_local_admin(
         ):
             continue
 
-        # secret_kind from meta or inference.
-        stored_kind = meta.get("secret_kind")
-        try:
-            kind = (
-                CredentialKind(stored_kind)
-                if stored_kind
-                else _infer_secret_kind(secret)
-            )
-        except ValueError:
-            kind = _infer_secret_kind(secret)
+        # secret_kind: the stored label, checked against the secret's shape.
+        kind = resolve_secret_kind(meta.get("secret_kind"), secret)
 
         if require_cleartext and kind is not CredentialKind.PASSWORD:
             continue
@@ -1037,9 +1203,12 @@ def pick_credential_for_local_admin(
 
 
 __all__ = [
+    "resolve_secret_kind",
     "CredentialPrivilegeRole",
     "CredentialKind",
+    "DirectoryPrincipal",
     "ROLE_PRIORITY",
+    "directory_admin_roles",
     "append_credential_origin",
     "credential_secret_fingerprint",
     "get_credential_meta",

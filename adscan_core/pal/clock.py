@@ -20,6 +20,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from adscan_core.pal.platform import current_os, is_windows
 
@@ -28,6 +29,7 @@ __all__ = [
     "can_step_system_clock",
     "step_system_clock",
     "set_ntp_service",
+    "set_system_wall_clock",
     "is_domain_time_synced_natively",
 ]
 
@@ -139,6 +141,88 @@ def step_system_clock(iso_utc: str) -> ClockStepResult:
             os=os_name,
         )
     return ClockStepResult(stepped=False, reason=detail, os=os_name)
+
+
+def _windows_set_system_time(when_utc: datetime) -> tuple[bool, str]:
+    """Call ``SetSystemTime`` (UTC). Requires an elevated process."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _SystemTime(ctypes.Structure):
+            _fields_ = [
+                ("wYear", wintypes.WORD),
+                ("wMonth", wintypes.WORD),
+                ("wDayOfWeek", wintypes.WORD),
+                ("wDay", wintypes.WORD),
+                ("wHour", wintypes.WORD),
+                ("wMinute", wintypes.WORD),
+                ("wSecond", wintypes.WORD),
+                ("wMilliseconds", wintypes.WORD),
+            ]
+
+        value = when_utc.astimezone(timezone.utc)
+        st = _SystemTime(
+            value.year,
+            value.month,
+            (value.isoweekday() % 7),
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond // 1000,
+        )
+        ok = bool(ctypes.windll.kernel32.SetSystemTime(ctypes.byref(st)))  # type: ignore[attr-defined]
+        if ok:
+            return (True, "SetSystemTime succeeded")
+        return (False, f"SetSystemTime failed (error {ctypes.GetLastError()})")  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 — seam must never raise
+        return (False, f"SetSystemTime unavailable: {exc}")
+
+
+def _posix_set_system_time(when_utc: datetime) -> tuple[bool, str]:
+    """``date -u -s`` as root, else ``sudo -n``. Never prompts."""
+    from adscan_core.pal.process import effective_user_is_root
+
+    iso = when_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
+    date_bin = shutil.which("date")
+    if not date_bin:
+        return (False, "date binary not found")
+    argv = [date_bin, "-u", "-s", iso]
+    if not effective_user_is_root():
+        sudo = shutil.which("sudo")
+        if not sudo:
+            return (False, "not root and sudo not available")
+        argv = [sudo, "-n", *argv]
+    try:
+        completed = subprocess.run(  # noqa: S603 — fixed argv, validated datetime
+            argv, capture_output=True, text=True, timeout=_W32TM_TIMEOUT
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"date invocation failed: {exc}")
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return (False, f"date exit {completed.returncode}: {detail}"[:400])
+    return (True, "wall clock set with date -u -s")
+
+
+def set_system_wall_clock(when_utc: datetime) -> ClockStepResult:
+    """Set the host wall clock to an exact UTC instant (best-effort). Never raises.
+
+    Used to restore the clock after a scan stepped it to a domain controller
+    (``adscan_core/wall_clock.py``). Windows: ``SetSystemTime`` when elevated.
+    POSIX native runtime: ``date -u -s`` as root or through ``sudo -n``. Under the
+    Docker runtime the engine does not call this: the privileged host helper owns
+    the restore.
+    """
+    os_name = current_os()
+    if os_name == "windows":
+        if not _windows_is_elevated():
+            return ClockStepResult(stepped=False, reason="requires admin on Windows", os=os_name)
+        ok, detail = _windows_set_system_time(when_utc)
+        return ClockStepResult(stepped=ok, reason=detail, os=os_name)
+    ok, detail = _posix_set_system_time(when_utc)
+    return ClockStepResult(stepped=ok, reason=detail, os=os_name)
 
 
 def set_ntp_service(enabled: bool) -> bool:

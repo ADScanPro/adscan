@@ -225,3 +225,33 @@ def current_user_name() -> str | None:
         return pwd.getpwuid(os.getuid()).pw_name
     except (KeyError, AttributeError, OSError):
         return None
+
+
+def open_with_desktop_app(path: str) -> bool:
+    """Open ``path`` with the desktop's default application, best-effort.
+
+    Windows uses ``os.startfile`` (the shell association); POSIX spawns the
+    first desktop opener on ``PATH`` (``xdg-open`` on Linux, ``open`` on
+    macOS), detached from our output. The launch itself is asynchronous and
+    cannot be confirmed.
+
+    Returns:
+        True when an opener was dispatched, False when none is available.
+    """
+    if is_windows():
+        startfile = getattr(os, "startfile", None)
+        if startfile is None:
+            return False
+        startfile(str(path))  # pylint: disable=not-callable
+        return True
+    import shutil  # noqa: PLC0415
+
+    opener = shutil.which("xdg-open") or shutil.which("open")
+    if not opener:
+        return False
+    subprocess.Popen(  # noqa: S603 - fixed opener, path passed as one argv item
+        [opener, str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True

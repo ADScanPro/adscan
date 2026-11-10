@@ -15,9 +15,14 @@ from adscan_internal.services.collector.models import (
     PasswordComplianceReport,
     PasswordSettingsObject,
 )
+from adscan_core.engagement.coverage_io import stamp_artifact_run_id
 from adscan_internal.workspaces import domain_subpath, write_json_file
 
 INVENTORY_SCHEMA_VERSION = "inventory-1.0"
+
+#: Raw AD CS escalation rows (one per principal x object). Execution reads them
+#: through :func:`adscan_internal.services.attack_graph_service.load_adcs_attack_step_records`.
+ADCS_ATTACK_STEPS_FILE = "adcs_attack_steps.json"
 
 _NODE_KIND_TO_FILE: dict[str, str] = {
     "User": "users.json",
@@ -39,22 +44,23 @@ _RELATION_TO_FILE: dict[str, str] = {
     "MemberOf": "memberships.json",
     "GPLink": "gpo_links.json",
     "TrustedBy": "trusts.json",
-    "ADCSESC1": "adcs_attack_steps.json",
-    "ADCSESC2": "adcs_attack_steps.json",
-    "ADCSESC3": "adcs_attack_steps.json",
-    "ADCSESC4": "adcs_attack_steps.json",  # write on template
-    "ADCSESC5": "adcs_attack_steps.json",  # write on PKI container objects
-    "ADCSESC6": "adcs_attack_steps.json",
-    "ADCSESC7": "adcs_attack_steps.json",
-    "ADCSESC8": "adcs_attack_steps.json",
-    "ADCSESC9": "adcs_attack_steps.json",
-    "ADCSESC10": "adcs_attack_steps.json",
-    "ADCSESC11": "adcs_attack_steps.json",
-    "ADCSESC13": "adcs_attack_steps.json",
-    "ADCSESC14": "adcs_attack_steps.json",
-    "ADCSESC15": "adcs_attack_steps.json",
-    "ADCSESC16": "adcs_attack_steps.json",
-    "ADCSESC17": "adcs_attack_steps.json",
+    "ADCSESC1": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC2": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC3": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC4": ADCS_ATTACK_STEPS_FILE,  # write on template
+    "ADCSESC5": ADCS_ATTACK_STEPS_FILE,  # write on PKI container objects
+    "ADCSESC6": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC7": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC8": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC9": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC10": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC11": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC12": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC13": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC14": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC15": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC16": ADCS_ATTACK_STEPS_FILE,
+    "ADCSESC17": ADCS_ATTACK_STEPS_FILE,
 }
 _DCSYNC_RELATIONS: frozenset[str] = frozenset(
     {"GetChanges", "GetChangesAll", "GetChangesInFilteredSet"}
@@ -116,6 +122,7 @@ class CollectorInventoryPersistence:
             object_count += len(records)
             index_files[filename] = {"type": "nodes", "count": len(records)}
 
+        run_id = _active_run_id(shell)
         for filename, records in sorted(edge_records_by_file.items()):
             _write_inventory_file(
                 inventory_dir,
@@ -124,6 +131,7 @@ class CollectorInventoryPersistence:
                 generated_at=generated_at,
                 record_type="edges",
                 records=records,
+                run_id=run_id,
             )
             files_written += 1
             edge_count += len(records)
@@ -194,6 +202,9 @@ class CollectorInventoryPersistence:
             },
         }
         write_json_file(os.path.join(inventory_dir, "index.json"), index)
+        _observe_adcs_escalations(
+            shell, domain, result, edge_records_by_file.get(ADCS_ATTACK_STEPS_FILE, [])
+        )
         return {
             "inventory_files": files_written + 1,
             "inventory_nodes": object_count,
@@ -778,6 +789,7 @@ def _write_inventory_file(
     generated_at: str,
     record_type: str,
     records: list[dict[str, Any]],
+    run_id: str = "",
 ) -> None:
     payload = {
         "schema_version": INVENTORY_SCHEMA_VERSION,
@@ -787,7 +799,82 @@ def _write_inventory_file(
         "count": len(records),
         "records": records,
     }
+    # Which recorded run wrote this file, so the run's observation record can be
+    # matched to it (``adscan_core.engagement.coverage_io``). Empty outside a run.
+    stamp_artifact_run_id(payload, run_id)
     write_json_file(os.path.join(inventory_dir, filename), payload)
+
+
+def _active_run_id(shell: object) -> str:
+    try:
+        from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
+            active_run_id,
+        )
+
+        return active_run_id(shell)
+    except Exception:  # noqa: BLE001 - an unknown run stamps nothing
+        return ""
+
+
+#: Node kinds whose presence in the collection proves certificate services were
+#: read, so an escalation with no row was evaluated and is clear.
+_ADCS_AUTHORITY_KINDS = frozenset({"EnterpriseCA"})
+
+
+def _observe_adcs_escalations(
+    shell: object, domain: str, result: CollectionResult, records: list[dict[str, Any]]
+) -> None:
+    """Record each AD CS escalation family's observation with its raw rows.
+
+    The rows are the unsuppressed per-(principal x object) view execution reads
+    (the judged graph prunes Tier 0 sources and re-projects ESC4), identical to
+    the ``adcs_attack_steps.json`` records. An escalation with no row is clear
+    only when an enterprise CA was collected; without one nothing is recorded
+    and the certificate-services detection decides. Best-effort.
+    """
+    try:
+        from adscan_core.engagement.detectors import DETECTORS, adcs_check_id  # noqa: PLC0415
+        from adscan_core.engagement.observations import Outcome  # noqa: PLC0415
+        from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
+            flush_observations,
+            note_observation,
+        )
+
+        by_check: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for record in records:
+            relation = str(record.get("relation") or "")
+            if relation.upper().startswith("ADCSESC"):
+                by_check[adcs_check_id(relation)].append(record)
+        authority_seen = any(
+            node.kind in _ADCS_AUTHORITY_KINDS for node in result.nodes.values()
+        )
+        if not by_check and not authority_seen:
+            return
+        for detector in DETECTORS:
+            if not detector.check_id.startswith("adcs.esc"):
+                continue
+            # An instrumented family (ESC12, read on the CA host) records its
+            # own every outcome; a collected CA proves nothing about it, so it
+            # must never be marked clear here by absence.
+            if detector.instrumented:
+                continue
+            rows = by_check.get(detector.check_id, [])
+            if rows:
+                note_observation(
+                    shell, detector.check_id, Outcome.FINDING, domain=domain,
+                    scope_kind="object", examined=len(rows), instances=rows,
+                )
+            elif authority_seen:
+                note_observation(
+                    shell, detector.check_id, Outcome.CLEAR, domain=domain, scope_kind="object"
+                )
+        flush_observations(shell)
+    except Exception as exc:  # noqa: BLE001 - the inventory file is still written
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _write_domain_policy_file(

@@ -15,6 +15,7 @@ import importlib
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
+from adscan_core.secret_argv import mask_argv
 from adscan_core.version_context import RUNTIME_CONTRACT_VERSION
 from adscan_launcher.docker_pull_diagnostics import (
     PullFailureDiagnosis,
@@ -193,12 +195,27 @@ class DockerRunConfig:
     # file the container must read but that lives outside the standard mounted
     # tree (e.g. a ``--scan-config`` file passed by absolute path).
     extra_mounts: tuple[tuple[str, str], ...] = ()
+    # Extra READ-WRITE host directory bind-mounts as ``(host_path,
+    # container_path)`` pairs, rendered as ``-v <host>:<container>``. Used only
+    # where the engine must write OUT to a host path the operator chose (the
+    # ``adscan run --events-file`` directory). Keep this list minimal: every
+    # entry is host filesystem the container can modify.
+    extra_rw_mounts: tuple[tuple[str, str], ...] = ()
+    # Host variables that must NEVER be forwarded by the ADSCAN_* wildcard for
+    # this run (a RunPlan's env: secret, handed over as a file instead).
+    env_exclude_keys: tuple[str, ...] = ()
     # Host directory bind-mounted into the container at /run/adscan. When
     # None, defaults to ``workspaces_host_dir.parent / "run"`` for backwards
     # compatibility. Per-launcher session directories live under
     # ``run/sessions/<token>/`` and are passed in here so two launchers do
     # not share the same host-helper socket path.
     run_host_dir: Path | None = None
+    # The operator's deliverables folder (``ADSCAN_DELIVERABLES_DIR``, default
+    # ``~/ADscan-deliverables``), mounted read-write at
+    # ``DELIVERABLES_CONTAINER_DIR`` so the REPL can save a copy of a report
+    # outside ADscan's tree. Set only for the commands that offer that copy
+    # (``start`` and ``deliver``); None leaves the run unchanged.
+    deliverables_host_dir: Path | None = None
 
 
 def _get_effective_home() -> Path:
@@ -902,6 +919,18 @@ def _make_docker_accessible_url(url: str) -> str:
     )
 
 
+def redact_url_password(value: str) -> str:
+    """Return ``value`` with the password of a ``scheme://user:pass@host`` URL hidden.
+
+    Used wherever a connection URL is logged or echoed (the web stack's Redis
+    URL carries its password). Anything that is not such a URL is returned
+    unchanged.
+    """
+    import re
+
+    return re.sub(r"(?P<head>[a-z][a-z0-9+.-]*://[^/:@\s]*:)[^@/\s]+@", r"\g<head>***@", value)
+
+
 def runtime_cap_add_list() -> tuple[str, ...]:
     """Return the ``--cap-add`` names the real ADscan container is launched with.
 
@@ -1258,6 +1287,20 @@ LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
         # --- host-shell integration (launcher install/alias mechanics) ---
         "ADSCAN_CLI_PATH",  # host launcher invocation prefix
         "ADSCAN_SUDO_ALIAS_MARKER",  # marker line for the auto-sudo shell alias
+        # --- host-path overrides that would be wrong inside the container ---
+        # The Enterprise license dir is a per-process path override. Inside the
+        # scan container the license is reached through the state-dir mount
+        # (/opt/adscan/state/license); a forwarded HOST path would point at
+        # nothing and make a licensed appliance refuse its scans.
+        "ADSCAN_LICENSE_DIR",
+        # The deliverables folder is a HOST path: the container reaches it
+        # through a fixed mount, and the launcher injects the two values the
+        # container needs (the mount's host path, the host home) itself, only
+        # when it actually mounted the folder. A stray host value must never
+        # pretend a folder is mounted.
+        "ADSCAN_DELIVERABLES_DIR",
+        "ADSCAN_DELIVERABLES_HOST_DIR",
+        "ADSCAN_HOST_HOME",
     }
 )
 
@@ -1322,6 +1365,179 @@ def _iter_forwardable_adscan_env(
         yield key, value
 
 
+#: Docker label carrying the web scan id on the runtime container a scan runs in.
+#: The Celery worker finds the container by this label to stop it, so a stopped
+#: scan can never leave its engine running: killing the launcher or the docker
+#: CLI does not stop a container. Mirrored as a literal by the worker
+#: (``appliance/celery/adscan_celery/scan_termination.py``, which cannot import
+#: the launcher); a contract test keeps the two equal.
+SCAN_ID_CONTAINER_LABEL = "com.adscanpro.scan-id"
+
+#: Host env var the web worker sets to the scan id on the launcher it starts.
+SCAN_ID_ENV_KEY = "ADSCAN_SCAN_ID"
+
+
+def scan_container_label_args() -> list[str]:
+    """Return ``docker run`` label args identifying the web scan, if any.
+
+    Only a launcher started by the web worker carries ``ADSCAN_SCAN_ID``; a
+    plain operator run gets no label and is unaffected.
+    """
+    scan_id = str(os.environ.get(SCAN_ID_ENV_KEY) or "").strip()
+    if not scan_id:
+        return []
+    return ["--label", f"{SCAN_ID_CONTAINER_LABEL}={scan_id}"]
+
+
+#: Labels every runtime container carries so its owner can be read from the
+#: host. ``owner`` is ``web-scan`` for a scan the platform's worker started and
+#: ``cli`` otherwise; ``launcher-pid`` is the host process that started it and
+#: is the only process entitled to stop it (with the worker, for a web scan).
+OWNER_CONTAINER_LABEL = "com.adscanpro.owner"
+LAUNCHER_PID_CONTAINER_LABEL = "com.adscanpro.launcher-pid"
+COMMAND_CONTAINER_LABEL = "com.adscanpro.run-command"
+
+_CONTAINER_NAME_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _container_name_token(value: str, *, max_len: int) -> str:
+    token = _CONTAINER_NAME_TOKEN_RE.sub("-", str(value or "").lower()).strip("-")
+    return token[:max_len].strip("-")
+
+
+def _runtime_command_token(adscan_args: Sequence[str]) -> str:
+    """Return the engine command a run executes (``ci``, ``start``...), or ``run``."""
+    for arg in adscan_args:
+        text = str(arg or "")
+        if text and not text.startswith("-"):
+            return _container_name_token(text, max_len=20) or "run"
+    return "run"
+
+
+def runtime_container_identity_args(adscan_args: Sequence[str]) -> list[str]:
+    """Return ``docker run`` args that name the container after its owner.
+
+    The release gate lost a web scan to an operator's ``docker stop`` aimed at
+    what looked like a leftover CLI container: both were the same image under a
+    random name such as ``funny_brown``, so nothing on the host said whose
+    container it was. Every runtime container is now named for what started it
+    (``adscan-web-scan-<scan id>-<suffix>`` for a platform scan,
+    ``adscan-cli-<command>-<launcher pid>-<suffix>`` otherwise) and labelled
+    with its owner, so ``docker ps`` answers that question before anyone acts.
+    The suffix keeps names unique when a run is retried while a previous
+    container of the same scan is still being stopped.
+    """
+    command = _runtime_command_token(adscan_args)
+    launcher_pid = os.getpid()
+    suffix = secrets.token_hex(2)
+    scan_id = str(os.environ.get(SCAN_ID_ENV_KEY) or "").strip()
+    if scan_id:
+        owner = "web-scan"
+        scan_token = _container_name_token(scan_id, max_len=12) or "unknown"
+        name = f"adscan-web-scan-{scan_token}-{suffix}"
+    else:
+        owner = "cli"
+        name = f"adscan-cli-{command}-{launcher_pid}-{suffix}"
+    return [
+        "--name",
+        name,
+        "--label",
+        f"{OWNER_CONTAINER_LABEL}={owner}",
+        "--label",
+        f"{LAUNCHER_PID_CONTAINER_LABEL}={launcher_pid}",
+        "--label",
+        f"{COMMAND_CONTAINER_LABEL}={command}",
+    ]
+
+
+#: Container paths of the operator-preference artefacts that live at the ADscan
+#: home ROOT, which is not itself a mount (only its subdirectories are).
+OPERATOR_CONFIG_CONTAINER_PATH = "/opt/adscan/config.json"
+CLIENT_LOGO_CONTAINER_DIR = "/opt/adscan/branding"
+
+
+def _operator_preferences_mount_args(home_host_dir: Path) -> list[str]:
+    """``docker run`` args that expose the operator's preferences to the runtime.
+
+    ``config.json`` (capability entitlements such as white-label, the persisted
+    client logo, spray-variation defaults) and ``branding/`` (the client logo
+    the launcher stages for ``deliver --client-logo``) both sit at the home
+    root. The runtime reads and writes them through its own ADscan home
+    (``report_branding``, ``client_logo``, ``spray_preferences_service``), so
+    without these mounts it saw neither: an entitled ``--branding whitelabel``
+    render silently fell back to co-branding, and a staged logo was missing.
+
+    The file is mounted as a single file, which requires it to exist (Docker
+    would otherwise create a DIRECTORY at the host path), so an absent one is
+    created empty. The runtime writes it in place, which a file bind mount
+    supports. A path Docker cannot express, or a host path that is not a
+    regular file, is skipped rather than failing the run.
+    """
+    args: list[str] = []
+    config_file = home_host_dir / "config.json"
+    branding_dir = home_host_dir / "branding"
+    if ":" in str(home_host_dir):
+        print_info_debug(
+            f"[docker] operator preferences not mounted: ':' in {home_host_dir}"
+        )
+        return args
+    try:
+        if not config_file.exists():
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            config_file.write_text("{}\n", encoding="utf-8")
+        if config_file.is_file():
+            args.extend(["-v", f"{config_file}:{OPERATOR_CONFIG_CONTAINER_PATH}"])
+        else:
+            print_warning(
+                f"{config_file} is not a regular file, so the ADscan runtime "
+                "cannot read the operator preferences and entitlements in it."
+            )
+    except OSError as exc:
+        print_warning(f"Could not prepare {config_file} for the ADscan runtime: {exc}")
+    try:
+        branding_dir.mkdir(parents=True, exist_ok=True)
+        args.extend(["-v", f"{branding_dir}:{CLIENT_LOGO_CONTAINER_DIR}"])
+    except OSError as exc:
+        print_warning(f"Could not prepare {branding_dir} for the ADscan runtime: {exc}")
+    return args
+
+
+def _deliverables_mount_args(host_dir: Path | None) -> list[str]:
+    """``docker run`` args that mount the operator's deliverables folder.
+
+    Mounted at the fixed ``DELIVERABLES_CONTAINER_DIR`` with the host path and
+    the host home forwarded for display and ``~`` expansion (see
+    ``adscan_core.deliverable_destination``). A path with ``:`` cannot be
+    expressed in a ``-v`` spec, so the mount is skipped with a warning and the
+    REPL simply does not offer the copy.
+    """
+    if host_dir is None:
+        return []
+    from adscan_core.container_io import DELIVERABLES_CONTAINER_DIR  # noqa: PLC0415
+    from adscan_core.deliverable_destination import (  # noqa: PLC0415
+        DELIVERABLES_HOST_DIR_ENV,
+        HOST_HOME_ENV,
+    )
+    from adscan_core.path_utils import get_effective_user_home  # noqa: PLC0415
+
+    host = str(host_dir)
+    if ":" in host:
+        print_warning(
+            f"Deliverables folder not mounted: Docker cannot mount a path containing ':' ({host}). "
+            "Set ADSCAN_DELIVERABLES_DIR to another folder."
+        )
+        return []
+    print_info_debug(f"[docker] mounting deliverables folder: {host} -> {DELIVERABLES_CONTAINER_DIR}")
+    return [
+        "-v",
+        f"{host}:{DELIVERABLES_CONTAINER_DIR}",
+        "-e",
+        f"{DELIVERABLES_HOST_DIR_ENV}={host}",
+        "-e",
+        f"{HOST_HOME_ENV}={get_effective_user_home()}",
+    ]
+
+
 def build_adscan_run_command(
     cfg: DockerRunConfig,
     *,
@@ -1337,6 +1553,8 @@ def build_adscan_run_command(
         cmd.append("--rm")
     if cfg.interactive:
         cmd.extend(["-it"])
+    cmd.extend(scan_container_label_args())
+    cmd.extend(runtime_container_identity_args(adscan_args))
     if cfg.network_host:
         cmd.extend(["--network", "host"])
     else:
@@ -1420,6 +1638,7 @@ def build_adscan_run_command(
             f"{bonuses_host_dir}:/opt/adscan/bonuses",
         ]
     )
+    cmd.extend(_operator_preferences_mount_args(cfg.workspaces_host_dir.parent))
 
     # If the host uses systemd-resolved, mount its resolver files into the
     # container so the entrypoint can discover upstream DNS servers.
@@ -1444,6 +1663,13 @@ def build_adscan_run_command(
             print_info_debug(
                 f"[docker] mounting host file read-only: {host_path} -> {container_path}"
             )
+    for host_path, container_path in cfg.extra_rw_mounts:
+        if host_path and container_path:
+            cmd.extend(["-v", f"{host_path}:{container_path}"])
+            print_info_debug(
+                f"[docker] mounting host directory read-write: {host_path} -> {container_path}"
+            )
+    cmd.extend(_deliverables_mount_args(cfg.deliverables_host_dir))
 
     # Default to running as the current user to avoid root-owned files in the host mount.
     if cfg.run_as_current_user:
@@ -1561,14 +1787,17 @@ def build_adscan_run_command(
         if key in os.environ and str(os.environ.get(key, "")).strip():
             cmd.extend(["-e", f"{key}={os.environ[key]}"])
 
-    # Remote interaction bridge: forward a Docker-accessible Redis URL so the
-    # container can reach the host Redis instance when delegating interactive
-    # prompts (e.g. attack path selection) to the web UI.
+    # Remote interaction bridge: forward a Redis URL the container can reach so
+    # it can delegate interactive prompts (e.g. attack path selection) to the
+    # web UI through the host Redis instance.
     #
-    # The host uses localhost/127.0.0.1 which is unreachable from inside a
-    # Docker container.  We rewrite these to the special `host-gateway` hostname
-    # that Docker maps to the host's bridge IP, and add --add-host so Docker
-    # resolves it correctly on Linux (where host.docker.internal is unavailable).
+    # With ``--network host`` (the Linux default) the container shares the host
+    # network namespace, so the host's ``localhost`` IS reachable and the URL is
+    # forwarded unchanged. That matters: the web stack's Redis binds loopback
+    # only, so the ``host-gateway`` rewrite (the docker0 bridge address,
+    # 172.17.0.1 by default) would be refused there. Only bridge/NAT networking
+    # (macOS Docker Desktop) needs ``host-gateway``, where Docker resolves it to
+    # the host.
     _interactive_sink = (
         str(os.environ.get("ADSCAN_INTERACTIVE_SINK", "") or "").strip().lower()
     )
@@ -1577,14 +1806,18 @@ def build_adscan_run_command(
             os.environ.get("ADSCAN_REDIS_URL") or os.environ.get("REDIS_URL") or ""
         ).strip()
         if _host_redis_url:
-            _docker_redis_url = _make_docker_accessible_url(_host_redis_url)
-            if not host_gateway_added:
-                cmd.extend(["--add-host", "host-gateway:host-gateway"])
-                host_gateway_added = True
+            if cfg.network_host:
+                _docker_redis_url = _host_redis_url
+            else:
+                _docker_redis_url = _make_docker_accessible_url(_host_redis_url)
+                if not host_gateway_added:
+                    cmd.extend(["--add-host", "host-gateway:host-gateway"])
+                    host_gateway_added = True
             cmd.extend(["-e", f"ADSCAN_REDIS_URL={_docker_redis_url}"])
             print_info_debug(
                 f"[docker] forwarding Redis URL for interactive bridge: "
-                f"{_docker_redis_url} (host: {_host_redis_url})"
+                f"{redact_url_password(_docker_redis_url)} "
+                f"(host: {redact_url_password(_host_redis_url)})"
             )
 
     # Forward host distro metadata so telemetry inside the container reports the
@@ -1622,7 +1855,9 @@ def build_adscan_run_command(
         for i, arg in enumerate(cmd)
         if i > 0 and cmd[i - 1] == "-e" and arg.startswith("ADSCAN_") and "=" in arg
     )
-    for key, value in _iter_forwardable_adscan_env(_emitted_adscan_keys):
+    for key, value in _iter_forwardable_adscan_env(
+        _emitted_adscan_keys | frozenset(cfg.env_exclude_keys)
+    ):
         cmd.extend(["-e", f"{key}={value}"])
 
     cmd.append(cfg.image)
@@ -1676,12 +1911,32 @@ def emit_entrypoint_logs_from_state() -> None:
         print_info_debug(f"[entrypoint] error processing entrypoint log: {exc}")
 
 
+#: An environment variable whose NAME says it carries a secret. The launcher
+#: forwards every host ``ADSCAN_*`` variable by wildcard, so a client's cleanup
+#: account secret (``ADSCAN_CLEANUP_SECRET``), a licence or API token, or any
+#: future ``*_PASSWORD`` reaches the ``docker run`` argv; its VALUE must never
+#: reach a log. Matched on the name, so a new secret variable is covered without
+#: anyone remembering to list it.
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|PRIVATE_?KEY|LICEN[CS]E_?KEY|CREDENTIAL)",
+    re.IGNORECASE,
+)
+
+
+def env_name_carries_secret(key: str) -> bool:
+    """Return True when an environment variable's name marks it as a secret."""
+    return bool(_SECRET_ENV_NAME_RE.search(str(key or "")))
+
+
 def shell_quote_cmd(argv: Sequence[str]) -> str:
-    """Return a shell-escaped string for logging/debug."""
-    redacted_keys = {
-        "CLI_SHARED_TOKEN",
-        "CONTAINER_SHARED_TOKEN",
-    }
+    """Return a shell-escaped string for logging/debug.
+
+    The value of every ``-e KEY=VALUE`` whose name carries a secret is replaced
+    by ``[REDACTED]`` and every secret-bearing option (``-p``, ``--password``,
+    hashes, keys) is masked through ``adscan_core.secret_argv``: this string is written to the debug logs, and the
+    outside-workspace log outlives the workspace, so a secret logged here
+    survives the end-of-engagement delete.
+    """
     safe: list[str] = []
     i = 0
     while i < len(argv):
@@ -1689,10 +1944,14 @@ def shell_quote_cmd(argv: Sequence[str]) -> str:
         if item == "-e" and i + 1 < len(argv):
             kv = argv[i + 1]
             key, sep, value = kv.partition("=")
-            if sep and key in redacted_keys and value:
+            if sep and value and env_name_carries_secret(key):
                 safe.extend([item, f"{key}=[REDACTED]"])
+                i += 2
+                continue
+            if sep and value:
+                safe.extend([item, f"{key}={redact_url_password(value)}"])
                 i += 2
                 continue
         safe.append(item)
         i += 1
-    return " ".join(shlex.quote(a) for a in safe)
+    return " ".join(shlex.quote(a) for a in mask_argv(safe))

@@ -6,6 +6,8 @@ to keep `adscan.py` slimmer while preserving the exact runtime behaviour.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -43,6 +45,10 @@ from adscan_internal.cli.session_preflight import (
 )
 import asyncio
 from adscan_internal.services.posture_orchestration import ensure_posture_fresh
+from adscan_internal.cli.enterprise_license_gate import (
+    PHASE_UNAUTH,
+    ensure_environment_admitted,
+)
 from adscan_internal.services.posture_probe import ProbePhase
 from adscan_internal.services.cracking_benchmark import warm_benchmark_async
 from adscan_internal.services.background_jobs import (
@@ -85,6 +91,9 @@ from adscan_internal.services.network_preflight_service import (
 )
 from adscan_internal.services.session_compromise_state_service import (
     mark_session_compromise_evaluable,
+)
+from adscan_internal.services.engagement_timeline_record import (
+    record_engagement_timeline_for_session,
 )
 from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome, write_scan_summary
 from adscan_core.rich_output_collection import (
@@ -452,9 +461,6 @@ def _apply_lab_inference_result_to_shell(shell: Any, result: Any) -> bool:
         and not getattr(shell, "lab_inference_source", None)
     )
 
-    if not getattr(shell, "type", None):
-        shell.type = result.workspace_type
-
     if result.lab_provider and not explicit_provider:
         shell.lab_provider = result.lab_provider
 
@@ -513,7 +519,8 @@ def maybe_offer_post_scan_lab_confirmation(shell: Any) -> None:
     - Unknown lab/provider: no free-text prompt; keep provider context and use
       `provider/unknown` downstream when applicable.
     """
-    if getattr(shell, "type", None) != "ctf":
+    # Lab identification is genuinely environment.
+    if not policy_settings.is_lab(shell):
         return
     if getattr(shell, "_lab_prompt_shown", False):
         return
@@ -1211,6 +1218,21 @@ def _prompt_dc_discovery_recovery(
     return _DcDiscoveryRecoveryDecision(action="retry_scope", hosts=new_hosts)
 
 
+def _offer_cleanup_account(shell: Any, domain: str) -> None:
+    """The client's cleanup-only account, before any step can change the directory.
+
+    Asked once per workspace (default No, remembered either way; skipped when
+    unattended or when automatic reversion is off). A saved account is announced
+    in one line instead. Used solely to undo ADscan's changes, never for the
+    assessment. Shared by ``start unauth`` and ``start auth``.
+    """
+    from adscan_internal.services.cleanup_credential_loader import (  # noqa: PLC0415
+        offer_cleanup_credential_prompt,
+    )
+
+    offer_cleanup_credential_prompt(shell, domain=domain)
+
+
 def _maybe_ask_operator_role_at_startup(shell) -> None:
     """Ask the once-ever operator-role question at the first interactive scan.
 
@@ -1245,7 +1267,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
     Returns:
         ``True`` only when an unauthenticated scan actually started in this call
         (enumeration / service discovery ran). ``False`` on every early bail
-        before a scan runs (missing type/interface, invalid/missing target,
+        before a scan runs (missing type, invalid/missing target,
         cancelled discovery, preflight abort) and when the flow delegates to
         :func:`run_start_auth` (which emits its own post-scan panel). The caller
         uses this to gate the post-scan "Scan complete" panel.
@@ -1254,8 +1276,8 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
     if not shell._prompt_type_if_missing():
         return False
 
-    if not shell._prompt_interface_if_missing():
-        return False
+    # No interface prompt here: only broadcast poisoning needs a named NIC, so the
+    # question is asked where poisoning is decided (maybe_launch_poisoning_job).
 
     if not shell._prompt_auto_if_missing():
         return False
@@ -1704,6 +1726,17 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         ):
             return False
 
+    # Scan policy: chosen once the domain context is settled and before the scan
+    # starts (one Enter keeps the workspace's last policy; non-interactive runs
+    # never prompt). A cancel here is a cancelled wizard, not a partial scan.
+    from adscan_internal.cli.scan_policy_selector import (
+        choose_scan_policy_for_start,
+        scan_policy_header_value,
+    )
+
+    if not choose_scan_policy_for_start(shell).proceed:
+        return False
+
     # Professional scan initialization header
     from adscan_internal import print_operation_header
 
@@ -1711,8 +1744,9 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         "Scan Type": "Unauthenticated",
         "Workspace Type": shell.type.upper() if shell.type else "N/A",
         "Target": domain if domain else target,
+        "Scan Policy": scan_policy_header_value(shell),
         "Auto Mode": "Enabled" if shell.auto else "Disabled",
-        "Interface": shell.interface,
+        "Interface": shell.interface or "per-target route",
     }
 
     if skip_domain_discovery and known_domain:
@@ -1779,6 +1813,16 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
             pdc_ip=known_pdc_ip,
         ):
             return False
+
+        # Enterprise environment count — before any assessment activity in the
+        # domain (the posture probe below is the first). No-op outside an
+        # Enterprise license that limits environments.
+        if not ensure_environment_admitted(
+            shell, known_domain, dc_ip=known_pdc_ip, phase=PHASE_UNAUTH
+        ):
+            return False
+
+        _offer_cleanup_account(shell, known_domain)
 
         # Skip to enumeration for this domain
         asyncio.run(
@@ -2025,6 +2069,13 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
                     pdc_ip=known_pdc_ip,
                 ):
                     return False
+
+                if not ensure_environment_admitted(
+                    shell, known_domain, dc_ip=known_pdc_ip, phase=PHASE_UNAUTH
+                ):
+                    continue
+
+                _offer_cleanup_account(shell, known_domain)
 
                 asyncio.run(
                     ensure_posture_fresh(
@@ -2518,7 +2569,11 @@ def _build_interface_preflight_check(
     route_interface = str(getattr(route, "route_interface", "") or "").strip()
     if route is not None and route.ok and route_source_ip and route_interface == iface:
         try:
-            shell.myip = route_source_ip
+            from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+                record_interface_myip,
+            )
+
+            record_interface_myip(shell, route_source_ip)
         except Exception as exc:  # noqa: BLE001 - adoption is best effort
             print_exception(exception=exc)
         return _NetworkPreflightCheck(
@@ -2577,9 +2632,14 @@ def _run_start_network_preflight(
             tcp_ports=(),
         ).route
 
-    checks.append(
-        _build_interface_preflight_check(shell, iface=iface, route=route_assessment)
-    )
+    # With no interface configured there is nothing to judge: callbacks resolve
+    # per target from the kernel route, and only poisoning needs a named NIC (it
+    # asks for one itself). The route check below still gives the reachability
+    # verdict.
+    if iface:
+        checks.append(
+            _build_interface_preflight_check(shell, iface=iface, route=route_assessment)
+        )
 
     mismatch_route: RouteAssessment | None = None
     if probe_target and route_assessment is not None:
@@ -3531,6 +3591,17 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
             "Running as a compiled application. Skipping venv relaunch check."
         )
 
+    # Enterprise license gate (same seam as `adscan ci`; no-op outside
+    # Enterprise). Reports stay reachable through `adscan deliver` / `report`.
+    from adscan_internal.cli.enterprise_license_gate import (
+        LICENSE_BLOCKED_EXIT_CODE,
+        ensure_license_allows_new_scan,
+    )
+
+    if not ensure_license_allows_new_scan("start"):
+        deps.exit(LICENSE_BLOCKED_EXIT_CODE)
+        return
+
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
             command_name="start",
@@ -3747,6 +3818,16 @@ def _emit_post_scan_panels(shell, verb: str) -> None:
     except Exception:  # noqa: BLE001 - UX panel must not break the success path
         pass
     try:
+        # What the scan policy kept from running, once, with the command that
+        # turns each item back on. Silent when the policy skipped nothing.
+        from adscan_internal.services.scan_policy_notice import (
+            print_policy_skip_recap,
+        )
+
+        print_policy_skip_recap(shell)
+    except Exception:  # noqa: BLE001 - the recap must not break the success path
+        pass
+    try:
         from adscan_internal.services.post_scan_report import (
             print_post_scan_report_offer,
         )
@@ -3806,6 +3887,11 @@ def run_start_unauth(shell, args: str | None) -> None:
                     "start_unauth",
                     getattr(shell, "current_workspace_dir", None) or "",
                 )
+                # The engagement record a regulated client reconciles its own
+                # alerts against. Written here, with the scan outcome, because
+                # the clock each instant came from is resolved from in-scan
+                # state a later renderer no longer has.
+                record_engagement_timeline_for_session(shell)
                 # Re-materialize the web-consumed attack-path snapshot as a pure
                 # projection of the reconciled graph BEFORE the loot card / web
                 # handoff, so a compromised domain is never ingested as
@@ -3841,7 +3927,7 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     Returns:
         ``True`` only when an authenticated scan actually started in this call
         (the credential/enumeration path ran). ``False`` on every early bail
-        before a scan runs (missing type/interface, cancelled creds, invalid
+        before a scan runs (missing type, cancelled creds, invalid
         target, preflight/DNS abort) and when the flow delegates to
         :func:`run_start_unauth` (which emits its own post-scan panel). The
         caller uses this to gate the post-scan "Scan complete" panel.
@@ -3850,8 +3936,8 @@ def _run_start_auth_impl(shell, args: str | None) -> bool:
     if not shell._prompt_type_if_missing():
         return False
 
-    if not shell._prompt_interface_if_missing():
-        return False
+    # No interface prompt here: only broadcast poisoning needs a named NIC, so the
+    # question is asked where poisoning is decided (maybe_launch_poisoning_job).
 
     if not shell._prompt_auto_if_missing():
         return False
@@ -4178,10 +4264,13 @@ def _prompt_auth_credentials_interactive(shell: Any) -> tuple[str, str] | None:
 
         password = prompt_ask(
             Text(
-                "Enter the password or NTLM hash (visible input, blank to cancel)",
+                "Enter the password or NTLM hash (input hidden, blank to cancel)",
                 style="cyan",
             ),
             default="",
+            # Masked on screen; the answer is mark_sensitive'd in telemetry by
+            # the prompt helper (password_mode).
+            password=True,
         ).strip()
         if not password:
             print_info("No password/hash entered — cancelling credential entry.")
@@ -4228,11 +4317,10 @@ def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
         print_info_debug("[domain_inference] skip: domain is empty")
         return
 
-    # Lab attribution runs regardless of the workspace type. The operator's
-    # declared ``type`` is theirs and is never overwritten here — both
-    # application sites below only assign ``shell.type`` when it is unset — but
-    # which lab a domain belongs to is a separate, additive fact. Skipping
-    # inference for ``type=audit`` left a lab run indistinguishable from a real
+    # Lab attribution runs regardless of the scan policy. It names the lab
+    # provider and lab only (telemetry, wording); it never chooses or changes the
+    # policy, which alone decides how the scan behaves. Skipping it under a
+    # policy for a real environment left a lab run indistinguishable from a real
     # customer engagement in the telemetry review queue.
     marked_domain = mark_sensitive(domain, "domain")
     explicit_context_locked = _has_explicit_lab_context(shell)
@@ -4269,12 +4357,11 @@ def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
         return
 
     if result.source is InferenceSource.DEFAULT:
-        # No confident signal; ensure workspace_type has a sane default.
-        if not getattr(shell, "type", None):
-            shell.type = "ctf"
+        # No confident signal: no lab is named. The scan policy, not this
+        # inference, decides how the scan behaves.
         print_info_debug(
             f"[domain_inference] default fallback for {marked_domain}: "
-            f"no TLD/GOAD/name/pdc/sld match; workspace_type forced to ctf"
+            f"no TLD/GOAD/name/pdc/sld match"
         )
         return
 
@@ -4287,7 +4374,6 @@ def _maybe_apply_domain_inference(shell: Any, domain: str | None) -> None:
 
     print_info_debug(
         f"[domain_inference] {result.source.value} matched for {marked_domain}: "
-        f"type={getattr(shell, 'type', None)} "
         f"provider={getattr(shell, 'lab_provider', None)} "
         f"lab={getattr(shell, 'lab_name', None)} "
         f"whitelisted={getattr(shell, 'lab_name_whitelisted', None)} "
@@ -4323,7 +4409,7 @@ def _maybe_upgrade_inference_from_pdc(shell: Any, domain: str | None) -> None:
     """
     if not domain:
         return
-    if getattr(shell, "type", None) == "audit":
+    if policy_settings.policy_environment(shell) == "real":
         return
 
     pdc_hostname: str | None = getattr(shell, "pdc_hostname", None)
@@ -4399,6 +4485,15 @@ def _start_auth_with_params(
     ):
         return False
 
+    # Scan policy: after the DC and the credential, before the scan starts.
+    from adscan_internal.cli.scan_policy_selector import (
+        choose_scan_policy_for_start,
+        scan_policy_header_value,
+    )
+
+    if not choose_scan_policy_for_start(shell).proceed:
+        return False
+
     # Professional scan initialization header
     from adscan_internal import print_operation_header
 
@@ -4412,14 +4507,23 @@ def _start_auth_with_params(
             "PDC IP": pdc_ip,
             "Username": username,
             "Credential Type": cred_type,
+            "Scan Policy": scan_policy_header_value(shell),
             "Auto Mode": "Enabled" if shell.auto else "Disabled",
-            "Interface": shell.interface,
+            "Interface": shell.interface or "per-target route",
         },
         icon="🔐",
     )
 
     if not shell.do_check_dns(domain, pdc_ip):
         return False
+
+    # Enterprise environment count — before the credential is used against the
+    # domain. The authenticated enumeration seam re-checks (cheap memo hit, or
+    # an upgrade of a provisional identity).
+    if not ensure_environment_admitted(shell, domain, dc_ip=pdc_ip, phase=PHASE_UNAUTH):
+        return False
+
+    _offer_cleanup_account(shell, domain)
 
     # Offer broadcast poisoning as a background job HERE — after the domain
     # subworkspace + DNS are ready, and BEFORE ``add_credential`` below (which
@@ -4514,6 +4618,7 @@ def _start_auth_with_params(
     mark_workspace_start_scan_completed(shell, "start_auth")
     emit_scan_outcome(shell, "start_auth")
     write_scan_summary(shell, "start_auth", shell.current_workspace_dir or "")
+    record_engagement_timeline_for_session(shell)
     if hasattr(shell, "save_workspace_data"):
         try:
             shell.save_workspace_data()

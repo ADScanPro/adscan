@@ -33,6 +33,8 @@ from dataclasses import dataclass
 import ipaddress
 from typing import Any, Literal
 
+from rich.markup import escape
+
 from adscan_internal import print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.network_preflight_service import assess_route_to_target
@@ -51,6 +53,43 @@ from adscan_core.rich_output import print_exception
 EgressVantageKind = Literal["direct", "pivot", "unknown"]
 
 _EGRESS_CACHE_ATTR = "_egress_vantage_cache"
+_EGRESS_FAILURE_NOTED_ATTR = "_egress_failures_noted"
+
+
+def _note_best_effort_failure(shell: Any, stage: str, exc: Exception) -> None:
+    """Record a swallowed failure of a best-effort stage WITHOUT alarming the operator.
+
+    This resolver is a rung of the callback-address ladder and runs once per
+    target, and the ladder falls through to the kernel route when it contributes
+    nothing, so a failure here is a non-event for the operator: a visible error
+    line per target (a sweep over many hosts printed one each) would read as a
+    failed run when the fallback worked. So it is reported at debug level every
+    time, and the full traceback goes to the debug log and the sanitized session
+    recording (``visible=False``) plus telemetry ONCE per session and failure
+    kind, which is enough to diagnose a pivoted engagement under ``--debug``
+    without flooding it.
+    """
+
+    try:
+        print_info_debug(
+            f"egress-resolver: {stage} failed ({type(exc).__name__}: "
+            f"{escape(str(exc))}); the callback ladder falls through to the route lookup"
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never break resolution
+        pass
+    key = f"{stage}:{type(exc).__name__}"
+    noted = getattr(shell, _EGRESS_FAILURE_NOTED_ATTR, None)
+    if not isinstance(noted, set):
+        noted = set()
+        try:
+            setattr(shell, _EGRESS_FAILURE_NOTED_ATTR, noted)
+        except Exception:  # noqa: BLE001 - a read-only shell just repeats the log
+            pass
+    if key in noted:
+        return
+    noted.add(key)
+    telemetry.capture_exception(exc)
+    print_exception(exception=exc, visible=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,8 +190,7 @@ def _resolve_pivot_callback_ip(shell: Any, target_ip: str) -> tuple[str | None, 
         service = LigoloProxyService(workspace_dir=workspace_dir, current_domain=domain)
         records = service.list_tunnel_records()
     except Exception as exc:  # noqa: BLE001 — best-effort annotation, never raises
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _note_best_effort_failure(shell, "ligolo tunnel state read", exc)
         return None, "could not read the Ligolo tunnel state"
 
     for record in records:
@@ -213,8 +251,7 @@ def resolve_egress_for_target(shell: Any, target_ip: str) -> EgressVantage:
     try:
         route = assess_route_to_target(shell, target_ip=str(target_ip).strip())
     except Exception as exc:  # noqa: BLE001 — routing is best-effort
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        _note_best_effort_failure(shell, "route assessment", exc)
         return EgressVantage(
             interface=None,
             source_ip=None,

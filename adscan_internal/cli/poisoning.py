@@ -78,15 +78,18 @@ def _split_domain_user(raw_user: str) -> tuple[str, str | None]:
     return raw_user, None
 
 
-def _resolve_full_domain(shell: PoisoningShell, netbios: str | None) -> str | None:
-    """Map a NetBIOS short name to the full DNS domain registered in the workspace."""
+#: What the operator is told when a capture cannot be attributed to a collected
+#: domain. Never the storage key itself: the reserved bucket is a directory name,
+#: not a domain, and printing it where a domain goes is the defect this replaces.
+_UNATTRIBUTED_DOMAIN_NOTICE = "not yet attributed to a collected domain"
 
-    if not netbios:
-        return None
-    for domain, data in shell.domains_data.items():
-        if data.get("netbios") == netbios:
-            return domain
-    return None
+# Attribution itself lives in ONE place —
+# ``adscan_internal.services.captured_credential_attribution.resolve_capture_domain``.
+# The NetBIOS-only exact-match ladder that used to live here was both narrower
+# (it compared ``domains_data[d]["netbios"]`` case-SENSITIVELY, and it had no
+# answer at all for a capture that carried no NetBIOS name — the common
+# NetNTLMv1-ESS shape) and a second implementation of a question the whole
+# product has to answer identically. Do not reintroduce a local ladder.
 
 
 # ---------------------------------------------------------------------------
@@ -118,16 +121,40 @@ def start_poisoning(shell: PoisoningShell) -> None:
     notice.
     """
 
-    if not shell.interface:
-        print_error(
-            "The network interface must be configured before poisoning can start"
-        )
-        return
-
     existing = getattr(shell, "_poisoning_runtime", None)
     if existing is not None and existing.thread.is_alive():
         print_warning("Poisoning suite is already running.")
         return
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): the REPL command runs the same
+    # technique as the background job, so it obeys the same check.
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, "module:poisoning"):
+        return
+
+    # The interface is asked for here, beside the decision that needs it: confirm
+    # or switch the configured one, or pick one when none is set. The shared
+    # chooser is the same one the scan-flow consent seam uses.
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+    from adscan_internal.services.background_jobs.poisoning_interface import (  # noqa: PLC0415
+        choose_poisoning_interface,
+    )
+
+    if is_non_interactive(shell):
+        if not shell.interface:
+            print_error(
+                "Poisoning needs a network interface and cannot choose one "
+                "unattended. Run 'set iface <name>' first, or pass --interface."
+            )
+            return
+    else:
+        chosen = choose_poisoning_interface(shell, default_launch=True)
+        if not chosen:
+            print_instruction("Skipped. Run 'poisoning' again when you are ready.")
+            return
 
     stop_event = threading.Event()
     ready_event = threading.Event()
@@ -136,7 +163,13 @@ def start_poisoning(shell: PoisoningShell) -> None:
     loop_holder: list[asyncio.AbstractEventLoop] = []
 
     interface = shell.interface
-    advertised_ip = shell.myip
+    # Only an operator declaration is announced as-is; otherwise the poisoner
+    # answers each victim with this interface's address on the victim's subnet
+    # (services/poisoning/poisoner.py), so an interface-derived myip belonging to
+    # another NIC is never announced on this one.
+    from adscan_internal.services.listener_ip import myip_is_declared  # noqa: PLC0415
+
+    advertised_ip = shell.myip if myip_is_declared(shell) else None
 
     from adscan_internal.services.background_jobs.shared_capture_listener import (  # noqa: PLC0415
         get_or_create_capture_broker,
@@ -201,6 +234,12 @@ def start_poisoning(shell: PoisoningShell) -> None:
         loop=loop_holder[0] if loop_holder else None,
     )
     shell._poisoning_runtime = runtime  # type: ignore[attr-defined]
+    from adscan_internal.services.network_segments import (  # noqa: PLC0415
+        ROLE_POISONING,
+        record_interface_role,
+    )
+
+    record_interface_role(shell, interface, ROLE_POISONING)
 
     print_info("Native poisoning suite started (LLMNR / mDNS / NBT-NS + SMB capture).")
     print_instruction("Use 'stop_poisoning' to stop the listeners.")
@@ -353,14 +392,22 @@ async def _run_suite(
 
     try:
         await suite.start()
+        # Bind and announce are separate questions. The announced address goes
+        # into the poisoned answers (``advertised_ipv4`` above, or per victim);
+        # the :445 capture always asks for the WILDCARD, so N poisoning jobs (one
+        # per segment NIC) and every other consumer share one listener. Routing
+        # the announced address into the bind is what used to pin :445 to one
+        # segment.
         acquired = broker.acquire(
             consumer_id,
-            bind_ip=advertised_ipv4 or "0.0.0.0",
+            bind_ip="0.0.0.0",  # noqa: S104 - serve every segment's callbacks
             on_capture=lambda obs: capture_queue.put(_obs_to_poisoning_dict(obs)),
         )
         if not acquired:
+            refusal = getattr(broker, "last_refusal", lambda _cid: None)(consumer_id)
+            reason = refusal[1] if refusal else "bind failed"
             raise RuntimeError(
-                "shared :445 capture listener could not be acquired (bind failed)"
+                f"shared :445 capture listener could not be acquired ({reason})"
             )
     except Exception as exc:  # noqa: BLE001
         error_holder.append(exc)
@@ -467,16 +514,23 @@ def _handle_capture(
 
     # Never drop a captured hash: a NetNTLMv2/v1 is crackable regardless of workspace
     # context, and the domain match is only needed to decide WHERE to store the cracked
-    # credential. When no workspace domain matches the captured NetBIOS (e.g. standalone
-    # `poisoning` run before any domain is initialized), fall back to the NetBIOS short
-    # name as the storage key and still crack. The in-scan wiring resolves the real FQDN.
-    domain = _resolve_full_domain(shell, netbios)
-    if not domain:
-        domain = (netbios or "captured").strip().lower() or "captured"
+    # credential. Attribution goes through the shared ladder (principal realm, recorded
+    # NetBIOS map, the machine account's own machine, NetBIOS-as-label); what it cannot
+    # attribute lands in the reserved bucket, which is NOT a domain and is rendered as
+    # such. A bare NetBIOS short name is never used as the storage key — it reads as a
+    # domain in every consumer that enumerates the workspace's domains, and it is not one.
+    from adscan_internal.services.captured_credential_attribution import (  # noqa: PLC0415
+        storage_domain_for_capture,
+    )
+
+    domain, attributed = storage_domain_for_capture(
+        shell, netbios=netbios, principal=user
+    )
+    if not attributed:
         print_info(
-            f"Captured hash for {mark_sensitive(user, 'user')} in NetBIOS "
-            f"{mark_sensitive(netbios or '?', 'domain')} (no workspace domain match) "
-            "— cracking under the captured name.",
+            f"Captured hash for {mark_sensitive(user, 'user')} could not be attributed "
+            "to a collected domain yet — stored for cracking and re-filed automatically "
+            "once the domain is known.",
             spacing="none",
         )
 
@@ -489,14 +543,20 @@ def _handle_capture(
     # (higher likelihood/impact) and is not folded in here. Bare capture is the
     # LLMNR/NBT-NS poisoning FINDING; the edge is materialized only when the
     # cracking pipeline recovers a usable credential.
-    if version == "v2":
+    # Only when the capture IS attributed: the reserved bucket is not a domain,
+    # so a graph-edge precursor recorded against it keys the follow-up step to
+    # nothing. The reconcile re-files the material and the next scan records it.
+    if version == "v2" and attributed:
         _record_poison_captured_ntlmv2_user(shell, domain, user)
 
     print_success(f"New NTLM{version} hash captured:")
     print_info(f"User: {user}", spacing="none")
     if netbios:
         print_info(f"NetBIOS Domain: {netbios}", spacing="none")
-    print_info(f"Full Domain: {mark_sensitive(domain, 'domain')}", spacing="none")
+    if attributed:
+        print_info(f"Full Domain: {mark_sensitive(domain, 'domain')}", spacing="none")
+    else:
+        print_info(f"Full Domain: {_UNATTRIBUTED_DOMAIN_NOTICE}", spacing="none")
     print_info(f"Hash: {fullhash}", spacing="none")
     hash_file = os.path.join(
         shell.domains_dir, domain, shell.cracking_dir, f"{user}_hashes.NTLM{version}"
@@ -512,16 +572,22 @@ def _handle_capture(
         )
 
         masked_user = mark_sensitive(user, "user")
-        masked_domain_full = mark_sensitive(domain, "domain")
         evidence_lines = [f"NTLM{version} hash captured via poisoning"]
         if netbios:
             evidence_lines.append(f"NetBIOS: {mark_sensitive(netbios, 'domain')}")
+        if not attributed:
+            evidence_lines.append(_UNATTRIBUTED_DOMAIN_NOTICE)
         evidence_lines.append("Hash written to workspace; offline cracking pending.")
+        card_target = (
+            f"{masked_user}@{mark_sensitive(domain, 'domain')}"
+            if attributed
+            else str(masked_user)
+        )
         print_discovery_card(
             DiscoveryCard(
                 severity="high",
                 headline="FOOTHOLD CREDENTIAL CAPTURED",
-                target=f"{masked_user}@{masked_domain_full}",
+                target=card_target,
                 evidence=tuple(evidence_lines),
                 next_action=(
                     "Crack offline with weakpass/hashcat to convert into a "

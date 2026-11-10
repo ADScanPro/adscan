@@ -137,6 +137,13 @@ _fix_ownership_same_fs /opt/adscan/workspaces "workspaces"
 _fix_ownership_same_fs /opt/adscan/logs "logs"
 _fix_ownership_same_fs /opt/adscan/.config "config"
 _fix_ownership_same_fs /opt/adscan/.cache "cache"
+# The Enterprise license directory is shared with the web backend, which runs
+# as root and writes the lock, the clock high-water mark and the environment
+# ledger there on every scan launch. The engine opens the lock read-only and
+# root writes adopt the directory's owner, so this is defence in depth: it
+# repairs a directory an older build (or a manual copy) left root-owned, on
+# every scan start, because a black-box appliance has no host login to chown it.
+_fix_ownership_same_fs /opt/adscan/state/license "license"
 
 # Hashcat writes compiled OpenCL kernels under its own `kernels/` directory.
 # If that tree was previously touched by root, later runs as the unprivileged
@@ -676,6 +683,68 @@ if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev
   fi
 fi
 
+# >>> adscan-supervise (extracted verbatim by tests/unit/launcher/test_entrypoint_signal_forwarding.py)
+# Run the engine as a supervised child of this PID-1 shell and RELAY stop signals
+# to it.
+#
+# Why this exists: bash defers a trapped signal until the FOREGROUND command
+# finishes, and never passes it on. With the engine started in the foreground, a
+# `docker stop` (SIGTERM to PID 1) therefore reached nobody: the engine never ran
+# its graceful shutdown (rollback of environment changes, ledger finalisation,
+# checkpoint save) and kept acting on the network until it finished on its own,
+# and the web worker's stop request was silently ignored. Measured: a SIGTERM to
+# a foreground-waiting PID-1 bash took effect only when its child exited.
+#
+# How it keeps everything the foreground run gave us:
+#   * The child stays in this shell's process group (job control is off in a
+#     script), which is the TTY's foreground group, so prompts, resize (SIGWINCH)
+#     and Ctrl+C reach it exactly as before.
+#   * A script's asynchronous command starts with SIGINT/SIGQUIT IGNORED and its
+#     stdin on /dev/null; the subshell resets both signals and `<&0` keeps the TTY.
+#   * SIGINT is NOT relayed: the TTY already delivers Ctrl+C to the child, and a
+#     duplicate would read as a second Ctrl+C. TERM and HUP are relayed.
+#   * This shell remains PID 1, so it still reaps orphaned grandchildren and runs
+#     the EXIT cleanup trap, and the child's exit status becomes the container's.
+_adscan_child_pid=""
+
+_adscan_relay_signal() {
+  local sig="$1"
+  if [[ -n "${_adscan_child_pid}" ]]; then
+    kill -s "${sig}" "${_adscan_child_pid}" 2>/dev/null || true
+  fi
+}
+
+_adscan_run_supervised() {
+  trap '_adscan_relay_signal TERM' TERM
+  trap '_adscan_relay_signal HUP' HUP
+  trap ':' INT
+  ( trap - INT QUIT; exec "$@" ) <&0 &
+  _adscan_child_pid=$!
+  local rc again
+  while :; do
+    rc=0
+    wait "${_adscan_child_pid}" || rc=$?
+    # A trapped signal interrupts `wait` with a status above 128 while the child
+    # is still running: keep waiting for the real exit.
+    if (( rc > 128 )) && kill -0 "${_adscan_child_pid}" 2>/dev/null; then
+      continue
+    fi
+    if (( rc > 128 )); then
+      # Either the child's own status (killed by a signal) or an interruption
+      # that raced its exit; a second wait returns the unreaped status, or 127
+      # when the first one already collected it.
+      again=0
+      wait "${_adscan_child_pid}" 2>/dev/null || again=$?
+      if (( again != 127 )); then
+        rc="${again}"
+      fi
+    fi
+    break
+  done
+  return "${rc}"
+}
+# <<< adscan-supervise
+
 # Drop to the run user. In a ROOTFUL run we additionally raise the network
 # capabilities Docker granted (--cap-add NET_BIND_SERVICE / NET_ADMIN / NET_RAW)
 # into the INHERITABLE + AMBIENT sets so they survive BOTH the setuid drop and any
@@ -688,8 +757,10 @@ fi
 # and skipped entirely in the rootless path above (caps stripped, cannot be
 # honoured → plain uid drop, reduced network mode). If setpriv/capsh are absent we
 # fall back to gosu so the container ALWAYS starts.
-# Run ADscan in the foreground so it keeps a functional TTY (Prompts, selection UIs).
+# ADscan runs through `_adscan_run_supervised` (above) so it keeps the TTY
+# (prompts, selection UIs) AND receives `docker stop`.
 _amb_caps=""
+_adscan_rc=0
 if grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev/null \
    && command -v setpriv >/dev/null 2>&1 && command -v capsh >/dev/null 2>&1; then
   _bnd_hex="$(grep -m1 '^CapBnd:' /proc/self/status 2>/dev/null | awk '{print $2}')"
@@ -705,9 +776,10 @@ fi
 
 if [[ -n "${_amb_caps}" ]]; then
   _ep_log "raising ambient network caps for run user (${_amb_caps}) so privileged-port listeners (NTLM capture / relay / ESC8) work"
-  setpriv --reuid "${uid}" --regid "${gid}" --clear-groups \
+  _adscan_run_supervised setpriv --reuid "${uid}" --regid "${gid}" --clear-groups \
     --inh-caps "${_amb_caps}" --ambient-caps "${_amb_caps}" \
-    -- /usr/local/bin/adscan "$@"
+    -- /usr/local/bin/adscan "$@" || _adscan_rc=$?
 else
-  gosu "${uid}:${gid}" /usr/local/bin/adscan "$@"
+  _adscan_run_supervised gosu "${uid}:${gid}" /usr/local/bin/adscan "$@" || _adscan_rc=$?
 fi
+exit "${_adscan_rc}"

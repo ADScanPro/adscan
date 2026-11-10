@@ -200,8 +200,12 @@ class SMBConfig:
         from adscan_internal.services._kerberos_spn import (
             normalize_kerberos_target_hostname,
         )
+        from adscan_internal.services._kerberos_ccache_guard import (
+            ambient_ccache_check,
+        )
         from adscan_internal.services.credential_routing import (
             promote_credential_fields,
+            require_credential_material,
         )
 
         self.target_hostname = normalize_kerberos_target_hostname(
@@ -228,6 +232,17 @@ class SMBConfig:
                 aes_key=self.aes_key,
                 ccache_path=self.ccache_path,
             )
+        )
+        # A named principal must carry its own secret: refuse here, before any
+        # packet, rather than send an empty one (see credential_routing).
+        require_credential_material(
+            transport="SMB",
+            username=self.username,
+            password=self.password,
+            nt_hash=self.nt_hash,
+            aes_key=self.aes_key,
+            ccache_path=self.ccache_path,
+            ambient_kerberos=ambient_ccache_check(self.use_kerberos, self.username),
         )
 
 
@@ -503,6 +518,64 @@ def _describe_exception(exc: Exception) -> str:
     if rep and rep != f"{type(exc).__name__}()":
         return rep
     return type(exc).__name__
+
+
+# Lockout guard (``adscan_core.auth_attempt_guard``) for an NTLM session setup.
+# A Kerberos session setup is judged at kerbad ``get_TGT`` (``_kerberos_recovery``),
+# so only NTLM is handled here. What the reply means is decided by the shared
+# classifier ``adscan_core.auth_outcome.classify_ntlm_status``: only a status the
+# DC counted against ``badPwdCount`` (STATUS_LOGON_FAILURE / STATUS_WRONG_PASSWORD)
+# is a failure; STATUS_NTLM_BLOCKED, a Protected Users restriction or a refused MIC
+# leave the secret usable for the Kerberos fallback.
+
+
+def _ntlm_guard_target(config: "SMBConfig") -> "tuple[str, str, str] | None":
+    """``(realm, principal, secret)`` when this session setup sends an NTLM secret.
+
+    A local-account logon (``is_local_account``, or the account domain ``"."`` or
+    empty) is keyed to the host (``auth_attempt_guard.local_realm``), so one
+    host's local ``Administrator`` never shares a ledger entry with another's,
+    nor with the domain account of the same name. ``_build_smb_url`` would send
+    an EMPTY password when no secret is configured, so the secret is ``""`` then
+    and the guard refuses it before anything is sent.
+    """
+    if config.use_kerberos or not config.username:
+        return None
+    from adscan_core.auth_attempt_guard import local_realm  # noqa: PLC0415
+
+    secret = config.nt_hash or config.password or ""
+    realm = str(config.auth_domain or config.domain or "").strip()
+    if config.is_local_account or realm in ("", "."):
+        realm = local_realm(config.target_hostname or config.target_ip)
+    return realm, str(config.username), str(secret)
+
+
+def _record_ntlm_outcome(target: "tuple[str, str, str]", err: "Exception | None") -> None:
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+    from adscan_core.auth_outcome import SUCCESS, classify_ntlm_status  # noqa: PLC0415
+
+    realm, principal, secret = target
+    verdict = SUCCESS if err is None else classify_ntlm_status(_ntstatus_text(err))
+    auth_attempt_guard.record_verdict(realm, principal, secret, verdict)
+
+
+def _ntstatus_text(err: BaseException) -> str:
+    """The error text plus every NTSTATUS value carried on the exception chain.
+
+    aiosmb renders a status as ``NTStatus.LOGON_FAILURE`` (no ``STATUS_`` prefix,
+    no hex), so the numeric value is appended for the shared classifier.
+    """
+    parts = [_describe_exception(err) if isinstance(err, Exception) else str(err)]
+    seen: set[int] = set()
+    current: "BaseException | None" = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "ntstatus", None)
+        value = getattr(status, "value", status)
+        if isinstance(value, int) and value > 0:
+            parts.append(f"0x{value & 0xFFFFFFFF:08X}")
+        current = current.__cause__ or current.__context__
+    return " ".join(parts)
 
 
 def _translate_aiosmb_exception(exc: Exception) -> SMBTransportError:
@@ -1122,6 +1195,24 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
             f"{effective_config.target_ip}:{effective_config.port}"
         )
 
+        # Lockout guard: a known-bad secret, an account the domain reported as
+        # disabled or locked, or a principal already at its failure budget is
+        # never sent. Refusing here is fail-closed and caller-independent.
+        ntlm_target = _ntlm_guard_target(effective_config)
+        if ntlm_target is not None:
+            from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+                AuthAttemptRefused,
+                check_attempt,
+            )
+
+            try:
+                check_attempt(*ntlm_target)
+            except AuthAttemptRefused as refused:
+                from adscan_core.rich_output import print_warning  # noqa: PLC0415
+
+                print_warning(str(refused))
+                raise SMBAuthError(str(refused)) from refused
+
         factory = SMBConnectionFactory.from_url(url)
         connection = factory.get_connection()
         next_config: Optional["SMBConfig"] = None
@@ -1129,6 +1220,8 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
         try:
             async with connection:
                 _, err = await connection.login()
+                if ntlm_target is not None:
+                    _record_ntlm_outcome(ntlm_target, err)
                 if err is not None:
                     telemetry.capture_exception(err)
                     _emit_smb_failure_posture(
@@ -1370,6 +1463,11 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
                 f"[smb_transport] Kerberos failed — retrying with NTLM ({reason},"
                 f" {type(exc).__name__})"
             )
+            if effective_config.password is None and not has_nt_hash:
+                # NTLM needs a password or an NT hash. A ticket-only or key-only
+                # credential has neither, so the "fallback" would be an NTLM
+                # logon with an empty secret: a failed logon on a real account.
+                raise exc
             ntlm_config = dataclasses.replace(effective_config, use_kerberos=False)
             async with smb_machine_for(ntlm_config) as machine:
                 yield machine
@@ -1797,6 +1895,166 @@ async def create_unc_directory(machine: Any, remote_unc_path: str) -> None:
             print_info_debug(
                 f"[smb-transport] tree_disconnect after mkdir failed (ignored): {exc}"
             )
+
+
+_UNC_ABSENT_MARKERS = (
+    "OBJECT_NAME_NOT_FOUND",
+    "OBJECT_PATH_NOT_FOUND",
+    "NO_SUCH_FILE",
+    "DELETE_PENDING",
+)
+
+
+async def unc_path_exists(machine: Any, remote_unc_path: str) -> bool | None:
+    """Whether ``remote_unc_path`` (file or directory) exists: the revert re-read.
+
+    Opens the path for attributes only (``FILE_OPEN``, never creates). Returns
+    True when it opens, False when the server says it is not there (including
+    a delete still pending on another handle, which the server completes on
+    close), and None when the answer is anything else (access denied, a
+    transport error): an inconclusive re-read never confirms a revert.
+    """
+    from aiosmb.commons.interfaces.directory import SMBDirectory
+    from aiosmb.protocol.smb2.commands.create import (
+        CreateDisposition,
+        CreateOptions,
+        ShareAccess,
+    )
+    from aiosmb.wintypes.access_mask import FileAccessMask
+
+    remfile = SMBDirectory.from_uncpath(remote_unc_path)
+    tree_entry, err = await machine.connection.tree_connect(remfile.share_path)
+    if err is not None:
+        return None
+    tree_id = tree_entry.tree_id
+    try:
+        try:
+            file_id, cerr = await machine.connection.create(
+                tree_id,
+                remfile.fullpath,
+                FileAccessMask.FILE_READ_ATTRIBUTES | FileAccessMask.SYNCHRONIZE,
+                ShareAccess.FILE_SHARE_READ
+                | ShareAccess.FILE_SHARE_WRITE
+                | ShareAccess.FILE_SHARE_DELETE,
+                CreateOptions.FILE_SYNCHRONOUS_IO_NONALERT,
+                CreateDisposition.FILE_OPEN,
+                0,
+                return_reply=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - classified like a returned error
+            file_id, cerr = None, exc
+        if cerr is not None:
+            text = str(cerr).upper()
+            if any(marker in text for marker in _UNC_ABSENT_MARKERS):
+                return False
+            return None
+        if file_id is not None:
+            try:
+                await machine.connection.close(tree_id, file_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        return True
+    finally:
+        try:
+            await machine.connection.tree_disconnect(tree_id)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+
+def remove_unc_path_confirmed(
+    smb_config: Any, remote_unc_path: str, *, directory: bool = False
+) -> tuple[bool, str | None]:
+    """Delete a file or directory over SMB, then confirm it no longer exists.
+
+    The SMB transport of the shared revert precedence: ``smb_config`` is built
+    per candidate (``RevertCandidate.smb_config``). ``(True, None)`` only when
+    :func:`unc_path_exists` re-reads the path as absent; a path that was already
+    gone confirms too. Synchronous; transport errors propagate.
+    """
+
+    async def _run() -> tuple[bool, str | None]:
+        async with smb_machine_with_fallback(smb_config) as machine:
+            delete_error: str | None = None
+            try:
+                if directory:
+                    await delete_unc_directory(machine, remote_unc_path)
+                else:
+                    await delete_unc_file(machine, remote_unc_path)
+            except Exception as exc:  # noqa: BLE001 - the re-read decides
+                delete_error = str(exc)
+            exists = await unc_path_exists(machine, remote_unc_path)
+            if exists is False:
+                return True, None
+            return False, delete_error or "the re-read could not confirm it is gone"
+
+    return run_async_sync(_run())
+
+
+_SERVICE_ABSENT_MARKERS = ("SERVICE_DOES_NOT_EXIST", "SERVICE_MARKED_FOR_DELETE", "0x424", "0x430")
+
+
+def delete_service_confirmed(
+    smb_config: Any, service_name: str
+) -> tuple[bool, str | None]:
+    """Delete a Windows service over SCM, then confirm it no longer opens.
+
+    The service-control transport of the shared revert precedence: ``smb_config``
+    is built per candidate (``RevertCandidate.smb_config``). ``DeleteService``
+    only marks the service for deletion; the record goes when the last handle
+    closes, so the delete handle is closed first and a fresh open is the re-read.
+    ``(True, None)`` only when that open fails with "does not exist" or "marked
+    for deletion"; a service that was already absent confirms too, and any other
+    answer (access denied, a transport error) is inconclusive and never confirms.
+    Synchronous; transport errors propagate.
+    """
+    from aiosmb.dcerpc.v5.interfaces.servicemanager import (  # noqa: PLC0415
+        REMSVCRPC,
+    )
+
+    def _absent(error: object) -> bool:
+        text = str(error or "").upper()
+        return any(marker.upper() in text for marker in _SERVICE_ABSENT_MARKERS)
+
+    async def _run() -> tuple[bool, str | None]:
+        async with smb_machine_with_fallback(smb_config) as machine:
+            scm, err = await REMSVCRPC.from_smbconnection(
+                machine.connection, perform_dummy=True
+            )
+            if err is not None:
+                return False, f"service control could not be opened: {err}"
+            try:
+                delete_error: str | None = None
+                _opened, open_err = await scm.open_service(service_name)
+                if open_err is not None and not _absent(open_err):
+                    return False, f"the service could not be opened: {open_err}"
+                if open_err is None:
+                    _ok, del_err = await scm.delete_service(service_name)
+                    if del_err is not None and not _absent(del_err):
+                        delete_error = str(del_err)
+                    try:
+                        await scm.close_service(service_name)
+                    except Exception:  # noqa: BLE001 - the re-open decides
+                        pass
+                scm.service_handles.pop(service_name, None)
+                _reopened, reopen_err = await scm.open_service(service_name)
+                if reopen_err is not None and _absent(reopen_err):
+                    return True, None
+                if reopen_err is None:
+                    try:
+                        await scm.close_service(service_name)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False, delete_error or "the service still opens after the delete"
+                return False, f"the re-read was inconclusive: {reopen_err}"
+            finally:
+                try:
+                    await scm.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return run_async_sync(_run())
 
 
 async def delete_unc_directory(machine: Any, remote_unc_path: str) -> None:

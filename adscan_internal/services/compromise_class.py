@@ -8,11 +8,21 @@ represents from *how* that impact was discovered. It is the public
 vocabulary documented in `CLAUDE.md` and
 `adscan-obsidian/business/12_nomenclature_standard.md`.
 
-Four classes (priority order, highest first):
+Classes (priority order, highest first):
 
 * ``DOMAIN_BREAKER`` — accounts whose privileges directly equal domain
   compromise (Domain Admins, Enterprise Admins, BUILTIN\\Administrators,
-  Schema Admins, krbtgt). One-step. No escalation required.
+  Schema Admins, krbtgt). One-step. No escalation required. As a PATH class
+  (axis 2) it is reserved for routes that reach the DOMAIN OBJECT itself.
+* ``TIER0_CONTROL`` *(path class only, 2026-11-05)* — a route that ends in
+  control of a direct Tier 0 principal or asset (Domain Admins, Enterprise
+  Admins, Administrators, krbtgt, RID 500, a Domain Controller) WITHOUT
+  reaching the domain object. With the engine working correctly this class is
+  empty: control of a direct Tier 0 principal extends structurally to the
+  domain object (replication). It is the safety net for the unusual cases (a
+  Domain Admins group whose replication rights were stripped, a missing
+  structural edge, a depth cap) so such a route is never labelled domain
+  compromise and never silently dropped.
 * ``PRIVILEGED_ESCALATOR`` — accounts in privileged groups that are not
   themselves domain compromise but whose membership unlocks a confirmed
   one-technique escalation (Backup Operators, Account Operators,
@@ -55,6 +65,7 @@ class CompromiseClass(str, Enum):
     """Canonical customer-facing compromise classes."""
 
     DOMAIN_BREAKER = "domain_breaker"
+    TIER0_CONTROL = "tier0_control"
     PRIVILEGED_ESCALATOR = "privileged_escalator"
     COMPROMISE_ENABLER = "compromise_enabler"
     TIER0_FOOTHOLD = "tier0_foothold"
@@ -74,6 +85,7 @@ class CompromiseClass(str, Enum):
 
 _DISPLAY_LABELS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Domain Breaker",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 Control",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Privileged Escalator",
     CompromiseClass.COMPROMISE_ENABLER: "Compromise Enabler",
     CompromiseClass.TIER0_FOOTHOLD: "Critical Asset Access (post-exploitation pending)",
@@ -83,6 +95,7 @@ _DISPLAY_LABELS: dict[CompromiseClass, str] = {
 
 _CLI_BADGES: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "[T0/Domain Breaker]",
+    CompromiseClass.TIER0_CONTROL: "[T0/Control]",
     CompromiseClass.PRIVILEGED_ESCALATOR: "[T0/Privileged Esc.]",
     CompromiseClass.COMPROMISE_ENABLER: "[Compromise Enabler]",
     CompromiseClass.TIER0_FOOTHOLD: "[T0/Foothold]",
@@ -158,11 +171,47 @@ def derive_compromise_class_from_semantics(
 # ---------------------------------------------------------------------------
 
 
+# The Exchange security groups. Exchange setup creates them (in English, on
+# every locale) and grants them, by design, broad rights over the directory:
+# Exchange Windows Permissions and Exchange Trusted Subsystem can read and modify
+# every account and group, and the groups nest into one another. They are Tier 0
+# escalation-capable, and they carry no well-known RID, so they are matched by
+# NAME. This is the ONE list of Exchange group names: the escalator set below is
+# built from it, and the remediability classifier asks
+# :func:`is_exchange_security_group_name` rather than keeping its own copy.
+_EXCHANGE_SECURITY_GROUP_NAMES: frozenset[str] = frozenset(
+    name.lower()
+    for name in (
+        "Exchange Trusted Subsystem",
+        "Exchange Windows Permissions",
+        # Exchange control-plane groups: Tier 0 escalation-capable BY DESIGN. They
+        # own forest control-plane objects (WriteDACL / GenericAll over DnsAdmins,
+        # Enterprise Key Admins, Exchange Trusted Subsystem / Windows Permissions,
+        # the domain object, etc.), so compromising one is one technique from
+        # domain — exactly like EWP / ETS above.
+        "Exchange Servers",
+        "Exchange Enterprise Servers",
+        "Organization Management",
+        "Exchange Organization Administrators",
+    )
+)
+
+
+def is_exchange_security_group_name(value: str | None) -> bool:
+    """Return True when a group name (or ``name@domain`` label) is an Exchange group.
+
+    Matched case-insensitively against :data:`_EXCHANGE_SECURITY_GROUP_NAMES`
+    with a trailing ``@domain`` suffix stripped, the same normalization the
+    privileged-escalator classification applies.
+    """
+    return _normalize_group_token(str(value or "")) in _EXCHANGE_SECURITY_GROUP_NAMES
+
+
 # Names of privileged-escalator groups whose membership unlocks a
 # one-technique path to Tier 0. Mirrors the table in
 # 12_nomenclature_standard.md. We compare case-insensitively against the
 # target node's ``name`` or ``samaccountname`` field.
-_PRIVILEGED_ESCALATOR_GROUP_NAMES: frozenset[str] = frozenset(
+_PRIVILEGED_ESCALATOR_GROUP_NAMES: frozenset[str] = _EXCHANGE_SECURITY_GROUP_NAMES | frozenset(
     name.lower()
     for name in (
         "Schema Admins",
@@ -177,18 +226,6 @@ _PRIVILEGED_ESCALATOR_GROUP_NAMES: frozenset[str] = frozenset(
         "Cert Publishers",
         "Key Admins",
         "Enterprise Key Admins",
-        "Exchange Trusted Subsystem",
-        "Exchange Windows Permissions",
-        # Exchange control-plane groups: Tier 0 escalation-capable BY DESIGN. They
-        # own forest control-plane objects (WriteDACL / GenericAll over DnsAdmins,
-        # Enterprise Key Admins, Exchange Trusted Subsystem / Windows Permissions,
-        # the domain object, etc.), so compromising one is one technique from
-        # domain — exactly like EWP / ETS above. Exchange groups carry no
-        # well-known RID, so they are matched by NAME here.
-        "Exchange Servers",
-        "Exchange Enterprise Servers",
-        "Organization Management",
-        "Exchange Organization Administrators",
     )
 )
 
@@ -2065,7 +2102,8 @@ def esae_tier_number(tier: PrivilegeTier) -> int:
 # separate "N executed end to end" count (the exposure EXISTS; whether it was
 # executed is a separate, stronger claim carried by the execution count).
 _COMPROMISE_REACH_LABELS: dict[CompromiseClass, str] = {
-    CompromiseClass.DOMAIN_BREAKER: "Path to full domain compromise, confirmed by configuration (control of a Tier 0 asset)",
+    CompromiseClass.DOMAIN_BREAKER: "Path to full domain compromise, confirmed by configuration (reaches the domain itself)",
+    CompromiseClass.TIER0_CONTROL: "Control of a Tier 0 account, confirmed by configuration (no route on to the domain itself was found)",
     CompromiseClass.TIER0_FOOTHOLD: "Foothold on a Tier 0 asset (control pending validation)",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Control of a Tier 0 escalation group (one technique from domain)",
     CompromiseClass.COMPROMISE_ENABLER: "Path that advances toward Tier 0, confirmed by configuration",
@@ -2094,6 +2132,7 @@ def compromise_reach_label(cls: CompromiseClass) -> str:
 # is the prose, this is the column header for the same thing.
 _COMPROMISE_REACH_LABELS_SHORT: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Full domain compromise",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 control",
     CompromiseClass.TIER0_FOOTHOLD: "Tier 0 foothold",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Tier 0 group takeover",
     CompromiseClass.COMPROMISE_ENABLER: "Stepping-stone to Tier 0",
@@ -2126,6 +2165,7 @@ def compromise_reach_label_short(cls: CompromiseClass) -> str:
 # technique ("… → ESC13") leaves the reader with something they cannot act on.
 _COMPROMISE_TERMINUS_LABELS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Domain Compromised",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 Control",
     CompromiseClass.TIER0_FOOTHOLD: "Tier 0 Foothold",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Tier 0 Group Takeover",
     CompromiseClass.COMPROMISE_ENABLER: "Stepping Stone to Tier 0",
@@ -2312,9 +2352,16 @@ def tier_model_notes() -> list[dict[str, str]]:
 # legend). Client-safe English, no em dashes, no offensive-tool names.
 _COMPROMISE_REACH_MEANINGS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: (
-        "The path's final step takes control of a Tier 0 asset (a Domain "
-        "Admin, a Domain Controller, or the domain object itself), so the "
-        "domain is fully compromised."
+        "The path reaches the domain itself, typically by taking control of a "
+        "Domain Admin or a Domain Controller and replicating every password in "
+        "the directory, so the domain is fully compromised."
+    ),
+    CompromiseClass.TIER0_CONTROL: (
+        "The path's final step takes control of a Tier 0 account or machine "
+        "(such as Domain Admins, the built-in Administrator, krbtgt or a Domain "
+        "Controller), but no route from there to the domain itself was found, "
+        "for example because its replication rights were removed. It is "
+        "reported apart from full domain compromise for that reason."
     ),
     CompromiseClass.TIER0_FOOTHOLD: (
         "The path's final step lands an interactive session on a Tier 0 "
@@ -2347,15 +2394,11 @@ def reach_glossary() -> list[dict[str, str]]:
     * ``label_short`` — the card label (:func:`compromise_reach_label_short`).
     * ``meaning`` — one line on what the path's last edge does.
 
-    The four classes the dashboard and report surface (the unauthenticated and
-    "none" reach states are not part of the ladder legend).
+    The five classes the dashboard and report surface (the unauthenticated and
+    "none" reach states are not part of the ladder legend). ``tier0_control``
+    sits directly under full domain compromise; it is normally empty and is
+    listed so a reader who meets it has its meaning.
     """
-    ordered = (
-        CompromiseClass.DOMAIN_BREAKER,
-        CompromiseClass.TIER0_FOOTHOLD,
-        CompromiseClass.PRIVILEGED_ESCALATOR,
-        CompromiseClass.COMPROMISE_ENABLER,
-    )
     return [
         {
             "klass": cls.value,
@@ -2363,7 +2406,7 @@ def reach_glossary() -> list[dict[str, str]]:
             "label_short": compromise_reach_label_short(cls),
             "meaning": _COMPROMISE_REACH_MEANINGS[cls],
         }
-        for cls in ordered
+        for cls in COMPROMISE_REACH_ORDER
     ]
 
 
@@ -2566,6 +2609,8 @@ def derive_tier0_population_stat(
     tier0: int,
     domain_user_count: int,
     tier0_direct: int | None = None,
+    tier1: int | None = None,
+    tier1_accounts: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Derive the Tier 0 PRIVILEGE SPRAWL figure — how many accounts already ARE Tier 0.
 
@@ -2628,19 +2673,38 @@ def derive_tier0_population_stat(
             are escalation-capable (Account/Print/Server/Backup Operators,
             DnsAdmins, …). ``None`` leaves the split unknown and the wording
             falls back to the neutral form.
+        tier1: Enabled accounts graded Tier 1 (server or application
+            administration) by the stamped tier SSOT. They are administrative,
+            so they are not part of the ORDINARY population either: "ordinary"
+            is the Tier 2 population everywhere in the product (the exposure
+            KPI's ``tier2_exposure`` counts the same people). ``None`` keeps
+            the older two-way split, for an artifact without the Tier 1 count.
+        tier1_accounts: The Tier 1 accounts by name, so ``tier1_sentence``
+            names who the remainder is
+            (``privilege_tier_labels.tier1_remainder_sentence``).
 
     Returns:
         A flat dict every surface renders directly: ``tier0_count``,
-        ``tier0_direct`` / ``tier0_escalation_capable``, ``dominant_kind``,
-        ``ordinary_count`` (the population that can be exposed), ``pct``,
-        ``leads``, ``degenerate`` (no ordinary population at all) and
-        ``available``.
+        ``tier0_direct`` / ``tier0_escalation_capable``, ``tier1_count``,
+        ``dominant_kind``, ``ordinary_count`` (the Tier 2 population that can
+        be exposed), ``pct``, ``leads``, ``degenerate`` (no ordinary population
+        at all) and ``available``.
     """
     count = max(0, int(tier0))
     total = max(0, int(domain_user_count))
     direct = min(count, max(0, int(tier0_direct))) if tier0_direct is not None else None
     escalation = (count - direct) if direct is not None else None
-    ordinary = max(0, total - count)
+    tier1_count = (
+        min(max(0, total - count), max(0, int(tier1))) if tier1 is not None else 0
+    )
+    ordinary = max(0, total - count - tier1_count)
+    from adscan_core.reporting.privilege_tier_labels import (  # noqa: PLC0415
+        tier1_remainder_sentence,
+    )
+
+    _tier1_names = sorted(
+        {str(n).strip().lower() for n in (tier1_accounts or ()) if str(n or "").strip()}
+    )
     pct = round(count / total * 100.0, 1) if total > 0 else 0.0
     degenerate = total > 0 and ordinary == 0
     leads = bool(
@@ -2661,6 +2725,9 @@ def derive_tier0_population_stat(
         "tier0_count": count,
         "tier0_direct": direct,
         "tier0_escalation_capable": escalation,
+        "tier1_count": tier1_count,
+        "tier1_accounts": _tier1_names,
+        "tier1_sentence": tier1_remainder_sentence(tier1_count, _tier1_names),
         "dominant_kind": dominant,
         "ordinary_count": ordinary,
         "domain_user_count": total,
@@ -2678,6 +2745,7 @@ def derive_ordinary_breaker_stat(
     tier2: int,
     domain_user_count: int,
     population_tier0: int | None = None,
+    population_tier1: int | None = None,
 ) -> dict[str, Any]:
     """Derive the tier-aware, NON-CIRCULAR ordinary-account domain-compromise stat.
 
@@ -2695,8 +2763,13 @@ def derive_ordinary_breaker_stat(
     headline. The finding is the ordinary users, so the numerator and the
     denominator both drop the Tier-0 population.
 
-    Denominator. ``ordinary_total`` is the domain's non-Tier-0 user population,
-    ``domain_user_count - population_tier0``. ``population_tier0`` is the count of
+    Ordinary means Tier 2. A Tier 1 account (server or application
+    administration) is administrative too, so it sits in neither the numerator
+    nor the denominator; it is returned as ``tier1_with_breaker`` for the
+    surface to name beside the figure.
+
+    Denominator. ``ordinary_total`` is the domain's Tier 2 user population,
+    ``domain_user_count - population_tier0 - population_tier1``. ``population_tier0`` is the count of
     accounts that ARE Tier 0 by membership (from ``population_tier_breakdown``) —
     the correct exclusion, because a Tier-0 account is never an ordinary account
     whether or not it holds an outbound path. When ``population_tier0`` is not
@@ -2724,13 +2797,19 @@ def derive_ordinary_breaker_stat(
             exclusion so a Tier-0 sink account (RID-500 Administrator) is dropped
             from the ordinary population. ``None`` falls back to the affected
             ``tier0`` count (the broad-group case where the two coincide).
+        population_tier1: Count of accounts graded Tier 1 (from
+            ``population_tier_breakdown.tier1``), excluded from the ordinary
+            denominator the same way. ``None`` falls back to the affected
+            ``tier1`` count.
 
     Returns:
         A flat dict both surfaces render directly:
 
-        * ``ordinary_with_breaker`` — ``tier1 + tier2`` (the FINDING numerator:
+        * ``ordinary_with_breaker`` — ``tier2`` (the FINDING numerator:
           non-administrative accounts with a full-compromise path).
-        * ``ordinary_total`` — the denominator (non-Tier-0 domain population).
+        * ``ordinary_total`` — the denominator (the Tier 2 domain population).
+        * ``tier1_with_breaker`` — ``tier1`` (context: administrative accounts
+          below Tier 0 that also hold the path, named beside the figure).
         * ``pct_non_admin`` — ``ordinary_with_breaker / ordinary_total * 100``.
         * ``total_with_breaker`` — ``tier0 + tier1 + tier2`` (context: every
           account with the path, ordinary + already-privileged).
@@ -2754,12 +2833,20 @@ def derive_ordinary_breaker_stat(
     t1 = max(0, int(tier1))
     t2 = max(0, int(tier2))
     total_users = max(0, int(domain_user_count))
-    ordinary_with_breaker = t1 + t2
-    # Exclude the FULL Tier-0-by-membership population from the ordinary
-    # denominator, not merely the Tier-0 accounts that happen to hold an outbound
-    # path. Fall back to the affected count when the population figure is absent.
+    # "Ordinary" is the Tier 2 population, the same people the exposure KPI
+    # (``tier2_exposure``, ``chokepoint_cardinality._node_is_standard_user``)
+    # and the remediation reach count. A Tier 1 account administers servers or
+    # applications: it is reported beside the figure (``tier1_with_breaker``),
+    # never inside it. Counting it in made the executive page say "10 of 10
+    # ordinary accounts" above a Start Here that said "9 of 9" for one scan.
+    ordinary_with_breaker = t2
+    # Exclude the FULL Tier-0- and Tier-1-by-membership population from the
+    # ordinary denominator, not merely the accounts that happen to hold an
+    # outbound path. Fall back to the affected count when the population figure
+    # is absent.
     denom_tier0 = t0 if population_tier0 is None else max(t0, int(population_tier0))
-    ordinary_total = max(total_users - denom_tier0, ordinary_with_breaker)
+    denom_tier1 = t1 if population_tier1 is None else max(t1, int(population_tier1))
+    ordinary_total = max(total_users - denom_tier0 - denom_tier1, ordinary_with_breaker)
     pct_non_admin = (
         round(ordinary_with_breaker / ordinary_total * 100.0, 1)
         if ordinary_total > 0
@@ -2771,9 +2858,56 @@ def derive_ordinary_breaker_stat(
         "pct_non_admin": pct_non_admin,
         "total_with_breaker": t0 + t1 + t2,
         "tier0_with_breaker": t0,
+        "tier1_with_breaker": t1,
         "tier_breakdown": {"tier0": t0, "tier1": t1, "tier2": t2},
         "available": (t0 + t1 + t2) > 0 and ordinary_total > 0,
     }
+
+
+def node_is_domain_object(node: Mapping[str, Any] | None) -> bool:
+    """Return whether ``node`` is the DOMAIN OBJECT (``kind == "domain"``).
+
+    The one test that separates full domain compromise (a route that reaches
+    the domain itself) from Tier 0 control (a route that stops on a direct
+    Tier 0 principal or asset). Reads the node's ``kind`` only; a bare name
+    stub carries no kind and is never treated as the domain object, so an
+    unresolved terminal degrades to the more conservative Tier 0 control.
+    """
+    if not isinstance(node, Mapping):
+        return False
+    return str(node.get("kind") or "").strip().lower() == "domain"
+
+
+#: Path classes that end in CONTROL of a direct Tier 0 principal or asset: full
+#: domain compromise and Tier 0 control. The set a consumer reads when it means
+#: "the most direct reach on the ladder" (severity, ordering, the Tier 0 asset
+#: exposure count). A figure that states FULL DOMAIN COMPROMISE reads
+#: :attr:`CompromiseClass.DOMAIN_BREAKER` alone.
+DIRECT_TIER0_CONTROL_CLASSES: frozenset[CompromiseClass] = frozenset(
+    {CompromiseClass.DOMAIN_BREAKER, CompromiseClass.TIER0_CONTROL}
+)
+
+
+def is_direct_tier0_control_class(value: Any) -> bool:
+    """Return whether a path class (enum or string) is in the direct band.
+
+    True for ``domain_breaker`` and ``tier0_control``. Accepts the enum or its
+    string value, so record dicts and enum members compare the same way.
+    """
+    token = str(getattr(value, "value", value) or "").strip().lower()
+    return token in {cls.value for cls in DIRECT_TIER0_CONTROL_CLASSES}
+
+
+#: The Compromise Reach ladder in canonical client order (report and web). The
+#: SSOT for any surface that enumerates the classes it renders, so adding a
+#: class cannot leave one surface a row short.
+COMPROMISE_REACH_ORDER: tuple[CompromiseClass, ...] = (
+    CompromiseClass.DOMAIN_BREAKER,
+    CompromiseClass.TIER0_CONTROL,
+    CompromiseClass.TIER0_FOOTHOLD,
+    CompromiseClass.PRIVILEGED_ESCALATOR,
+    CompromiseClass.COMPROMISE_ENABLER,
+)
 
 
 def _last_real_edge(edges: Iterable[Mapping[str, Any]]) -> Mapping[str, Any] | None:
@@ -2802,7 +2936,12 @@ def derive_compromise_class_from_path(
     clasificador"):
 
     * If the last non-membership edge is ``control``/``derived``/
-      ``escalation`` and lands on a Tier 0 asset → ``DOMAIN_BREAKER``.
+      ``escalation`` and lands on the DOMAIN OBJECT → ``DOMAIN_BREAKER``
+      (full domain compromise).
+    * Same edge kinds landing on a direct Tier 0 principal or asset (Domain
+      Admins, Enterprise Admins, Administrators, krbtgt, RID 500, a DC) that
+      is NOT the domain object → ``TIER0_CONTROL``. Normally empty: the
+      engine extends those routes to the domain object.
     * If the last non-membership edge is ``auth`` and lands on a Tier 0
       asset → ``TIER0_FOOTHOLD`` (NEW Phase 1 — fixes the HTB Forest
       false positive where ``CanPSRemote`` to a DC was wrongly flagged
@@ -2851,7 +2990,16 @@ def derive_compromise_class_from_path(
             # direct domain-compromise paths. See spec
             # 2026-06-03-attack-path-terminal-ordering.md.
             if _is_direct_domain_breaker_target(target_node):
-                return CompromiseClass.DOMAIN_BREAKER
+                # Only a route that reaches the DOMAIN OBJECT is full domain
+                # compromise. A route that stops on a direct Tier 0 principal
+                # or asset (Domain Admins, krbtgt, RID 500, a DC) controls Tier
+                # 0 but has not shown the step to the domain itself; the engine
+                # normally extends such a route through replication, so this
+                # branch is the safety net that keeps an unextended one from
+                # being labelled domain compromise.
+                if node_is_domain_object(target_node):
+                    return CompromiseClass.DOMAIN_BREAKER
+                return CompromiseClass.TIER0_CONTROL
             return CompromiseClass.PRIVILEGED_ESCALATOR
         if _is_privileged_escalator_target(target_node):
             return CompromiseClass.PRIVILEGED_ESCALATOR
@@ -2891,6 +3039,12 @@ def derive_compromise_class_from_path(
 # string is the only addition; the rest are preserved verbatim.
 _COMPROMISE_CLASS_TO_OUTCOME: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "direct_compromise",
+    # Tier 0 control keeps the engine's legacy ``direct_compromise`` outcome on
+    # purpose: the outcome string drives the engine's collapse and sort keys
+    # (``_OUTCOME_CLASS_RANK``, ``target_terminal_class``), and the split
+    # between the two classes is a display distinction that must not move the
+    # path set. Consumers read ``compromise_class`` for the split.
+    CompromiseClass.TIER0_CONTROL: "direct_compromise",
     CompromiseClass.PRIVILEGED_ESCALATOR: "followup_terminal",
     CompromiseClass.TIER0_FOOTHOLD: "tier0_foothold",
     CompromiseClass.COMPROMISE_ENABLER: "graph_extension",
@@ -2926,6 +3080,7 @@ _OUTCOME_CLASS_TO_COMPROMISE_CLASS: dict[str, CompromiseClass] = {
     "high_impact_privilege": CompromiseClass.PRIVILEGED_ESCALATOR,
     # Canonical names, so the resolver accepts either vocabulary.
     "domain_breaker": CompromiseClass.DOMAIN_BREAKER,
+    "tier0_control": CompromiseClass.TIER0_CONTROL,
     "privileged_escalator": CompromiseClass.PRIVILEGED_ESCALATOR,
     "compromise_enabler": CompromiseClass.COMPROMISE_ENABLER,
     "unauthenticated_principal": CompromiseClass.UNAUTHENTICATED_PRINCIPAL,

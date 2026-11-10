@@ -15,6 +15,8 @@ import asyncio
 from collections.abc import Callable, Sequence
 
 from adscan_core.tui import LiveSession, LiveSessionConfig
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_runtime import active_runtime
 from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
@@ -95,7 +97,7 @@ def print_smb_privilege_preflight(
 async def run_privilege_check_with_display(
     configs: Sequence[SMBPrivilegeConfig],
     *,
-    max_concurrency: int = 10,
+    max_concurrency: int | None = None,
     on_result: Callable[[SMBPrivilegeResult], None] | None = None,
 ) -> list[SMBPrivilegeResult]:
     """Run privilege checks concurrently, rendering a live table as results arrive.
@@ -127,7 +129,9 @@ async def run_privilege_check_with_display(
 
         return table
 
-    semaphore = asyncio.Semaphore(max_concurrency)
+    if max_concurrency is None:
+        max_concurrency = int(component_pacing(active_pacing(), "sweep.smb_privilege")["max_concurrency"])
+    semaphore = active_runtime().semaphore(max_concurrency)
 
     async def _run_one(i: int, cfg: SMBPrivilegeConfig) -> None:
         async with semaphore:

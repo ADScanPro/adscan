@@ -51,7 +51,8 @@ from adscan_internal.services.auth_plan import (
 from adscan_internal.services.auth_error_classification import (
     is_pypsrp_kerberos_infra_error,
 )
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_warning
+from adscan_core.auth_attempt_guard import AuthAttemptRefused
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.domain_posture import DomainPosture
@@ -152,6 +153,16 @@ class WinRMPSRPService:
         posture_snapshot: Optional["DomainPosture"] = None,
         domain_for_posture: Optional[str] = None,
     ) -> None:
+        # ``password`` carries the password, NT hash or ccache path for
+        # ``username``. A named principal without any of them would go out as
+        # an empty secret: refuse before a connection exists.
+        from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+            require_credential_material,
+        )
+
+        require_credential_material(
+            transport="WinRM", username=username, password=password
+        )
         self.domain = domain
         self.host = host
         self.username = username
@@ -1092,8 +1103,11 @@ class WinRMPSRPService:
         )
         client = self._get_client(auth_settings)
         try:
-            with self._temporary_kerberos_env(auth_settings):
-                return operation(client, auth_settings)
+            return self._run_guarded_operation(operation, client, auth_settings)
+        except AuthAttemptRefused:
+            # The lockout guard withheld this sign-in; every fallback below
+            # signs in as the same principal, so none of them may run either.
+            raise
         except Exception as exc:
             # "Matching credential not found" is overloaded: with a ccache it
             # usually means the HTTP/<host> service ticket isn't present and a
@@ -1135,8 +1149,9 @@ class WinRMPSRPService:
                 self._client_auth_settings = None
                 fallback_auth = self._build_ntlm_auth_settings()
                 fallback_client = self._get_client(fallback_auth)
-                with self._temporary_kerberos_env(fallback_auth):
-                    return operation(fallback_client, fallback_auth)
+                return self._run_guarded_operation(
+                    operation, fallback_client, fallback_auth
+                )
 
             fallback_auth = wsman_fallback_auth
             if not (
@@ -1162,8 +1177,82 @@ class WinRMPSRPService:
             self._client = None
             self._client_auth_settings = None
             fallback_client = self._get_client(fallback_auth)
-            with self._temporary_kerberos_env(fallback_auth):
-                return operation(fallback_client, fallback_auth)
+            return self._run_guarded_operation(operation, fallback_client, fallback_auth)
+
+    # ------------------------------------------------------------------ #
+    # Sign-in lockout guard (adscan_core.auth_attempt_guard)
+    # ------------------------------------------------------------------ #
+
+    def _guard_target(
+        self, auth_settings: WinRMPSRPAuthSettings
+    ) -> "tuple[str, str, str] | None":
+        """``(realm, principal, secret)`` when this PSRP sign-in sends a secret.
+
+        pypsrp authenticates lazily inside the operation, with the password the
+        client was built with: NTLM always, and Kerberos too when no ccache could
+        be prepared (pyspnego then asks GSSAPI for a TGT itself). A sign-in that
+        presents a ccache sends no secret here (its AS exchange already went
+        through the kerbad seam) and is not judged. A local account (no domain,
+        or ``"."``) is keyed to the host.
+        """
+        if str(auth_settings.kerberos_ticket_path or "").strip():
+            return None
+        if not str(self.username or "").strip():
+            return None
+        from adscan_core.auth_attempt_guard import local_realm  # noqa: PLC0415
+
+        realm = str(self.domain or "").strip()
+        if realm in ("", "."):
+            realm = local_realm(self.host)
+        # A ccache path in the password slot is not a secret: sending it over
+        # NTLM is a guaranteed failed sign-in, so it is refused like an empty one.
+        if auth_settings.password is None or self._looks_like_ccache_path():
+            secret = ""
+        else:
+            secret = str(self.password or "")
+        return realm, str(self.username), secret
+
+    def _run_guarded_operation(self, operation, client, auth_settings: WinRMPSRPAuthSettings):
+        """Run one PSRP operation behind the lockout guard and record its verdict.
+
+        A WinRM 401 says nothing about WHY (wrong password, disabled account,
+        blocked NTLM and a Protected Users member all look the same), so the
+        shared classifier reads it as UNKNOWN: it is never counted and never
+        withholds the secret. Only a GSSAPI acquisition error that names the
+        KDC's answer, or a success, changes the ledger.
+        """
+        from adscan_core import auth_attempt_guard  # noqa: PLC0415
+        from adscan_core.auth_outcome import (  # noqa: PLC0415
+            SUCCESS,
+            classify_http_negotiate,
+        )
+
+        target = self._guard_target(auth_settings)
+        if target is not None:
+            try:
+                auth_attempt_guard.check_attempt(*target)
+            except AuthAttemptRefused as refused:
+                print_warning(str(refused))
+                raise
+        try:
+            with self._temporary_kerberos_env(auth_settings):
+                result = operation(client, auth_settings)
+        except Exception as exc:
+            if target is not None:
+                chain: list[str] = []
+                current: BaseException | None = exc
+                while current is not None and len(chain) < 8:
+                    chain.append(str(current))
+                    current = current.__cause__ or current.__context__
+                verdict = classify_http_negotiate(
+                    " ".join(chain),
+                    kerberos_password=auth_settings.auth in {"kerberos", "negotiate"},
+                )
+                auth_attempt_guard.record_verdict(*target, verdict)
+            raise
+        if target is not None:
+            auth_attempt_guard.record_verdict(*target, SUCCESS)
+        return result
 
     def _log_execution_debug(
         self,

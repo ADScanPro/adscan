@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.ledger/1",
+  "title": "ADscan engagement ledger export v1",
+  "description": "Projection of <workspace>/engagement/engagement.sqlite (adscan_core/engagement/store.py): the runs applied, every finding and attack-step item with its lifecycle status and last verification, the status transitions, and the client's dispositions. Holds no secret. Names AD objects (object ids, labels), so it stays on the node unless the data policy allows findings.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "engagement_id", "generated_at", "runs", "items", "events", "dispositions"],
+  "$defs": {
+    "nstr": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+  },
+  "properties": {
+    "schema": {"const": "adscan.ledger/1"},
+    "engagement_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "generated_at": {"type": "string"},
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "kind", "status", "vantage", "applied_at"],
+        "properties": {
+          "run_id": {"type": "string", "minLength": 1, "maxLength": 64},
+          "kind": {"enum": ["scan", "recheck", "postprocess", "import"]},
+          "status": {"enum": ["complete", "partial", "interrupted", "unknown"]},
+          "vantage": {"type": "integer", "minimum": 0, "maximum": 2},
+          "started_at": {"$ref": "#/$defs/nstr"},
+          "finished_at": {"$ref": "#/$defs/nstr"},
+          "parent_run_id": {"$ref": "#/$defs/nstr"},
+          "applied_at": {"type": "string"}
+        }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "kind", "key", "domain_id", "status", "evaluation_state"],
+        "properties": {
+          "item_id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["finding", "step", "structural_step"]},
+          "key": {"type": "string"},
+          "domain_id": {"type": "string", "minLength": 1},
+          "object_id": {"$ref": "#/$defs/nstr"},
+          "label": {"type": "string"},
+          "legacy_alias": {"type": "string"},
+          "status": {"enum": ["open", "reopened", "remediated", "accepted", "false_positive"]},
+          "disposition": {"oneOf": [{"enum": ["accepted", "false_positive"]}, {"type": "null"}]},
+          "evaluation_state": {"enum": ["evaluated", "not_reevaluated"]},
+          "evaluation_reason": {"$ref": "#/$defs/nstr"},
+          "first_seen_run": {"$ref": "#/$defs/nstr"},
+          "last_seen_run": {"$ref": "#/$defs/nstr"},
+          "last_verified_run": {"$ref": "#/$defs/nstr"},
+          "last_verified_at": {"$ref": "#/$defs/nstr"}
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run_id", "item_id", "transition", "new_status", "at"],
+        "properties": {
+          "run_id": {"type": "string"},
+          "item_id": {"type": "string"},
+          "transition": {"enum": ["new", "reopened", "remediated"]},
+          "old_status": {"$ref": "#/$defs/nstr"},
+          "new_status": {"enum": ["open", "reopened", "remediated"]},
+          "reason": {"$ref": "#/$defs/nstr"},
+          "at": {"type": "string"}
+        }
+      }
+    },
+    "dispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "status", "set_at"],
+        "properties": {
+          "item_id": {"type": "string"},
+          "status": {"enum": ["accepted", "false_positive"]},
+          "reason": {"$ref": "#/$defs/nstr"},
+          "set_by": {"$ref": "#/$defs/nstr"},
+          "set_at": {"type": "string"},
+          "expires_at": {"$ref": "#/$defs/nstr"}
+        }
+      }
+    }
+  }
+}

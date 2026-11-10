@@ -53,6 +53,7 @@ from adscan_core.rich_output import (
     print_panel,
 )
 from adscan_core.output import prompt_ask, questionary_select_index
+from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.tui.progress_dashboard import format_eta
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.services.scan_config import HOST_CAP_DEFAULT
@@ -66,17 +67,12 @@ _SCALE_GATE_THRESHOLD_DEFAULT = 1000
 SCALE_GATE_THRESHOLD_ENV = "ADSCAN_SCALE_GATE_THRESHOLD"
 
 # Coarse per-host-time model for the estimate (see the module docstring for why a
-# measured benchmark is impractical at this seam). These mirror the collector's
-# own env-configurable knobs so a tuned deployment estimates against its OWN
-# timing, not a hardcoded one.
-_HOST_CONCURRENCY_ENV = "ADSCAN_COLLECTOR_HOST_CONCURRENCY"
-_HOST_CONCURRENCY_DEFAULT = 20
-_PER_HOST_TIMEOUT_ENV = "ADSCAN_COLLECTOR_PER_HOST_TIMEOUT"
-# The per-host timeout (default 20s) is the honest UPPER-BOUND figure for one
-# host's wall time: a fast host finishes in a second or two, a filtered/hardened
-# host burns close to the full per-host timeout in dead-wait. Modelling every host
-# at the timeout keeps the estimate a conservative upper bound, never optimistic.
-_PER_HOST_SECONDS_DEFAULT = 20
+# measured benchmark is impractical at this seam). Both inputs are the SMB host
+# collector's OWN resolved pacing (consumer ``collector.smb_hosts``), so a tuned
+# or slowed deployment estimates against the concurrency and per-host timeout
+# the collector will actually use. The per-host timeout is the honest UPPER-BOUND
+# figure for one host's wall time: a fast host finishes in a second or two, a
+# filtered/hardened host burns close to the full per-host timeout in dead-wait.
 
 
 def _resolve_threshold() -> int:
@@ -96,25 +92,14 @@ def _resolve_threshold() -> int:
 SCALE_GATE_THRESHOLD = _resolve_threshold()
 
 
-def _env_int(name: str, default: int, *, floor: int = 1) -> int:
-    """Read a positive integer env override, floored, else the default."""
-    raw = os.environ.get(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    try:
-        return max(floor, int(str(raw).strip()))
-    except (TypeError, ValueError):
-        return default
-
-
 def _resolve_concurrency() -> int:
-    """The SMB sweep concurrency the estimate divides by (collector's own knob)."""
-    return _env_int(_HOST_CONCURRENCY_ENV, _HOST_CONCURRENCY_DEFAULT, floor=1)
+    """The SMB sweep concurrency the estimate divides by (the collector's own pacing)."""
+    return max(1, int(component_pacing(active_pacing(), "collector.smb_hosts")["concurrency"]))
 
 
 def _resolve_per_host_seconds() -> int:
     """The coarse per-host wall-time model the estimate multiplies by."""
-    return _env_int(_PER_HOST_TIMEOUT_ENV, _PER_HOST_SECONDS_DEFAULT, floor=1)
+    return max(1, int(component_pacing(active_pacing(), "collector.smb_hosts")["per_host_timeout_s"]))
 
 
 def estimate_sweep_seconds(

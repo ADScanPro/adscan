@@ -1,11 +1,12 @@
 """What share of the ENS regime an assessment actually measures, stated once.
 
 The compliance section of a Security Assessment Report prints a conformance
-figure over the Anexo II measures this engine maps. Eleven of the annex's 73
-measures are mapped at all, because the other 62 are organisational, physical or
-personnel measures that no reading of Active Directory can evidence. A
-denominator of ten or eleven left unexplained reads as if it were the ENS, so the
-share is stated rather than implied.
+figure over the Anexo II measures this engine maps. A minority of the annex's 73
+measures are mapped at all, because the rest are organisational, physical or
+personnel measures that no reading of Active Directory can evidence. A short
+denominator left unexplained reads as if it were the ENS, so the share is stated
+rather than implied. The mapped count is passed in, never assumed here, so the
+sentence re-derives when a measure is mapped or dropped.
 
 Two things make that statement a shared derivation rather than a sentence beside
 one renderer.
@@ -81,8 +82,51 @@ def _unmeasurable_clause(remaining: int, *, here: bool) -> str:
     )
 
 
+def _beyond_core_clause(
+    beyond_core: int, reported_total: int, *, here: bool = False
+) -> str:
+    """The clause accounting for a mapped measure the common core does not hold.
+
+    Why this clause exists, and why it is not optional. The share statement is
+    a fraction of the EXIGIBLE set, and the engine also maps measures whose
+    exigibility follows a categorisation nobody declared. Those still carry a
+    control card, so the section renders more cards than the fraction's
+    numerator names: a real kit stated "measures 12 of the 52" on one page
+    while the facing page's grid totalled 13, and the per-block breakdown
+    independently summed to 13. Both figures were right about their own set,
+    which is what made it a presentation defect rather than an arithmetic one.
+
+    So the statement names the measures beyond the core and the total they add
+    up to, and the total is the count of cards the section reports. The clause
+    disappears when every mapped measure is inside the exigible set, which is
+    the case for any declared scope, so no declared-scope sentence moves.
+    """
+    if beyond_core <= 0:
+        return ""
+    subject = (
+        "one further measure"
+        if beyond_core == 1
+        else f"{beyond_core:,} further measures"
+    )
+    tail = (
+        f"{reported_total:,} measures in all"
+        if here
+        else f"{reported_total:,} controls are reported below"
+    )
+    return (
+        f" It also assesses {subject} whose exigibility follows the "
+        f"categorisation, so {tail}."
+    )
+
+
 def _assessment_statement(
-    *, basis: str, measured: int, exigible: int, remaining: int
+    *,
+    basis: str,
+    measured: int,
+    exigible: int,
+    remaining: int,
+    beyond_core: int,
+    reported_total: int,
 ) -> str:
     """The register the Security Assessment Report's scope header prints.
 
@@ -102,7 +146,8 @@ def _assessment_statement(
             f"This assessment measures {measured:,} of the {exigible:,} Anexo "
             "II measures exigible for this system."
         )
-    return f"{opening} {_unmeasurable_clause(remaining, here=False)}"
+    beyond = _beyond_core_clause(beyond_core, reported_total)
+    return f"{opening}{beyond} {_unmeasurable_clause(remaining, here=False)}"
 
 
 def _coverage_statement(
@@ -113,6 +158,8 @@ def _coverage_statement(
     remaining: int,
     annex_total: int,
     undeclared: int,
+    beyond_core: int,
+    reported_total: int,
 ) -> str:
     """The register the AD Control Coverage Report prints.
 
@@ -132,6 +179,7 @@ def _coverage_statement(
             "No system category is declared for this assessment, so it covers "
             f"the {exigible:,} measures Anexo II requires at every category, "
             f"and this report measures {measured:,} of them."
+            f"{_beyond_core_clause(beyond_core, reported_total, here=True)}"
         )
         closing = (
             f"Declaring the scope resolves the other {undeclared:,} measures "
@@ -189,6 +237,13 @@ def build_ens_mapping_coverage(
 
     measured = len(required & mapped)
     remaining = len(required - mapped)
+    # Mapped measures the exigible set does not hold. They still carry a
+    # control card, so the section reports more cards than ``measured`` names,
+    # and a statement that leaves them out contradicts the grid on the facing
+    # page. ``reported_total`` is the count of cards, derived from the SAME
+    # mapped set the requirement catalog is built from, so the two cannot drift.
+    beyond_core = len(mapped - required)
+    reported_total = len(mapped)
     if not required:
         basis = BASIS_UNRESOLVED
     elif declared:
@@ -206,11 +261,18 @@ def build_ens_mapping_coverage(
         "required_and_mapped_total": measured,
         "required_and_unmapped_total": remaining,
         "exigibility_undeclared_total": undeclared,
+        # Mapped but outside the exigible set, and the total the section's
+        # control cards therefore come to. The ONE pair a renderer reads when
+        # it has to reconcile its grid total against the share statement.
+        "mapped_beyond_exigible_total": beyond_core,
+        "reported_control_total": reported_total,
         "statement": _assessment_statement(
             basis=basis,
             measured=measured,
             exigible=len(required),
             remaining=remaining,
+            beyond_core=beyond_core,
+            reported_total=reported_total,
         ),
         "coverage_statement": _coverage_statement(
             basis=basis,
@@ -219,6 +281,8 @@ def build_ens_mapping_coverage(
             remaining=remaining,
             annex_total=len(annex_ids),
             undeclared=undeclared,
+            beyond_core=beyond_core,
+            reported_total=reported_total,
         ),
     }
 

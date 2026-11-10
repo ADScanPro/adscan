@@ -340,6 +340,33 @@ class _RichOutputLoggerAdapter:
         print_error_debug(text)
 
 
+#: Kerberos errors in which the KDC judged the secret itself for an existing
+#: account. Retrying them with another client (kinit) only repeats the same
+#: wrong secret, adding a ``badPwdCount`` increment on a real account.
+_DEFINITIVE_CREDENTIAL_REJECTION_MARKERS: tuple[str, ...] = (
+    "kdc_err_preauth_failed",
+    "kdc_err_client_revoked",
+    "kdc_err_key_expired",
+)
+
+
+#: ``KerberosTGTResult.error_kind`` for a sign-in the lockout guard withheld.
+LOCKOUT_REFUSED_ERROR_KIND = "lockout_guard_refused"
+
+
+def _lockout_refusal_kind(exc: BaseException | None) -> Optional[str]:
+    """``LOCKOUT_REFUSED_ERROR_KIND`` when the lockout guard refused, else ``None``."""
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+
+    return LOCKOUT_REFUSED_ERROR_KIND if refusal_in_chain(exc) is not None else None
+
+
+def _is_definitive_credential_rejection(exc: BaseException | str | None) -> bool:
+    """Return ``True`` when ``exc`` is a KDC verdict on the credential itself."""
+    text = str(exc or "").lower()
+    return any(marker in text for marker in _DEFINITIVE_CREDENTIAL_REJECTION_MARKERS)
+
+
 def _write_ccache_bytes(ccache_bytes: bytes, ccache_path: Path) -> str:
     """Write raw ccache bytes to a file and return the path string."""
     ccache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,6 +617,7 @@ class KerberosTicketService(BaseService):
                 method="auto",
                 success=False,
                 error_message=str(exc),
+                error_kind=_lockout_refusal_kind(exc),
             )
 
     def create_tgt_from_kerberos_key_material(
@@ -1131,6 +1159,38 @@ class KerberosTicketService(BaseService):
                 success=True,
             )
         except Exception as exc:
+            if _lockout_refusal_kind(exc):
+                # The lockout guard withheld the sign-in; the credential was never
+                # judged. kinit would send the same secret again, so do not retry.
+                return KerberosTGTResult(
+                    username=username,
+                    domain=domain,
+                    ticket_path=None,
+                    method="kerberos_password",
+                    success=False,
+                    error_message=str(exc),
+                    error_kind=LOCKOUT_REFUSED_ERROR_KIND,
+                )
+            if _is_definitive_credential_rejection(exc):
+                # The KDC already judged this secret for this account. A kinit
+                # retry would send the SAME wrong secret again (one more
+                # badPwdCount on a real account) and cannot succeed, so the
+                # Kerberos verdict is returned as the real cause.
+                self.logger.warning(
+                    "Native kerbad TGT rejected for %s@%s (%s); not retrying with "
+                    "kinit (the KDC rejected the credential itself)",
+                    username,
+                    domain,
+                    exc,
+                )
+                return KerberosTGTResult(
+                    username=username,
+                    domain=domain,
+                    ticket_path=None,
+                    method="kerberos_password",
+                    success=False,
+                    error_message=f"KDC rejected the credential: {exc}",
+                )
             self.logger.warning(
                 "Native kerbad TGT failed for %s@%s (%s), falling back to kinit",
                 username,
@@ -1222,28 +1282,18 @@ class KerberosTicketService(BaseService):
             username=username,
         )
 
-        krb5_conf_backup: Optional[Path] = None
-        krb5_conf_path = Path("/etc/krb5.conf")
-
+        # Never rewrite the system /etc/krb5.conf: inside the container it is not
+        # writable (the old code died there with Errno 13 and the sweep reported
+        # a misleading "ccache write error"), and on a host it is shared state.
+        # The realm/KDC mapping goes into a private file handed to kinit through
+        # KRB5_CONFIG; a domain-specific krb5.conf already selected by
+        # _setup_domain_krb5_config takes precedence.
+        private_krb5_conf: Optional[Path] = None
         try:
-            if dc_ip:
-                if krb5_conf_path.exists():
-                    krb5_conf_backup = krb5_conf_path.with_suffix(".backup")
-                    shutil.copy2(krb5_conf_path, krb5_conf_backup)
-
-                krb5_content = (
-                    "[libdefaults]\n"
-                    f"    default_realm = {domain.upper()}\n\n"
-                    "[realms]\n"
-                    f"    {domain.upper()} = {{\n"
-                    f"        kdc = {dc_ip}\n"
-                    f"        admin_server = {dc_ip}\n"
-                    "    }\n\n"
-                    "[domain_realm]\n"
-                    f"    .{domain} = {domain.upper()}\n"
-                    f"    {domain} = {domain.upper()}\n"
+            if dc_ip and not os.environ.get("KRB5_CONFIG"):
+                private_krb5_conf = self._write_private_krb5_conf(
+                    workspace_dir=workspace_dir, domain=domain, dc_ip=dc_ip
                 )
-                krb5_conf_path.write_text(krb5_content, encoding="utf-8")
 
             kinit_cmd = ["kinit", f"{username}@{domain.upper()}"]
             self.logger.info(
@@ -1251,9 +1301,12 @@ class KerberosTicketService(BaseService):
             )
             env = get_clean_env_for_compilation()
             env["KRB5CCNAME"] = str(temp_ccache_path)
-            # Preserve any KRB5_CONFIG set by _setup_domain_krb5_config.
+            # Preserve any KRB5_CONFIG set by _setup_domain_krb5_config, else use
+            # the private realm mapping written above.
             if os.environ.get("KRB5_CONFIG"):
                 env["KRB5_CONFIG"] = os.environ["KRB5_CONFIG"]
+            elif private_krb5_conf is not None:
+                env["KRB5_CONFIG"] = str(private_krb5_conf)
 
             result = self._run_command_logged(
                 label="kinit",
@@ -1312,15 +1365,43 @@ class KerberosTicketService(BaseService):
             )
 
         finally:
-            # Restaurar krb5.conf si se modificó
-            if krb5_conf_backup and krb5_conf_backup.exists():
+            if private_krb5_conf is not None:
                 try:
-                    shutil.move(str(krb5_conf_backup), str(krb5_conf_path))
-                except Exception:
-                    self.logger.exception(
-                        "Failed to restore original krb5.conf from backup %s",
-                        krb5_conf_backup,
+                    private_krb5_conf.unlink(missing_ok=True)
+                except OSError:
+                    self.logger.debug(
+                        "Could not remove private krb5.conf %s", private_krb5_conf
                     )
+
+    @staticmethod
+    def _write_private_krb5_conf(
+        *, workspace_dir: str, domain: str, dc_ip: str
+    ) -> Path:
+        """Write a private realm/KDC mapping for one kinit call and return it."""
+        import tempfile  # noqa: PLC0415
+
+        realm = domain.upper()
+        content = (
+            "[libdefaults]\n"
+            f"    default_realm = {realm}\n\n"
+            "[realms]\n"
+            f"    {realm} = {{\n"
+            f"        kdc = {dc_ip}\n"
+            f"        admin_server = {dc_ip}\n"
+            "    }\n\n"
+            "[domain_realm]\n"
+            f"    .{domain} = {realm}\n"
+            f"    {domain} = {realm}\n"
+        )
+        base_dir = Path(workspace_dir).expanduser() / "kerberos"
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            base_dir = Path(tempfile.gettempdir())
+        fd, path = tempfile.mkstemp(prefix="krb5_", suffix=".conf", dir=str(base_dir))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        return Path(path)
 
     # ------------------------------------------------------------------ #
     # TGT from Kerberos AES key
@@ -1397,6 +1478,7 @@ class KerberosTicketService(BaseService):
                 method=f"kerberos_{key_kind}",
                 success=False,
                 error_message=str(exc),
+                error_kind=_lockout_refusal_kind(exc),
             )
 
         try:
@@ -1524,6 +1606,7 @@ class KerberosTicketService(BaseService):
                 method="kerberos_ntlm",
                 success=False,
                 error_message=str(exc),
+                error_kind=_lockout_refusal_kind(exc),
             )
 
         try:

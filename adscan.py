@@ -213,6 +213,7 @@ from adscan_core.console_runtime import (
     ensure_utf8_console as _ensure_utf8_console,
 )
 from adscan_core.pal import process as pal_process
+from adscan_core.scan_policy import settings as policy_settings
 from adscan_core.native_secret_scrub import scrub_native_secrets
 from adscan_core.outbound_links import cta_display_url, cta_markup, cta_url
 from adscan_core.lab_context import build_lab_telemetry_fields
@@ -1674,16 +1675,6 @@ from adscan_internal.sudo_utils import (  # noqa: E402
 )
 
 
-def _get_nxc_base_dir() -> str:
-    """Return the NetExec (nxc) state directory (~/.nxc) for the effective user."""
-    return os.path.join(_get_effective_user_home(), ".nxc")
-
-
-def _get_nxc_modules_dir() -> str:
-    """Return the NetExec modules directory (~/.nxc/modules) for the effective user."""
-    return os.path.join(_get_nxc_base_dir(), "modules")
-
-
 def _expand_effective_user_path(path: str) -> str:
     """Expand ~ paths using the effective user's home directory.
 
@@ -2524,12 +2515,6 @@ EXTERNAL_TOOLS_CONFIG = {
         "check_path": "massdns/bin/massdns",
         "check_venv_link": True,
     },
-    # "rdplogin_module": {
-    #     "url": "https://raw.githubusercontent.com/quahac/NetExec-Module-RDP-login-checker/refs/heads/main/rdplogin.py",
-    #     "type": "curl_nxc_module",
-    #     "script_name": "rdplogin.py",
-    #     "check_path": "~/.nxc/modules/rdplogin.py",  # Will be expanded at runtime
-    # },
 }
 
 # Global wordlists configuration for the `handle_install` download flow.
@@ -2631,21 +2616,6 @@ def _setup_external_tool(
                 file_dest = os.path.join(tool_path, file_info["name"])
                 run_command(["curl", "-L", "-o", file_dest, file_info["url"]])
                 run_command(["chmod", "+x", file_dest])
-
-        elif tool_type == "curl_nxc_module":
-            nxc_modules_path = _get_nxc_modules_dir()
-            os.makedirs(nxc_modules_path, exist_ok=True)
-            dest_file_path = os.path.join(nxc_modules_path, config["script_name"])
-            if not os.path.exists(dest_file_path) or force_reinstall:
-                print_info(
-                    f"Downloading {config['script_name']} to {nxc_modules_path}..."
-                )
-                run_command(["curl", "-L", config["url"], "-o", dest_file_path])
-                print_success(f"{config['script_name']} downloaded successfully.")
-            else:
-                print_info(
-                    f"{config['script_name']} already exists in {nxc_modules_path}, skipping."
-                )
 
         elif tool_type == "curl_zip_extract_linux_app":
             os.makedirs(tool_path, exist_ok=True)
@@ -3312,12 +3282,6 @@ PipToolsConfig = {  # pylint: disable=invalid-name
         # "unsupported hash type MD4" errors when running tools like dacledit.py.
         "extra_specs": ["pycryptodome==3.23.0"],
     },
-    "netexec": {
-        "spec": "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d",
-        "check_target": "nxc",
-        "check_type": "executable",
-        "exe_name": "nxc",
-    },
     "manspider": {
         "spec": "git+https://github.com/ADScanPro/MANSPIDER@cedb138",
         "check_target": "manspider",
@@ -3410,6 +3374,15 @@ try:
     tame_native_stack_loggers()
 except Exception:
     # Never let logger taming prevent the main CLI from starting.
+    pass
+
+# Show the scan-pacing strain safeguard's actions (slowed / paused hosts) to the
+# operator while the scan runs. Best-effort, like the taming above.
+try:
+    from adscan_internal.services.scan_pacing_notify import install_strain_notifier
+
+    install_strain_notifier()
+except Exception:
     pass
 
 # Drain the persistent telemetry queue from previous CLI runs that
@@ -4384,8 +4357,13 @@ def _maybe_show_report_cta(shell) -> None:
     victories = getattr(shell, "_session_victories", [])
     if not (bool(victories) or attack_paths > 0 or creds > 0):
         return
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type != "audit":
+    # A PRO user already owns the deliverable kit: never upsell it to them.
+    from adscan_core import tier as _tier
+
+    if _tier.is_pro():
+        return
+    # The report CTA is for a real environment (genuinely environment).
+    if policy_settings.policy_environment(shell) != "real":
         return
     shell.console.print()
 
@@ -9243,19 +9221,33 @@ class PentestShell:
     isolated as much as possible.
     """
 
+    @property
+    def type(self) -> str | None:  # noqa: A003 - the attribute every reader uses
+        """The workspace label, ``ctf`` or ``audit``, DERIVED from the scan policy.
+
+        Read-only, and for display, telemetry and the persisted
+        ``variables.json`` label only: nothing decides on it (the structural
+        test ``tests/unit/scan_policy/test_no_workspace_type_decisions.py``).
+        The policy's environment (``lab`` / ``real``) is the single source of
+        truth; behaviour reads the policy's settings
+        (``adscan_core.scan_policy.settings``). ``None`` until a workspace has a
+        policy.
+        """
+        from adscan_internal.services.scan_controls import workspace_type  # noqa: PLC0415
+
+        return workspace_type(self)
+
     def _is_ctf_domain_pwned(self, domain: str) -> bool:
-        """Return True when we should treat the domain flow as completed in CTF mode.
+        """Return True when the domain flow is complete: the policy's objective is reached.
 
         Args:
             domain: Domain name key in ``self.domains_data``.
 
         Returns:
-            True if scan type is CTF and domain auth status is "pwned".
+            True when the active policy aims at domain compromise and the domain
+            is compromised (``auth == "pwned"``).
         """
-        if self.type != "ctf":
-            return False
-        domain_data = self.domains_data.get(domain, {})
-        return domain_data.get("auth") == "pwned"
+        return policy_settings.domain_compromise_reached(self, domain)
 
     def _domain_flow_completed_by_pwn(self, domain: str) -> bool:
         """Return True when the domain is compromised and per-credential follow-up work is redundant.
@@ -9316,7 +9308,7 @@ class PentestShell:
 
         if auth_state in ["auth", "pwned"] and username in ["null", "guest"]:
             return True
-        if auth_state in ["pwned"] and self.type == "ctf":
+        if auth_state in ["pwned"] and policy_settings.aims_at_domain_compromise(self):
             return True
         return False
 
@@ -9346,7 +9338,8 @@ class PentestShell:
         We intentionally defer executing these actions while an enumeration step
         is running, so that step status prints happen in the correct order.
         """
-        if self.type != "ctf":
+        # Flag collection is a lab activity (genuinely environment).
+        if not policy_settings.is_lab(self):
             return
 
         # Store/refresh context used by post-compromise actions.
@@ -9378,7 +9371,7 @@ class PentestShell:
         and the operator may want to retry even after a clean miss or a
         previous capture they did not save.
         """
-        if self.type != "ctf":
+        if not policy_settings.is_lab(self):
             return
 
         # Idempotency guard — this function may be called from multiple
@@ -9644,6 +9637,8 @@ class PentestShell:
         """
         remote_context = dict(context or {})
         allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
+        if allow_remote_interaction and _scan_policy_answers_decision(self, remote_context):
+            allow_remote_interaction = False
         if allow_remote_interaction:
             remote_selection = request_remote_select(
                 title=title,
@@ -9690,6 +9685,8 @@ class PentestShell:
         """
         remote_context = dict(context or {})
         allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
+        if allow_remote_interaction and _scan_policy_answers_decision(self, remote_context):
+            allow_remote_interaction = False
         if allow_remote_interaction:
             remote_confirmation = request_remote_confirm(
                 prompt=prompt,
@@ -9773,6 +9770,8 @@ class PentestShell:
         """
         remote_context = dict(context or {})
         allow_remote_interaction = bool(remote_context.pop("remote_interaction", False))
+        if allow_remote_interaction and _scan_policy_answers_decision(self, remote_context):
+            allow_remote_interaction = False
         if allow_remote_interaction:
             default_indices = [
                 options.index(value) for value in (default_values or []) if value in options
@@ -10567,8 +10566,10 @@ class PentestShell:
     dns = None
     hash = None
     myip = None
+    # Provenance of ``myip``: "declared" (``set myip``) or "interface" (derived).
+    myip_source = None
     auto = False
-    type = None
+    # ``type`` is a property derived from the scan policy (see the top of the class).
     base_dn = None
     telemetry = True  # CLI persisted telemetry setting
     workspaces_dir = os.path.join(ADSCAN_BASE_DIR, "workspaces")
@@ -10777,7 +10778,12 @@ class PentestShell:
 
         # Initialize paths for external tools
         # These paths are resolved once when the shell starts.
-        self.netexec_path = get_tool_executable_path("netexec")
+        # NetExec is no longer bundled. Only the development-only reverse-shell
+        # launcher (``session``) still reads this, so a developer testing it can
+        # point at their own ``nxc``; a shipped image always leaves it unset.
+        from adscan_core.runtime_channel import is_dev_image
+
+        self.netexec_path = (shutil.which("nxc") if is_dev_image() else None) or None
         self.manspider_path = get_tool_executable_path("manspider")
         self.credsweeper_path = get_tool_executable_path("credsweeper")
         if not self.credsweeper_path:
@@ -10935,16 +10941,57 @@ class PentestShell:
         # retrying once. Best-effort: never blocks shell startup.
         try:
             from adscan_internal.services.dc_time import (
+                arm_wall_clock_restore,
                 register_clock_resync_for_shell,
             )
 
             register_clock_resync_for_shell(self)
+            # Baseline for the session-end wall-clock restore, captured before
+            # anything can step the clock to a domain controller.
+            arm_wall_clock_restore(self)
         except Exception as exc:  # noqa: BLE001 — backstop arming must not break startup
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(
                 f"(clock-resync-backstop) arming failed: {type(exc).__name__}: {exc}"
             )
+
+        # Sign-in lockout guard: give the authentication seams this session's
+        # password-attempt rules and each domain's lockout policy. Without it
+        # the guard still runs on its fail-closed budget.
+        try:
+            from adscan_internal.services.auth_attempt_policy import (
+                register_auth_attempt_guard_for_shell,
+            )
+
+            register_auth_attempt_guard_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+        # Engagement scope at the MSSQL transport: a query that runs on the far
+        # side of a linked server reaches that host, so the transport holds it
+        # to this session's scope and collection rule whoever built it.
+        try:
+            from adscan_internal.services.engagement_scope import register_scope_shell
+
+            register_scope_shell(self)
+        except Exception as exc:  # noqa: BLE001 — must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+        # Attack-graph notes hold credential-store REFERENCES, never recovered
+        # values. Bind the resolver to this session so the operator's own views
+        # (attack-path detail) still show the cleartext they are entitled to.
+        try:
+            from adscan_internal.services.graph_secret_store import (
+                register_graph_secret_resolver_for_shell,
+            )
+
+            register_graph_secret_resolver_for_shell(self)
+        except Exception as exc:  # noqa: BLE001 — must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         # Arm remote-artefact disclosure ONCE per session. Techniques that must
         # write a file on a target (a process dump, a saved registry hive, an
@@ -11248,9 +11295,20 @@ class PentestShell:
             return None
 
     def _restore_ntp_service(self):
-        """Ensure system NTP synchronization is enabled before exiting."""
+        """Put host time sync back the way this session found it, at exit.
+
+        It used to force ``timedatectl set-ntp true`` on every exit, which turned
+        time sync ON on hosts where it was deliberately off (the delivered
+        appliance ships with it off: no outbound NTP). Now:
+
+        * Docker runtime: ask the host helper to restore the state it recorded
+          before the session's first ``set-ntp false`` (nothing recorded means
+          ADscan never touched it). An older helper without that op gets the
+          previous ``set-ntp true``, but only if this session turned NTP off.
+        * Native runtime: re-enable only if this session turned it off.
+        """
+        session_disabled_ntp = bool(getattr(self, "_host_ntp_disabled_once", False))
         if _is_full_adscan_container_runtime():
-            # Docker runtime: restore host NTP using the host helper (best-effort).
             sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
             if not sock_path:
                 return
@@ -11260,13 +11318,20 @@ class PentestShell:
                     host_helper_client_request,
                 )
 
-                host_helper_client_request(
-                    sock_path, op="timedatectl_set_ntp", payload={"value": True}
+                resp = host_helper_client_request(
+                    sock_path, op="timedatectl_restore_ntp", payload={}
                 )
+                unsupported = str(getattr(resp, "message", "") or "").startswith(
+                    "Unsupported op"
+                )
+                if unsupported and session_disabled_ntp:
+                    host_helper_client_request(
+                        sock_path, op="timedatectl_set_ntp", payload={"value": True}
+                    )
             except (HostHelperError, OSError):
                 pass
             return
-        if shutil.which("timedatectl") is None:
+        if not session_disabled_ntp or shutil.which("timedatectl") is None:
             return
         try:
             self.run_command("timedatectl set-ntp true", timeout=60, ignore_errors=True)
@@ -11274,7 +11339,6 @@ class PentestShell:
         except Exception as e:
             telemetry.capture_exception(e)
             print_exception(exception=e)
-            pass
 
         # Start the output processor thread
         # if hasattr(self, '_stop_output_processor') and hasattr(self, '_output_processor_loop'):
@@ -11325,7 +11389,8 @@ class PentestShell:
                 print_error(
                     f"Error loading technical report cache: {self.technical_report_file}"
                 )
-        self.type = None  # Initialize pentest type (ctf or audit)
+        # ``self.type`` is a property derived from the scan policy (see the
+        # class body); there is nothing to initialise.
         # Didactic mode override: None = derive from workspace type (ctf/lab →
         # deep, audit → basic); "off"|"basic"|"deep" = explicit operator choice
         # set via `set explain_level …` / `--learn` / `--quiet`.
@@ -11981,7 +12046,12 @@ class PentestShell:
         )
 
         print("")
-        print_warning("Ctrl+C detected. Attempting graceful shutdown...")
+        if signal_name == "SIGINT":
+            print_warning("Ctrl+C detected. Attempting graceful shutdown...")
+        else:
+            # SIGTERM / SIGHUP: a `docker stop`, a web stop/cancel, or a closed
+            # terminal. Same graceful path, but it was not the operator's Ctrl+C.
+            print_warning("Stop requested. Attempting graceful shutdown...")
         print_info_verbose("Saving data before exiting...")
         print_info_debug("Signal handler invoked; running graceful shutdown")
 
@@ -12043,7 +12113,13 @@ class PentestShell:
                         console=TELEMETRY_CONSOLE, metadata=metadata
                     )
                 _SESSION_CAPTURE_FINALIZED = True
-            sys.exit(0)
+            # Exit with the signal's status (130 Ctrl+C, 143 SIGTERM, 129
+            # SIGHUP), never 0: the run was interrupted, and a 0 here made the
+            # web worker record a scan stopped from outside as completed and
+            # dispatch a deliverable kit for it.
+            from adscan_core.ci_exit_codes import exit_code_for_signal
+
+            sys.exit(exit_code_for_signal(_signum))
 
     def auto_save(self):
         """Executes workspace_save every 5 seconds in a background thread."""
@@ -12122,11 +12198,18 @@ class PentestShell:
             action = sub_args[0]
             if action == "start":
                 # Defaults: current myip or 0.0.0.0, port 4444
-                lhost = (
-                    sub_args[1]
-                    if len(sub_args) >= 2
-                    else getattr(self, "myip", "0.0.0.0") or "0.0.0.0"
-                )
+                if len(sub_args) >= 2:
+                    lhost = sub_args[1]
+                else:
+                    # A BIND address: a declared callback address may be on no
+                    # local interface, so bind what the ladder says is bindable.
+                    from adscan_internal.services.listener_ip import (
+                        resolve_untargeted_listener_ip,
+                    )
+
+                    lhost = (
+                        resolve_untargeted_listener_ip(self).bind_ip or "0.0.0.0"
+                    )
                 # If the user specified a port, respect it. Otherwise try
                 # common egress ports first (443, then 80) and fall back to
                 # 4444 for lab environments.
@@ -12411,27 +12494,11 @@ class PentestShell:
                 return
             listener_host, listener_port = listener_bind
 
-            # Resolve LHOST used in payloads: avoid 0.0.0.0 by preferring myip
-            # or the first non-loopback interface IP.
-            lhost = listener_host
-            if lhost == "0.0.0.0":
-                myip = getattr(self, "myip", None)
-                if myip:
-                    lhost = myip
-                else:
-                    ip_map = self._collect_interface_ips()
-                    non_loopback_ips = [
-                        ip for ip in sorted(ip_map.keys()) if not ip.startswith("127.")
-                    ]
-                    if non_loopback_ips:
-                        lhost = non_loopback_ips[0]
-                    else:
-                        print_error(
-                            "Listener is bound to 0.0.0.0 and no usable local IPv4 "
-                            "addresses were detected. Set 'myip' or restart the "
-                            "listener with an explicit LHOST."
-                        )
-                        return
+            # Resolve LHOST used in payloads per target: the payload runs on
+            # ``host``, so the address must be one that host can dial back.
+            lhost = self.resolve_payload_lhost(listener_host, host)
+            if not lhost:
+                return
 
             lport = listener_port
 
@@ -13065,28 +13132,11 @@ class PentestShell:
                     return
                 listener_host, listener_port = listener_bind
 
-                # Resolve a concrete LHOST for the payload (avoid 0.0.0.0).
-                lhost = listener_host
-                if lhost == "0.0.0.0":
-                    myip = getattr(self, "myip", None)
-                    if myip:
-                        lhost = myip
-                    else:
-                        ip_map = self._collect_interface_ips()
-                        non_loopback_ips = [
-                            ip
-                            for ip in sorted(ip_map.keys())
-                            if not ip.startswith("127.")
-                        ]
-                        if non_loopback_ips:
-                            lhost = non_loopback_ips[0]
-                        else:
-                            print_error(
-                                "Listener is bound to 0.0.0.0 and no usable local "
-                                "IPv4 addresses were detected. Set 'myip' or restart "
-                                "the listener with an explicit LHOST."
-                            )
-                            return
+                # Resolve a concrete LHOST for the payload (avoid 0.0.0.0). The
+                # one-liner has no single deployment host, so no target is given.
+                lhost = self.resolve_payload_lhost(listener_host, "")
+                if not lhost:
+                    return
 
                 python_exe = sub_args[1] if len(sub_args) >= 2 else "python"
                 one_liner = build_python_agent_one_liner(
@@ -13166,10 +13216,11 @@ class PentestShell:
                 lhost = sub_args[1]
             else:
                 listener_bind = self.session_manager.get_listener_bind()
-                if listener_bind:
-                    lhost = listener_bind[0]
-                else:
-                    lhost = getattr(self, "myip", "0.0.0.0") or "0.0.0.0"
+                lhost = self.resolve_payload_lhost(
+                    listener_bind[0] if listener_bind else None, ""
+                )
+                if not lhost:
+                    return
 
             try:
                 if len(sub_args) >= 3:
@@ -13220,6 +13271,31 @@ class PentestShell:
                 "info, rename, interfaces, launch, connect, download, upload, "
                 "or system."
             )
+
+    def resolve_payload_lhost(self, bind_host: str | None, target: str = "") -> str | None:
+        """Return the LHOST to embed in a payload/agent run on ``target``.
+
+        Routes through the per-target listener-IP ladder (declared address,
+        pivot egress, route toward ``target``, interface-derived ``myip``). Only
+        when the ladder cannot answer does it take the first non-loopback local
+        IPv4, as before. Prints an error and returns ``None`` when nothing is
+        usable, so a payload is never built around an unreachable address.
+        """
+        from adscan_internal.services.listener_ip import resolve_payload_lhost
+
+        selection = resolve_payload_lhost(self, bind_host=bind_host, target=target)
+        if selection.resolved:
+            return str(selection.ip)
+        ip_map = self._collect_interface_ips()
+        non_loopback_ips = [ip for ip in sorted(ip_map) if not ip.startswith("127.")]
+        if non_loopback_ips:
+            return non_loopback_ips[0]
+        print_error(
+            "Listener is bound to 0.0.0.0 and no usable local IPv4 address was "
+            "detected. Declare one with 'set listener-ip <ip>' or restart the "
+            "listener with an explicit LHOST."
+        )
+        return None
 
     def _collect_interface_ips(self) -> dict[str, str]:
         """Return a mapping of IPv4 address to interface name.
@@ -13503,9 +13579,11 @@ class PentestShell:
         )
 
         if self.myip:
+            from adscan_internal.services.listener_ip import myip_toolbar_label
+
             toolbar_parts.append('<style bg="#3B4252" fg="#88C0D0"> │ </style>')
             toolbar_parts.append(
-                f'<style bg="#2E3440" fg="#A3BE8C">IP: {self.myip} </style>'
+                f'<style bg="#2E3440" fg="#A3BE8C">{myip_toolbar_label(self)} </style>'
             )
 
         toolbar_parts.append('<style bg="#3B4252" fg="#88C0D0"> │ </style>')
@@ -13532,6 +13610,20 @@ class PentestShell:
                 method = getattr(self, name)
                 if callable(method):
                     self.commands[name[3:]] = method
+
+    def _discoverable_command_stems(self) -> list[str]:
+        """Command stems that may be OFFERED to the operator.
+
+        Every discovery surface (prompt completion, ``help <verb>`` completion,
+        did-you-mean) enumerates THIS, never ``self.commands`` directly, so a
+        verb flagged ``is_dev_only`` in the shell-command registry disappears
+        from all of them from that one declaration. Dispatch still uses
+        ``self.commands`` (the verb stays runnable, or refuses, when typed).
+        """
+        from adscan_internal.cli.shell_commands import dev_only_verbs
+
+        hidden = dev_only_verbs()
+        return [stem for stem in self.commands if stem not in hidden]
 
     def check_background_tasks(self):
         """Reap finished threads and drain any deferred background-job results.
@@ -13605,6 +13697,21 @@ class PentestShell:
                 "to the next loop-free pre-prompt drain"
             )
             return
+        # Backstop for "no callback arrived" guidance queued by a coercion
+        # coroutine whose consumer did not drain it at its own seam. Never asks
+        # here (allow_prompt=False): a prompt at the pre-prompt poll is detached
+        # from the action it was about. Idempotent, so a consumer that already
+        # drained leaves nothing to print. Runs before the registry early-return
+        # because it does not depend on a job registry existing.
+        try:
+            from adscan_internal.services.listener_ip import (
+                present_pending_callback_advice,
+            )
+
+            present_pending_callback_advice(self, allow_prompt=False)
+        except Exception as exc:  # noqa: BLE001 — guidance must never break the loop
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         try:
             registry = getattr(self, "_background_jobs", None)
             if registry is None:
@@ -14083,13 +14190,13 @@ class PentestShell:
         """
         set_variables = [
             "hosts",
+            "listener-ip",
             "myip",
             "iface",
             "pdc",
             "pdc_hostname",
             "domain",
             "auto",
-            "type",  # Added 'type'
             "username",
             "password",
             "hash",
@@ -14104,12 +14211,20 @@ class PentestShell:
             for var in set_variables  # Default to no specific value completer
         }
         set_args_completers["auto"] = WordCompleter(["True", "False"], ignore_case=True)
-        set_args_completers["type"] = WordCompleter(
-            ["ctf", "audit"], ignore_case=True
-        )  # Added completer for 'type'
         set_args_completers["iface"] = InterfaceCompleter(
             self
         )  # Use our custom completer
+        # Scan pace: the level, every knob and the saved profiles, from the pacing SSOT.
+        from adscan_internal.cli.scan_pacing_cmd import (
+            set_value_suggestions as _pacing_value_suggestions,
+            set_variable_names as _pacing_set_variables,
+        )
+
+        for _pacing_var in _pacing_set_variables():
+            set_args_completers[_pacing_var] = WordCompleter(
+                lambda _var=_pacing_var: _pacing_value_suggestions(_var, self),
+                ignore_case=True,
+            )
 
         # Path completers for file system commands
         dir_completer = PathCompleter(only_directories=True, expanduser=True)
@@ -14152,10 +14267,80 @@ class PentestShell:
                 pass
             return None
 
+        # Scan policy: subcommands, built-ins, and every check / family from
+        # the check registry (WORD=True keeps the ':' inside one completion word).
+        from adscan_internal.cli.scan_policy_cmd import (
+            selectable_selectors as _policy_selectors,
+            use_choices as _policy_use_choices,
+        )
+
+        _policy_selector_completer = WordCompleter(
+            _policy_selectors(), ignore_case=True, WORD=True
+        )
+        # Saved policy names change during the session, so the completer reads
+        # them on every Tab (WordCompleter accepts a callable).
+        _policy_names_completer = WordCompleter(
+            lambda: _policy_use_choices(
+                str(getattr(self, "current_workspace_dir", "") or "") or None
+            ),
+            ignore_case=True,
+        )
+        policy_completers = {
+            "show": _policy_names_completer,
+            "use": _policy_names_completer,
+            "exclude": _policy_selector_completer,
+            "include": _policy_selector_completer,
+            "clear": WordCompleter(["--yes"], WORD=True),
+            "list": None,
+            "create": None,
+            "edit": _policy_names_completer,
+            "save": None,
+            "delete": _policy_names_completer,
+            "export": _policy_names_completer,
+            "import": PathCompleter(expanduser=True),
+            "review-new": _policy_names_completer,
+        }
+
+        # Saved pace profiles: subcommands, then the saved profile names.
+        _pace_profile_names = WordCompleter(
+            lambda: _pacing_value_suggestions("pacing.profile", self), ignore_case=True
+        )
+        pace_completers = {
+            "list": None,
+            "show": _pace_profile_names,
+            "use": _pace_profile_names,
+            "create": None,
+            "save": None,
+            "delete": _pace_profile_names,
+        }
+
+        # Cleanup-only account: subcommands, then the workspace's domains (read
+        # on every Tab, since domains are discovered during the session).
+        from adscan_internal.cli.cleanup_credential_cmd import (
+            known_domains as _cleanup_known_domains,
+        )
+
+        _cleanup_domain_completer = WordCompleter(
+            lambda: _cleanup_known_domains(self), ignore_case=True
+        )
+        cleanup_credential_completers = {
+            "set": _cleanup_domain_completer,
+            "show": None,
+            "clear": WordCompleter(
+                lambda: [*_cleanup_known_domains(self), "all"], ignore_case=True
+            ),
+        }
+
         # Initial completers for specific commands
         completer_dict = {
             "set": set_args_completers,
-            "help": WordCompleter(list(self.commands.keys()), ignore_case=True),
+            "cleanup_credential": cleanup_credential_completers,
+            "help": WordCompleter(
+                self._discoverable_command_stems(), ignore_case=True
+            ),
+            "policy": policy_completers,
+            "pace": pace_completers,
+            "show": {"pacing": None},
         }
 
         # Instance of our custom completers
@@ -14169,7 +14354,6 @@ class PentestShell:
         domain_prefixes = [
             "smb",
             "ldap",
-            "netexec",
             "cve",
             "bloodhound",
         ]  # List of prefixes that require domain autocompletion
@@ -14193,7 +14377,9 @@ class PentestShell:
 
         for (
             cmd_stem
-        ) in self.commands.keys():  # cmd_stem is 'asreproast', 'spraying', 'cd', etc.
+        ) in (
+            self._discoverable_command_stems()
+        ):  # cmd_stem is 'asreproast', 'spraying', 'cd', etc.
             if cmd_stem not in completer_dict:  # completer_dict keys are also stems
                 if cmd_stem in FLAG_COMPLETION_SPECS:
                     # Migrated flag-grammar command (get_flags, dcsync, ...):
@@ -14657,7 +14843,10 @@ class PentestShell:
                     import difflib
 
                     close = difflib.get_close_matches(
-                        command_name, list(self.commands.keys()), n=1, cutoff=0.6
+                        command_name,
+                        self._discoverable_command_stems(),
+                        n=1,
+                        cutoff=0.6,
                     )
                     if close:
                         print_info(
@@ -14765,20 +14954,30 @@ class PentestShell:
         Available variables:
 
         - hosts: list of hosts to scan
+        - listener-ip: declare the address targets must call back to (for example a tunnel or
+          jump-host address on none of your interfaces). It beats every inferred address.
+          'set myip <ip>' is a permanent alias.
         - iface: network interface to use. Automatically adds the interface's IP to the myip variable
         - auto: enable or disable automatic mode. It will run the scan without prompting (automatic) or by prompting the user (semi-automatic)
-        - type: set the pentest type. Must be 'ctf' for CTF scenarios or 'audit' for real audits. This setting is mandatory before starting scans.
         - telemetry: turn anonymous usage telemetry on or off. The change applies to every
           workspace and future session; add 'workspace' to scope it to the current one.
+        - pacing: how hard ADscan works the network: fragile, polite, normal (default) or
+          fast. Saved in the workspace; a scan policy may cap it ('show pacing').
+        - pacing.<setting>: one pace setting, for example pacing.max_parallel_hosts 4.
+          Use 'unlimited' where a setting allows it and 'default' to drop your value.
+        - auto_revert: on, off or default. Whether ADscan undoes the changes it made
+          in the directory on its own, for this session (default: the scan policy's
+          'auto_revert' setting, on for a real environment and off for a lab).
 
         Examples:
 
         set hosts 192.168.1.0/24, set hosts 192.168.1.10-23
         set iface eth0
         set auto True
-        set type ctf
         set telemetry off
         set telemetry off workspace
+        set pacing polite
+        set pacing.max_parallel_hosts 4
         """
         try:
             # Split only on the first space to separate variable from values
@@ -14792,9 +14991,26 @@ class PentestShell:
             if variable == "hosts":
                 self.hosts = value
                 print_success(f"Hosts configured: {self.hosts}")
-            elif variable == "myip":
-                self.myip = value
-                print_success(f"My IP configured: {self.myip}")
+            elif variable in ("listener-ip", "myip"):
+                # 'listener-ip' is the documented name; 'myip' stays a permanent
+                # alias (muscle memory, notes) and the persisted key is unchanged.
+                from adscan_internal.services.listener_ip import (
+                    declare_myip,
+                    is_valid_ip_literal,
+                )
+
+                if not is_valid_ip_literal(value):
+                    print_error(
+                        f"Invalid IP address: {mark_sensitive(value, 'ip')}. "
+                        f"Usage: set {variable} <ip>"
+                    )
+                    return
+                # An explicit declaration beats per-target inference: it is how
+                # an operator behind a tunnel names an address on no local NIC.
+                declare_myip(self, value.strip())
+                print_success(
+                    f"Callback address declared: {mark_sensitive(self.myip, 'ip')}"
+                )
             elif variable == "iface":
                 self.interface = value
                 ip = self.set_interface_ip(value)
@@ -14827,20 +15043,33 @@ class PentestShell:
                     return
                 print_success(f"Auto mode configured: {self.auto}")
             elif variable == "type":
-                if value.lower() in ["ctf", "audit"]:
-                    self.type = value.lower()
-                    print_info(f"Pentest type configured: {self.type}.")
-                    if self.type == "ctf":
-                        self.auto = True
-                        print_warning(
-                            "Be aware that auto mode has been enabled. If you want to disable it, use 'set auto False'."
-                        )
-                else:
-                    print_error("Invalid type. Please use 'ctf' or 'audit'.")
+                # Retired: scan policies replaced the workspace type. Nothing
+                # changes; the guidance panel names the equivalent policy.
+                from adscan_core.scan_policy import (  # noqa: PLC0415
+                    legacy_type_notice as policy_guidance,
+                )
+
+                if policy_guidance.legacy_type_builtin(value) is None:
+                    print_error(
+                        "The workspace type was replaced by scan policies. "
+                        "Choose one with: policy use <name> (see: policy list)."
+                    )
+                    return
+                policy = getattr(self, "scan_policy", None)
+                active = ""
+                if policy is not None:
+                    from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+                        policy_display_name,
+                    )
+
+                    active = policy_display_name(policy.definition)
+                policy_guidance.print_notice(
+                    policy_guidance.build_repl_type_notice(value, active_policy=active)
+                )
             elif variable in ("explain_level", "explain", "learn"):
                 from adscan_internal.services.didactic_service import (
                     ExplainLevel,
-                    default_level_for_type,
+                    default_level_for_environment,
                 )
 
                 level = ExplainLevel.coerce(value)
@@ -14851,11 +15080,14 @@ class PentestShell:
                     )
                 else:
                     self.explain_level = level.value
-                    default = default_level_for_type(self.type)
+                    environment = policy_settings.policy_environment(self)
+                    default = default_level_for_environment(environment)
+                    where = {"lab": "a lab policy", "real": "a real-environment policy"}.get(
+                        environment or "", "a workspace without a scan policy"
+                    )
                     print_info(
                         f"Didactic mode set to '{level.value}'. "
-                        f"(Workspace default for type={self.type or 'unset'} is "
-                        f"'{default.value}'.)"
+                        f"(The default under {where} is '{default.value}'.)"
                     )
                     if level == ExplainLevel.DEEP:
                         print_info(
@@ -14875,6 +15107,38 @@ class PentestShell:
                     return
                 apply_telemetry_setting(self, request)
 
+            elif variable == "pacing" or variable.startswith("pacing."):
+                from adscan_internal.cli.scan_pacing_cmd import handle_set_pacing
+
+                handle_set_pacing(self, variable, value)
+
+            elif variable in ("auto_revert", "auto-revert"):
+                from adscan_internal.services.durable_change_policy import (
+                    resolve_auto_revert,
+                )
+
+                choice = value.strip().lower()
+                if choice in ("on", "true", "yes", "1"):
+                    self.auto_revert = True
+                elif choice in ("off", "false", "no", "0"):
+                    self.auto_revert = False
+                elif choice == "default":
+                    self.auto_revert = None
+                else:
+                    print_error("Usage: set auto_revert on|off|default")
+                    return
+                decision = resolve_auto_revert(self)
+                state = "on" if decision.enabled else "off"
+                print_success(
+                    f"Automatic reversion of ADscan's directory changes: {state} "
+                    f"({decision.source.replace('_', ' ')})."
+                )
+                if not decision.enabled:
+                    print_info(
+                        "Changes stay in place and are listed as kept in the report, "
+                        "with the command to remove each one."
+                    )
+
             elif variable == "username":
                 if self.domain is None:
                     print_error(
@@ -14883,9 +15147,24 @@ class PentestShell:
                     )
                     return
                 domain_entry = self.domains_data.setdefault(self.domain, {})
+                previous_user = str(domain_entry.get("username") or "").strip()
                 domain_entry["username"] = value
                 marked_username_1 = mark_sensitive(domain_entry["username"], "user")
                 print_success(f"User configured: {marked_username_1}")
+                if (
+                    previous_user
+                    and previous_user.lower() != str(value or "").strip().lower()
+                    and domain_entry.get("password")
+                ):
+                    # The configured password belonged to the previous user.
+                    # Keeping it would pair the new username with another
+                    # account's secret and fail every logon (badPwdCount).
+                    domain_entry["password"] = None
+                    print_info(
+                        "The configured password belonged to "
+                        f"{mark_sensitive(previous_user, 'user')} and was cleared. "
+                        f"Set the password for {marked_username_1} with: set password <value>"
+                    )
             elif variable == "password":
                 if self.domain is None:
                     print_error(
@@ -14940,7 +15219,25 @@ class PentestShell:
 
             ips = get_interface_ipv4_addresses(interface)
             if ips:
-                self.myip = ips[0]
+                from adscan_internal.services.listener_ip import (
+                    myip_is_declared,
+                    record_interface_myip,
+                )
+
+                # Choosing an interface is an explicit operator action, so it
+                # replaces a prior declaration; the value stays an inference.
+                replaced_declared = (
+                    str(self.myip) if myip_is_declared(self) else None
+                )
+                record_interface_myip(self, ips[0], replace_declared=True)
+                if replaced_declared and replaced_declared != self.myip:
+                    print_warning(
+                        "Your declared callback address "
+                        f"{mark_sensitive(replaced_declared, 'ip')} was replaced by the "
+                        f"address of interface {mark_sensitive(str(interface), 'hostname')} "
+                        f"({mark_sensitive(str(self.myip), 'ip')}). "
+                        "Run 'set listener-ip <ip>' again to declare it."
+                    )
                 return self.myip
             print_error(f"The interface '{interface}' does not have an assigned IP.")
             return None
@@ -15096,6 +15393,30 @@ class PentestShell:
             if hint:
                 content.append("  Re-enable with: ", style="dim")
                 content.append(f"{hint}\n", style="dim")
+        try:
+            from adscan_core.scan_pacing import active_pacing
+            from adscan_internal.cli.scan_policy_cmd import pacing_label
+            from adscan_internal.services.scan_controls import policy_display_name
+
+            _policy = getattr(self, "scan_policy", None)
+            content.append("Scan Policy: ", style=f"bold {BRAND_COLORS['info']}")
+            content.append(
+                (
+                    policy_display_name(_policy.definition)
+                    if _policy is not None
+                    else "None (every check allowed)"
+                )
+                + "\n",
+                style="white",
+            )
+            content.append("Scan Pace: ", style=f"bold {BRAND_COLORS['info']}")
+            content.append(
+                pacing_label(getattr(self, "scan_pacing", None) or active_pacing()) + "\n",
+                style="white",
+            )
+        except Exception as exc:  # noqa: BLE001 - info must render regardless
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
         content.append("\nDomain Information:\n", style="bold green")
         domain_data_text = self.show_domains_data()
@@ -15129,6 +15450,24 @@ class PentestShell:
 
         handle_posture_command(self, args)
 
+    def do_cleanup_credential(self, args):
+        """Manage the client's cleanup-only account saved in this workspace.
+
+        Usage: cleanup_credential set [<domain>] | show | clear [<domain>|all]
+            set     Save the account your client provided to undo ADscan's
+                    changes (the secret is asked for at a masked prompt).
+            show    List the cleanup accounts available, never the secret.
+            clear   Remove the saved account for a domain, or every one.
+
+        ADscan tries this account first when it undoes its own changes and never
+        uses it for the assessment.
+        """
+        from adscan_internal.cli.cleanup_credential_cmd import (
+            handle_cleanup_credential_command,
+        )
+
+        handle_cleanup_credential_command(self, args)
+
     def do_benchmark(self, args):
         """Measure (or re-measure) the local hashcat hardware benchmark used
         to time-budget cracking effort tiers (fast/balanced/thorough).
@@ -15149,10 +15488,13 @@ class PentestShell:
         """
         Manages operations related to workspaces.
 
-        Usage: workspace <create|delete|select|show|save|list> [name]
+        Usage: workspace <create|delete|purge-secrets|select|show|save|list> [name]
 
         - create [name]: Create a new workspace. If name is not provided, prompts for it.
         - delete <name>: Delete an existing workspace.
+        - purge-secrets [name] [--keep-starting-credential] [--delete-deliverables]:
+          Remove every recovered secret from a workspace (the active one by
+          default) and keep its findings, attack paths and history.
         - select: Select a workspace from available workspaces.
         - show: Display information about the current workspace.
         - save: Save the current workspace state.
@@ -15180,37 +15522,6 @@ class PentestShell:
         from adscan_internal.cli.workspaces import workspace_create
 
         workspace_create(self, workspace_name)
-
-    def initialize_workspace_files(
-        self,
-        workspace_name,
-        workspace_path,
-        workspace_type,
-        lab_provider=None,
-        lab_name=None,
-        lab_name_whitelisted=None,
-    ):
-        """Initializes default data files for a new workspace.
-
-        Args:
-            workspace_name (str): Name of the workspace
-            workspace_path (str): Full path to the workspace directory
-            workspace_type (str): Type of workspace ('ctf' or 'audit')
-            lab_provider (str, optional): Lab provider for CTF workspaces (HTB, TryHackMe, etc.)
-            lab_name (str, optional): Specific lab/machine name (e.g., "Forest" for HTB)
-            lab_name_whitelisted (bool, optional): Whether lab_name is in whitelist (None if no lab_name)
-        """
-
-        from adscan_internal.workspaces import write_initial_workspace_variables
-
-        write_initial_workspace_variables(
-            workspace_name=workspace_name,
-            workspace_path=workspace_path,
-            workspace_type=workspace_type,
-            lab_provider=lab_provider,
-            lab_name=lab_name,
-            lab_name_whitelisted=lab_name_whitelisted,
-        )
 
     def workspace_delete(self, workspace_name):
         """Deletes an existing workspace."""
@@ -15241,46 +15552,6 @@ class PentestShell:
         from adscan_internal.cli.domains import domain_save
 
         domain_save(self)
-
-    def _get_nxc_workspaces_dir(self) -> str:
-        """Return the NetExec workspaces directory for the effective user."""
-        from adscan_internal.integrations.netexec.workspaces import (
-            get_nxc_workspaces_dir,
-        )
-
-        return get_nxc_workspaces_dir(_get_nxc_base_dir())
-
-    def _clean_netexec_workspaces(self, *, use_sudo_if_needed: bool = True) -> bool:
-        """Clean NetExec workspaces directory to avoid schema mismatch errors.
-
-        NetExec can have schema mismatches when switching between different
-        workspace contexts. Removing the NetExec workspaces directory forces a
-        clean state on the next run.
-
-        Args:
-            use_sudo_if_needed: When True, attempts a sudo-based cleanup if the
-                directory cannot be removed due to permissions (common when older
-                ADscan versions were run as root).
-
-        Returns:
-            True if the directory is now absent (cleaned or already missing), False otherwise.
-        """
-        from adscan_internal.integrations.netexec.workspaces import (
-            clean_netexec_workspaces,
-        )
-
-        nxc_workspaces_dir = self._get_nxc_workspaces_dir()
-
-        def _env_builder(cmd: list[str]) -> dict[str, str]:
-            return _build_effective_user_env_for_command(cmd, shell=False)
-
-        return clean_netexec_workspaces(
-            nxc_workspaces_dir,
-            use_sudo_if_needed=use_sudo_if_needed,
-            is_tool_installed=is_tool_installed,
-            sudo_prefix_args=_sudo_prefix_args,
-            build_effective_user_env_for_command=_env_builder,
-        )
 
     def load_workspace_data(self, workspace_path):
         """Load workspace data (variables and credentials) from JSON files."""
@@ -15557,6 +15828,82 @@ class PentestShell:
 
         return f"{prefix}_{domain_name}_{safe_user}{extension}"
 
+    def _record_must_change_password_rotation(
+        self, *, domain_name: str, user: str
+    ) -> None:
+        """Disclose a password ADscan assigned to a must-change account.
+
+        Same ledger kind and terminal state as ForceChangePassword: the previous
+        secret is gone, so the record goes straight to ``manual_required`` with
+        the native reset command the client runs.
+        """
+        from adscan_internal.services.ledger_guard import ledger_or_warn as _lw
+
+        ledger = _lw(self)
+        if ledger is None:
+            return
+        from adscan_internal.services import cleanup_taxonomy as _tax
+
+        try:
+            change_id = ledger.register_change(
+                kind="password_changed",
+                domain=domain_name,
+                target=user,
+                detail={
+                    "target_domain": domain_name,
+                    "target_object": user,
+                    "target_user": user,
+                    "reason": "password_must_change_at_next_logon",
+                },
+                method="Password assigned to an account that must change it at next logon",
+            )
+            ledger.mark_manual_required(
+                change_id,
+                reason=_tax.MANUAL_REASON_NOT_ATTEMPTED,
+                remediation_command=_tax.MANUAL_PASSWORD.replace("TARGET", user),
+                remediation_object_dn=user,
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    def _record_must_change_not_rotated(self, *, domain_name: str, user: str) -> None:
+        """Say honestly that a valid credential was left as it is.
+
+        The password is correct, but the domain refuses it until it is changed,
+        and the scan policy (or the operator) did not allow ADscan to change it.
+        The account is kept out of the credentials ADscan can use, and the
+        operator is told which setting enables the rotation.
+        """
+        from adscan_internal.services.directory_change_consent import (
+            PASSWORD_ROTATION_CHECK_ID,
+            policy_for_consent,
+        )
+        from adscan_internal.services.scan_policy_notice import notify_policy_skip
+
+        marked_user = mark_sensitive(user, "user")
+        print_info(
+            f"The password for '[bold]{marked_user}[/bold]' is valid, but the domain "
+            "requires a new one before it can be used. ADscan did not change it: "
+            "assigning a new password modifies the account in the directory."
+        )
+        try:
+            domain_data = self.domains_data.setdefault(domain_name, {})
+            pending = domain_data.setdefault("password_change_required", {})
+            pending[str(user).lower()] = "not_changed_by_policy"
+            policy = policy_for_consent(self)
+            if PASSWORD_ROTATION_CHECK_ID not in getattr(policy, "effective_ids", ()):
+                notify_policy_skip(
+                    self,
+                    [PASSWORD_ROTATION_CHECK_ID],
+                    subject="Password rotation for an account that must change it",
+                    key=PASSWORD_ROTATION_CHECK_ID,
+                    target=user,
+                )
+        except Exception as exc:  # noqa: BLE001 - wording and bookkeeping only
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
     def _maybe_change_password_after_must_change(
         self,
         *,
@@ -15567,8 +15914,24 @@ class PentestShell:
         pdc_fqdn: str,
         ui_silent: bool,
     ) -> str | None:
-        """Offer a password change when the current credential must be rotated."""
-        from rich.prompt import Confirm, Prompt
+        """Offer a password change when the current credential must be rotated.
+
+        Assigning a new password changes the account in the client's directory
+        and cannot be undone (the previous secret is gone), so it passes the same
+        consent gate as ForceChangePassword (``directory_change_consent``), with
+        its own scan-policy check (``module:password_rotation_on_required_change``,
+        in the same "Password Changes" family): off by default in an audit, which
+        an unattended run therefore refuses, and on in Lab / CTF. A rotation that
+        happens is recorded
+        in the environment-change ledger as ``password_changed`` and reported
+        ``manual_required`` with the native reset command.
+        """
+        from rich.prompt import Prompt
+
+        from adscan_internal.services.directory_change_consent import (
+            PASSWORD_ROTATION_CHECK_ID,
+            confirm_directory_change,
+        )
 
         from adscan_internal.passwords import (
             generate_strong_password,
@@ -15608,10 +15971,29 @@ class PentestShell:
             "the password before interactive use can continue."
         )
 
-        if not Confirm.ask(
-            "Would you like ADscan to assign a new strong password now?",
-            default=True,
+        # A running system depends on the password of a computer account, krbtgt,
+        # a managed service account or an Entra ID sync account, and the change
+        # cannot be undone: the same destructive-action classifier every reset
+        # path uses refuses it here too, whatever the scan policy says.
+        from adscan_internal.services.password_reset_target import (
+            password_reset_verdict,
+        )
+
+        rotation_verdict = password_reset_verdict(
+            self, domain=domain_name, account=user
+        )
+        if rotation_verdict.hard_blocked:
+            print_warning(
+                "ADscan will not assign a new password to this account: "
+                f"{rotation_verdict.client_safe_reason}"
+            )
+            return None
+
+        if not confirm_directory_change(
+            self, "Would you like ADscan to assign a new strong password now?",
+            check_id=PASSWORD_ROTATION_CHECK_ID,
         ):
+            self._record_must_change_not_rotated(domain_name=domain_name, user=user)
             return None
 
         suggested_password = generate_strong_password(16)
@@ -15656,6 +16038,10 @@ class PentestShell:
 
         from adscan_internal.services.credentials.credential_origin import (
             CredentialProvenanceStrength,
+        )
+
+        self._record_must_change_password_rotation(
+            domain_name=domain_name, user=user
         )
 
         store_service = CredentialStoreService()
@@ -16101,6 +16487,14 @@ class PentestShell:
             return False
 
         self._last_domain_credential_verification_result = result
+        if getattr(result, "skipped_for_lockout", False):
+            # The lockout guard withheld the sign-in and already told the operator
+            # (and recorded the skip). The credential was not judged: no error
+            # line, no retry advice, nothing recorded against the secret.
+            print_info_debug(
+                "[verify] sign-in skipped for lockout safety; credential left as is."
+            )
+            return False
         status = result.status
         marked_user = mark_sensitive(user, "user")
         marked_domain_name = mark_sensitive(domain_name, "domain")
@@ -16201,20 +16595,15 @@ class PentestShell:
                     if _maybe_retry_pwdlastset_year_variant():
                         return True
                     if not ui_silent and not password_change_attempted:
-                        respuesta = Confirm.ask(
-                            "Would you like to perform a password spraying with this password?",
-                            default=True,
+                        self._offer_failed_credential_spray(
+                            domain_name,
+                            cred_value,
+                            source_context={
+                                "auth_username": user,
+                                "origin": "credential_validation",
+                            },
+                            source_steps=source_steps,
                         )
-                        if respuesta:
-                            self.spraying_with_password(
-                                domain_name,
-                                cred_value,
-                                source_context={
-                                    "auth_username": user,
-                                    "origin": "credential_validation",
-                                },
-                                source_steps=source_steps,
-                            )
                     elif ui_silent:
                         print_info_verbose(
                             "[ui_silent] Password spraying prompt suppressed."
@@ -16248,21 +16637,16 @@ class PentestShell:
                 if _maybe_retry_pwdlastset_year_variant():
                     return True
                 if not ui_silent and not password_change_attempted:
-                    respuesta = Confirm.ask(
-                        "Would you like to perform a password spraying with this password?",
-                        default=True,
+                    self._offer_failed_credential_spray(
+                        domain_name,
+                        cred_value,
+                        source_context={
+                            "auth_username": user,
+                            "origin": "credential_validation",
+                            "verification_failure": spraying_failure_detail,
+                        },
+                        source_steps=source_steps,
                     )
-                    if respuesta:
-                        self.spraying_with_password(
-                            domain_name,
-                            cred_value,
-                            source_context={
-                                "auth_username": user,
-                                "origin": "credential_validation",
-                                "verification_failure": spraying_failure_detail,
-                            },
-                            source_steps=source_steps,
-                        )
                 elif ui_silent:
                     print_info_verbose(
                         "[ui_silent] Password spraying prompt suppressed."
@@ -16362,7 +16746,7 @@ class PentestShell:
             if ui_silent or recovery_attempted:
                 return False
 
-            from adscan_core.rich_output import confirm_ask, prompt_ask
+            from adscan_core.rich_output import prompt_ask
             from adscan_internal.services.credential_recovery_service import (
                 recover_user_not_found,
             )
@@ -16390,9 +16774,11 @@ class PentestShell:
                 )
 
             def _spray() -> None:
+                # A candidate password whose owner is unknown: step:passwordspray.
                 self.spraying_with_password(
                     domain_name,
                     cred_value,
+                    check_id="step:passwordspray",
                     source_context={
                         "auth_username": user,
                         "origin": "credential_recovery_user_not_found",
@@ -16401,12 +16787,20 @@ class PentestShell:
                 )
 
             def _confirm_spray() -> bool:
-                return bool(
-                    confirm_ask(
+                from adscan_internal.services.scan_policy_enforcement import (
+                    check_consented,
+                )
+
+                # Off: nothing asked, nothing sent. Unattended: only under a
+                # policy that turns step:passwordspray on.
+                return check_consented(
+                    self,
+                    "step:passwordspray",
+                    prompt=(
                         "Spray the recovered password across the known accounts "
-                        "to find its owner?",
-                        default=True,
-                    )
+                        "to find its owner?"
+                    ),
+                    surface="spray",
                 )
 
             def _prompt_manual_username() -> str | None:
@@ -16801,10 +17195,10 @@ class PentestShell:
         start_from_phase: int | None = None,
     ):
         def _is_audit_map_only() -> bool:
-            """Return True when audit mode is post-compromise and should avoid active exploitation."""
+            """Return True when a full assessment is post-compromise and should avoid active exploitation."""
             try:
                 return (
-                    self.type == "audit"
+                    policy_settings.runs_full_assessment(self)
                     and self.domains_data.get(domain, {}).get("auth") == "pwned"
                 )
             except Exception:
@@ -16892,7 +17286,7 @@ class PentestShell:
             phases_for_scan_type as _phases_for_scan_type,
         )
 
-        _scan_type = self.type or "default"
+        _scan_type = policy_settings.scan_phase_family(self)
         _scan_phase_titles: list[str] = [
             phase.title for phase in _phases_for_scan_type(_scan_type)
         ]
@@ -16969,6 +17363,10 @@ class PentestShell:
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
 
+        # Phase id currently entered; the step runner attributes a failed step to
+        # it so the run's coverage record can mark that phase's checks FAILED.
+        _current_phase_id: list[str | None] = [None]
+
         def _enter_phase(title: str) -> None:
             """Render the chapter for ``title`` and open a fresh timeline span."""
             _close_active_phase()
@@ -16984,12 +17382,13 @@ class PentestShell:
             )
             if phase is None:
                 return
+            _current_phase_id[0] = phase.phase_id
             # Record entry into this phase so the checkpoint tracks the phase in
             # progress when the process dies (``last_phase_reached``) and stamps
             # ``status="running"``. Idempotent + preserves ``phases_complete``.
             if _manage_progress:
                 _scan_progress.mark_scan_running(
-                    self, domain, self.type, phase_id=phase.phase_id
+                    self, domain, _scan_type, phase_id=phase.phase_id
                 )
             try:
                 cm = _phase_span(
@@ -17070,6 +17469,16 @@ class PentestShell:
 
                 # User-visible error is sanitized unless --debug is set.
                 print_exception(exception=e, show_locals=False)
+                # The pipeline continues past a failed step, so the phase will
+                # still be checkpointed complete: tell the coverage record that
+                # this step's checks did NOT run, or an item it observes would
+                # be closed by its absence.
+                if _current_phase_id[0]:
+                    from adscan_internal.services.engagement.coverage_recorder import (
+                        note_step_failed,
+                    )
+
+                    note_step_failed(self, domain, _current_phase_id[0], step_name)
             finally:
                 self._exit_enumeration_context()
 
@@ -17203,6 +17612,13 @@ class PentestShell:
             )
             # Phase 1 is already done (cached results reused) — record it so the
             # checkpoint's completed set stays consistent for the resume gate.
+            # It did not RUN now, which the coverage record must know: absence
+            # from cached results is not a re-check.
+            from adscan_internal.services.engagement.coverage_recorder import (
+                note_phase_not_run,
+            )
+
+            note_phase_not_run(self, domain, "domain_analysis", "reused_cached_results")
             _mark_done("domain_analysis")
         else:
             if _run_step(
@@ -17257,12 +17673,29 @@ class PentestShell:
                 ).should_stop:
                     return
             else:
+                from adscan_internal.services.scan_policy_notice import (
+                    announce_phase_skip,
+                    policy_skip_cause,
+                    step_detail,
+                )
+
                 print_step_status(
                     "NTLM Auth-Type Sweep",
                     status="skipped",
                     step_number=3,
                     total_steps=3,
-                    details="Disabled in scan configuration",
+                    details=step_detail(
+                        policy_skip_cause(
+                            self, "domain_analysis", "ntlm_auth_type_sweep"
+                        )
+                    ),
+                )
+                announce_phase_skip(
+                    self,
+                    "domain_analysis",
+                    label="NTLM Auth-Type Sweep",
+                    subphase_id="ntlm_auth_type_sweep",
+                    config_line=False,
                 )
 
             self.domains_data.setdefault(domain, {})["phase1_complete"] = (
@@ -17342,7 +17775,7 @@ class PentestShell:
         # attack-path step — is handled by the pwned-exit in
         # attack_graph_reports.run_attack_paths.)
         _domain_already_pwned = (
-            self.type in ("ctf", "audit")
+            policy_settings.policy_environment(self) is not None
             and str(
                 getattr(self, "domains_data", {}).get(domain, {}).get("auth") or ""
             ).strip().lower() == "pwned"
@@ -17374,7 +17807,7 @@ class PentestShell:
                 domains=[domain],
                 checkpoint_domains=[domain] if _manage_progress else [],
                 span_domain=domain,
-                scan_type=self.type,
+                scan_type=_scan_type,
                 announce=False,
                 run_step=_run_step,
             ):
@@ -17393,7 +17826,8 @@ class PentestShell:
         if not _phase_done("quick_credential_wins"):
             _enter_phase("Quick Credential Wins")
             step_num = 1
-            total_quickwin_steps = 2 + (2 if self.type == "audit" else 0)
+            _full_assessment = policy_settings.runs_full_assessment(self)
+            total_quickwin_steps = 2 + (2 if _full_assessment else 0)
 
             if _run_step(
                 "Timeroast Candidate Check",
@@ -17413,8 +17847,8 @@ class PentestShell:
                 return
             step_num += 1
 
-            # GPP enumeration (audit mode only)
-            if self.type == "audit":
+            # GPP enumeration (full assessment only)
+            if _full_assessment:
                 if _run_step(
                     "GPP Autologin Search",
                     lambda: self.ask_for_smb_gpp_autologin(domain),
@@ -17504,8 +17938,8 @@ class PentestShell:
         if stop_after_phase == 5:
             return
 
-        # ========== PHASE 6: Audit-only Unauthenticated Attack Surface ==========
-        if self.type == "audit":
+        # ========== PHASE 6: Full-assessment Unauthenticated Attack Surface ==========
+        if policy_settings.runs_full_assessment(self):
             if not _phase_done("unauthenticated_attack_surface"):
                 _enter_phase("Unauthenticated Attack Surface")
                 if _run_step(
@@ -17535,7 +17969,7 @@ class PentestShell:
         # — detection only, no exploitation — followed by a consolidated audit
         # summary that rehydrates hygiene findings + CVE results from disk into
         # a single closing panel for the auditor.
-        if self.type == "audit":
+        if policy_settings.runs_full_assessment(self):
             if not _phase_done("audit_extras"):
                 _enter_phase("CVE Verification")
                 if _run_step(
@@ -17636,7 +18070,13 @@ class PentestShell:
             self, domains=[domain], scan_mode=_scan_mode
         )
         if _ap_verdict.kind == "exploited":
-            if should_show_victory_hint("scan_complete_report", "subtle"):
+            from adscan_core import tier as _tier_cta
+
+            # PRO already has the client PDF: the "PRO turns them into a PDF"
+            # hint is a LITE-only upsell.
+            if not _tier_cta.is_pro() and should_show_victory_hint(
+                "scan_complete_report", "subtle"
+            ):
                 _pro_url = mark_passthrough(cta_display_url("scan_complete_paths"))
                 self.console.print()
                 print_info(
@@ -18379,6 +18819,19 @@ class PentestShell:
         if self._resume_stored_credential_is_revoked(domain):
             return
 
+        # Enterprise environment count — authenticated collection in a domain
+        # (a primary forest, or one reached across a trust: it counts only when
+        # ADscan collects in it, which is exactly here). Re-resolves a forest
+        # that was admitted provisionally. No-op outside an Enterprise license
+        # that limits environments.
+        from adscan_internal.cli.enterprise_license_gate import (  # noqa: PLC0415
+            PHASE_AUTH,
+            ensure_environment_admitted,
+        )
+
+        if not ensure_environment_admitted(self, domain, phase=PHASE_AUTH):
+            return
+
         # Posture freshness guard — convergence point for both Scenario A
         # (start_auth with explicit creds) and Scenario B (start_unauth
         # discovered creds via add_credential). Idempotent: no-op when posture
@@ -18583,7 +19036,7 @@ class PentestShell:
 
     def ask_for_ldap_descriptions(self, target_domain):
         """Prompt user to search for passwords in LDAP user descriptions."""
-        if self.domains_data[target_domain]["auth"] == "pwned" and self.type == "ctf":
+        if policy_settings.domain_compromise_reached(self, target_domain):
             return
         if self.auto:
             from adscan_internal.cli.ldap import run_ldap_descriptions
@@ -19771,8 +20224,18 @@ class PentestShell:
         return run_do_dump_lsass(self, args)
 
     def ask_for_local_cred_reuse(self, domain, user, cred):
-        if Confirm.ask(
-            "Do you want to check for local admin creds reuse?", default=False
+        """Offer the local credential reuse check for a newly stored local credential.
+
+        Gated by the scan-policy check ``module:local_credential_reuse``: when the
+        active policy switches it off, nothing is asked and nothing is sent (the
+        refusal is explained once). The prompt defaults to running only when a
+        scan policy is in force and enables the check, so an unattended run
+        tries the credential on other hosts only under such a policy.
+        """
+        from adscan_internal.cli.smb import local_credential_reuse_consented
+
+        if local_credential_reuse_consented(
+            self, prompt="Do you want to check for local admin creds reuse?"
         ):
             from adscan_internal.rich_output import mark_sensitive
 
@@ -20236,12 +20699,9 @@ class PentestShell:
         have been specified for authentication.
 
         """
-        from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.cli.exploits import run_nopac
 
-        marked_domain = mark_sensitive(domain, "domain")
-        command = f"noPac.py {marked_domain}/{self.domains_data[domain]['pdc']} -u {self.username}:{self.domains_data[domain]['password']} -dc-ip {self.domains_data[domain]['pdc']} -use-ldap -dump -just-dc-user Administrator -just-dc-ntlm"
-        print_info("Exploiting noPac")
-        self.execute_nopac(command, domain)
+        run_nopac(self, domain=domain)
 
     def printnightmare(self, target_domain):
         self.do_open_smb(target_domain)
@@ -20403,15 +20863,6 @@ class PentestShell:
 
         return get_spraying_user_list_path(self, domain, requires_auth_users)
 
-    def _get_nxc_cli_args(self) -> list[str]:
-        """Return CLI arguments to point helpers to the ADscan-managed NetExec binary."""
-        nxc_path = os.path.join(
-            ADSCAN_BASE_DIR, "tool_venvs", "netexec", "venv", "bin", "nxc"
-        )
-        if os.path.exists(nxc_path):
-            return ["--nxc-path", nxc_path]
-        return []
-
     def _get_password_spraying_history(self) -> dict:
         """Return the password spraying history dict, initializing it if needed.
 
@@ -20468,7 +20919,7 @@ class PentestShell:
         *,
         domain: str,
         user_list_file: str,
-        safe_threshold: int,
+        safe_threshold: int | None = None,
     ) -> object | None:
         """Compute eligible and excluded users for password spraying.
 
@@ -22552,9 +23003,9 @@ class PentestShell:
             unique_passwords.append(normalized)
         if not unique_passwords or domain not in getattr(self, "domains", []):
             return
-        if self.type == "ctf" and self._is_ctf_domain_pwned(domain):
+        if self._is_ctf_domain_pwned(domain):
             print_info_debug(
-                "Skipping KeePass spraying prompt because the CTF domain is already pwned."
+                "Skipping KeePass spraying prompt because the domain is already compromised."
             )
             return
         try:
@@ -23097,6 +23548,7 @@ class PentestShell:
         domain,
         password,
         *,
+        check_id: str,
         source_context: dict[str, object] | None = None,
         source_steps: list[object] | None = None,
     ):
@@ -23109,6 +23561,8 @@ class PentestShell:
         Args:
             domain (str): The domain in which to perform spraying.
             password (str): The password to use for spraying.
+            check_id (str): The scan-policy check that owns this spray (required;
+                the executor refuses when the policy switches it off).
         """
         from adscan_internal.cli.spraying import spraying_with_password
 
@@ -23116,9 +23570,41 @@ class PentestShell:
             self,
             domain,
             password,
+            check_id=check_id,
             source_context=source_context,
             source_steps=source_steps,
         )
+
+    def _offer_failed_credential_spray(
+        self,
+        domain,
+        password,
+        *,
+        source_context: dict[str, object] | None = None,
+        source_steps: list[object] | None = None,
+    ):
+        """Offer to spray a password whose stated owner rejected it.
+
+        The password's owner is unknown, so the spray is ``step:passwordspray``:
+        with that check off nothing is asked and nothing is sent, and the
+        question defaults to yes only under a scan policy in force, so an
+        unattended run sprays only when the policy turns the check on.
+        """
+        from adscan_internal.services.scan_policy_enforcement import check_consented
+
+        if check_consented(
+            self,
+            "step:passwordspray",
+            prompt="Would you like to perform a password spraying with this password?",
+            surface="spray",
+        ):
+            self.spraying_with_password(
+                domain,
+                password,
+                check_id="step:passwordspray",
+                source_context=source_context,
+                source_steps=source_steps,
+            )
 
     def spraying_with_passwords(
         self,
@@ -24678,36 +25164,6 @@ class PentestShell:
         """
         self._dispatch_user_postauth_access(args, prog="user_postauth_access")
 
-    def ask_for_exploit_delegation(
-        self, domain, username, password, delegation_type, delegation_to
-    ):
-        """Prompt user to exploit a delegation."""
-        from adscan_internal.cli.delegations import ask_for_exploit_delegation
-
-        ask_for_exploit_delegation(
-            self, domain, username, password, delegation_type, delegation_to
-        )
-
-    def return_credentials(self, domain):
-        """
-        Allows selecting a user and returns their credentials.
-
-        Args:
-            domain (str): The domain from which to select credentials
-
-        Returns:
-            tuple: (username, password) if a valid user is selected, (None, None) otherwise
-        """
-        from adscan_internal.cli.creds import return_credentials
-
-        return return_credentials(self, domain)
-
-    def exploit_delegation_rbcd(self, domain, username, password, target):
-        """Coordinates the exploitation of resource-based constrained delegation."""
-        from adscan_internal.cli.delegations import exploit_delegation_rbcd
-
-        exploit_delegation_rbcd(self, domain, username, password, target)
-
     def get_domain_admins(self, domain):
         """Obtains a list of users from the Domain Admins group."""
         from adscan_internal.cli.ldap import get_domain_admins
@@ -24946,7 +25402,7 @@ class PentestShell:
                 f"Enabling user {marked_target} via LDAP on {mark_sensitive(pdc_host, 'ip')}"
             )
             service = ExploitationService()
-            success = service.acl.enable_user(
+            change = service.acl.enable_user(
                 pdc_host=pdc_host,
                 username=username,
                 password=password,
@@ -24955,11 +25411,27 @@ class PentestShell:
                 kerberos=True,
                 timeout=120,
             )
-            if success:
+            if change:
                 print_success(f"Successfully enabled user: {marked_target}")
+                # A directory change in its own right: disclosed in the report
+                # and set back to disabled at exit (only when ADscan cleared the
+                # bit on an account the pre-read proved was disabled).
+                from adscan_internal.services.account_lifecycle_ledger import (
+                    record_account_enabled,
+                )
+
+                record_account_enabled(
+                    self,
+                    domain=domain,
+                    target=target_username,
+                    object_kind="user",
+                    change=change,
+                    exec_username=username,
+                    exec_password=password,
+                )
             else:
                 print_error(f"Failed to enable user {marked_target}.")
-            return success
+            return bool(change)
         except Exception as e:
             telemetry.capture_exception(e)
             print_exception(exception=e)
@@ -25020,6 +25492,17 @@ class PentestShell:
                 print_success(
                     f"Restored deleted object to {mark_sensitive(str(info), 'path')}"
                 )
+                from adscan_internal.services.account_lifecycle_ledger import (
+                    record_object_restored,
+                )
+
+                record_object_restored(
+                    self,
+                    domain=domain,
+                    restored_dn=str(info or ""),
+                    sam_account_name=sam_account_name,
+                    exec_username=username,
+                )
             else:
                 print_error(f"Failed to restore {marked_target}: {info}")
             return success
@@ -25046,7 +25529,7 @@ class PentestShell:
                 f"Enabling computer {marked_target} via LDAP on {mark_sensitive(pdc_host, 'ip')}"
             )
             service = ExploitationService()
-            success = service.acl.enable_computer(
+            change = service.acl.enable_computer(
                 pdc_host=pdc_host,
                 username=username,
                 password=password,
@@ -25055,11 +25538,24 @@ class PentestShell:
                 kerberos=True,
                 timeout=120,
             )
-            if success:
+            if change:
                 print_success(f"Successfully enabled computer account: {marked_target}")
+                from adscan_internal.services.account_lifecycle_ledger import (
+                    record_account_enabled,
+                )
+
+                record_account_enabled(
+                    self,
+                    domain=domain,
+                    target=target_computer,
+                    object_kind="computer",
+                    change=change,
+                    exec_username=username,
+                    exec_password=password,
+                )
             else:
                 print_error(f"Failed to enable computer account {marked_target}.")
-            return success
+            return bool(change)
 
         except Exception as e:
             telemetry.capture_exception(e)
@@ -25797,6 +26293,22 @@ class PentestShell:
                 domain=target_domain,
                 kerberos=True,
             ) or pdc_ip
+            from adscan_internal.cli.exploits import (
+                ShadowCredentialsStepRevert,
+                _register_shadow_credentials_environment_change,
+            )
+
+            # The key credential is removed through the shared revert precedence
+            # (the same seam as the attack-path step), and the write is disclosed
+            # whenever it landed, success or not.
+            step_revert = ShadowCredentialsStepRevert(
+                self,
+                domain=domain,
+                target_domain=target_domain,
+                target_user=target_user,
+                exec_username=username,
+                exec_password=password,
+            )
             service = ExploitationService()
             result = service.acl.add_shadow_credentials(
                 pdc_host=pdc_host,
@@ -25806,57 +26318,20 @@ class PentestShell:
                 target_user=target_user,
                 kerberos=True,
                 timeout=300,
+                revert_added_key=step_revert,
             )
+            if getattr(result, "added_key_credential_value", None):
+                _register_shadow_credentials_environment_change(
+                    self,
+                    domain=domain,
+                    target_domain=target_domain,
+                    target_user=target_user,
+                    exec_username=username,
+                    shadow_result=result,
+                    step_revert=step_revert,
+                )
 
             if result.success and result.nt_hash:
-                ledger = getattr(self, "environment_change_ledger", None)
-                if ledger is not None:
-                    try:
-                        change_id = ledger.register_change(
-                            kind="shadow_credentials_added",
-                            domain=domain,
-                            target=target_user,
-                            detail={
-                                "target_domain": target_domain,
-                                "target_object": target_user,
-                                "target_user": target_user,
-                                "exec_username": username,
-                                "executor_username": username,
-                                "executor_auth_domain": domain,
-                                "credential_lookup_domain": domain,
-                                "added_key_credential_value": getattr(
-                                    result, "added_key_credential_value", None
-                                ),
-                                "cleanup_success": getattr(
-                                    result, "cleanup_success", None
-                                ),
-                                "cleanup_raw_output": getattr(
-                                    result, "cleanup_raw_output", None
-                                ),
-                            },
-                            method="Shadow Credentials (msDS-KeyCredentialLink)",
-                        )
-                        if getattr(result, "cleanup_success", None) is True:
-                            ledger.mark_reverted(change_id)
-                        elif isinstance(
-                            getattr(self, "acl_cleanup_actions", None), list
-                        ):
-                            self.acl_cleanup_actions.append(
-                                {
-                                    "kind": "shadow_credentials_added",
-                                    "domain": domain,
-                                    "target_domain": target_domain,
-                                    "target": target_user,
-                                    "exec_username": username,
-                                    "added_key_credential_value": getattr(
-                                        result, "added_key_credential_value", None
-                                    ),
-                                    "_ledger_change_id": change_id,
-                                }
-                            )
-                    except Exception as exc:
-                        telemetry.capture_exception(exc)
-                        print_exception(exception=exc)
                 if getattr(result, "cleanup_success", None) is False:
                     print_warning(
                         "Shadow Credentials cleanup did not complete automatically. "
@@ -27016,7 +27491,7 @@ class PentestShell:
                 domain,
                 scope="domain",
                 max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
-                max_paths=_resolve_attack_paths_compute_cap(50),
+                enumeration_cap=_resolve_attack_paths_compute_cap(50),
                 target="highvalue",
                 target_mode="tier0",
                 no_cache=False,
@@ -27106,7 +27581,7 @@ class PentestShell:
                 domain,
                 scope="domain",
                 max_depth=ATTACK_PATHS_MAX_DEPTH_USER,
-                max_paths=_resolve_attack_paths_compute_cap(50),
+                enumeration_cap=_resolve_attack_paths_compute_cap(50),
                 target="highvalue",
                 target_mode="tier0",
                 no_cache=False,
@@ -27175,6 +27650,7 @@ class PentestShell:
 
         Usage:
             attack_paths <domain>   [--max N] [--depth N] [--path-steps N] [--all] [--lowpriv] [--keep-longest] [--target LABEL]
+                                    [--terminal-relations REL1,REL2]
 
         Args:
             domain: Target domain (e.g. `north.sevenkingdoms.local`)
@@ -27200,6 +27676,17 @@ class PentestShell:
                 name is resolved to its canonical graph label; on no match the command
                 lists the closest objects instead of returning empty. Implies the full
                 target universe (as `--all`) unless combined with `--lowpriv`.
+            --terminal-relations REL1,REL2: Keep only paths whose LAST step uses one
+                of these relations (case-insensitive, comma-separated, e.g.
+                `forcechangepassword` or `adcsesc7,genericall`). Membership steps
+                are not counted as the last step. Only those paths are listed, and
+                only those paths are executed: no step of any other path runs.
+                Implies the full target universe (as `--all`) unless combined with
+                `--lowpriv`, because the relation's target is often not a
+                high-value object.
+
+            An unrecognised option stops the command with an error; it is never
+            read as a start principal.
 
         Examples:
             attack_paths north.sevenkingdoms.local
@@ -27209,6 +27696,7 @@ class PentestShell:
             attack_paths north.sevenkingdoms.local --keep-longest
             attack_paths north.sevenkingdoms.local --target "Domain Admins"
             attack_paths north.sevenkingdoms.local owned --target DC01$
+            attack_paths north.sevenkingdoms.local jon.snow --terminal-relations forcechangepassword
             attack_paths north.sevenkingdoms.local --max 20 --depth 6
             attack_paths north.sevenkingdoms.local --path-steps 2
             attack_paths north.sevenkingdoms.local jon.snow
@@ -27230,144 +27718,40 @@ class PentestShell:
             parts = shlex.split(args)
         except ValueError:
             parts = args.split()
-        domain = parts[0] if parts else (self.domain or "")
+        from adscan_internal.cli.attack_paths_args import (
+            USAGE as _ATTACK_PATHS_USAGE,
+            parse_attack_paths_args,
+        )
+
+        parsed = parse_attack_paths_args(parts)
+        domain = parsed.domain or (self.domain or "")
         if not domain:
-            print_instruction(
-                "Usage: attack_paths <domain> [user|owned|user1 user2 ...] [index] [--max N] [--depth N] "
-                "[--path-steps N] [--tier0-only] [--all] [--lowpriv] [--no-cache] [--keep-longest] [--target LABEL]"
-            )
+            print_instruction(_ATTACK_PATHS_USAGE)
+            return
+        if parsed.errors:
+            # Refuse rather than guess: an unrecognised flag used to be read as a
+            # start principal, which silently widened the run to every path of the
+            # start user (an unattended `execute attack_paths` then executed them).
+            for error in parsed.errors:
+                print_error(error)
+            print_instruction(_ATTACK_PATHS_USAGE)
+            self._report_verb_exit_code(2)
             return
 
-        index: int | None = None
-        start_user: str | None = None
-        max_display = 20
-        max_depth = ATTACK_PATHS_MAX_DEPTH_USER
-        max_path_steps: int | None = None
-        include_all = False
-        lowpriv = False
-        target_mode = "object"
-        no_cache = False
-        keep_longest = True
-        user_target: str | None = None
-
-        # Parse flags first: --max N, --depth N (and remove them from positional parsing).
-        positionals: list[str] = []
-        i = 0
-        while i < len(parts):
-            token = parts[i]
-            if token == "--all":
-                include_all = True
-                i += 1
-                continue
-            if token in {"--lowpriv", "--low-priv", "--non-highvalue"}:
-                include_all = False
-                lowpriv = True
-                i += 1
-                continue
-            if token in {"--tier0-only", "--tierzero-only", "--tier0"}:
-                target_mode = "tier0"
-                i += 1
-                continue
-            if token in {"--impact", "--highvalue"}:
-                # Backward-compatible alias for the current default.
-                i += 1
-                continue
-            if token == "--max" and i + 1 < len(parts):
-                try:
-                    max_display = int(parts[i + 1])
-                except ValueError:
-                    pass
-                i += 2
-                continue
-            if token.startswith("--max="):
-                try:
-                    max_display = int(token.split("=", 1)[1])
-                except ValueError:
-                    pass
-                i += 1
-                continue
-            if token == "--depth" and i + 1 < len(parts):
-                try:
-                    max_depth = int(parts[i + 1])
-                except ValueError:
-                    pass
-                i += 2
-                continue
-            if token.startswith("--depth="):
-                try:
-                    max_depth = int(token.split("=", 1)[1])
-                except ValueError:
-                    pass
-                i += 1
-                continue
-            if token == "--path-steps" and i + 1 < len(parts):
-                try:
-                    max_path_steps = int(parts[i + 1])
-                except ValueError:
-                    max_path_steps = None
-                i += 2
-                continue
-            if token.startswith("--path-steps="):
-                try:
-                    max_path_steps = int(token.split("=", 1)[1])
-                except ValueError:
-                    max_path_steps = None
-                i += 1
-                continue
-            if token == "--target" and i + 1 < len(parts):
-                user_target = parts[i + 1]
-                i += 2
-                continue
-            if token.startswith("--target="):
-                user_target = token.split("=", 1)[1]
-                i += 1
-                continue
-            if token == "--no-cache":
-                no_cache = True
-                i += 1
-                continue
-            if token in {"--keep-longest", "--keep_longest"}:
-                # Default is now keep_longest; the flag is retained as a harmless
-                # no-op for backwards compatibility.
-                keep_longest = True
-                i += 1
-                continue
-            if token in {"--keep-shortest", "--keep_shortest"}:
-                # Opt-out: the legacy most-direct-route view (drops distinct entry
-                # points / a longer PROVEN chain — kept for debugging/comparison).
-                keep_longest = False
-                i += 1
-                continue
-            positionals.append(token)
-            i += 1
-
-        # Positional args after domain: [user|owned|user1 user2 ...] [index]
-        # Rules:
-        #   - Single non-digit, non-"owned" token  → user scope
-        #   - Multiple non-digit tokens            → principals scope (multi-user)
-        #   - "owned" token                        → owned scope
-        #   - Trailing digit token                 → path index
-        start_users: list[str] = []
-        if len(positionals) >= 2:
-            # Collect all non-digit positionals after domain as user tokens,
-            # then look for an optional trailing numeric index.
-            remaining = positionals[1:]
-            if remaining and remaining[-1].isdigit():
-                index = int(remaining[-1])
-                remaining = remaining[:-1]
-            for token in remaining:
-                if token.isdigit():
-                    # Unexpected second digit — treat as index (legacy compat)
-                    index = int(token)
-                else:
-                    start_users.append(token)
-
-        if len(start_users) == 1:
-            start_user = start_users[0]
-        elif len(start_users) > 1:
-            start_user = None  # principals scope handled via start_users
-
-        attack_target = "lowpriv" if lowpriv else "all" if include_all else "highvalue"
+        start_users: list[str] = list(parsed.start_users)
+        index: int | None = parsed.index
+        start_user: str | None = start_users[0] if len(start_users) == 1 else None
+        max_display = parsed.max_display if parsed.max_display is not None else 20
+        max_depth = (
+            parsed.max_depth if parsed.max_depth is not None else ATTACK_PATHS_MAX_DEPTH_USER
+        )
+        max_path_steps: int | None = parsed.max_path_steps
+        target_mode = parsed.target_mode
+        no_cache = parsed.no_cache
+        keep_longest = parsed.keep_longest
+        user_target: str | None = parsed.target or None
+        terminal_relations: tuple[str, ...] = parsed.terminal_relations
+        attack_target = parsed.attack_target
 
         # Resolve a named --target (a group, host or OU) to its canonical graph
         # label(s). The filter is a post-compute label narrowing over the full
@@ -27403,9 +27787,8 @@ class PentestShell:
                         "No attack graph is loaded for this domain, or it has no "
                         "objects. Run a scan first, then retry."
                     )
+                self._report_verb_exit_code(2)
                 return
-            if not lowpriv:
-                attack_target = "all"
 
         run_show_attack_paths(
             self,
@@ -27422,6 +27805,7 @@ class PentestShell:
             no_cache=no_cache,
             keep_longest=keep_longest,
             target_labels=target_labels,
+            terminal_relations=terminal_relations,
         )
 
     def do_attack_steps(self, args):
@@ -27982,6 +28366,7 @@ class PentestShell:
             "_snapshot_note": DOMAIN_SNAPSHOT_NOTE,
             "hosts": self.hosts,
             "myip": self.myip,
+            "myip_source": getattr(self, "myip_source", None),
             "interface": self.interface,
             "pdc": self.pdc,
             "pdc_hostname": self.pdc_hostname,
@@ -28680,7 +29065,6 @@ class PentestShell:
             _FRAMEWORK_KEY_MAP,
             _parse_frameworks,
         )
-        from adscan_internal.services.compliance_scope import CTF_ENGAGEMENT
 
         frameworks_arg: list[str] | None = None
         frameworks_index = profile_index + 1
@@ -28691,7 +29075,7 @@ class PentestShell:
             except ValueError as exc:
                 print_error(str(exc))
                 return None
-        elif getattr(self, "type", None) == CTF_ENGAGEMENT:
+        elif policy_settings.is_lab(self):
             # A lab has no regulatory regime, so do not ask.
             frameworks_arg = []
         else:
@@ -29861,10 +30245,6 @@ class PentestShell:
         """
         Opens a local SMB port in the current directory using smbserver.py.
         """
-        if not self.myip:
-            print_error("Please configure your interface with 'set iface <value>'.")
-            return
-
         if not self.impacket_scripts_dir:
             print_error(
                 "Impacket scripts directory not configured. Please ensure Impacket is installed via 'adscan install'."
@@ -29897,33 +30277,42 @@ class PentestShell:
         # threading.Thread(target=self.monitor_smb, args=(proc, domain)).start()
 
     def _prompt_type_if_missing(self):
-        """Interactively prompt for pentest type if not configured."""
-        if self.type:
+        """Ask for the workspace's scan policy when it has none.
+
+        The scan policy decides how the scan behaves, so a workspace without
+        one is asked for one: Lab / CTF, Audit or a saved global policy. A
+        workspace whose policy was cleared keeps its environment and is not asked.
+        """
+        if policy_settings.policy_environment(self) is not None:
             return True
 
-        from adscan_internal import print_warning
+        from adscan_internal.cli.workspaces import prompt_workspace_policy  # noqa: PLC0415
+        from adscan_internal.services.scan_controls import (  # noqa: PLC0415
+            SOURCE_WORKSPACE,
+            ScanControlsError,
+            adopt_policy,
+        )
 
-        print_warning("⚠️  Pentest type not configured")
-
-        type_options = [
-            "🎯 CTF (Capture The Flag)",
-            "🔒 Audit (Real Pentest)",
-        ]
-
-        selection_idx = self._questionary_select("Select pentest type:", type_options)
-
-        if selection_idx is None:
-            print_error("Pentest type is required to continue.")
+        print_warning("This workspace has no scan policy yet.")
+        policy = prompt_workspace_policy(self)
+        if policy is None:
+            print_error("A scan policy is required to continue.")
             return False
+        try:
+            adopt_policy(self, policy.definition, source=SOURCE_WORKSPACE)
+        except ScanControlsError as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_error(f"Could not select the policy: {exc}")
+            return False
+        print_success(f"Scan policy: {policy.name}.")
 
-        # Map selection to type value
-        type_values = ["ctf", "audit"]
-        self.type = type_values[selection_idx]
-        print_success(f"✓ Pentest type configured: {self.type}")
-
-        if self.type == "ctf":
+        if (
+            policy_settings.policy_setting(self, policy_settings.OPERATOR_PROMPTS)
+            == policy_settings.OPERATOR_PROMPTS_ANSWER_DEFAULTS
+        ):
             self.auto = True
-            print_info("   Auto mode enabled automatically for CTF")
+            print_info("   Auto mode enabled automatically for a lab")
 
         return True
 
@@ -29933,17 +30322,55 @@ class PentestShell:
         Each option is annotated with its IPv4 address (or a ``(no IPv4)``
         marker) so the operator does not blindly pick an interface that cannot
         source traffic. Selecting a no-IPv4 interface re-prompts instead of
-        dead-ending; the user must explicitly cancel to abort. In
-        non-interactive mode the selection auto-resolves to the first interface
-        that has an IPv4 (never loops).
+        dead-ending; the user must explicitly cancel to abort. Each option also
+        carries the kernel's verdict (a container bridge is labelled as one and
+        sorted last, never removed). In non-interactive mode the selection
+        auto-resolves to the first interface a target can call back to that has
+        an IPv4, hard-filtered (never a container bridge), and never loops.
+
+        The interface is no longer demanded at scan startup: only broadcast
+        poisoning needs a named NIC, so the question is asked where poisoning is
+        decided (see ``background_jobs.poisoning_interface``). This method stays
+        the "ask only if nothing is set" entry point for callers that need one.
         """
         if self.interface:
             return True
+        return self._select_network_interface()
 
+    def _select_network_interface(
+        self,
+        *,
+        allow_skip: bool = False,
+        default_skip: bool = False,
+        purpose: str = "",
+    ) -> bool:
+        """Run the interface picker, whether or not an interface is already set.
+
+        The SSOT picker: each option is annotated with its IPv4, a no-IPv4 pick
+        re-prompts, and a Ligolo TUN is accepted as an L3 vantage.
+
+        Args:
+            allow_skip: Append an explicit "skip" option. Choosing it, or
+                cancelling the prompt, returns ``False`` without an error: the
+                caller treats it as "the operator declined to provide one".
+            default_skip: Make the skip option the pre-selected default (used
+                where the safe answer is "do not run the feature").
+            purpose: One line explaining why the interface is being asked for.
+
+        Returns:
+            ``True`` when an interface is configured (or kept) afterwards;
+            ``False`` when the operator skipped or no usable interface exists.
+            A failed or skipped switch restores the interface that was set
+            before, it never leaves the session with none.
+        """
         from adscan_internal import print_warning
         from adscan_internal.interaction import is_non_interactive
 
-        print_warning("⚠️  Network interface not configured")
+        previous_interface = self.interface
+        if purpose:
+            print_info(purpose)
+        elif not previous_interface:
+            print_warning("⚠️  Network interface not configured")
 
         # Get available network interfaces with their IPv4 addresses so the
         # picker can annotate each option and avoid the no-IP dead-end.
@@ -29953,38 +30380,51 @@ class PentestShell:
                 is_ligolo_interface,
             )
 
+            from adscan_core.interface_options import (
+                auto_pick_index,
+                build_interface_options,
+            )
+
             annotated = _list_local_interfaces_with_ipv4()
 
             if not annotated:
                 print_error("No network interfaces found.")
                 return False
 
-            interfaces = [name for name, _ipv4s in annotated]
-            ipv4_by_iface = {name: list(ipv4s) for name, ipv4s in annotated}
-
-            def _format_option(name: str) -> str:
-                ipv4s = ipv4_by_iface.get(name) or []
-                if ipv4s:
-                    return f"🌐 {name}  [{', '.join(ipv4s)}]"
-                return f"🌐 {name}  (no IPv4)"
-
-            # Default to the first interface that actually has an IPv4 so the
-            # non-interactive auto-resolution picks a usable vantage point.
-            default_idx = next(
-                (idx for idx, name in enumerate(interfaces) if ipv4_by_iface.get(name)),
-                0,
-            )
-
+            # Annotate-and-sort for the operator (nothing is removed: inside a
+            # bridge-mode container the only interface is a veth end); the
+            # pre-selected default, which is also the unattended pick, is
+            # hard-filtered to an interface a target can call back to.
+            options = build_interface_options(annotated)
+            interfaces = [option.name for option in options]
+            guess_idx = auto_pick_index(options, is_l3_vantage=is_ligolo_interface)
             noninteractive = is_non_interactive(self)
+            if guess_idx is None and noninteractive and not allow_skip:
+                print_error(
+                    "No network interface a target could call back to was found "
+                    "(only container bridges, loopback or interfaces without IPv4). "
+                    "Pass --interface <name> to choose one explicitly."
+                )
+                return False
+            default_idx = guess_idx if guess_idx is not None else 0
+            skip_idx = len(interfaces)
+            if allow_skip and (default_skip or (noninteractive and guess_idx is None)):
+                default_idx = skip_idx
 
             while True:
-                iface_options = [_format_option(name) for name in interfaces]
+                iface_options = [option.label for option in options]
+                if allow_skip:
+                    iface_options.append("⏭  Skip (do not use a network interface)")
 
                 selection_idx = self._questionary_select(
                     "Select network interface:",
                     iface_options,
                     default_idx=default_idx,
                 )
+
+                if allow_skip and (selection_idx is None or selection_idx == skip_idx):
+                    self.interface = previous_interface
+                    return False
 
                 if selection_idx is None:
                     print_error("Network interface is required to continue.")
@@ -30010,8 +30450,10 @@ class PentestShell:
                     self._render_pivot_vantage_panel(selected_iface)
                     return True
 
-                # No usable IPv4 on the chosen interface.
-                self.interface = None
+                # No usable IPv4 on the chosen interface. Restore what was set
+                # before (None when nothing was), so a failed switch never
+                # leaves the session worse off than it was.
+                self.interface = previous_interface
                 if noninteractive:
                     print_error(
                         f"Could not get IP for interface {selected_iface}; "
@@ -31078,6 +31520,19 @@ class PentestShell:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(f"[ledger] operator-confirmed exit cleanup failed: {exc}")
+        # ONE final retry pass over every revert still outstanding, with the best
+        # credential available now (a cleanup account, or a privileged account
+        # verified late in the run). Skipped when automatic reversion is off.
+        try:
+            from adscan_internal.services.final_revert_pass import (
+                run_final_revert_retry_pass,
+            )
+
+            run_final_revert_retry_pass(self)
+        except Exception as exc:  # pragma: no cover - best-effort shutdown
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[ledger] final revert retry pass failed: {exc}")
         # Finalise the ledger FIRST so the session-died reconciliation
         # force-transitions any non-terminal record (pending / revert_in_progress
         # / revert_failed_retrying) to manual_required(session_died) with a native
@@ -31244,6 +31699,28 @@ class PentestShell:
             )
 
         _SESSION_CAPTURE_FINALIZED = True
+        # Scoped licences: record the enabled identities this session assessed
+        # (a no-op elsewhere, and after `adscan ci` already recorded them).
+        try:
+            from adscan_internal.cli.enterprise_license_gate import (
+                record_scan_identity_usage,
+            )
+
+            record_scan_identity_usage(self)
+        except Exception as exc:  # noqa: BLE001 — exit must never fail on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        # Wall clock first (back to pre-scan time + elapsed, never the DC's
+        # time), then the time-sync service the way this session found it.
+        try:
+            from adscan_internal.services.dc_time import (
+                restore_wall_clock_after_session,
+            )
+
+            restore_wall_clock_after_session(self)
+        except Exception as exc:  # noqa: BLE001 — exit must never fail on this
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         self._restore_ntp_service()
         if exit_requested:
             print_info("Exiting...")
@@ -31286,7 +31763,7 @@ class PentestShell:
                 "extract_netbios",
                 "update_domain_data",
             ],
-            "Credentials": ["creds"],
+            "Credentials": ["creds", "cleanup_credential"],
             "SMB": [
                 "smb_scan",
                 "rid_cycling",
@@ -31373,7 +31850,7 @@ class PentestShell:
                 "update_resolv_conf",
             ],
             "System": ["system", "ls", "rm", "cp", "mv", "cd", "mkdir", "cat", "exit"],
-            "Sessions": ["session", "ligolo"],
+            "Sessions": ["ligolo"],
             "Help": ["help"],
             "ACL": ["enumerate_user_aces", "enum_cross_domain_acl"],
             "Reporting": ["initialize_report", "compliance_scope"],
@@ -31419,7 +31896,7 @@ class PentestShell:
             "BloodHound": "Using BloodHound for advanced analysis.",
             "Configs": "Management and enumeration of configurations.",
             "System": "System commands (ls, rm, etc.).",
-            "Sessions": "Management of remote sessions, reverse-shell listener, and pivots.",
+            "Sessions": "Network pivots (ligolo).",
             "Help": "Tool help and documentation.",
             "ACL": "ACL enumeration",
             "Reporting": "Report generation",
@@ -31435,6 +31912,16 @@ class PentestShell:
             from adscan_internal.cli.shell_commands import (
                 REGISTRY as _SHELL_CMD_REGISTRY,
             )
+            from adscan_internal.cli.shell_commands import (
+                dev_only_verbs as _dev_only_verbs,
+            )
+
+            _hidden_verbs = _dev_only_verbs()
+            # Hand-listed categories above are filtered by the same declaration.
+            for _cat in list(help_tree):
+                help_tree[_cat] = [
+                    v for v in help_tree[_cat] if v not in _hidden_verbs
+                ]
             for _spec in _SHELL_CMD_REGISTRY:
                 if _spec.is_dev_only:
                     continue
@@ -31549,6 +32036,11 @@ class PentestShell:
 try:
     from adscan_internal.cli.shell_commands import bind_registered_shell_commands
     bind_registered_shell_commands(PentestShell)
+    # Verbs flagged is_dev_only refuse to run in a shipped image (one declaration
+    # also drives their absence from help and completion).
+    from adscan_internal.cli.shell_commands import enforce_dev_only_commands
+
+    enforce_dev_only_commands(PentestShell)
 except Exception as _shell_cmd_bind_exc:  # noqa: BLE001 — non-fatal
     try:
         from adscan_core import telemetry as _shell_cmd_bind_telemetry
@@ -31651,7 +32143,6 @@ def _build_venv_exec_env(venv_path: str, python_executable: str) -> dict[str, st
         install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
         apply_effective_user_home_to_env=_apply_effective_user_home_to_env,
         expand_effective_user_path=_expand_effective_user_path,
-        get_nxc_base_dir=_get_nxc_base_dir,
         sudo_validate=_sudo_validate,
         telemetry_capture_exception=telemetry.capture_exception,
         telemetry_capture=telemetry.capture,
@@ -31696,7 +32187,6 @@ def _ensure_isolated_tool_extra_specs_installed(
         install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
         apply_effective_user_home_to_env=_apply_effective_user_home_to_env,
         expand_effective_user_path=_expand_effective_user_path,
-        get_nxc_base_dir=_get_nxc_base_dir,
         sudo_validate=_sudo_validate,
         telemetry_capture_exception=telemetry.capture_exception,
         telemetry_capture=telemetry.capture,
@@ -31756,7 +32246,6 @@ def _check_executable_help_works(
         install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
         apply_effective_user_home_to_env=_apply_effective_user_home_to_env,
         expand_effective_user_path=_expand_effective_user_path,
-        get_nxc_base_dir=_get_nxc_base_dir,
         sudo_validate=_sudo_validate,
         telemetry_capture_exception=telemetry.capture_exception,
         telemetry_capture=telemetry.capture,
@@ -31788,7 +32277,7 @@ def _fix_isolated_python_tool_venv(
     This recreates the tool venv and reinstalls the tool spec defined in PipToolsConfig.
 
     Args:
-        tool_key: Key in PipToolsConfig (e.g., "manspider", "netexec").
+        tool_key: Key in PipToolsConfig (e.g., "manspider", "credsweeper").
         python_version: Pyenv Python version to use for venv creation.
 
     Returns:
@@ -31809,7 +32298,6 @@ def _fix_isolated_python_tool_venv(
         install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
         apply_effective_user_home_to_env=_apply_effective_user_home_to_env,
         expand_effective_user_path=_expand_effective_user_path,
-        get_nxc_base_dir=_get_nxc_base_dir,
         sudo_validate=_sudo_validate,
         telemetry_capture_exception=telemetry.capture_exception,
         telemetry_capture=telemetry.capture,
@@ -31861,7 +32349,6 @@ def _diagnose_manspider_help_failure(
         install_pyenv_python_and_venv=_install_pyenv_python_and_venv,
         apply_effective_user_home_to_env=_apply_effective_user_home_to_env,
         expand_effective_user_path=_expand_effective_user_path,
-        get_nxc_base_dir=_get_nxc_base_dir,
         sudo_validate=_sudo_validate,
         telemetry_capture_exception=telemetry.capture_exception,
         telemetry_capture=telemetry.capture,
@@ -32231,6 +32718,22 @@ def handle_uninstall():
 
 
 
+def _scan_policy_answers_decision(shell: Any, context: dict[str, object]) -> bool:
+    """True when an unattended scan policy already answered an attack-step decision.
+
+    Such a decision resolves locally to its default (the operator-less ``ci``
+    behaviour) instead of being relayed to the web operator, so an unattended
+    policy runs exactly its enabled steps (execution spec § 4).
+    """
+    try:
+        from adscan_core.scan_policy.execution import suppress_remote_decision
+
+        return suppress_remote_decision(shell, str(context.get("category") or ""))
+    except Exception as exc:  # noqa: BLE001 - keep relaying when unknown
+        telemetry.capture_exception(exc)
+        return False
+
+
 def _questionary_select_standalone(title: str, options: list, default_idx: int = 0):
     """Minimal questionary select for use outside the shell class."""
     try:
@@ -32298,6 +32801,32 @@ def handle_ci(args):
     )
 
 
+def _execute_bootstrap_deps():
+    """The shell factory, preflight and licence hooks ``execute`` and ``recheck`` share."""
+    from adscan_internal.cli.execute import ExecuteDeps
+
+    return ExecuteDeps(
+        enable_auto_mode=enable_auto_mode,
+        build_preflight_args=lambda: argparse.Namespace(
+            command="check",
+            fix=False,
+            preflight_mode="ci",
+        ),
+        handle_check=handle_check,
+        get_last_check_extra=lambda: _LAST_CHECK_SESSION_EXTRA or {},
+        track_docs_link_shown=track_docs_link_shown,
+        resolve_license_mode=lambda requested: _resolve_license_mode(
+            requested_pro=requested
+        ),
+        create_shell=lambda console_instance, license_mode: PentestShell(
+            console_instance=console_instance,
+            license_mode=license_mode,
+        ),
+        console=console,
+        exit=sys.exit,
+    )
+
+
 def handle_execute(args):
     """Handle ``adscan execute <verb>`` — non-interactive single-verb runner.
 
@@ -32305,7 +32834,6 @@ def handle_execute(args):
     ``handle_ci`` so the two stay in lockstep (one engine, two entry points).
     """
     from adscan_internal.cli.execute import (
-        ExecuteDeps,
         config_from_args,
         list_execute_verbs,
         run_execute,
@@ -32314,29 +32842,14 @@ def handle_execute(args):
     if getattr(args, "list_verbs", False):
         return list_execute_verbs()
 
-    return run_execute(
-        config=config_from_args(args),
-        deps=ExecuteDeps(
-            enable_auto_mode=enable_auto_mode,
-            build_preflight_args=lambda: argparse.Namespace(
-                command="check",
-                fix=False,
-                preflight_mode="ci",
-            ),
-            handle_check=handle_check,
-            get_last_check_extra=lambda: _LAST_CHECK_SESSION_EXTRA or {},
-            track_docs_link_shown=track_docs_link_shown,
-            resolve_license_mode=lambda requested: _resolve_license_mode(
-                requested_pro=requested
-            ),
-            create_shell=lambda console_instance, license_mode: PentestShell(
-                console_instance=console_instance,
-                license_mode=license_mode,
-            ),
-            console=console,
-            exit=sys.exit,
-        ),
-    )
+    return run_execute(config=config_from_args(args), deps=_execute_bootstrap_deps())
+
+
+def handle_recheck(args):
+    """Handle ``adscan recheck`` — re-verify ledger items (PRO)."""
+    from adscan_internal.cli.recheck import run_recheck_command
+
+    return run_recheck_command(args, _execute_bootstrap_deps())
 
 
 def handle_doctor(args):
@@ -32400,15 +32913,28 @@ def add_ci_subparser(subparsers):
         choices=["auth", "unauth"],
         help="Scan mode: authenticated vs. unauthenticated",
     )
+    # Retired: scan policies replaced the workspace type. Still parsed (hidden)
+    # only so ``--type`` answers with the guidance panel instead of an argparse
+    # "unrecognized argument"; it never selects anything. Removed at the next
+    # major release (BACKLOG.md).
     ci_parser.add_argument(
         "--type",
         "-t",
-        required=True,
+        dest="type",
+        default=None,
         choices=["ctf", "audit"],
-        help="Workspace type (ctf/audit)",
+        help=argparse.SUPPRESS,
     )
     ci_parser.add_argument(
-        "--interface", "-i", required=True, help="Network interface to use"
+        "--interface",
+        "-i",
+        required=False,
+        default=None,
+        help=(
+            "Network interface for broadcast poisoning (LLMNR/NBT-NS/mDNS). Omit "
+            "it and poisoning runs on every interface that has a known domain "
+            "controller or computer behind it; name one to limit poisoning to it."
+        ),
     )
     ci_parser.add_argument("--hosts", help="CIDR range (required for unauth mode)")
     ci_parser.add_argument("--domain", help="Domain to scan (required for auth mode)")
@@ -32428,7 +32954,12 @@ def add_ci_subparser(subparsers):
     ci_parser.add_argument("--username", "-u", help="Username for auth mode")
     ci_parser.add_argument("--password", "-p", help="Password for auth mode")
     ci_parser.add_argument(
-        "--workspace", "-w", help="Optional workspace name (random if omitted)"
+        "--workspace",
+        "-w",
+        help=(
+            "Workspace name. Omitted: ci-<domain>-<YYYYMMDD-HHMM>. The workspace "
+            "is kept after the run unless --ephemeral."
+        ),
     )
     ci_parser.add_argument(
         "-v",
@@ -32447,10 +32978,17 @@ def add_ci_subparser(subparsers):
         action="store_true",
         help="Enable debug mode.",
     )
+    from adscan_internal.workspaces.retention import add_ephemeral_argument
+
+    add_ephemeral_argument(
+        ci_parser,
+        help_suffix="With --generate-report, --output is required so the report survives.",
+    )
     ci_parser.add_argument(
-        "--keep-workspace",
-        action="store_true",
-        help="Keep the workspace after scan completion (do not delete auto-created workspace)",
+        "--output",
+        metavar="DIR",
+        default=None,
+        help="Copy the generated report into this folder.",
     )
     ci_parser.add_argument(
         "--show-structural",
@@ -32468,83 +33006,85 @@ def add_ci_subparser(subparsers):
         dest="read_only",
         help="Map and report attack paths without executing them (read-only).",
     )
+    from adscan_core.scan_pacing import ORDERED_LEVELS as _PACING_LEVELS
+
+    ci_parser.add_argument(
+        "--pacing",
+        dest="pacing",
+        choices=[level.value for level in _PACING_LEVELS],
+        default=None,
+        help=(
+            "Scan pace: how hard ADscan works the network (default: normal). Beats the "
+            "scan config's pace; a scan policy can still cap it."
+        ),
+    )
+    ci_parser.add_argument(
+        "--pacing-set",
+        dest="pacing_set",
+        action="append",
+        default=None,
+        metavar="KNOB=VALUE",
+        help=(
+            "Set one pace setting, e.g. max_parallel_hosts=4 or "
+            "share_bandwidth_mibps=unlimited. Repeatable."
+        ),
+    )
+    ci_parser.add_argument(
+        "--pace-profile",
+        dest="pace_profile",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Start the scan pace from a saved pace profile (see `adscan pace list`). "
+            "--pacing and --pacing-set adjust it; the scan policy still caps it. Not "
+            "together with a 'pacing' section in --scan-config."
+        ),
+    )
+    ci_parser.add_argument(
+        "--policy",
+        dest="policy",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Required: the scan policy the run follows (see `adscan policy list`), a "
+            "built-in (lab_ctf, audit, production_sensitive) or one saved in the "
+            "workspace or globally. It decides what runs and, unless --pacing, "
+            "--pacing-set or --pace-profile is given, the scan pace. A 'checks' "
+            "section in --scan-config names the policy instead."
+        ),
+    )
     ci_parser.add_argument(
         "--generate-report",
         action="store_true",
-        help="Generate report after successful scan with flags captured (requires Report License)",
-    )
-    ci_parser.add_argument(
-        "--only",
-        dest="only",
-        type=str,
-        default="report",
         help=(
-            "Deliverable selection for --generate-report, routed through the "
-            "unified deliver engine. Default 'report' = the single Security "
-            "Assessment Report PDF (CI stays report-only so the web does not "
-            "double-generate the full kit). Pass a wider comma-separated set "
-            "(e.g. 'report,playbook') to render those inline."
+            "Render the deliverable after a successful scan, through the same "
+            "pipeline as `adscan deliver` and with the same options (requires a "
+            "report license). Default selection: the Security Assessment Report. "
+            "A completed scan whose deliverable does not render exits 4; its "
+            "results stand and `adscan deliver` renders it again."
         ),
     )
     ci_parser.add_argument(
-        "--report-format",
-        choices=["pdf"],
-        default="pdf",
-        help="Report format: pdf.",
-    )
-    ci_parser.add_argument(
-        "--frameworks",
+        "--auto-revert",
+        dest="auto_revert",
+        choices=["on", "off"],
         default=None,
         help=(
-            "Comma-separated compliance frameworks: "
-            "ens,nis2,iso27001,dora,pci_dss,cis (no default; required with "
-            "--generate-report on --type audit)."
+            "Undo ADscan's directory changes on its own, for this run (default: the "
+            "scan policy's auto_revert setting, on for a real environment and off "
+            "for a lab). Overrides durable_changes.auto_revert in --scan-config."
         ),
     )
-    ci_parser.add_argument(
-        "--report-engine",
-        dest="report_engine",
-        choices=["chromium"],
-        default=None,
-        help="PDF engine (chromium).",
-    )
-    ci_parser.add_argument(
-        "--report-renderer",
-        dest="report_renderer",
-        choices=["cytoscape"],
-        default=None,
-        help="Attack-path renderer (cytoscape).",
-    )
-    ci_parser.add_argument(
-        "--report-template",
-        dest="report_template",
-        choices=["premium"],
-        default=None,
-        help="Report template (only premium supported).",
-    )
-    ci_parser.add_argument(
-        "--report-theme",
-        dest="report_theme",
-        choices=["premium_dark", "corporate_light"],
-        default=None,
-        help="Report theme: premium_dark or corporate_light (default: none).",
-    )
-    ci_parser.add_argument(
-        "--display-name",
-        dest="display_name",
-        default=None,
-        help="Client-facing name shown on the report cover (e.g. the web workspace name).",
-    )
-    ci_parser.add_argument(
-        "--client-logo",
-        dest="client_logo",
-        default=None,
-        metavar="PATH",
-        help=(
-            "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on the "
-            "report cover; persisted and reused on later runs."
-        ),
-    )
+    # The deliverable options (selection, frameworks, theme, branding, client
+    # identity, composition seams, outputs) come from the shared model, so
+    # `ci --generate-report` accepts exactly what `deliver` accepts. --only
+    # defaults to the report alone on `ci`, and the report flags earlier
+    # releases accepted stay parsed (hidden, one warning line). --frameworks
+    # also scopes the scan's own compliance mapping, stamped at scan end with
+    # or without a report.
+    from adscan_core.report_options import add_ci_report_arguments
+
+    add_ci_report_arguments(ci_parser)
     return ci_parser
 
 
@@ -32741,6 +33281,13 @@ if __name__ == "__main__":
     ci_parser = add_ci_subparser(subparsers)
     _install_ci_missing_args_hint(ci_parser)
 
+    # ── adscan run --plan (engine contract, adscan.run_plan/1) ─────────
+    # The canonical entry for an orchestrator: ci / doctor / deliver flags and a
+    # RunPlan file describe the same run and execute the same handler.
+    from adscan_internal.cli.run_plan import add_run_subparser as _add_run_subparser
+
+    _add_run_subparser(subparsers)
+
 
 
     # ── adscan demo ───────────────────────────────────────────────────────
@@ -32771,6 +33318,37 @@ if __name__ == "__main__":
         add_doctor_subparser as _add_doctor_subparser,
     )
     _add_doctor_subparser(subparsers)
+
+    # ── adscan pace (saved pace profiles) ─────────────────────────────
+    # list / show / create / delete, forwarded verbatim by the launcher
+    # (PACE_PASSTHROUGH).
+    from adscan_internal.cli.pace_profile_cmd import (
+        add_pace_subparser as _add_pace_subparser,
+    )
+    _add_pace_subparser(subparsers)
+
+    # ── adscan policy (saved scan policies) ───────────────────────────
+    # list / show / create / export / import, forwarded verbatim by the
+    # launcher (POLICY_PASSTHROUGH in adscan_core/cli_passthrough_spec.py).
+    from adscan_internal.cli.scan_policy_library import (
+        add_policy_subparser as _add_policy_subparser,
+    )
+    _add_policy_subparser(subparsers)
+
+    # ── adscan engagement (engagement ledger, PRO) ────────────────────
+    # status / history / export over <workspace>/engagement/, forwarded
+    # verbatim by the launcher (ENGAGEMENT_PASSTHROUGH).
+    from adscan_internal.cli.engagement import (
+        add_engagement_subparser as _add_engagement_subparser,
+    )
+    _add_engagement_subparser(subparsers)
+
+    # ── adscan recheck (re-verification from the ledger, PRO) ─────────
+    # Forwarded verbatim by the launcher (RECHECK_PASSTHROUGH).
+    from adscan_internal.cli.recheck import (
+        add_recheck_subparser as _add_recheck_subparser,
+    )
+    _add_recheck_subparser(subparsers)
 
     # ── adscan deliver (PRO Client Deliverable Kit) ───────────────────
     # Renders the four PRO PDFs in parallel and packages them into a
@@ -32988,6 +33566,14 @@ if __name__ == "__main__":
             parser.print_help()
         sys.exit(0)
 
+    # A removed ci/execute/doctor flag gets its replacement, not argparse's
+    # bare "unrecognized arguments" (adscan_core/cli_removed_flags.py).
+    from adscan_core.cli_removed_flags import removed_flag_message as _removed_flag_message
+
+    _removed_flag = _removed_flag_message(sys.argv[1:])
+    if _removed_flag:
+        parser.error(_removed_flag)
+
     args = parser.parse_args()
     SESSION_COMMAND_TYPE = args.command
     # Propagate --output to adscan_core.output (and ADSCAN_OUTPUT_MODE
@@ -33030,6 +33616,16 @@ if __name__ == "__main__":
 
         sys.exit(run_host_helper_server(getattr(args, "socket")))
 
+    # Log files: an engagement command logs into its workspace only; just the
+    # maintenance commands (install/update/check/version) keep a global log.
+    # Whatever is logged before a workspace activates is held in memory and
+    # written into that workspace's log. See adscan_core.logging_config.
+    from adscan_core.logging_config import enable_global_log_for_command
+
+    enable_global_log_for_command(
+        "version" if getattr(args, "version", False) else args.command
+    )
+
     if getattr(args, "version", False):
         license_mode = _resolve_license_mode(requested_pro=False)
         print(f"ADscan {_format_runtime_version_tag(license_mode)}")
@@ -33038,7 +33634,7 @@ if __name__ == "__main__":
     # Set global verbose mode (VERBOSE_MODE) if --verbose is passed with start/install/auto command
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "mitre-navigator")
+        and args.command in ("start", "ci", "run", "execute", "doctor", "install", "check", "mitre-navigator")
         and hasattr(args, "verbose")
         and args.verbose
     ):
@@ -33054,7 +33650,7 @@ if __name__ == "__main__":
     # and raw internal-detail visibility).
     if (
         hasattr(args, "command")
-        and args.command in ("start", "ci", "execute", "doctor", "install", "check", "deliver", "report", "writeup", "mitre-navigator")
+        and args.command in ("start", "ci", "run", "execute", "doctor", "install", "check", "deliver", "report", "writeup", "mitre-navigator")
         and hasattr(args, "debug")
         and args.debug
     ):
@@ -33083,8 +33679,11 @@ if __name__ == "__main__":
         os.environ["ADSCAN_DOCKER_CHANNEL"] = "dev"
 
     # Offer upgrades early for relevant subcommands (interactive only).
-    if getattr(args, "command", None) in ("ci", "execute", "doctor"):
+    from adscan_core.cli_catalog import NON_INTERACTIVE_COMMANDS as _NON_INTERACTIVE_COMMANDS
+
+    if getattr(args, "command", None) in _NON_INTERACTIVE_COMMANDS:
         # These commands must be non-interactive even in a real TTY (Docker -it).
+        # Every one is PRO-only or a declared exemption (cli_catalog).
         os.environ.setdefault("ADSCAN_SESSION_ENV", "ci")
         os.environ["ADSCAN_NONINTERACTIVE"] = "1"
         enable_auto_mode()
@@ -33208,11 +33807,26 @@ if __name__ == "__main__":
         sys.exit(0)
     elif args.command == "ci":
         use_docker_mode = _should_use_docker_mode()
+        if use_docker_mode and getattr(args, "ephemeral", False) and getattr(
+            args, "generate_report", False
+        ):
+            # This path does not mount an --output folder, so the report would
+            # only exist in the workspace --ephemeral deletes.
+            print_error(
+                "--ephemeral with --generate-report needs the adscan launcher, which "
+                "mounts the --output folder: run `adscan ci ...`, or drop --ephemeral."
+            )
+            sys.exit(2)
         if use_docker_mode:
+            from adscan_core.report_options import (
+                forward_report_options as _forward_report_options,
+            )
+
             exit_code = _handle_ci_docker_mode(
                 mode=str(getattr(args, "mode", "")),
-                workspace_type=str(getattr(args, "type", "")),
-                interface=str(getattr(args, "interface", "")),
+                policy=getattr(args, "policy", None),
+                legacy_type=getattr(args, "type", None),
+                interface=str(getattr(args, "interface", "") or ""),
                 hosts=getattr(args, "hosts", None),
                 domain=getattr(args, "domain", None),
                 dc_ip=getattr(args, "dc_ip", None),
@@ -33222,14 +33836,12 @@ if __name__ == "__main__":
                 workspace=getattr(args, "workspace", None),
                 verbose=bool(getattr(args, "verbose", False)),
                 debug=bool(getattr(args, "debug", False)),
-                keep_workspace=bool(getattr(args, "keep_workspace", False)),
+                ephemeral=bool(getattr(args, "ephemeral", False)),
                 generate_report=bool(getattr(args, "generate_report", False)),
                 report_format="pdf",
-                report_engine=str(getattr(args, "report_engine", "") or ""),
-                report_renderer=str(getattr(args, "report_renderer", "") or ""),
-                report_template=str(getattr(args, "report_template", "") or ""),
-                report_theme=str(getattr(args, "report_theme", "") or ""),
-                report_only=str(getattr(args, "only", "") or ""),
+                # Every deliverable option the operator set, re-emitted from the
+                # shared model so this path forwards what `deliver` accepts.
+                report_args=_forward_report_options(args),
             )
             # Docker-mode CI runs inside the container and should own session uploads.
             _SESSION_CAPTURE_FINALIZED = True
@@ -33244,6 +33856,47 @@ if __name__ == "__main__":
                 success=(exit_code == 0),
                 extra={"mode": "container", "ci_mode": str(getattr(args, "mode", ""))},
             )
+        sys.exit(exit_code)
+    elif args.command == "run":
+        # Engine contract entry: one RunPlan file in, the same handler its
+        # ci / doctor / deliver flags would reach. Session capture is labelled
+        # with that legacy command so a plan run is recorded exactly like it.
+        if _should_use_docker_mode():
+            print_error("`adscan run` executes inside the ADscan runtime; use the launcher.")
+            sys.exit(2)
+        from adscan_internal.cli.run_plan import run_plan_command as _run_plan_command
+
+        _run_session = {"command": ""}
+
+        def _on_run_command_resolved(command):
+            global SESSION_COMMAND_TYPE, _SESSION_CAPTURE_FINALIZED  # pylint: disable=global-statement
+            _run_session["command"] = command
+            SESSION_COMMAND_TYPE = command
+            _SESSION_CAPTURE_FINALIZED = not _is_session_capture_allowed(command)
+
+        def _run_deliver_handler(ns):
+            from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
+
+            return _run_deliver_sync(ns)
+
+        exit_code = 1
+        try:
+            exit_code = _run_plan_command(
+                args,
+                handlers={
+                    "scan": handle_ci,
+                    "doctor": handle_doctor,
+                    "deliver": _run_deliver_handler,
+                },
+                on_command_resolved=_on_run_command_resolved,
+            )
+        finally:
+            if _run_session["command"]:
+                _capture_command_session(
+                    _run_session["command"],
+                    success=(exit_code == 0),
+                    extra={"mode": "container", "entry": "run_plan"},
+                )
         sys.exit(exit_code)
     elif args.command == "execute":
         # Single-verb non-interactive runner. Runs inside the container; the
@@ -33266,6 +33919,29 @@ if __name__ == "__main__":
         finally:
             _capture_command_session(
                 "doctor",
+                success=(exit_code == 0),
+                extra={"mode": "container"},
+            )
+        sys.exit(exit_code)
+    elif args.command == "policy":
+        from adscan_internal.cli.scan_policy_library import handle_policy_command
+
+        sys.exit(handle_policy_command(args))
+    elif args.command == "pace":
+        from adscan_internal.cli.pace_profile_cmd import handle_pace_command
+
+        sys.exit(handle_pace_command(args))
+    elif args.command == "engagement":
+        from adscan_internal.cli.engagement import handle_engagement_command
+
+        sys.exit(handle_engagement_command(args))
+    elif args.command == "recheck":
+        exit_code = 1
+        try:
+            exit_code = handle_recheck(args)
+        finally:
+            _capture_command_session(
+                "recheck",
                 success=(exit_code == 0),
                 extra={"mode": "container"},
             )

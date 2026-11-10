@@ -20,6 +20,7 @@ from adscan_internal import (
     print_error_debug,
     print_info,
     print_info_debug,
+    print_instruction,
     print_success,
     print_warning,
     telemetry,
@@ -31,6 +32,7 @@ from adscan_internal.services.llm.config import (
     AIPrivacyMode,
     AIProvider,
     CodexTransport,
+    ai_offline_reason,
     load_ai_config,
     masked_status,
     save_ai_config,
@@ -42,6 +44,11 @@ from adscan_internal.services.llm.external_cli_profiles import (
 )
 from adscan_core.paths import get_state_dir
 from adscan_core.rich_output import print_exception
+
+# `ask` subcommands still served in offline mode: they read local state only.
+_AI_OFFLINE_ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"help", "--help", "-h", "status", "usage"}
+)
 
 SETUP_PROVIDER_CHOICES: tuple[AIProvider, ...] = (
     AIProvider.OPENAI,
@@ -72,12 +79,24 @@ def handle_ask_command(shell: Any, args: str) -> None:
     - `ask` (interactive loop)
     """
     arg_line = (args or "").strip()
+    argv = shlex.split(arg_line) if arg_line else []
+    subcommand = argv[0].lower() if argv else ""
+
+    # Offline mode disables AI entirely: no provider is set up, logged into or
+    # asked anything. Help, status and the local usage ledger stay readable.
+    offline_reason = ai_offline_reason()
+    if offline_reason is not None and subcommand not in _AI_OFFLINE_ALLOWED_SUBCOMMANDS:
+        print_warning(offline_reason)
+        print_instruction(
+            "Unset ADSCAN_OFFLINE (or drop --offline) to use `ask` on a run that may "
+            "reach an AI provider."
+        )
+        return
+
     if not arg_line:
         _run_interactive_ask(shell)
         return
 
-    argv = shlex.split(arg_line)
-    subcommand = argv[0].lower()
     if subcommand in {"help", "--help", "-h"}:
         run_ask_help()
         return
@@ -314,6 +333,8 @@ def run_ask_status(shell: Any) -> None:
         "external_cli_auth_check_configured="
         f"{status['external_cli_auth_check_configured']}"
     )
+    if ai_offline_reason() is not None:
+        lines.append("offline_mode=true (AI disabled for this run)")
     print_info("AI status:\n" + "\n".join(lines))
 
 

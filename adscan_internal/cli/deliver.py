@@ -45,6 +45,14 @@ quality gain.
 
 from __future__ import annotations
 
+from adscan_core.report_options import (
+    REPORT_DEFAULT_EMIT,
+    REPORT_EMIT_VALUES,
+    REPORT_ONLY_ALIASES,
+    add_report_arguments,
+    parse_emit_values,
+    parse_only_slugs,
+)
 from adscan_core.version import get_version
 
 import argparse
@@ -56,7 +64,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from adscan_core import telemetry, tier
 from adscan_core.rich_output import (
@@ -70,9 +78,10 @@ from adscan_core.rich_output import (
 from adscan_core.rich_output import print_exception
 from adscan_internal.cli.common import (
     _FRAMEWORK_KEY_MAP,
-    _VALID_FRAMEWORK_KEYS,
+    _VALID_FRAMEWORK_KEYS,  # noqa: F401 - re-exported (tests read deliver._VALID_FRAMEWORK_KEYS)
     _parse_frameworks,
     _resolve_workspace,
+    log_into_workspace,
 )
 from adscan_internal.services.compliance_scope import (
     announce_compliance_scope,
@@ -226,7 +235,7 @@ DEFAULT_DELIVERABLE_SLUGS: tuple[str, ...] = DELIVERABLE_SLUGS
 # ``checklist`` → ``executive``: the standalone MITRE Remediation Checklist was
 # retired (folded into the main report). A pinned ``--only checklist`` now renders
 # the Security Assessment Report (which carries the ATT&CK lens) instead of erroring.
-_ONLY_ALIASES: dict[str, str] = {"report": "executive", "checklist": "executive"}
+_ONLY_ALIASES: dict[str, str] = dict(REPORT_ONLY_ALIASES)
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +286,8 @@ _DEFAULT_FRAMEWORKS: tuple[str, ...] = ()
 # the web Enterprise product's Celery worker, which shells out to
 # ``adscan deliver`` without ``--emit`` — renders byte-identically to before
 # this flag existed.
-_VALID_EMIT_VALUES: tuple[str, ...] = ("pdf", "html", "data")
-_DEFAULT_EMIT: tuple[str, ...] = ("pdf", "html")
+_VALID_EMIT_VALUES: tuple[str, ...] = REPORT_EMIT_VALUES
+_DEFAULT_EMIT: tuple[str, ...] = REPORT_DEFAULT_EMIT
 
 
 def _parse_emit(raw: str | None) -> tuple[str, ...]:
@@ -295,19 +304,9 @@ def _parse_emit(raw: str | None) -> tuple[str, ...]:
     Raises:
         ValueError: If any token is not one of :data:`_VALID_EMIT_VALUES`.
     """
-    if raw is None or not raw.strip():
-        return _DEFAULT_EMIT
-    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        return _DEFAULT_EMIT
-    invalid = [tok for tok in tokens if tok not in _VALID_EMIT_VALUES]
-    if invalid:
-        raise ValueError(
-            f"--emit: unknown format(s): {', '.join(invalid)}. "
-            f"Use a comma-separated list of: {', '.join(_VALID_EMIT_VALUES)}."
-        )
-    selected = set(tokens)
-    return tuple(fmt for fmt in _VALID_EMIT_VALUES if fmt in selected)
+    # One parser for every surface (``ci --generate-report`` validates the
+    # same value before its scan starts).
+    return parse_emit_values(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -508,23 +507,10 @@ def _parse_only(raw: str | None) -> tuple[_KitItem, ...]:
         ValueError: If any token is not a valid kit slug, with a
             message naming the invalid token and the allowed set.
     """
-    if raw is None or not raw.strip():
-        return _KIT
-    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        return _KIT
-    # Resolve aliases (e.g. ``report`` → ``executive``) before validation so
-    # public-facing names never reach the slug check. Unknown tokens still
-    # raise — the alias map is intentionally narrow.
-    normalised = [_ONLY_ALIASES.get(tok, tok) for tok in tokens]
-    invalid = [tok for tok in normalised if tok not in _VALID_SLUGS]
-    if invalid:
-        allowed = ", ".join(list(_VALID_SLUGS) + list(_ONLY_ALIASES.keys()))
-        raise ValueError(
-            f"--only: unknown deliverable(s): {', '.join(invalid)}. "
-            f"Use one of: {allowed}."
-        )
-    selected_slugs = set(normalised)
+    # The slug vocabulary and the alias map live in the shared report-options
+    # model, so ``ci`` validates ``--only`` before its scan with this same
+    # parser. ``_KIT`` stays the definition of what each slug renders.
+    selected_slugs = set(parse_only_slugs(raw))
     return tuple(item for item in _KIT if item.slug in selected_slugs)
 
 
@@ -752,15 +738,15 @@ def _drop_unsupportable_items(
     if any(item.slug == "password-hygiene" for item in kept):
         try:
             from adscan_internal.pro.reporting.password_hygiene_databinding import (
+                password_hygiene_skip_reason,
                 workspace_has_password_hygiene,
             )
 
             if not workspace_has_password_hygiene(workspace_dir):
-                print_info(
-                    "Skipping the AD Password Hygiene Report: this engagement "
-                    "attempted no credential recovery, so there is nothing to "
-                    "report on password strength or reuse."
-                )
+                # States the real reason, and names any credential that WAS
+                # recovered: "no credential recovery" was printed on a run that
+                # had recovered one by Kerberoasting (release gate 14.0.0).
+                print_info(password_hygiene_skip_reason(workspace_dir))
                 kept = tuple(it for it in kept if it.slug != "password-hygiene")
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -788,6 +774,7 @@ async def _render_bonus_async(
     cover_title: str = "",
     cover_subtitle: str = "",
     is_sample: bool = False,
+    gap_sink: dict[str, Any] | None = None,
 ) -> int:
     """Render a single bonus PDF in a worker thread.
 
@@ -817,6 +804,9 @@ async def _render_bonus_async(
     through this same function rather than a second, drifting copy of it. The
     cheatsheet is product documentation and ``render_bonus`` refuses to
     watermark it even when the flag is set.
+
+    ``gap_sink`` is filled with this document's client-section gap view so the
+    kit manifest can declare the document incomplete. See ``render_bonus``.
     """
     from adscan_internal.cli.bonuses import render_bonus
 
@@ -835,6 +825,7 @@ async def _render_bonus_async(
         composition_seams_enabled=composition_seams_enabled,
         cover_title=cover_title,
         cover_subtitle=cover_subtitle,
+        gap_sink=gap_sink,
     )
 
 
@@ -928,18 +919,30 @@ def _is_lite_runtime() -> bool:
 
 
 def _resolve_branding_posture(args: argparse.Namespace):
-    """Resolve the deliverable's branding posture (mirrors ``_resolve_theme``)."""
+    """Resolve the deliverable's branding posture (mirrors ``_resolve_theme``).
+
+    Says so out loud when a white-label request is downgraded for lack of the
+    entitlement, instead of handing over a cobranded kit without comment.
+    """
     from adscan_internal.services.report_branding import (
         resolve_branding_posture,
+        whitelabel_downgrade_notice,
         whitelabel_entitled_from_config,
     )
 
     requested = (getattr(args, "branding", None) or "").strip() or None
+    entitled = whitelabel_entitled_from_config()
+    notice = whitelabel_downgrade_notice(
+        requested, env=os.environ, whitelabel_entitled=entitled
+    )
+    # ``ci --generate-report`` states it before its scan and sets the sentinel.
+    if notice and not getattr(args, "_branding_notice_shown", False):
+        print_warning(notice)
     return resolve_branding_posture(
         requested=requested,
         env=os.environ,
         is_lite=_is_lite_runtime(),
-        whitelabel_entitled=whitelabel_entitled_from_config(),
+        whitelabel_entitled=entitled,
     )
 
 
@@ -1220,6 +1223,9 @@ async def _render_assessment_async(
             branding=branding,
             client_cover_html=client_cover_html,
             client_back_html=client_back_html,
+            # The HTML twin of a sample is a sample too: same watermark CSS,
+            # and no client logo (see client_logo.client_logo_permitted).
+            is_sample=is_sample,
         )
         output_path.with_suffix(".html").write_text(html_str, encoding="utf-8")
         # Emit the branding-invariant derived-data export (report_model.json)
@@ -1270,6 +1276,7 @@ async def _render_kit(
     client_logo_data_uri: str = "",
     composition_seams_enabled: bool = False,
     is_sample: bool = False,
+    gap_sinks: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Render the selected kit artefacts in parallel.
 
@@ -1307,6 +1314,15 @@ async def _render_kit(
             example kit is rendered by this function rather than by a second
             copy of it that can drift from what delivery ships. ``False`` for
             every delivery.
+        gap_sinks: Optional dict this function fills with ``{filename: gap
+            view}`` for every document that could lose a client-specific
+            section, so :func:`_write_manifest` can declare that document
+            incomplete. The same out-parameter mechanism as ``render_bonus``'s
+            ``gap_sink``, one level up: the gap is discovered inside a worker
+            thread under ``asyncio.gather``, while the return value is the byte
+            count every existing caller reads. Left ``None`` by a caller that
+            writes no manifest, and a document with no client-specific section
+            records an empty view, which the manifest writer reads as complete.
 
     Returns:
         Mapping ``{filename: byte_size}`` for the rendered artefacts.
@@ -1345,6 +1361,9 @@ async def _render_kit(
                 )
             )
         else:
+            item_gap_sink: dict[str, Any] | None = None
+            if gap_sinks is not None:
+                item_gap_sink = gap_sinks.setdefault(item.filename, {})
             tasks.append(
                 _render_bonus_async(
                     item.bonus_key,
@@ -1360,6 +1379,7 @@ async def _render_kit(
                     cover_title=item.cover_title,
                     cover_subtitle=item.cover_subtitle,
                     is_sample=is_sample,
+                    gap_sink=item_gap_sink,
                 )
             )
     # ``return_exceptions=True`` so one broken renderer cannot mask the others:
@@ -1821,6 +1841,7 @@ def collect_kit_bundle(
     client: str | None = None,
     engagement: str | None = None,
     include_navigator: bool = True,
+    branding: str = "cobrand",
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Produce the kit's non-PDF companions and confirm what the run wrote.
 
@@ -1845,6 +1866,8 @@ def collect_kit_bundle(
         engagement: Engagement name stamped into the Navigator layer.
         include_navigator: ``False`` skips the Navigator bundle (``deliver
             --no-navigator``).
+        branding: The resolved ``BrandingPosture`` value. Under
+            ``"whitelabel"`` the Navigator layer and page carry no product name.
 
     Returns:
         ``(extras, flat_bundle)`` — the Navigator filenames, which go into the
@@ -1857,6 +1880,7 @@ def collect_kit_bundle(
             workspace_dir=workspace_dir,
             client=client,
             engagement=engagement,
+            branding=branding,
         )
 
     # Consolidated affected-assets appendix (CSV + JSON) — the complete,
@@ -1953,6 +1977,7 @@ def _write_manifest(
     workspace_dir: Path,
     extras: tuple[str, ...] = (),
     appendix: tuple[str, ...] = (),
+    gaps: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Write ``manifest.json`` next to the ZIP describing the deliverable.
 
@@ -1966,7 +1991,22 @@ def _write_manifest(
 
     Paths point into THIS run's staging directory, which is what lets the web
     keep serving an older kit's files correctly after a newer kit is built.
+
+    ``gaps`` maps a filename to that document's client-section gap view (filled
+    by :func:`_render_kit`), and every file entry gains the resulting
+    completeness record. This manifest is what the Enterprise platform lists for
+    download, so without the record a degraded document is offered there with no
+    indicator that it is degraded: the client opens a document presenting itself
+    as complete. An entry is written for EVERY file, including the documents
+    that have no client-specific section to lose, so an absent record on a
+    manifest this function wrote means a hop in the chain dropped it rather than
+    that the document declined to answer. ``manifest_version`` is 3 for exactly
+    that reason: a v2 manifest predates the record and nothing can be concluded
+    from its silence. Nothing branches on the version; a reader decides on the
+    presence of the field.
     """
+    from adscan_core.reporting.deliverable_section_gap import manifest_completeness
+
     selection = {slug: (slug in {it.slug for it in items}) for slug in _VALID_SLUGS}
 
     files: list[dict[str, Any]] = []
@@ -1979,6 +2019,9 @@ def _write_manifest(
                 "title": item.title,
                 "size": stage.size_of(item.filename),
                 "path": str(path),
+                **manifest_completeness(
+                    (gaps or {}).get(item.filename),
+                ),
             }
         )
 
@@ -2003,7 +2046,11 @@ def _write_manifest(
         )
 
     manifest: dict[str, Any] = {
-        "manifest_version": 2,
+        # v3 added the per-file completeness record (see the ``gaps`` note
+        # above). The bump is the only way a reader can tell "this kit recorded
+        # nothing because it predates the field" from "this kit recorded
+        # complete".
+        "manifest_version": 3,
         # Per RUN, not per day: two kits built the same day are two different
         # kits, and a day-granular id made two manifests claim to describe the
         # same one. The DB keys kit rows on their own UUID, so nothing breaks;
@@ -2050,6 +2097,83 @@ def _announce_kit_manifest(stage: _KitStage) -> None:
     )
 
 
+#: Stdout contract of ``--progress-model``: the path of the PDF just written.
+#: Mirrored by the host worker (``appliance/celery``), which never imports this
+#: package; it reads the PDF from the host side of the same workspace mount.
+PROGRESS_REPORT_ANNOUNCE_PREFIX: str = "ADSCAN_PROGRESS_REPORT="
+
+
+def _resolve_progress_model_path(args: argparse.Namespace) -> Path:
+    """Resolve ``--progress-model``: relative paths are read from the workspace.
+
+    The web writes the model inside the workspace mount and passes it relative
+    to the workspace, because the engine may run in a container where the
+    host path does not exist. Without ``--workspace`` a relative path is read
+    from the current directory.
+    """
+    raw = Path(str(getattr(args, "progress_model", "") or "")).expanduser()
+    if raw.is_absolute():
+        return raw
+    if getattr(args, "workspace", None):
+        workspace_dir = _resolve_workspace(args)
+        if workspace_dir is not None:
+            return workspace_dir / raw
+    return Path.cwd() / raw
+
+
+def run_progress_report_from_model(args: argparse.Namespace) -> int:
+    """Render the Executive Progress Report from a model file (``--progress-model``).
+
+    The model is built by the shared derivation
+    (``adscan_core.reporting.progress_report``) wherever the assessment history
+    lives (the Enterprise web database); this renders it through the shared
+    Chromium engine and design system. The PDF is written beside the model, or
+    into ``--output`` when given, and its path announced on stdout.
+
+    Returns:
+        ``0`` on success, ``1`` when the render fails, ``2`` on a usage error
+        (LITE, missing or unknown model).
+    """
+    if not tier.is_pro():
+        from adscan_core.operator_role import resolve_cta_lane
+        from adscan_core.pro_upsell import print_pro_upsell
+
+        print_pro_upsell("deliver", "direct_invocation", lane=resolve_cta_lane())
+        return 2
+
+    from adscan_internal.pro.reporting import progress_report_render as render
+
+    model_path = _resolve_progress_model_path(args)
+    if not model_path.is_file():
+        print_error(f"Progress report model not found: {model_path.name}")
+        return 2
+    try:
+        document = render.load_progress_report_model(model_path)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print_error(f"The progress report model could not be used: {exc}")
+        return 2
+
+    output_dir = Path(str(args.output)).expanduser() if getattr(args, "output", None) else model_path.parent
+    try:
+        pdf_path = render.write_progress_report_pdf(document, output_dir)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a failed render, never a crash
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error("The Executive Progress Report could not be rendered.")
+        return 1
+
+    from adscan_core.output._state import get_console
+
+    print_success(f"Executive Progress Report written: {pdf_path.name}")
+    get_console().print(
+        f"{PROGRESS_REPORT_ANNOUNCE_PREFIX}{pdf_path}",
+        soft_wrap=True,
+        markup=False,
+        highlight=False,
+    )
+    return 0
+
+
 def _format_size(num_bytes: int) -> str:
     """Return a human-readable size string (KB / MB)."""
     if num_bytes >= 1_000_000:
@@ -2079,6 +2203,7 @@ def _generate_navigator_extras(
     workspace_dir: Path,
     client: str | None,
     engagement: str | None,
+    branding: str = "cobrand",
 ) -> tuple[str, ...]:
     """Render the Navigator layer + interactive HTML + (optional) diff.
 
@@ -2108,10 +2233,16 @@ def _generate_navigator_extras(
         build_report_data_from_raw,
     )
     from adscan_internal.services.mitre_navigator import (
+        WATERMARK_NONE,
         WATERMARK_PRO,
         build_diff_layer,
         build_navigator_layer,
     )
+
+    # A white-label kit names no product in its Navigator layer or page.
+    whitelabel = branding == "whitelabel"
+    watermark = WATERMARK_NONE if whitelabel else WATERMARK_PRO
+    layer_names = {"name": "AD Posture"} if whitelabel else {}
 
     report_path = workspace_dir / "technical_report.json"
     if not report_path.is_file():
@@ -2168,8 +2299,9 @@ def _generate_navigator_extras(
         layer = build_navigator_layer(
             report_data,
             domain=domain,
-            watermark=WATERMARK_PRO,
+            watermark=watermark,
             extra_metadata=extra_meta,
+            **layer_names,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort, kit must still ship
         telemetry.capture_exception(exc)
@@ -2203,7 +2335,13 @@ def _generate_navigator_extras(
             previous_layer = None
     if previous_layer is not None:
         try:
-            diff_layer = build_diff_layer(layer, previous_layer, domain=domain)
+            diff_layer = build_diff_layer(
+                layer,
+                previous_layer,
+                domain=domain,
+                watermark=watermark,
+                **({"name": "Posture Diff"} if whitelabel else {}),
+            )
             diff_path = staging_dir / _NAVIGATOR_DIFF_FILE
             diff_path.write_text(
                 json.dumps(diff_layer, indent=2, sort_keys=True),
@@ -2224,6 +2362,7 @@ def _generate_navigator_extras(
             client=client,
             diff_layer=diff_layer,
             previous_layer=previous_layer,
+            branding=branding,
         )
         html_path = staging_dir / _NAVIGATOR_HTML_FILE
         html_path.write_text(html, encoding="utf-8")
@@ -2374,7 +2513,30 @@ async def run_deliver(args: argparse.Namespace) -> int:
             "No workspace available. Run 'adscan start' first, or pass --workspace WS."
         )
         return 2
+    # What the render logs belongs to this engagement: keep it in the
+    # workspace, so deleting the workspace removes it too.
+    log_into_workspace(workspace_dir)
 
+    # A render re-projects the run that produced this workspace; it observes
+    # nothing new. Adopting that run for the render keeps the report bound to its
+    # coverage record, so the web re-ingesting the post-render report can still
+    # judge (and close) the findings the run proved remediated.
+    from adscan_core.engagement.coverage_io import render_of_recorded_run
+
+    with render_of_recorded_run(workspace_dir):
+        return await _run_deliver_in_workspace(
+            args, workspace_dir=workspace_dir, items=items, emit=emit
+        )
+
+
+async def _run_deliver_in_workspace(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    items: tuple[_KitItem, ...],
+    emit: tuple[str, ...],
+) -> int:
+    """Render the kit for a resolved workspace (the body of :func:`run_deliver`)."""
     # Reconcile the workspace's findings against its attack graph ONCE, before
     # anything reads ``technical_report.json`` — the supportability filter below,
     # the assessment report, the bonuses and the affected-assets appendix all
@@ -2497,6 +2659,19 @@ async def run_deliver(args: argparse.Namespace) -> int:
         getattr(args, "client_logo", None)
     )
 
+    # Resolve the branding posture ONCE for every kit artefact, and say so out
+    # loud when a white-label request was downgraded for lack of entitlement:
+    # a silent downgrade is how a co-branded kit reached a white-label client.
+    from adscan_internal.services.report_branding import whitelabel_degrade_notice
+
+    branding_posture = _resolve_branding_posture(args)
+    branding = branding_posture.value
+    degrade_notice = whitelabel_degrade_notice(
+        getattr(args, "branding", None), branding_posture
+    )
+    if degrade_notice:
+        print_warning(degrade_notice)
+
     print_info(f"Rendering Client Deliverable Kit for {workspace_dir.name}…")
     # State the compliance scope out loud, including when it is empty. A kit
     # that quietly omits its paid-tier compliance mapping is how one ships
@@ -2519,6 +2694,9 @@ async def run_deliver(args: argparse.Namespace) -> int:
         return 1
     zip_path = stage.zip_path
 
+    # Collected during the render and handed to the manifest, so the platform's
+    # download list can say which document is incomplete.
+    kit_gaps: dict[str, dict[str, Any]] = {}
     try:
         sizes = await _render_kit(
             staging_dir=stage.root,
@@ -2528,12 +2706,13 @@ async def run_deliver(args: argparse.Namespace) -> int:
             report_theme=report_theme,
             bonus_theme=bonus_theme,
             frameworks=frameworks,
-            branding=_resolve_branding_posture(args).value,
+            branding=branding,
             emit=emit,
             client_cover_raw=client_cover_raw,
             client_back_raw=client_back_raw,
             client_logo_data_uri=client_logo_data_uri,
             composition_seams_enabled=composition_seams_enabled,
+            gap_sinks=kit_gaps,
         )
     except KitArtifactError as exc:
         # Each failing deliverable was already reported individually inside
@@ -2552,6 +2731,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
         client=client,
         engagement=engagement,
         include_navigator=not getattr(args, "no_navigator", False),
+        branding=branding,
     )
 
     try:
@@ -2576,6 +2756,7 @@ async def run_deliver(args: argparse.Namespace) -> int:
             workspace_dir=workspace_dir,
             extras=extras,
             appendix=flat_bundle,
+            gaps=kit_gaps,
         )
         _announce_kit_manifest(stage)
     except Exception as exc:  # noqa: BLE001 — manifest is best-effort but logged
@@ -2604,6 +2785,15 @@ async def run_deliver(args: argparse.Namespace) -> int:
     headline_name = "Security_Assessment_Report.pdf"
     if stage.produced(headline_name):
         setattr(args, "_headline_pdf", str(stage.path_for(headline_name)))
+    # What "save a copy to another folder" copies: the kit ZIP and the PDFs
+    # this run produced (the ZIP carries the appendices and extras too).
+    setattr(
+        args,
+        "_kit_copy_files",
+        [str(zip_path)]
+        + [str(stage.path_for(item.filename)) for item in items if stage.produced(item.filename)],
+    )
+    setattr(args, "_kit_workspace", str(workspace_dir))
 
     return 0
 
@@ -2627,144 +2817,30 @@ def add_deliver_subparser(
         help="Workspace name or path (default: prompt or active workspace).",
     )
     parser.add_argument(
-        "--client",
-        dest="client",
-        default=None,
-        help="Client name (optional, embedded in metadata).",
-    )
-    parser.add_argument(
-        "--engagement",
-        dest="engagement",
-        default=None,
-        help="Engagement code (optional, embedded in metadata).",
-    )
-    parser.add_argument(
         "--output",
         dest="output",
         default=None,
         help="Override the deliverables output directory.",
     )
+    # Every option that DESCRIBES the deliverable (selection, frameworks, theme,
+    # branding, client identity, composition seams, outputs) is declared once in
+    # the shared model, so ``deliver``, the REPL ``deliver``, ``ci
+    # --generate-report`` and the host launcher accept the same set. Theme
+    # values are validated by :func:`_resolve_theme` (no argparse ``choices``:
+    # internal preview themes and ``.css`` paths stay accepted).
+    add_report_arguments(parser)
+    # ``deliver`` stored an empty theme when none was given (the run-plan
+    # contract and ``_resolve_theme`` both read "" as "not chosen").
+    parser.set_defaults(theme="", report_theme="")
     parser.add_argument(
-        "--client-logo",
-        dest="client_logo",
+        "--progress-model",
+        dest="progress_model",
         default=None,
         metavar="PATH",
         help=(
-            "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on the "
-            "report cover. Persisted and reused on later runs. The ADscan mark "
-            "is kept; suppressing it (full white-label) is a separate paid tier."
-        ),
-    )
-    parser.add_argument(
-        "--client-cover",
-        dest="client_cover",
-        default=None,
-        metavar="PATH",
-        help=(
-            "HTML fragment file that REPLACES ADscan's own cover page verbatim "
-            "on EVERY kit deliverable (each filled with that PDF's own title). "
-            "PATH may instead be a DIRECTORY of per-deliverable fragments "
-            "(cover-<slug>.html, else a shared cover.html fallback). Requires "
-            "the composition_seams entitlement; an un-entitled install ignores "
-            "this flag and renders the default cover."
-        ),
-    )
-    parser.add_argument(
-        "--client-back",
-        dest="client_back",
-        default=None,
-        metavar="PATH",
-        help=(
-            "HTML fragment file rendered as a closing back page on EVERY kit "
-            "deliverable. PATH may instead be a DIRECTORY of per-deliverable "
-            "fragments (back-<slug>.html, else a shared back.html fallback). "
-            "Requires the composition_seams entitlement; an un-entitled install "
-            "ignores this flag."
-        ),
-    )
-    parser.add_argument(
-        "--only",
-        dest="only",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated list of deliverables to generate. "
-            f"Choices: report, {', '.join(s for s in _VALID_SLUGS if s != 'executive')}. "
-            "Default: all four. ('executive' kept as a deprecated alias for 'report'.)"
-        ),
-    )
-    parser.add_argument(
-        "--frameworks",
-        dest="frameworks",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated compliance frameworks to render in the kit. "
-            f"Choices: {', '.join(_VALID_FRAMEWORK_KEYS)}. "
-            "When omitted, an interactive checkbox prompts in TTY contexts; "
-            "non-interactive runs include no compliance section unless one is "
-            "selected explicitly."
-        ),
-    )
-    parser.add_argument(
-        "--no-navigator",
-        dest="no_navigator",
-        action="store_true",
-        help=(
-            "Skip the MITRE ATT&CK Navigator extras (JSON layer + "
-            "interactive HTML + diff). Default: included in every kit."
-        ),
-    )
-    # NOTE on theme validation: we deliberately do NOT use argparse
-    # ``choices=`` here. Only the two SUPPORTED, homogeneous kit themes
-    # (``editorial`` / ``corporate_light``) are advertised via ``metavar`` and
-    # the help text. ``premium_dark`` (and its ``dark`` alias) remain ACCEPTED
-    # for internal preview/testing — they render a mixed kit (dark report +
-    # light bonuses), so we don't surface them to customers, but a developer
-    # can still pass ``--theme dark``. Unknown/typo'd values degrade to the
-    # default inside :func:`_resolve_theme` (it never raises).
-    parser.add_argument(
-        "--report-theme",
-        dest="report_theme",
-        metavar="{editorial,corporate_light}",
-        default="",
-        help=(
-            "Visual theme for the whole kit. 'editorial' = premium warm-bone "
-            "(McKinsey-grade); 'corporate_light' = white Big-4/auditor. "
-            f"Default: {_DEFAULT_REPORT_THEME}."
-        ),
-    )
-    parser.add_argument(
-        "--theme",
-        dest="theme",
-        default="",
-        metavar="{editorial,corporate_light}",
-        help=(
-            "Kit theme. 'editorial' = premium warm-bone editorial "
-            "(McKinsey-grade). 'corporate_light' = white Big-4/auditor. "
-            f"Default: env var ADSCAN_PDF_THEME or '{_DEFAULT_REPORT_THEME}'."
-        ),
-    )
-    parser.add_argument(
-        "--branding",
-        choices=("adscan", "cobrand", "whitelabel"),
-        default=None,
-        help="Branding posture for the deliverable: adscan | cobrand (default) | whitelabel.",
-    )
-    parser.add_argument(
-        "--emit",
-        dest="emit",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated Security Assessment Report outputs. The PDF and "
-            "HTML are always produced; the only opt-in is 'data', which adds "
-            "report_model.json (the branding-invariant derived-data export) "
-            "alongside them. "
-            f"Choices: {', '.join(_VALID_EMIT_VALUES)}. "
-            f"Default: {','.join(_DEFAULT_EMIT)}. "
-            "'data' requires the data_export entitlement; an un-entitled "
-            "install silently omits it."
+            "Render the Executive Progress Report from a progress report model "
+            "(JSON) instead of the kit. A relative PATH is read from the "
+            "workspace. The PDF is written beside the model, or into --output."
         ),
     )
     # Mirrors the per-subcommand --debug on start/ci/install/check. The host
@@ -2834,26 +2910,45 @@ def _prefill_interactive_inputs(args: argparse.Namespace) -> None:
 
 
 def _maybe_open_headline(args: argparse.Namespace) -> None:
-    """Offer to open the Security Assessment Report once the kit is built.
+    """Offer a copy elsewhere, then to open the Security Assessment Report.
 
-    Runs in the SYNC wrapper, after the event loop has exited — the
-    ``prompt_and_open`` confirm prompt is yet another prompt_toolkit
-    Application that must not run inside ``asyncio.run``'s loop. Auto-skips
-    in non-interactive contexts (handled inside ``prompt_and_open``).
+    Runs in the SYNC wrapper, after the event loop has exited — these prompts
+    are prompt_toolkit Applications that must not run inside ``asyncio.run``'s
+    loop. Both steps auto-skip in non-interactive contexts.
+
+    With ``--output`` the kit already sits where the operator asked, so only
+    the open step runs. Otherwise the shared copy flow (the same one the LITE
+    report uses) offers the deliverables folder, and the open step opens the
+    copy when one was made.
     """
     headline = getattr(args, "_headline_pdf", "") or ""
-    if not headline:
-        return
-    path = Path(headline)
-    if not path.is_file():
-        return
-    from adscan_internal.services.host_open import prompt_and_open
+    if getattr(args, "output", None):
+        if not headline or not Path(headline).is_file():
+            return
+        from adscan_internal.services.host_open import prompt_and_open
 
-    prompt_and_open(path, prompt="Open the security assessment report now?")
+        prompt_and_open(Path(headline), prompt=_OPEN_HEADLINE_PROMPT)
+        return
+    from adscan_internal.services.deliverable_copy_flow import offer_copy_and_open
+
+    offer_copy_and_open(
+        getattr(args, "_shell", None),
+        files=list(getattr(args, "_kit_copy_files", []) or []),
+        headline=headline or None,
+        workspace=str(getattr(args, "_kit_workspace", "") or getattr(args, "workspace", "") or ""),
+        open_prompt=_OPEN_HEADLINE_PROMPT,
+    )
+
+
+_OPEN_HEADLINE_PROMPT = "Open the security assessment report now?"
 
 
 def run_deliver_sync(args: argparse.Namespace) -> int:
     """Synchronous wrapper for the top-level CLI dispatcher."""
+    if getattr(args, "progress_model", None):
+        # A different document from the kit: no prompts, no kit staging, no
+        # workspace reconcile. Rendered synchronously, outside any event loop.
+        return run_progress_report_from_model(args)
     try:
         # All interactive prompts run HERE, outside the event loop. See
         # _prefill_interactive_inputs for why (questionary + asyncio.run).
@@ -2871,7 +2966,9 @@ __all__ = (
     "DEFAULT_DELIVERABLE_SLUGS",
     "DELIVERABLE_LABELS",
     "DELIVERABLE_SLUGS",
+    "PROGRESS_REPORT_ANNOUNCE_PREFIX",
     "add_deliver_subparser",
     "run_deliver",
     "run_deliver_sync",
+    "run_progress_report_from_model",
 )

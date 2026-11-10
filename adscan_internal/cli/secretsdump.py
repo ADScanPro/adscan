@@ -563,6 +563,24 @@ def _build_password_hygiene_for_dump(
     # verbatim without reaching the tier classifier.
     install_privilege_tier_label_provider()
 
+    from adscan_core.credential_origins import is_adscan_created_account
+    from adscan_internal.services.session_compromise_state_service import (
+        adscan_created_accounts_for_shell,
+    )
+
+    # An account ADscan created during the run holds a password ADscan chose.
+    # It is not part of the client's password population, so it is neither an
+    # extracted account nor a recovered one in the hygiene figures.
+    created_accounts = adscan_created_accounts_for_shell(shell)
+
+    def _client_row(row: dict[str, str]) -> bool:
+        return not is_adscan_created_account(
+            created_accounts, domain=domain, account=str(row.get("raw_user") or "")
+        )
+
+    cracked_rows = [row for row in cracked_rows if _client_row(row)]
+    uncracked_rows = [row for row in uncracked_rows if _client_row(row)]
+
     accounts: list[dict[str, Any]] = []
     tier_by_username: dict[str, str] = {}
     for row, recovered in ((r, True) for r in cracked_rows):
@@ -1255,6 +1273,14 @@ def execute_dcsync_native(
         target_users: List of sAMAccountNames to replicate. ``None`` / empty
             means "all users" (full DRSUAPI walk).
     """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dcsync"):
+        return None
+
     from adscan_internal.services.async_bridge import run_async_sync
     import time
 
@@ -2070,31 +2096,39 @@ def execute_dcsync_native(
                 promote_to_pwned,
             )
 
-            # Name the promotion after the strongest secret replicated: krbtgt
-            # when present (Golden-Ticket material), else the built-in
-            # Administrator, else the first Tier-0 account extracted.
+            # The promotion hands its (username, credential) to the post-compromise
+            # queues, which AUTHENTICATE with it (the cross-domain escalation signs
+            # in as that principal). So it carries a principal that can sign in:
+            # the built-in Administrator when replicated, else another Tier-0
+            # account, else the principal that performed this replication. Never
+            # krbtgt: the account is disabled by design (its key forges tickets),
+            # and signing in as it is refused by every DC (KDC_ERR_CLIENT_REVOKED,
+            # release gate 14.0.0, Audit row).
+            from adscan_internal.services.cross_domain_escalation import (  # noqa: PLC0415
+                is_signin_principal,
+            )
+
             promote_username = ""
             promote_credential: str | None = None
-            for _a, _n in raw_credentials:
-                if _a.lower() == "krbtgt":
-                    promote_username, promote_credential = "krbtgt", _n or None
+            for _wanted in (lambda rid: rid == 500, lambda rid: rid in _dcsync_tier0_rids):
+                for _a, _n in raw_credentials:
+                    if (
+                        _n
+                        and is_signin_principal(_a)
+                        and _wanted(rid_by_account.get(_a.lower()))
+                    ):
+                        promote_username, promote_credential = _a, _n
+                        break
+                if promote_username:
                     break
-            if not promote_username:
-                for _a, _n in raw_credentials:
-                    if rid_by_account.get(_a.lower()) == 500:
-                        promote_username, promote_credential = _a, _n or None
-                        break
-            if not promote_username:
-                for _a, _n in raw_credentials:
-                    if rid_by_account.get(_a.lower()) in _dcsync_tier0_rids:
-                        promote_username, promote_credential = _a, _n or None
-                        break
+            if not promote_username and is_signin_principal(username) and password:
+                promote_username, promote_credential = username, password
 
             promote_to_pwned(
                 shell,
                 domain=domain,
                 evidence=CompromiseEvidence.DOMAIN_ADMIN_MEMBERSHIP,
-                username=promote_username or "krbtgt",
+                username=promote_username,
                 credential=promote_credential,
                 evidence_ref="native_dcsync",
             )

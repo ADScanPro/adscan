@@ -149,7 +149,7 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
         args: Raw argument string after the `workspace` command.
     """
     if not args:
-        print_instruction("Usage: workspace <create|delete|select|show|save|list>")
+        print_instruction("Usage: workspace <create|delete|purge-secrets|select|show|save|list>")
         if shell.current_workspace:
             marked_current_workspace_dir = mark_sensitive(
                 shell.current_workspace_dir or "", "path"
@@ -166,6 +166,8 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
         workspace_create(shell, sub_args[0] if sub_args else None)
     elif command == "delete":
         workspace_delete(shell, sub_args[0] if sub_args else "")
+    elif command == "purge-secrets":
+        workspace_purge_secrets(shell, sub_args)
     elif command == "select":
         workspace_select(shell)
     elif command == "show":
@@ -181,7 +183,7 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
         from rich.markup import escape as _rich_escape
         import difflib
 
-        valid_commands = ["create", "delete", "select", "show", "save", "list"]
+        valid_commands = ["create", "delete", "purge-secrets", "select", "show", "save", "list"]
         print_warning(
             f"`workspace {_rich_escape(command)}` is not a recognized workspace command."
         )
@@ -191,7 +193,7 @@ def do_workspace(shell: WorkspaceShell, args: str) -> None:
                 f"Did you mean `workspace {close[0]}`? Type `workspace {close[0]}` to run it."
             )
         print_instruction(
-            "Available commands: create, delete, select, show, save, list. "
+            "Available commands: create, delete, purge-secrets, select, show, save, list. "
             "Type `help` for the full command list."
         )
 
@@ -248,6 +250,71 @@ def workspace_list(shell: WorkspaceShell) -> None:
     print_table(table)
 
 
+def workspace_policy_choices() -> list[Any]:
+    """The policies a new workspace may start with: Lab / CTF, Audit, then saved global ones.
+
+    The policy's environment is the workspace type (``scan_controls.workspace_type``),
+    so choosing the policy is choosing whether the workspace is a lab or a real
+    environment. Other built-ins remain one ``policy use`` away.
+    """
+    from adscan_core.scan_policy.policy import BASE_AUDIT, BASE_LAB_CTF  # noqa: PLC0415
+    from adscan_internal.services import saved_scan_policies as store  # noqa: PLC0415
+
+    choices = []
+    for policy in store.list_policies(None):
+        if policy.scope == store.SCOPE_BUILTIN:
+            if policy.key in (BASE_LAB_CTF, BASE_AUDIT):
+                choices.append(policy)
+        elif policy.scope == store.SCOPE_GLOBAL:
+            choices.append(policy)
+    order = {BASE_LAB_CTF: 0, BASE_AUDIT: 1}
+    return sorted(choices, key=lambda p: order.get(p.key, 2) if p.scope == store.SCOPE_BUILTIN else 2)
+
+
+def workspace_policy_label(policy: Any) -> str:
+    """``Lab / CTF``, ``Audit``, or ``<name> (saved, real environment)``."""
+    from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+        ENVIRONMENT_LABELS,
+        effective_environment,
+    )
+    from adscan_internal.services import saved_scan_policies as store  # noqa: PLC0415
+
+    if policy.scope == store.SCOPE_BUILTIN:
+        return policy.name
+    environment = ENVIRONMENT_LABELS[effective_environment(policy.definition)].lower()
+    return f"{policy.name} (saved, {environment})"
+
+
+def prompt_workspace_policy(shell: Any, *, title: str = "Scan policy for this workspace?") -> Any | None:
+    """Ask which policy a workspace starts with; ``None`` when cancelled.
+
+    Unattended, the first choice (Lab / CTF) is taken, as the purpose question
+    this replaces did.
+    """
+    choices = workspace_policy_choices()
+    if not choices:
+        return None
+    selection = shell._questionary_select(title, [workspace_policy_label(p) for p in choices])
+    if selection is None:
+        return None
+    return choices[int(selection)]
+
+
+def install_workspace_policy(workspace_path: str, definition: Any) -> None:
+    """Persist ``definition`` as the workspace's scan policy before the workspace loads."""
+    from adscan_internal.services.scan_controls import (  # noqa: PLC0415
+        SOURCE_WORKSPACE,
+        resolve_definition,
+        save_workspace_policy,
+    )
+
+    save_workspace_policy(
+        workspace_path,
+        resolve_definition(definition, strict=False),
+        source=SOURCE_WORKSPACE,
+    )
+
+
 def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -> None:
     """Create a new workspace and load it.
 
@@ -272,16 +339,22 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
         print_error(f"Workspace '{workspace_name}' already exists at {workspace_path}")
         return
 
-    # One question only: purpose determines scan flow + telemetry split.
+    # One question only: the scan policy. Its environment (lab or real) is the
+    # workspace type, so it decides the scan flow and the telemetry split.
     # Lab provider/name are inferred automatically at scan start from the domain.
-    selection = shell._questionary_select(
-        "Workspace purpose?", ["CTF / Lab", "Client / Prod"]
+    from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+        BASE_LAB_CTF,
+        builtin_definition,
+        workspace_type_for_definition,
     )
-    if selection == 1:
-        workspace_type = "audit"
+
+    chosen_policy = prompt_workspace_policy(shell)
+    if chosen_policy is not None:
+        policy_definition = chosen_policy.definition
     else:
-        # Default to ctf on cancel (selection is None) or explicit CTF choice.
-        workspace_type = "ctf"
+        # Cancelled: Lab / CTF, as the purpose question defaulted to CTF.
+        policy_definition = builtin_definition(BASE_LAB_CTF)
+    workspace_type = workspace_type_for_definition(policy_definition) or "ctf"
 
     try:
         create_workspace_dir(shell.workspaces_dir, workspace_name)
@@ -295,12 +368,18 @@ def workspace_create(shell: WorkspaceShell, workspace_name: str | None = None) -
             workspace_path=workspace_path,
             workspace_type=workspace_type,
         )
+        install_workspace_policy(workspace_path, policy_definition)
         print_info_verbose(
             f"Initialized files for workspace '{marked_workspace_name}'."
         )
 
-        shell.current_workspace = workspace_name
-        shell.current_workspace_dir = workspace_path
+        from adscan_internal.workspaces.session import (  # noqa: PLC0415
+            activate_workspace as _activate_workspace,
+        )
+
+        _activate_workspace(
+            shell, workspaces_dir=shell.workspaces_dir, workspace_name=workspace_name
+        )
         shell.load_workspace_data(workspace_path)
         print_success(
             f"Workspace '{marked_workspace_name}' created and loaded successfully."
@@ -320,6 +399,11 @@ def workspace_delete(shell: WorkspaceShell, workspace_name: str) -> None:
 
     from adscan_internal.workspaces import delete_workspace_dir, resolve_workspace_paths
 
+    # Before the first line this command logs: the open workspace's logs must
+    # never carry the name of the one being deleted. The screen still shows it.
+    from adscan_core.telemetry import forget_workspace_name  # noqa: PLC0415
+
+    forget_workspace_name(workspace_name)
     workspace_path = resolve_workspace_paths(shell.workspaces_dir, workspace_name).root
     if not os.path.exists(workspace_path):
         print_error(f"Workspace '{workspace_name}' does not exist at {workspace_path}")
@@ -347,6 +431,193 @@ def workspace_delete(shell: WorkspaceShell, workspace_name: str) -> None:
         telemetry.capture_exception(exc)
         print_error(f"Failed to delete workspace '{workspace_name}': {exc}")
         print_exception(show_locals=False, exception=exc)
+
+
+PURGE_USAGE = (
+    "Usage: workspace purge-secrets [workspace_name] "
+    "[--keep-starting-credential] [--delete-deliverables]"
+)
+
+
+def _purge_confirmation_lines(deliverables: list[str], *, keep_starting: bool, delete_deliverables: bool) -> list[str]:
+    """What the operator is told before confirming (removed, kept, not changed)."""
+    lines = [
+        "Removes every password, hash, Kerberos key, ticket and certificate this workspace "
+        "recorded, from its credential store and from every file. Logs are emptied.",
+        "Keeps the findings, attack paths, asset inventory and engagement history, so the "
+        "next scan can still be compared with this one.",
+    ]
+    if keep_starting:
+        lines.append("The credential the scans started from is kept. Nothing else is.")
+    else:
+        lines.append(
+            "The credential the scans started from is removed as well. Pass "
+            "--keep-starting-credential to keep it."
+        )
+    if deliverables and delete_deliverables:
+        lines.append(f"The rendered reports in this workspace are deleted too ({len(deliverables)}).")
+    elif deliverables:
+        lines.append(
+            f"The rendered reports in this workspace ({len(deliverables)}) stay as they are. They cannot be edited and "
+            "may contain recovered secrets. Pass --delete-deliverables to delete them, or "
+            "remove the copies you shared yourself."
+        )
+    return lines
+
+
+def _clear_loaded_credential_store(shell: Any, *, keep_starting: bool) -> None:
+    """Empty the credential store the session holds in memory, then save it.
+
+    Purging the active workspace on disk alone would let the next autosave write
+    the session's copy of the store back.
+    """
+    from adscan_core.workspace_secret_purge import clear_credential_store  # noqa: PLC0415
+
+    view: dict[str, Any] = {
+        "domains_data": getattr(shell, "domains_data", None) or {},
+        "username": getattr(shell, "username", None),
+        "password": getattr(shell, "password", None),
+        "hash": getattr(shell, "hash", None),
+    }
+    clear_credential_store(view, keep_starting_credential=keep_starting)
+    for key in ("password", "hash"):
+        if key not in view and hasattr(shell, key):
+            setattr(shell, key, None)
+    shell.save_workspace_data()
+
+
+def workspace_purge_secrets(shell: Any, args: Sequence[str]) -> None:
+    """Remove every recovered secret from a workspace and keep its history.
+
+    Defaults to the active workspace. The operator confirms by typing the
+    workspace name, and the purge is recorded under the operator's name.
+    """
+    from adscan_core import workspace_secret_purge as purge  # noqa: PLC0415
+    from adscan_internal.services.operator_identity import command_line_operator_name  # noqa: PLC0415
+    from adscan_internal.workspaces import resolve_workspace_paths  # noqa: PLC0415
+
+    flags = {a for a in args if a.startswith("--")}
+    names = [a for a in args if not a.startswith("--")]
+    unknown = flags - {"--keep-starting-credential", "--delete-deliverables"}
+    if unknown or len(names) > 1:
+        print_instruction(PURGE_USAGE)
+        return
+    keep_starting = "--keep-starting-credential" in flags
+    delete_deliverables = "--delete-deliverables" in flags
+    workspace_name = names[0] if names else (shell.current_workspace or "")
+    if not workspace_name:
+        print_error("No workspace selected.")
+        print_instruction(PURGE_USAGE)
+        return
+    workspace_path = resolve_workspace_paths(shell.workspaces_dir, workspace_name).root
+    marked = mark_sensitive(workspace_name, "workspace")
+    if not os.path.isdir(workspace_path):
+        print_error(f"Workspace '{marked}' does not exist.")
+        return
+    active = shell.current_workspace_dir == workspace_path
+    if active:
+        registry = getattr(shell, "_background_jobs", None)
+        if registry is not None and registry.has_active_jobs():
+            print_warning(
+                "No secrets were removed. A background job is still running in this "
+                "workspace. List it with 'jobs' and stop it with 'jobs stop <id>' first."
+            )
+            return
+
+    deliverables = purge.find_rendered_deliverables(workspace_path)
+    print_panel(
+        "\n\n".join(
+            _purge_confirmation_lines(
+                deliverables, keep_starting=keep_starting, delete_deliverables=delete_deliverables
+            )
+        ),
+        title=f"Remove recovered secrets from {marked}",
+    )
+    if not _confirm_typed_workspace_name(shell, workspace_name):
+        print_warning("Cancelled. Nothing was removed.")
+        return
+    operator = command_line_operator_name(
+        shell,
+        prompt_text="Your name, recorded with the removal in the workspace history",
+        prompt=prompt_ask,
+    )
+    if not operator:
+        print_warning("Cancelled. A name is required to record who removed the secrets.")
+        return
+
+    options = purge.PurgeOptions(
+        keep_starting_credential=keep_starting,
+        delete_deliverables=delete_deliverables,
+        allow_own_lock=active,
+    )
+    try:
+        if active:
+            _clear_loaded_credential_store(shell, keep_starting=keep_starting)
+        result = purge.purge_workspace_secrets(
+            workspace_path,
+            operator=operator,
+            surface=purge.SURFACE_CLI,
+            options=options,
+            workspaces_dir=shell.workspaces_dir,
+        )
+    except purge.PurgeRefused as exc:
+        print_warning(f"No secrets were removed. {exc.reason.capitalize()}.")
+        return
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error("The secret removal stopped part way. Run it again to finish it.")
+        return
+    _print_purge_result(result)
+
+
+def _print_purge_result(result: Any) -> None:
+    """Summarise a finished purge, including what it could not remove."""
+    print_success(
+        f"Recovered secrets removed. Files deleted {len(result.files_deleted)}, rewritten "
+        f"{len(result.files_rewritten)}, logs emptied {len(result.logs_cleared)}, credential "
+        f"store entries removed {result.store_entries_removed}."
+    )
+    collisions = result.secrets_not_substituted.get("equals_an_identifier", 0)
+    if collisions:
+        print_warning(
+            f"Recovered passwords equal to an account or host name, {collisions}. They stay "
+            "wherever that name appears, because removing them would remove the name."
+        )
+    short = result.secrets_not_substituted.get("shorter_than_minimum_replaced_whole_only", 0)
+    if short:
+        print_warning(
+            f"Recovered values shorter than six characters, {short}. They were removed "
+            "where they stand alone, not inside longer text."
+        )
+    for item in result.remaining:
+        print_warning(
+            f"{mark_sensitive(item.get('path', ''), 'path')} was not changed "
+            f"({str(item.get('reason', '')).replace('_', ' ')})."
+        )
+    kept_reports = [d for d in result.deliverables if d not in result.deliverables_deleted]
+    if kept_reports:
+        print_warning(
+            f"Rendered reports left unchanged, {len(kept_reports)}. They may contain "
+            "recovered secrets, and so may any copy already shared."
+        )
+    if result.deliverables_deleted:
+        print_info(f"Rendered reports deleted, {len(result.deliverables_deleted)}.")
+    if result.execution_workspaces_purged:
+        print_info(
+            f"Copies of this workspace left by earlier scans cleaned too, "
+            f"{len(result.execution_workspaces_purged)}."
+        )
+
+
+def _confirm_typed_workspace_name(shell: Any, workspace_name: str) -> bool:
+    """Return True only when the operator types the exact workspace name.
+
+    Non-interactive runs resolve to an empty answer, so they never confirm.
+    """
+    print_instruction("Type the workspace name to confirm.")
+    confirmation = str(prompt_ask("Workspace name", default="", shell=shell) or "").strip()
+    return confirmation == workspace_name
 
 
 def workspace_select(shell: WorkspaceShell) -> None:

@@ -311,35 +311,57 @@ def _patch_custom_binary_cache(src_path: str, filename: str) -> None:
 
 
 def _select_auth(shell: Any, domain: str, host: str) -> RemoteWindowsAuth | None:
-    """Build RemoteWindowsAuth by selecting from stored credentials + ccache tickets."""
+    """Build RemoteWindowsAuth from a credential the operator selects.
+
+    Every option names its principal. The first (default) option is the
+    credential the privilege SSOT grades as local administrator on ``host``,
+    so an unattended run deploys as that account, never as whichever stored
+    credential happens to come first.
+    """
+    from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+        pick_credential_for_local_admin,
+    )
+
     domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    credentials: dict = domain_data.get("credentials", {})
-    kerberos_tickets: dict = domain_data.get("kerberos_tickets", {})
+    credentials = domain_data.get("credentials", {}) or {}
+    kerberos_tickets = domain_data.get("kerberos_tickets", {}) or {}
 
     options: list[tuple[str, str, str]] = []  # (label, username, secret)
 
-    # Stored password credentials
-    for ukey, cred_data in credentials.items():
-        username = str(cred_data.get("username") or ukey.split("\\")[-1])
-        secret = str(cred_data.get("password") or cred_data.get("hash") or "")
-        if secret:
-            kind = "hash" if len(secret) == 32 and all(c in "0123456789abcdefABCDEF" for c in secret) else "password"
-            options.append((f"{username} ({kind})", username, secret))
+    def _kind(secret: str) -> str:
+        is_hash = len(secret) == 32 and all(
+            c in "0123456789abcdefABCDEF" for c in secret
+        )
+        return "hash" if is_hash else "password"
 
-    # Kerberos ccache tickets
+    try:
+        admin = pick_credential_for_local_admin(shell, domain=domain, target_host=host)
+    except Exception as exc:  # noqa: BLE001 - an ungraded graph just has no default
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        admin = None
+    if admin:
+        admin_user, admin_secret, _admin_kind = admin
+        options.append(
+            (
+                f"{admin_user} ({_kind(admin_secret)}, local admin on {host})",
+                admin_user,
+                admin_secret,
+            )
+        )
+
+    # Stored domain credentials: ``credentials`` maps a principal to its secret.
+    for ukey, cred_value in credentials.items():
+        username = str(ukey).split("\\")[-1]
+        secret = str(cred_value or "")
+        if not secret or (admin and username.lower() == str(admin[0]).lower()):
+            continue
+        options.append((f"{username} ({_kind(secret)})", username, secret))
+
+    # This principal's own Kerberos tickets, keyed by the principal they hold.
     for username, ticket_path in kerberos_tickets.items():
         if ticket_path and Path(ticket_path).is_file():
             options.append((f"{username} (ccache: {Path(ticket_path).name})", username, ticket_path))
-
-    # Workspace-level ccache files (like the Garfield administrator ccache)
-    workspace_dir = getattr(shell, "current_workspace_dir", "")
-    if workspace_dir:
-        for ccache_file in Path(workspace_dir).glob("*.ccache"):
-            label = ccache_file.name
-            username = label.split("@")[0] if "@" in label else "unknown"
-            already = any(opt[2] == str(ccache_file) for opt in options)
-            if not already:
-                options.append((f"{username} (ccache: {label})", username, str(ccache_file)))
 
     options.append(("[ Enter manually ]", "", ""))
 

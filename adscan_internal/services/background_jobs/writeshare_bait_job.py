@@ -87,6 +87,9 @@ class WriteShareBaitJobRuntime:
         self._lock = threading.Lock()
         self._consumer_id = f"writeshare_bait@{scope}"
         self._pivot_listener_id: Optional[int] = None
+        #: Operator-facing reason ``start()`` returned False because no listener
+        #: could serve the callback address; ``None`` otherwise.
+        self.start_failure: Optional[str] = None
 
     # ── JobRuntime protocol ─────────────────────────────────────────────────
 
@@ -101,8 +104,18 @@ class WriteShareBaitJobRuntime:
         if not broker.acquire(
             self._consumer_id, bind_ip=self.listener_bind_ip, on_capture=self._on_capture
         ):
+            refusal = None
+            last_refusal = getattr(broker, "last_refusal", None)
+            if callable(last_refusal):
+                refusal = last_refusal(self._consumer_id)
+            # Read by the foreground launch seam, which tells the operator why no
+            # bait was planted (start() runs on the foreground thread, but a
+            # runtime never prints user-facing output itself).
+            self.start_failure = (
+                refusal[1] if refusal else "the shared SMB capture listener is unavailable"
+            )
             print_info_debug(
-                f"writeshare-bait: could not acquire shared :445 listener on "
+                f"writeshare-bait: could not acquire shared :445 listener for "
                 f"{self.listener_bind_ip}; not planting bait."
             )
             return False

@@ -308,7 +308,7 @@ class DRSUAPIRPC:
 				#guid = GUID.from_string(crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName'][:-1][1:-1])
 				raw_pname = crackedName['pmsgOut']['V1']['pResult']['rItems'][0]['pName']
 				guid = raw_pname[:-1][1:-1]
-				print('[drsuapi-cracknames] user=%s format=%s rstatus=%s raw_pname=%r guid=%r' % (username, formatOffered, rstatus, raw_pname, guid))
+				logger.debug('drsuapi-cracknames user=%s format=%s rstatus=%s raw_pname=%r guid=%r' % (username, formatOffered, rstatus, raw_pname, guid))
 				if len(guid) == 0:
 					continue
 				break

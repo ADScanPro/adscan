@@ -87,11 +87,13 @@ from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry, tier
+from adscan_core.credential_origins import NOT_RECOVERED_ORIGINS, ORIGIN_ADSCAN_PROVISIONED
 from adscan_core.reporting.attack_step_reason_codes import (
     REASON_CODE_KEY,
     normalize_reason_code as _normalize_reason_code,
     reason_code_client_note,
 )
+from adscan_core.reporting.cleanup_remediation import remediation_steps
 from adscan_core.reporting.kit_facts import chain_reconcile_clause
 from adscan_core.reporting.principal_display import (
     deshout_directory_name,
@@ -180,7 +182,9 @@ LITE_REPL_VERBS: tuple[str, ...] = (
     "attack_paths",
     "get_flags",
 )
-LITE_CLI_COMMANDS: tuple[str, ...] = ("execute",)
+# ``adscan execute`` moved to PRO with every non-interactive entry point
+# (2026-11-04), so the footer replays the chain from the REPL instead.
+LITE_CLI_COMMANDS: tuple[str, ...] = ()
 
 _MITRE_BASE = "https://attack.mitre.org/techniques"
 
@@ -415,6 +419,7 @@ _ROUTE_MAP_MAX = 50
 _REAL_COMPROMISE_CLASSES: frozenset[str] = frozenset(
     {
         CompromiseClass.DOMAIN_BREAKER.value,
+        CompromiseClass.TIER0_CONTROL.value,
         CompromiseClass.TIER0_FOOTHOLD.value,
         CompromiseClass.PRIVILEGED_ESCALATOR.value,
     }
@@ -681,6 +686,9 @@ class ChangeRow:
     status: str
     at: str | None = None
     instructions: str = ""
+    #: ``instructions`` as ordered ``(prose, command)`` pairs: the explanation is
+    #: printed as text and the code block holds only the command.
+    steps: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1213,6 +1221,23 @@ def credential_origin_label(origin: str) -> str:
     return label or _words_from_identifier(raw)
 
 
+def _checked_secret_kind(stored_kind: Any, secret: Any) -> str | None:
+    """The stored ``secret_kind`` label, checked against the secret's shape.
+
+    Routes through the credentials SSOT reader so a stale ``password`` label on
+    an NT hash is not carried into the writeup. Any other label, or no label,
+    is passed through as recorded.
+    """
+    from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+        resolve_secret_kind,
+    )
+
+    label = str(stored_kind or "").strip()
+    if isinstance(secret, str) and secret and label.lower() == "password":
+        return resolve_secret_kind(label, secret).value
+    return label or None
+
+
 def secret_kind_label(secret_kind: str) -> str:
     """Return how a stored ``secret_kind`` is written in the credential ledger."""
     raw = str(secret_kind or "").strip()
@@ -1739,7 +1764,7 @@ def _credential_origins(credential_meta: dict[str, Any]) -> CredentialOrigins:
         if not isinstance(meta, dict):
             continue
         origin = str(meta.get("credential_origin") or "").strip().lower()
-        if not origin or origin == "authenticated_scan":
+        if not origin or origin in NOT_RECOVERED_ORIGINS:
             continue
         key = origin.replace("_", "").replace("-", "")
         name = str(principal)
@@ -1984,7 +2009,7 @@ def _split_into_stages(
                 proven=step.outcome == "success" or has_secret,
                 steps=tuple(pending),
                 credential_origin=origin,
-                secret_kind=str(meta.get("secret_kind") or "") or None,
+                secret_kind=_checked_secret_kind(meta.get("secret_kind"), stored_secret),
                 has_stored_secret=has_secret,
                 secret_value=str(stored_secret or ""),
             )
@@ -2003,6 +2028,8 @@ def _terminal_title(compromise_class: str, target: str, *, proven: bool) -> str:
     normalized = str(compromise_class or "").strip().lower()
     if normalized == CompromiseClass.DOMAIN_BREAKER.value:
         outcome = "Domain compromise"
+    elif normalized == CompromiseClass.TIER0_CONTROL.value:
+        outcome = f"Control of Tier 0 account {target}"
     elif normalized == CompromiseClass.TIER0_FOOTHOLD.value:
         outcome = f"Session on {target}"
     elif normalized == CompromiseClass.PRIVILEGED_ESCALATOR.value:
@@ -2024,6 +2051,8 @@ def _compromise_reach_phrase(compromise_class: str, target: str) -> str:
     normalized = str(compromise_class or "").strip().lower()
     if normalized == CompromiseClass.DOMAIN_BREAKER.value:
         return "full domain compromise"
+    if normalized == CompromiseClass.TIER0_CONTROL.value:
+        return f"control of the Tier 0 account `{target}`"
     if normalized == CompromiseClass.PRIVILEGED_ESCALATOR.value:
         return f"control of `{target}`"
     if normalized == CompromiseClass.TIER0_FOOTHOLD.value:
@@ -2043,7 +2072,8 @@ def _mapped_onward_compromise(
     graph found beyond the proven foothold without claiming the run walked it.
     """
     rank = {
-        CompromiseClass.DOMAIN_BREAKER.value: 3,
+        CompromiseClass.DOMAIN_BREAKER.value: 4,
+        CompromiseClass.TIER0_CONTROL.value: 3,
         CompromiseClass.PRIVILEGED_ESCALATOR.value: 2,
         CompromiseClass.TIER0_FOOTHOLD.value: 1,
     }
@@ -2358,7 +2388,13 @@ def _collect_credentials(
         secret = str(credentials.get(principal) or "")
         entry = _lookup_ci(meta, str(principal))
         entry = entry if isinstance(entry, dict) else {}
-        declared = secret_kind_label(str(entry.get("secret_kind") or ""))
+        # The password of an account ADscan created was never recovered; it is
+        # in the change ledger, not in the credential ledger.
+        if str(entry.get("credential_origin") or "").strip().lower() == ORIGIN_ADSCAN_PROVISIONED:
+            continue
+        declared = secret_kind_label(
+            str(_checked_secret_kind(entry.get("secret_kind"), secret) or "")
+        )
         if declared:
             kind = declared
         elif _NT_HASH.match(secret):
@@ -2445,6 +2481,11 @@ def _collect_environment_changes(
             recorded_domain = str(change.get("domain") or "").strip().lower()
             if wanted and recorded_domain and recorded_domain != wanted:
                 continue
+            instruction = (
+                _cleanup_instruction(change)
+                if bucket == cleanup_taxonomy.CLEANUP_BUCKET_MANUAL
+                else ""
+            )
             rows.append(
                 ChangeRow(
                     kind=str(change.get("kind_display") or "").strip(),
@@ -2452,10 +2493,10 @@ def _collect_environment_changes(
                     bucket=bucket,
                     status=str(change.get("status_label") or "").strip(),
                     at=_timestamp_display(change.get("registered_at")),
-                    instructions=(
-                        _cleanup_instruction(change)
-                        if bucket == cleanup_taxonomy.CLEANUP_BUCKET_MANUAL
-                        else ""
+                    instructions=instruction,
+                    steps=tuple(
+                        (step["intro"], step["command"])
+                        for step in remediation_steps(instruction)
                     ),
                 )
             )
@@ -2984,6 +3025,18 @@ def collect_spine_inputs(
     workspace_path = Path(workspace_dir)
     domain_dir = Path(domain_subpath(workspace_dir, domains_dir, domain, ""))
 
+    # An account ADscan created during the run is ADscan's own, never a
+    # credential the box gave up: the ledger names it, and tagging its origin
+    # keeps it out of the recovered-credential ledger and the technique index.
+    from adscan_core.credential_origins import (  # noqa: PLC0415
+        load_adscan_created_accounts,
+        mark_adscan_provisioned_origins,
+    )
+
+    domain_data = mark_adscan_provisioned_origins(
+        {domain: domain_data}, load_adscan_created_accounts(workspace_path)
+    ).get(domain, domain_data)
+
     # Two artifacts, two questions. "What is EXPOSED" (alt routes, dead ends, and
     # the theoretical fallback when nothing ran) is the canonical domain-scoped
     # picture — the SAME computation the client report uses, never the
@@ -3217,7 +3270,7 @@ def collect_spine_inputs(
     # The start principal has to be an ACCOUNT, because it is pasted into a
     # command — and it has to be THIS chain's own entry point, not the session's
     # authenticated user. The two differ: the reproduce footer runs
-    # ``adscan execute attack_paths <domain> <start>``, which replays the chain
+    # ``attack_paths <domain> <start>`` in the shell, which replays the chain
     # from ``<start>``, so naming the session user (who may be a later,
     # already-escalated identity) prints a command that reproduces a DIFFERENT
     # chain. Walk the chain's own endpoints in order and take the FIRST real
@@ -3800,6 +3853,10 @@ def _fill_command(command: str, step: SpineStep, fill: CommandFill | None) -> st
         ("<recovered_pass>", target_secret, True),
         ("<user>", actor, True),
         ("<pass>", fill.secret_for(actor), True),
+        # The structured catalog commands spell the secret token ``<password>``
+        # (and quote it themselves), so the same practice-target fill applies.
+        ("'<password>'", fill.secret_for(actor), True),
+        ("<password>", fill.secret_for(actor), True),
         ("<dc_fqdn>", fill.dc_fqdn, False),
         ("<baseDN>", fill.base_dn, False),
         ("<domain>", fill.domain, False),
@@ -4055,10 +4112,11 @@ def _summary_step_phrase(step: SpineStep) -> str:
     ``render_step_narrative(..., short=True)`` is the catalog's pre-authored,
     causal one-liner — the same register as the per-step narrative rendered
     lower in the document, never a decision or struggle sentence invented here.
-    A technique with no authored short narrative yet (a P2-pending catalog
-    entry, e.g. GPP cpassword at the time of writing) has nothing to render, so
-    the chain falls back to the technique's public display name rather than a
-    blank link — the reader still sees every hop that happened.
+    The link names the technique (its public display name) and carries the
+    one-liner as a parenthetical gloss. A technique with no authored short
+    narrative yet (a P2-pending catalog entry, e.g. GPP cpassword at the time
+    of writing) has nothing to gloss, so the link is the name alone, never a
+    blank link: the reader still sees every hop that happened.
 
     The catalog narrative is authored as a standalone sentence (trailing
     period included), but here it is one link in a " → " chain that the
@@ -4066,11 +4124,15 @@ def _summary_step_phrase(step: SpineStep) -> str:
     carried into the middle of that sentence prints as a stray ``.,`` — so the
     period is dropped here, once, for every caller of this chain link.
     """
+    name = step.technique.name.removesuffix(".")
     if step.catalog_step is not None:
         narrative = render_step_narrative(step.catalog_step, short=True)
         if narrative:
-            return narrative.removesuffix(".")
-    return step.technique.name.removesuffix(".")
+            # The catalog one-liner is a plain sentence about THIS step and no
+            # longer opens on the technique token, so the chain names the
+            # technique itself and keeps the sentence as its gloss.
+            return f"{name} ({narrative.strip().removesuffix('.')})"
+    return name
 
 
 def _fastest_domain_compromise(
@@ -5714,10 +5776,15 @@ def _render_changes(inputs: SpineInputs) -> list[str]:
             printed.add(key)
             lines.append(f"`{change.target}`:")
             lines.append("")
-            lines.append("```text")
-            lines.extend(change.instructions.splitlines())
-            lines.append("```")
-            lines.append("")
+            for intro, command in change.steps or ((change.instructions, ""),):
+                if intro:
+                    lines.append(intro)
+                    lines.append("")
+                if command:
+                    lines.append("```text")
+                    lines.extend(command.splitlines())
+                    lines.append("```")
+                    lines.append("")
     return lines
 
 
@@ -5811,10 +5878,7 @@ def _render_reproduce(inputs: SpineInputs) -> list[str]:
         f"> attack_paths {inputs.domain}",
     ]
     if inputs.start_principal:
-        lines.append("")
-        lines.append(
-            f"adscan execute attack_paths {inputs.domain} {inputs.start_principal}"
-        )
+        lines.append(f"> attack_paths {inputs.domain} {inputs.start_principal}")
     lines.append("```")
     lines.append("")
     return lines

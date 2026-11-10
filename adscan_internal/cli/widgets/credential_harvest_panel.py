@@ -49,7 +49,8 @@ _TIER_RANK: dict[str, int] = {
 # The documented 4-level Compromise Reach ladder (CLAUDE.md § Nomenclature
 # Standard), highest-impact first — the tie-breaker within a tier.
 _REACH_RANK: dict[str, int] = {
-    CompromiseClass.DOMAIN_BREAKER.value: 5,
+    CompromiseClass.DOMAIN_BREAKER.value: 6,
+    CompromiseClass.TIER0_CONTROL.value: 5,
     CompromiseClass.TIER0_FOOTHOLD.value: 4,
     CompromiseClass.PRIVILEGED_ESCALATOR.value: 3,
     CompromiseClass.COMPROMISE_ENABLER.value: 2,
@@ -161,7 +162,11 @@ def _reach_cell(compromise_reach: str | None) -> Text:
         (c for c in CompromiseClass if c.value == compromise_reach), CompromiseClass.NONE
     )
     label = compromise_reach_label_short(cls)
-    if cls in (CompromiseClass.DOMAIN_BREAKER, CompromiseClass.TIER0_FOOTHOLD):
+    if cls in (
+        CompromiseClass.DOMAIN_BREAKER,
+        CompromiseClass.TIER0_CONTROL,
+        CompromiseClass.TIER0_FOOTHOLD,
+    ):
         return Text(f"→ {label}", style=f"bold {COLOR_CRIMSON}")
     if cls is CompromiseClass.NONE:
         return Text(label, style=COLOR_MUTED)
@@ -638,6 +643,7 @@ from adscan_internal.services.credential_harvest_classification import (  # noqa
 _PATH_TO_TIER0_REACH: frozenset[str] = frozenset(
     {
         CompromiseClass.DOMAIN_BREAKER.value,
+        CompromiseClass.TIER0_CONTROL.value,
         CompromiseClass.TIER0_FOOTHOLD.value,
         CompromiseClass.PRIVILEGED_ESCALATOR.value,
     }

@@ -1070,8 +1070,10 @@ async def _probe_ldap_starttls_available(
 #
 # OPSEC note: each bogus bind generates a ``4625`` audit event on the DC.
 # NetExec produces the same event with every ``nxc ldap`` invocation, so this
-# is industry-norm noise for an authorised engagement. Operators who need a
-# quieter probe can opt out via ``ADSCAN_NO_POSTURE_PROBE=1``.
+# is industry-norm noise for an authorised engagement. A scan policy can switch
+# each probe off on its own (``module:connection_posture.ldap_signing`` /
+# ``.ldap_channel_binding`` / ``.ntlm_enabled`` are the bogus-account binds), and
+# ``ADSCAN_NO_POSTURE_PROBE=1`` switches every probe off.
 # --------------------------------------------------------------------------- #
 _BOGUS_CRED_PASSWORD = "Bogus!Probe#Pw0"  # noqa: S105 — intentionally rejected
 
@@ -3150,8 +3152,20 @@ async def _run_with_lifecycle(
     on_progress: Optional[ProbeProgressCallback],
     posture: Optional[DomainPosture],
     force: bool,
+    disabled: frozenset[ConstraintCategory] = frozenset(),
 ) -> ProbeResult:
-    """Apply skip logic, fire ``on_progress`` start/end, and run ``runner``."""
+    """Apply skip logic, fire ``on_progress`` start/end, and run ``runner``.
+
+    A category in ``disabled`` (its probe check switched off by the scan policy)
+    sends nothing and reports a skipped UNKNOWN/LOW result that is never handed
+    to the sink: an absence is never cached, so the reactive layer still learns
+    the category on the first real failure.
+    """
+    if category in disabled:
+        policy_skipped = _make_policy_skipped(category)
+        _safe_progress(on_progress, category, None)
+        _safe_progress(on_progress, category, policy_skipped)
+        return policy_skipped
     skip, skipped_result = _should_skip(posture, category, force)
     if skip and skipped_result is not None:
         _safe_progress(on_progress, category, None)
@@ -3192,6 +3206,24 @@ def _make_skipped(
         confidence=SignalConfidence.LOW,
         signal_code="SKIPPED_NO_CREDENTIAL",
         message=reason,
+        duration_ms=0.0,
+        succeeded=True,
+        skipped=True,
+    )
+
+
+#: ``ProbeResult.signal_code`` of a probe the scan policy switched off.
+SKIPPED_BY_SCAN_POLICY = "SKIPPED_BY_SCAN_POLICY"
+
+
+def _make_policy_skipped(category: ConstraintCategory) -> ProbeResult:
+    """A skipped result for a probe the scan policy switched off (nothing sent)."""
+    return ProbeResult(
+        category=category,
+        state=TriState.UNKNOWN,
+        confidence=SignalConfidence.LOW,
+        signal_code=SKIPPED_BY_SCAN_POLICY,
+        message="Not probed: switched off by the scan policy",
         duration_ms=0.0,
         succeeded=True,
         skipped=True,
@@ -3267,8 +3299,13 @@ async def probe_unauth(
     timeout_per_probe: float = 5.0,
     force: bool = False,
     posture: Optional[DomainPosture] = None,
+    disabled_categories: frozenset[ConstraintCategory] = frozenset(),
 ) -> list[ProbeResult]:
     """Run the unauth probe set against the DC.
+
+    ``disabled_categories`` names the categories whose probe check the scan
+    policy switched off (``scan_phases.POSTURE_PROBE_CHECK_BY_CATEGORY``): their
+    probe sends nothing and reports a skipped UNKNOWN result.
 
     Probes:
         U1 — ``LDAPS_AVAILABLE`` (anonymous LDAPS bind).
@@ -3386,6 +3423,7 @@ async def probe_unauth(
 
     # U1 first — its LDAPS verdict gates U3's self-skip below.
     u1 = await _run_with_lifecycle(
+        disabled=disabled_categories,
         category=ConstraintCategory.LDAPS_AVAILABLE,
         runner=_u1,
         on_progress=on_progress,
@@ -3395,6 +3433,7 @@ async def probe_unauth(
 
     # U4 — StartTLS availability on port 389. Independent of U1's verdict.
     u4 = await _run_with_lifecycle(
+        disabled=disabled_categories,
         category=ConstraintCategory.LDAP_STARTTLS_AVAILABLE,
         runner=_u4,
         on_progress=on_progress,
@@ -3445,6 +3484,7 @@ async def probe_unauth(
 
     # U2 — bogus-cred unsigned NTLM bind on port 389.
     u2 = await _run_with_lifecycle(
+        disabled=disabled_categories,
         category=ConstraintCategory.LDAP_SIGNING,
         runner=_u2,
         on_progress=on_progress,
@@ -3454,6 +3494,7 @@ async def probe_unauth(
 
     # U3 — bogus-cred NTLM bind on LDAPS/636 (uses posture_for_u3 from U1).
     u3 = await _run_with_lifecycle(
+        disabled=disabled_categories,
         category=ConstraintCategory.LDAP_CHANNEL_BINDING,
         runner=_u3,
         on_progress=on_progress,
@@ -3501,6 +3542,7 @@ async def probe_unauth(
             )
 
         u3b = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.LDAP_CHANNEL_BINDING,
             runner=_u3b,
             on_progress=on_progress,
@@ -3523,8 +3565,11 @@ async def probe_auth(
     force: bool = False,
     posture: Optional[DomainPosture] = None,
     dc_fqdn: Optional[str] = None,
+    disabled_categories: frozenset[ConstraintCategory] = frozenset(),
 ) -> list[ProbeResult]:
     """Run the auth-mechanism probe set against the DC.
+
+    ``disabled_categories``: as in :func:`probe_unauth`.
 
     The auth phase exists to characterise the **credential and Kerberos
     machinery**, nothing else. Properties of the DC that can be measured
@@ -3620,6 +3665,7 @@ async def probe_auth(
             )
 
         a1 = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.KERBEROS_RC4,
             runner=_a1,
             on_progress=on_progress,
@@ -3647,6 +3693,7 @@ async def probe_auth(
             )
 
         a2 = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.KERBEROS_ETYPE_PROBE,
             runner=_a2,
             on_progress=on_progress,
@@ -3675,6 +3722,7 @@ async def probe_auth(
             )
 
         a3 = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.NTLM_AUTHENTICATION,
             runner=_a3,
             on_progress=on_progress,
@@ -3712,6 +3760,7 @@ async def probe_auth(
             )
 
         a4 = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.SMB_SIGNING,
             runner=_a4,
             on_progress=on_progress,
@@ -3761,6 +3810,7 @@ async def probe_auth(
             )
 
         a6 = await _run_with_lifecycle(
+            disabled=disabled_categories,
             category=ConstraintCategory.LDAP_CHANNEL_BINDING,
             runner=_a6,
             on_progress=on_progress,
@@ -3831,6 +3881,7 @@ async def probe_auth(
                 )
 
             a5 = await _run_with_lifecycle(
+                disabled=disabled_categories,
                 category=ConstraintCategory.LDAP_SIGNING,
                 runner=_a5,
                 on_progress=on_progress,
@@ -3955,20 +4006,28 @@ async def probe_password_policy(
         )
         return None
 
+    if username and password is None and not nt_hash and not ccache_path:
+        # A named account with no secret would bind with an empty one (a failed
+        # logon on that account). Skip the live read; the caller falls back.
+        print_info_debug(
+            "[password-policy-probe] no credential material for the bind account; "
+            "skipping live read (caller falls back to default)."
+        )
+        return None
+
     cfg = ADscanLDAPConfig(
         domain=domain,
         dc_ip=dc_ip,
         use_ldaps=True,
         use_kerberos=use_kerberos,
         username=username,
-        password=password,
+        # The NT hash rides in the password slot (the URL builder detects it and
+        # binds pass-the-hash over NTLM, or RC4 over Kerberos). It used to be
+        # set only for NTLM, so a Kerberos read with a hash carried no secret.
+        password=password if password is not None else nt_hash,
         ccache_path=ccache_path,
         kerberos_target_hostname=spn_host or None,
     )
-    if password is None and nt_hash is not None and not use_kerberos:
-        # Pass NT hash via the password slot (badldap auto-detects via
-        # _is_nt_hash in _build_ldap_connection_url).
-        cfg.password = nt_hash
 
     try:
         conn, _ = await asyncio.wait_for(
@@ -4594,6 +4653,7 @@ async def resolve_resultant_password_policy(
         target_user
         and domain_default is not None
         and not (use_kerberos and not _pso_dc_fqdn)
+        and not (username and password is None and not nt_hash and not ccache_path)
     ):
         cfg = ADscanLDAPConfig(
             domain=domain,
@@ -4601,12 +4661,10 @@ async def resolve_resultant_password_policy(
             use_ldaps=True,
             use_kerberos=use_kerberos,
             username=username,
-            password=password,
+            password=password if password is not None else nt_hash,
             ccache_path=ccache_path,
             kerberos_target_hostname=_pso_dc_fqdn or None,
         )
-        if password is None and nt_hash is not None and not use_kerberos:
-            cfg.password = nt_hash
         try:
             conn, _used_ldaps = await asyncio.wait_for(
                 async_connect_with_ldap_fallback(cfg), timeout=timeout

@@ -957,7 +957,14 @@ def _build_context(
             "brand_logo_light", "" if is_whitelabel else _brand_logo_data_uri("light")
         )
         ctx.setdefault("branding", branding)
-        return _with_score_labels(ctx, branding)
+        # White-label: debrand every assembled prose string in ONE place, the
+        # same SSOT walk the Security Assessment Report runs, so catalog copy a
+        # databinding builder passes through ("a new ADscan scan no longer
+        # reports...") cannot reach a white-label bonus while the report is
+        # clean. No-op for adscan/cobrand.
+        from adscan_internal.services.report_branding import debrand_prose
+
+        return debrand_prose(_with_score_labels(ctx, branding), branding)
 
     if bonus_key in _CONTEXT_BUILDERS_STATIC:
         return _with_brand(_CONTEXT_BUILDERS_STATIC[bonus_key]())
@@ -1038,6 +1045,7 @@ def render_bonus(
     composition_seams_enabled: bool = False,
     cover_title: str = "",
     cover_subtitle: str = "",
+    gap_sink: dict[str, Any] | None = None,
 ) -> int:
     """Render a single bonus PDF to ``output_path``. Returns bytes written.
 
@@ -1094,6 +1102,16 @@ def render_bonus(
             ``{{DOCUMENT_TITLE}}`` token (e.g. "Remediation Playbook").
         cover_subtitle: Per-deliverable subtitle filled into the client
             cover/back ``{{DOCUMENT_SUBTITLE}}`` token.
+        gap_sink: Optional dict this renderer fills with the document's
+            client-section gap view (see
+            :mod:`adscan_core.reporting.deliverable_section_gap`). It is an
+            out-parameter because the return value is the byte count every
+            caller already reads, and because the gap has to travel to the kit
+            MANIFEST, which is what the Enterprise platform lists for download:
+            without it a degraded document is offered there with no indicator
+            that it is degraded. Left ``None`` by every caller that does not
+            build a manifest, and a document with no client-specific section
+            leaves it empty, which the manifest writer reads as complete.
 
     Real customer flows (``adscan deliver``, web Celery
     ``generate_deliverable_kit``) MUST NOT pass ``is_sample=True``.
@@ -1113,6 +1131,12 @@ def render_bonus(
     # the DFY (and web Celery worker) render byte-identical.
     seams = composition_seams_enabled and bool(client_cover_html or client_back_html)
 
+    # A public sample or an ADscan-posture render never carries a client mark.
+    from adscan_internal.services.client_logo import client_logo_permitted
+
+    if not client_logo_permitted(is_sample=is_sample, branding=branding):
+        client_logo_data_uri = ""
+
     context = _build_context(
         bonus_key,
         workspace_dir,
@@ -1120,6 +1144,14 @@ def render_bonus(
         frameworks=frameworks,
         branding=branding,
     )
+    # Hand the gap to the caller BEFORE any render can fail, so a manifest
+    # built from it describes what the context actually resolved.
+    if gap_sink is not None:
+        from adscan_core.reporting.deliverable_section_gap import SECTION_GAP_KEY
+
+        recorded = context.get(SECTION_GAP_KEY)
+        if isinstance(recorded, dict):
+            gap_sink.update(recorded)
     # Skip the bonus template's own cover only when a client cover will be
     # prepended in its place. ``skip_cover`` defaults to a falsy value, so the
     # bonus keeps its own cover on every non-seam render.

@@ -35,9 +35,22 @@ _BRAND_CYAN = "bright_cyan"
 # instead of the kit panel below. `ci` is the first member: autonomous,
 # non-interactive scanning has nothing to do with the Client Deliverable
 # Kit, and pointing a `ci` user at `generate_report` (a kit-only verb) was
-# both wrong and confusing. Extend this set when a new non-deliverable PRO
-# command needs its own upsell body.
-_AUTONOMOUS_MODE_FEATURES: frozenset[str] = frozenset({"ci"})
+# both wrong and confusing. ``execute`` joined it when every non-interactive
+# entry point moved to PRO (LITE is interactive-only). Extend this set when a new
+# non-deliverable PRO command needs its own upsell body.
+_AUTONOMOUS_MODE_FEATURES: frozenset[str] = frozenset({"ci", "execute"})
+
+#: What each unattended entry point does, in one client-facing sentence.
+_AUTONOMOUS_CAPABILITY: dict[str, str] = {
+    "ci": (
+        "'adscan ci' runs a full assessment end to end with no prompts: "
+        "CI/CD pipelines, lab automation, and scheduled or unattended runs."
+    ),
+    "execute": (
+        "'adscan execute' runs one ADscan action from your shell or a script with "
+        "no prompts, for smoke tests, lab automation and scripted re-checks."
+    ),
+}
 
 _FEATURE_DISPLAY_NAMES: dict[str, str] = {
     "playbook": "AD Hardening Playbook",
@@ -138,7 +151,7 @@ def _render_kit_panel_body(*, report_path: str | None) -> list[Text]:
     ]
 
 
-def _render_autonomous_mode_panel_body() -> list[Text]:
+def _render_autonomous_mode_panel_body(feature: str = "ci") -> list[Text]:
     """Body for the `adscan ci` (autonomous/non-interactive mode) upsell.
 
     Distinct from the Client Deliverable Kit panel: `ci` is about how a scan
@@ -153,14 +166,14 @@ def _render_autonomous_mode_panel_body() -> list[Text]:
     header = Text("Autonomous Scanning", style="bold")
 
     capability = Text(
-        "'adscan ci' runs a full assessment end to end with no prompts: "
-        "CI/CD pipelines, lab automation, and scheduled or unattended runs.\n"
+        f"{_AUTONOMOUS_CAPABILITY.get(feature, _AUTONOMOUS_CAPABILITY['ci'])}\n"
         "This is a PRO capability."
     )
 
     lite_line = Text(
         "The free LITE tier includes the full interactive 'adscan start' "
-        "workflow, on every platform: the same engine, driven step by step."
+        "workflow, on every platform: the same engine, driven step by step. "
+        "Every action 'adscan execute' runs is available there too."
     )
 
     return [
@@ -272,7 +285,7 @@ def render_pro_upsell_panel(
     if lane is CtaLane.ENTERPRISE:
         parts = _render_enterprise_panel_body()
     elif feature in _AUTONOMOUS_MODE_FEATURES:
-        parts = _render_autonomous_mode_panel_body()
+        parts = _render_autonomous_mode_panel_body(feature)
     else:
         parts = _render_kit_panel_body(report_path=report_path)
 

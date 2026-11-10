@@ -123,13 +123,41 @@ def build_lab_telemetry_fields(
     return fields
 
 
+def normalize_scan_policy_base(value: Any) -> str | None:
+    """A scan-policy base id safe for telemetry, or ``None``.
+
+    Only a known base id passes (``lab_ctf`` / ``audit`` /
+    ``production_sensitive`` or a first-generation id): it is a product
+    constant, never a user-chosen name, so it carries nothing about the client.
+    """
+    from adscan_core.scan_policy.policy import BASES  # noqa: PLC0415
+
+    token = str(value or "").strip().lower()
+    return token if token in BASES else None
+
+
+def scan_policy_base_of(shell: Any) -> str | None:
+    """The base id of the shell's active scan policy, or ``None`` without one."""
+    policy = getattr(shell, "scan_policy", None)
+    definition = getattr(policy, "definition", None)
+    return normalize_scan_policy_base(getattr(definition, "base", None))
+
+
 def build_workspace_telemetry_fields(
     *,
     workspace_type: str | None,
+    scan_policy_base: str | None = None,
 ) -> dict[str, Any]:
-    """Build normalized workspace context fields for telemetry payloads."""
+    """Build normalized workspace context fields for telemetry payloads.
+
+    ``scan_policy_base`` travels beside ``workspace_type`` so a custom policy is
+    attributable to the built-in it starts from.
+    """
     fields: dict[str, Any] = {}
     workspace_type_norm = normalize_workspace_type(workspace_type)
     if workspace_type_norm:
         fields["workspace_type"] = workspace_type_norm
+    base = normalize_scan_policy_base(scan_policy_base)
+    if base:
+        fields["scan_policy_base"] = base
     return fields

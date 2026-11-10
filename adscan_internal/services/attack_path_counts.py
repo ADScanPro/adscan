@@ -58,6 +58,7 @@ from typing import Any, Mapping, Sequence
 
 from adscan_core.rich_output import print_exception, print_info_debug
 from adscan_internal.services.compromise_class import (
+    COMPROMISE_REACH_ORDER,
     CompromiseClass,
     compromise_reach_label_short,
 )
@@ -74,12 +75,7 @@ from adscan_internal.services.relay_status_constants import CONFIGURATION_CLOSE_
 #: with open exposure is the run's strongest proven-or-identified reach, which is
 #: what a one-line digest names. Mirrors the canonical report order in
 #: ``exposure_score_service._KPI_COMPROMISE_CLASSES``.
-_REACH_ORDER: tuple[CompromiseClass, ...] = (
-    CompromiseClass.DOMAIN_BREAKER,
-    CompromiseClass.TIER0_FOOTHOLD,
-    CompromiseClass.PRIVILEGED_ESCALATOR,
-    CompromiseClass.COMPROMISE_ENABLER,
-)
+_REACH_ORDER: tuple[CompromiseClass, ...] = COMPROMISE_REACH_ORDER
 
 
 @dataclass(frozen=True)
@@ -110,6 +106,11 @@ class PathHeadline:
         compromised: The ``promote_to_pwned`` oracle.
         label: The headline sentence. Never reads "0" / "not compromised" when
             ``compromised`` is true.
+        tier0_control: Open routes that control a direct Tier 0 account but on
+            which no step to the domain itself was found. Never folded into
+            :attr:`reachable` (that figure is full domain compromise only);
+            stated as its own clause when non-zero, and silent when zero, which
+            is the normal case.
     """
 
     proven: int
@@ -119,6 +120,7 @@ class PathHeadline:
     label: str
     reachable_assets: int = 0
     assets_label: str = ""
+    tier0_control: int = 0
 
 
 @dataclass(frozen=True)
@@ -367,6 +369,25 @@ class ClientPathTotals:
             # found": state what IS known, in its own units.
             label = f"{assets_label}{suffix}"
         else:
+            label = ""
+        # Tier 0 control (no route on to the domain found) is its own clause and
+        # never part of the full-domain-compromise figure above. Normally zero.
+        tier0_control = max(
+            0,
+            int(
+                self.open_exposure_by_class.get(
+                    CompromiseClass.TIER0_CONTROL.value, 0
+                )
+                or 0
+            ),
+        )
+        if tier0_control > 0:
+            clause = (
+                f"{tier0_control} route(s) to control of a Tier 0 account "
+                "with no route on to the domain found"
+            )
+            label = f"{label}; {clause}" if label else clause
+        if not label:
             label = "no attack paths found"
         return PathHeadline(
             proven=proven,
@@ -376,6 +397,7 @@ class ClientPathTotals:
             label=label,
             reachable_assets=reachable_assets,
             assets_label=assets_label,
+            tier0_control=tier0_control,
         )
 
     def merged_with(self, other: "ClientPathTotals") -> "ClientPathTotals":

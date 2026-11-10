@@ -620,11 +620,15 @@ class SessionShell:
             )
             return
 
-        lhost, lport = listener_bind
-        if lhost == "0.0.0.0":
-            myip = getattr(self.parent_shell, "myip", None)
-            if myip:
-                lhost = myip
+        bind_host, lport = listener_bind
+        # The agent is deployed to this session's host, so resolve the callback
+        # address toward it (parent_shell is the PentestShell carrying myip and
+        # myip_source), never one global address.
+        lhost = self.parent_shell.resolve_payload_lhost(
+            bind_host, str(self.session.peer_address[0])
+        )
+        if not lhost:
+            return
 
         agent_path = get_agent_ng_local_path(target_os="windows", arch="amd64")
         if agent_path is None:

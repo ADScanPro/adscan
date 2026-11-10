@@ -954,6 +954,34 @@ async def hBaseRegQueryValue(dce, hKey, lpValueName, dataLen=512, unpack_vals = 
 			return resp['lpType'], unpackValue(resp['lpType'], resp['lpData']), None
 		return resp['lpType'], b''.join(resp['lpData']), None
 
+async def hBaseRegQueryValueSize(dce, hKey, lpValueName):
+	"""Return ``(lpType, size_in_bytes, err)`` for a value WITHOUT reading its data.
+
+	ADscan addition. Sends BaseRegQueryValue (opnum 17) with a zero-length data
+	buffer, so the server can only answer with the value's TYPE and SIZE: either
+	ERROR_MORE_DATA carrying the required ``lpcbData`` (a non-NULL buffer that is
+	too small, MS-RRP 3.1.5.17) or ERROR_SUCCESS with ``lpcbData`` set. The value's
+	content never crosses the wire, which is what a presence check on a secret
+	(a stored HSM password, for instance) must guarantee. Unlike
+	:func:`hBaseRegQueryValue` there is NO retry with a larger buffer.
+	"""
+	request = BaseRegQueryValue()
+	request['hKey'] = hKey
+	request['lpValueName'] = checkNullString(lpValueName)
+	request['lpData'] = b''
+	request['lpcbData'] = 0
+	request['lpcbLen'] = 0
+	resp, e = await dce.request(request)
+	if e is not None:
+		if isinstance(e, DCERPCSessionError) and e.get_error_code() == system_errors.ERROR_MORE_DATA:
+			packet = e.get_packet()
+			try:
+				return packet['lpType'], int(packet['lpcbData']), None
+			except Exception as parse_err:
+				return None, None, parse_err
+		return None, None, e
+	return resp['lpType'], int(resp['lpcbData']), None
+
 async def hBaseRegReplaceKey(dce, hKey, lpSubKey, lpNewFile, lpOldFile):
 	request = BaseRegReplaceKey()
 	request['hKey'] = hKey

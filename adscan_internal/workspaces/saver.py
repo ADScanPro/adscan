@@ -18,6 +18,7 @@ from adscan_internal.rich_output import (
 )
 from adscan_internal.workspaces.io import write_json_file
 from adscan_internal.workspaces.state import (
+    WRITE_ONLY_WORKSPACE_KEYS,
     collect_domain_variables_from_shell,
     collect_workspace_variables_from_shell,
 )
@@ -47,6 +48,11 @@ def save_workspace_data(shell: WorkspaceSaverShell) -> bool:
         print_warning("No active workspace to save.")
         return False  # Indicate failure
 
+    from adscan_core.workspace_freeze import write_blocked
+
+    if write_blocked(os.path.join(shell.current_workspace_dir, "variables.json")):
+        # A frozen workspace (a recheck) keeps the scan's state byte-identical.
+        return True
     # print_info(f"Saving workspace data to: {self.current_workspace_dir}")
     saved_successfully = True
 
@@ -62,15 +68,25 @@ def save_workspace_data(shell: WorkspaceSaverShell) -> bool:
         return False
 
     current_variables = collect_workspace_variables_from_shell(shell)
+    # Keys only their owner module may read (the client cleanup account) go to
+    # disk but never onto shell.variables. Absent from the collection means the
+    # owner holds nothing, so the key leaves the file too.
+    write_only = {
+        key: current_variables.pop(key)
+        for key in WRITE_ONLY_WORKSPACE_KEYS
+        if key in current_variables
+    }
     # Update shell.variables with the current state before saving
     if hasattr(shell, "variables") and isinstance(shell.variables, dict):
         shell.variables.update(current_variables)
     else:
         shell.variables = current_variables
+    for key in WRITE_ONLY_WORKSPACE_KEYS:
+        shell.variables.pop(key, None)
 
     variables_file = os.path.join(shell.current_workspace_dir, "variables.json")
     try:
-        write_json_file(variables_file, shell.variables)
+        write_json_file(variables_file, {**shell.variables, **write_only})
         # print_info(f"Variables saved to {variables_file}")
     except TypeError as e:
         telemetry.capture_exception(e)
@@ -121,6 +137,10 @@ def save_domain_data(shell: WorkspaceSaverShell) -> bool:
         )
         return False  # Indicate failure
 
+    from adscan_core.workspace_freeze import write_blocked
+
+    if write_blocked(os.path.join(shell.current_domain_dir, "variables.json")):
+        return True
     print_info(f"Saving domain data to: {shell.current_domain_dir}")
     saved_successfully = True
 

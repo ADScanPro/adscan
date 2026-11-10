@@ -250,6 +250,14 @@ TRUST_POLICY_CHOICES: tuple[str, ...] = (
     "selected",
     "interactive",
 )
+# What the form OFFERS, as opposed to what the engine ACCEPTS. ``skip`` is a
+# back-compat alias of ``origin_only`` (see scan_config.py): a saved config that
+# says "skip" must keep parsing, but offering both renders two buttons with one
+# meaning, and "Skip" reads as "trust mapping is skipped", which it no longer is.
+TRUST_POLICY_ALIASES: frozenset[str] = frozenset({"skip"})
+TRUST_POLICY_FORM_CHOICES: tuple[str, ...] = tuple(
+    choice for choice in TRUST_POLICY_CHOICES if choice not in TRUST_POLICY_ALIASES
+)
 ATTACK_PATH_POLICY_CHOICES: tuple[str, ...] = (
     "none",
     "all",
@@ -338,7 +346,7 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
                 key="policy",
                 kind="enum",
                 label="Trust enumeration",
-                choices=TRUST_POLICY_CHOICES,
+                choices=TRUST_POLICY_FORM_CHOICES,
                 default="interactive",
             ),
             PhaseConfigOption(
@@ -434,22 +442,10 @@ SCAN_PHASES: tuple[ScanPhase, ...] = (
         commands=_ALL_AUTH,
         optional=True,
         configurable=True,
-        config_options=(
-            PhaseConfigOption(
-                key="policy",
-                kind="enum",
-                label="Attack-path execution",
-                choices=ATTACK_PATH_POLICY_CHOICES,
-                default="interactive",
-            ),
-            PhaseConfigOption(
-                key="selected",
-                kind="multiselect",
-                label="Attack paths (when policy is 'selected')",
-                choices=(),  # populated at form time from discovered paths
-                default=(),
-            ),
-        ),
+        # No per-scan execution control: how attack steps run is the scan
+        # policy's execution mode (unattended / decide during scan), not a phase
+        # option (scan-policy two-groups spec § 4). ``attack_paths.policy`` stays
+        # accepted in a scan-config file for CLI back-compat.
     ),
     ScanPhase(
         phase_id="quick_credential_wins",
@@ -647,16 +643,29 @@ _PHASES_BY_ID: dict[str, ScanPhase] = {p.phase_id: p for p in SCAN_PHASES}
 # ---------------------------------------------------------------------------
 
 
-def command_for_scan_type(scan_type: str, *, authenticated: bool = True) -> str:
-    """Map a legacy ``LdapShell.type`` value to a canonical command key.
+#: Phase-family keys older ``scan_progress`` records persisted, read as the
+#: objective they stood for (the legacy workspace-type vocabulary).
+_LEGACY_PHASE_FAMILIES: dict[str, str] = {
+    "audit": "full_assessment",
+    "ctf": "domain_compromise",
+}
 
-    ``scan_type`` is the value of ``LdapShell.type`` (``"audit"`` / ``"ctf"`` /
-    ``"default"``). ``authenticated`` selects between the auth and unauth
-    command families. ``"audit"`` unlocks the two audit-only phases.
+
+def command_for_scan_type(scan_type: str, *, authenticated: bool = True) -> str:
+    """Map a phase family to a canonical command key.
+
+    ``scan_type`` is the scan policy's objective
+    (:func:`adscan_core.scan_policy.settings.scan_phase_family`):
+    ``full_assessment`` unlocks the two full-assessment-only phases. A legacy
+    persisted key (``audit`` / ``ctf``) reads as the objective it stood for;
+    anything else is the domain-compromise set. ``authenticated`` selects
+    between the auth and unauth command families.
     """
     if not authenticated:
         return COMMAND_START_UNAUTH
-    if scan_type == "audit":
+    token = str(scan_type or "").strip().lower()
+    family = _LEGACY_PHASE_FAMILIES.get(token, token)
+    if family == "full_assessment":
         return COMMAND_AUDIT
     return COMMAND_START_AUTH
 
@@ -736,6 +745,24 @@ def resolve_disabled_subphases(
     return frozenset(honored), warnings
 
 
+def _scan_policy_allows_subphase(shell: object, phase_id: str, subphase_id: str) -> bool:
+    """Policy verdict for a subphase: True without a policy, fail closed with one."""
+    from adscan_core.scan_policy.gate import active_policy, subphase_allowed
+
+    if active_policy(shell) is None:
+        return True
+    return subphase_allowed(shell, phase_id, subphase_id)
+
+
+def _scan_policy_allows_phase(shell: object, phase_id: str) -> bool:
+    """Policy verdict for a whole phase: True without a policy, fail closed with one."""
+    from adscan_core.scan_policy.gate import active_policy, phase_allowed
+
+    if active_policy(shell) is None:
+        return True
+    return phase_allowed(shell, phase_id)
+
+
 def subphase_is_enabled(shell: object, phase_id: str, subphase_id: str) -> bool:
     """Return False when ``phase_id.subphase_id`` was disabled by the config.
 
@@ -745,6 +772,10 @@ def subphase_is_enabled(shell: object, phase_id: str, subphase_id: str) -> bool:
     True. Best-effort and fail-open: any error, a missing config, or an unknown
     id yields True so the no-op default path stays byte-for-byte today's
     behavior. Mirrors :func:`phase_is_enabled` one level down.
+
+    Scan policy (``shell.scan_policy``, spec 2026-11-04 § 7.2 S5): when a policy
+    is set, a subphase bound to a check the policy excludes returns False, and
+    that branch fails CLOSED. The config check below still applies on top.
 
     Args:
         shell: The pentest shell; ``shell.scan_config`` is consulted when set.
@@ -756,6 +787,12 @@ def subphase_is_enabled(shell: object, phase_id: str, subphase_id: str) -> bool:
         subphase explicitly listed under
         ``scan_config.phases.steps[phase_id].disabled``.
     """
+    # Scan-policy branch (fail closed): with a resolved policy on the shell, a
+    # subphase bound to an excluded check does not run, and the legacy config
+    # check below still ANDs in (most restrictive wins). With no policy this
+    # branch is a no-op and the fail-open behaviour is byte-identical.
+    if not _scan_policy_allows_subphase(shell, phase_id, subphase_id):
+        return False
     try:
         config = getattr(shell, "scan_config", None)
         if config is None:
@@ -852,6 +889,10 @@ def phase_is_enabled(shell: object, phase_id: str) -> bool:
     id yields True so a config problem never silently drops a phase (the no-op
     default path stays byte-for-byte today's behavior).
 
+    Scan policy (``shell.scan_policy``, spec 2026-11-04 § 7.2 S5): when a policy
+    is set, a phase whose every bound check is excluded returns False, and that
+    branch fails CLOSED. The preset and config checks below still apply on top.
+
     Args:
         shell: The pentest shell; ``shell.scan_config`` is consulted when set.
         phase_id: The canonical phase id to check.
@@ -860,6 +901,10 @@ def phase_is_enabled(shell: object, phase_id: str) -> bool:
         True when the phase should run; False only when it is an optional phase
         explicitly listed in ``scan_config.phases.disabled``.
     """
+    # Scan-policy branch (fail closed): a phase whose every bound check the
+    # policy excludes does not run. No policy: no-op, today's behaviour.
+    if not _scan_policy_allows_phase(shell, phase_id):
+        return False
     try:
         # Session phase preset (interactive resume front door) — an explicit
         # enabled set of OPTIONAL phase ids. None (the default) means "no preset",
@@ -885,6 +930,16 @@ def phase_is_enabled(shell: object, phase_id: str) -> bool:
         return not (phase is not None and phase.optional)
     except Exception:  # noqa: BLE001 — gate must never break the scan
         return True
+
+
+def phases_enabled_for_run(shell: object, phase_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the subset of ``phase_ids`` this run is configured to run.
+
+    A read for verdicts about a finished run (did a phase the run MEANT to run
+    complete?), never a skip: the run that skipped a disabled phase already
+    announced it through ``announce_phase_skip``. Order is preserved.
+    """
+    return tuple(phase_id for phase_id in phase_ids if phase_is_enabled(shell, phase_id))
 
 
 def _serialize_config_options(
@@ -1134,3 +1189,577 @@ def _emit_phase_event(phase_id: str) -> None:
 def phase_titles(scan_type: str = "default") -> tuple[str, ...]:
     """Return the ordered tuple of phase titles for the given scan type."""
     return tuple(p.title for p in phases_for_scan_type(scan_type))
+
+
+# ---------------------------------------------------------------------------
+# Scan-policy bindings (docs/superpowers/specs/2026-11-04-scan-policy-checks-
+# by-family-design.md § 4.4.2 and § 6.5). Phases stay the "how and when" layer;
+# a subphase or phase that IS a check declares which check id gates it here, and
+# the work that is not a catalog technique declares its own safety axes below.
+# ---------------------------------------------------------------------------
+
+#: ``(phase_id, subphase_id) -> check id``. Every OPTIONAL subphase is bound
+#: (structural test). A mandatory subphase is bound only when it is surfaced as a
+#: locked check (the directory graph and the port scan always run and say so).
+SUBPHASE_CHECK_BINDINGS: dict[tuple[str, str], str] = {
+    ("domain_collection", "ldap"): "module:domain_collection.ldap",
+    ("domain_collection", "samr"): "module:domain_collection.samr",
+    ("domain_collection", "shares"): "module:domain_collection.shares",
+    ("domain_collection", "mssql"): "module:domain_collection.mssql",
+    ("domain_analysis", "port_scan"): "module:domain_analysis.port_scan",
+    ("domain_analysis", "ntlm_auth_type_sweep"): "module:domain_analysis.ntlm_auth_type_sweep",
+    ("quick_credential_wins", "timeroast"): "step:timeroasting",
+    ("quick_credential_wins", "ldap_descriptions"): "step:userdescription",
+    ("quick_credential_wins", "gpp_autologin"): "module:quick_credential_wins.gpp_autologin",
+    ("quick_credential_wins", "gpp_passwords"): "step:gpppassword",
+    ("password_spraying", "pre2k"): "step:computerpre2k",
+    ("password_spraying", "blank"): "step:blankpassword",
+    ("password_spraying", "useraspass"): "step:useraspass",
+    ("password_spraying", "reuse"): "module:password_spraying.reuse",
+    ("password_spraying", "month_season"): "module:password_spraying.month_season",
+}
+
+#: Check id of the local credential reuse validation (a recovered local
+#: credential tried against the same local account on the other hosts). Gated
+#: in ``PentestShell.ask_for_local_cred_reuse`` and ``cli/smb.run_local_cred_reuse``.
+LOCAL_CREDENTIAL_REUSE_CHECK_ID = "module:local_credential_reuse"
+
+# ── Network pivot (family ``lateral_movement``) ──────────────────────────────
+#: Opening a network pivot through a compromised host so ADscan can reach an
+#: otherwise-unreachable network segment (``services/pivot_service.py``,
+#: ``orchestrate_ligolo_pivot_tunnel``). It UPLOADS a tunnel agent to the pivot
+#: host (ledger kind ``file_uploaded``, removed by the Ligolo artifact cleanup
+#: service at stop or listed for manual cleanup) AND opens a local 443/8443
+#: listener that routes traffic into the pivoted segment. Because it writes to a
+#: client host and opens a listener, it is off in Production-sensitive by
+#: construction (the deployment that must write nothing and open no listener);
+#: on in Audit, still behind the scope-expansion consent; on in Lab/CTF. Gated
+#: at the single seam every pivot caller converges on
+#: (``orchestrate_ligolo_pivot_tunnel``) and in the pre-search predicate
+#: ``is_pivoting_enabled``.
+NETWORK_PIVOT_CHECK_ID = "module:network_pivot"
+
+# ── Connection posture probes (family ``connection_posture``) ────────────────
+#: One check per proactive posture probe of ``services/posture_probe.py``. The
+#: probes run before the scan connects (``posture_orchestration.ensure_posture_fresh``)
+#: and learn which signing, encryption and authentication settings a domain
+#: controller enforces, so the first connection is built right. Each one is
+#: gated on its own in ``probe_unauth`` / ``probe_auth`` (and in the per-DC LDAP
+#: security audit, which runs the LDAP signing and channel binding probes). A
+#: probe switched off leaves its category UNKNOWN: nothing is cached for it, and
+#: the reactive layer (transport signals on a real failure) learns it the first
+#: time an operation needs it. ``ADSCAN_NO_POSTURE_PROBE`` still switches every
+#: probe off at once.
+POSTURE_PROBE_LDAPS_AVAILABLE = "module:connection_posture.ldaps_available"
+POSTURE_PROBE_STARTTLS = "module:connection_posture.starttls"
+POSTURE_PROBE_LDAP_SIGNING = "module:connection_posture.ldap_signing"
+POSTURE_PROBE_LDAP_CHANNEL_BINDING = "module:connection_posture.ldap_channel_binding"
+POSTURE_PROBE_NTLM_ENABLED = "module:connection_posture.ntlm_enabled"
+POSTURE_PROBE_KERBEROS_RC4 = "module:connection_posture.kerberos_rc4"
+POSTURE_PROBE_KERBEROS_SALT = "module:connection_posture.kerberos_salt"
+POSTURE_PROBE_SMB_SIGNING = "module:connection_posture.smb_signing"
+
+#: Posture category (``domain_posture.ConstraintCategory`` value) -> the check
+#: that gates the probe answering it. ``kerberos_aes_only`` has no check of its
+#: own: the same RC4-only AS-REQ answers both, so ``kerberos_rc4`` gates it.
+POSTURE_PROBE_CHECK_BY_CATEGORY: dict[str, str] = {
+    "ldaps_available": POSTURE_PROBE_LDAPS_AVAILABLE,
+    "ldap_starttls_available": POSTURE_PROBE_STARTTLS,
+    "ldap_signing": POSTURE_PROBE_LDAP_SIGNING,
+    "ldap_channel_binding": POSTURE_PROBE_LDAP_CHANNEL_BINDING,
+    "ntlm_authentication": POSTURE_PROBE_NTLM_ENABLED,
+    "kerberos_rc4": POSTURE_PROBE_KERBEROS_RC4,
+    "kerberos_aes_only": POSTURE_PROBE_KERBEROS_RC4,
+    "kerberos_etype_probe_needed": POSTURE_PROBE_KERBEROS_SALT,
+    "smb_signing": POSTURE_PROBE_SMB_SIGNING,
+}
+
+# ── Checks run with each credential obtained (family ``new_credential``) ─────
+#: Signing in to every in-scope host as an account ADscan holds, over SMB,
+#: WinRM, RDP (CredSSP) and SQL Server, to learn where it is accepted and with
+#: which rights (``cli/privileges.run_service_access_sweep``). Runs for each
+#: credential obtained: the scan account at start, every credential a step
+#: yields (the "Check New Host Access" follow-up), owned users after a pivot.
+NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID = "module:new_credential.host_access"
+#: Re-running the share collection (listing and effective access) as each
+#: account obtained during the scan. The share listing itself is owned by
+#: ``module:domain_collection.shares``; this check gates only the re-run, so it
+#: runs when BOTH are on (declared through ``same_action_as``).
+NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID = "module:new_credential.share_access"
+#: Offering, when an account is obtained, to spray that account's own password
+#: across the domain. The spray itself is owned by ``module:password_spraying.reuse``
+#: (owned-credential reuse); this check gates only the trigger, so it runs when
+#: BOTH are on (declared through ``same_action_as``).
+NEW_CREDENTIAL_PASSWORD_REUSE_CHECK_ID = "module:new_credential.password_reuse"
+#: The host-access service leg that is another check's action: the SQL Server
+#: leg is the same Windows-authenticated login the ``module:domain_collection.mssql``
+#: collection makes, so it runs only when that check is on too (enforced per
+#: service in ``run_service_access_sweep``).
+NEW_CREDENTIAL_HOST_ACCESS_SERVICE_OWNERS: dict[str, str] = {
+    "mssql": "module:domain_collection.mssql",
+}
+
+#: Mandatory subphases that are deliberately NOT checks (pure pipeline steps
+#: with no traffic of their own beyond what the bound checks already send).
+SUBPHASES_NOT_CHECKS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("domain_analysis", "host_inventory"),
+        ("domain_analysis", "identity_inventory"),
+    }
+)
+
+
+@dataclass(frozen=True)
+class ModuleCheckDeclaration:
+    """Safety declaration for an active module that is not a catalog technique.
+
+    Mirrors the catalog's declaration discipline: every axis is explicit and the
+    ``undeclared`` sentinel is the only default-like value. ``events_from_relation``
+    reuses a catalog technique's ``detection_event_ids`` when the module runs the
+    SAME executor (so the declaration cannot drift); otherwise ``event_ids``
+    stays ``None`` (undeclared).
+
+    Attributes:
+        check_id: Registry id (``module:<phase>.<subphase>`` or ``module:<job>``).
+        family: Family id from ``adscan_core.scan_policy.families``.
+        title: Client-facing check title.
+        environment_change_kinds: Ledger change kinds the module writes (``()``
+            declares "writes nothing"; ``None`` is undeclared).
+        lockout_risk: As on the attack-step catalog.
+        lockout_guard: Guard id when ``bounded``.
+        service_interference: ``none`` | ``transient`` | ``undeclared``.
+        locked_state: ``always_runs`` for mandatory collection, else ``""``.
+        phases: Whole phases this check also gates.
+        jobs: Background job kinds this check gates.
+        events_from_relation: Catalog relation whose events this module shares.
+        event_ids: Explicit events, ``None`` when undeclared.
+        group: Scan-policy group (``attack_steps`` | ``vulnerabilities``). Empty
+            means derived: family ``collection`` is the collection block, every
+            other module is an attack step (it produces something only by
+            running). Declared ``vulnerabilities`` for a module that observes a
+            configuration rather than attacking it.
+        no_native_events: The module sends nothing a Windows Security event
+            records (a TLS or SMB negotiation with no sign-in). ``event_ids``
+            stays ``None``.
+        same_action_as: Another module check that owns the network action this
+            one re-runs (a follow-up trigger). Its events, lockout and
+            interference are reused instead of declared twice, and it becomes a
+            requirement: this check runs only when the owner is on too.
+    """
+
+    check_id: str
+    family: str
+    title: str
+    environment_change_kinds: tuple[str, ...] | None
+    lockout_risk: str
+    lockout_guard: str = ""
+    service_interference: str = "undeclared"
+    locked_state: str = ""
+    phases: tuple[str, ...] = ()
+    jobs: tuple[str, ...] = ()
+    events_from_relation: str = ""
+    event_ids: tuple[str, ...] | None = None
+    group: str = ""
+    no_native_events: bool = False
+    same_action_as: str = ""
+
+
+MODULE_CHECK_DECLARATIONS: tuple[ModuleCheckDeclaration, ...] = (
+    ModuleCheckDeclaration(
+        check_id="module:domain_collection.ldap",
+        family="collection",
+        title="Directory Graph & ACLs",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        locked_state="always_runs",
+        # LDAP reads of the directory as the scan account (4662 where directory
+        # access auditing covers the objects).
+        event_ids=("4624", "4662"),
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:domain_analysis.port_scan",
+        family="collection",
+        title="Port Scan",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        locked_state="always_runs",
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:domain_collection.samr",
+        family="collection",
+        title="Sessions & Local Admins",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        # SAMR and session enumeration over SMB named pipes; reading a local
+        # group's members logs 4799 on the host.
+        event_ids=("4624", "5145", "4799"),
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:domain_collection.shares",
+        family="collection",
+        title="Shares & Share Permissions",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        # Share listing and share security over SMB (SRVSVC on IPC$).
+        event_ids=("4624", "5145"),
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:domain_collection.mssql",
+        family="collection",
+        title="MSSQL Authorization",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        # A Windows-authenticated login to each SQL Server instance.
+        event_ids=("4624",),
+    ),
+    # Coerces each host to authenticate to an ADscan capture listener to read
+    # whether it answers with NetNTLMv1 or v2 (services/ntlm_capture_workflow.py).
+    ModuleCheckDeclaration(
+        check_id="module:domain_analysis.ntlm_auth_type_sweep",
+        family="coercion_relay",
+        title="NTLM Auth-Type Sweep",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="transient",
+        group="vulnerabilities",
+        # The coercion calls it makes: the scanner's network logon on each host
+        # and the named-pipe access (cve_scanner CVE_EVENT_DECLARATIONS).
+        event_ids=("4624", "5145"),
+    ),
+    # Owned-credential reuse and month/season run through the same user-spray
+    # executors as the wordlist spray (per-type eligibility + lockout margin).
+    ModuleCheckDeclaration(
+        check_id="module:password_spraying.reuse",
+        family="password_attacks",
+        title="Credential Reuse",
+        environment_change_kinds=(),
+        lockout_risk="bounded",
+        lockout_guard="spray_eligibility",
+        service_interference="none",
+        events_from_relation="passwordspray",
+    ),
+    # A local credential recovered from one host (SAM dump, LAPS read, a share,
+    # a stored local credential) is tried against the local account of the same
+    # name on every other enabled host (cli/smb.py run_local_cred_reuse). Each
+    # sign-in is an NTLM logon into the target's OWN SAM (is_local_account), so
+    # no domain account is ever counted; the host's local lockout policy applies
+    # and its counter cannot be read remotely, so the auth attempt guard keys
+    # the attempt to the host (auth_attempt_guard.local_realm) and counts its
+    # own failures per local account per host. Reads only: no directory or host
+    # change. Every target logs the logon (4624 / 4625) and the local NTLM
+    # credential validation (4776).
+    ModuleCheckDeclaration(
+        check_id=LOCAL_CREDENTIAL_REUSE_CHECK_ID,
+        family="password_attacks",
+        title="Local Credential Reuse Across Hosts",
+        environment_change_kinds=(),
+        lockout_risk="bounded",
+        lockout_guard="host_local_attempt_count",
+        service_interference="none",
+        event_ids=("4624", "4625", "4776"),
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:password_spraying.month_season",
+        family="password_attacks",
+        title="Month/Season + Year",
+        environment_change_kinds=(),
+        lockout_risk="bounded",
+        lockout_guard="spray_eligibility",
+        service_interference="none",
+        events_from_relation="passwordspray",
+    ),
+    # Same SYSVOL walk and credential ingestion as the GPP cpassword search.
+    ModuleCheckDeclaration(
+        check_id="module:quick_credential_wins.gpp_autologin",
+        family="credentials_exposed",
+        title="GPP Autologin Search",
+        environment_change_kinds=(),
+        lockout_risk="bounded",
+        lockout_guard="single_attempt_per_candidate",
+        service_interference="none",
+        events_from_relation="gpppassword",
+    ),
+    # Step 2 of the share-exposure phase: loot readable shares and validate each
+    # discovered credential once (cli/smb.py, ``passwordinshares`` origin). Step 1
+    # (bait on writable shares) is ``module:writeshare_bait``.
+    ModuleCheckDeclaration(
+        check_id="module:share_credential_hunt",
+        family="credentials_exposed",
+        title="Readable-Share Credential Hunt",
+        environment_change_kinds=(),
+        lockout_risk="bounded",
+        lockout_guard="single_attempt_per_candidate",
+        service_interference="none",
+        phases=("share_credential_hunt",),
+        events_from_relation="readshare",
+    ),
+    ModuleCheckDeclaration(
+        check_id="module:unauthenticated_attack_surface",
+        family="unauthenticated",
+        title="Unauthenticated Attack Surface",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        phases=("unauthenticated_attack_surface",),
+        group="vulnerabilities",
+    ),
+    # Background job: answers broadcast name-resolution queries (LLMNR / NBT-NS /
+    # mDNS) so a client authenticates to the scanner.
+    ModuleCheckDeclaration(
+        check_id="module:poisoning",
+        family="coercion_relay",
+        title="Broadcast Name Poisoning",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="transient",
+        jobs=("poisoning",),
+    ),
+    # Background job and share-exposure Step 1: plants a bait file on writable
+    # shares (ledger kind ``file_uploaded``, removed at stop or listed for manual
+    # cleanup: services/post_exploitation/ntlmv2_share_capture_service.py).
+    ModuleCheckDeclaration(
+        check_id="module:writeshare_bait",
+        family="coercion_relay",
+        title="Writable-Share Bait Files",
+        environment_change_kinds=("file_uploaded",),
+        lockout_risk="not_applicable",
+        service_interference="transient",
+        jobs=("writeshare_bait",),
+        # The uploaded file (services/change_kind_events.py, file_uploaded).
+        event_ids=("5145",),
+    ),
+    # Opens a network pivot through a compromised host (Ligolo,
+    # services/pivot_service.orchestrate_ligolo_pivot_tunnel). It uploads a
+    # tunnel agent to the pivot host (ledger kind ``file_uploaded``, removed by
+    # ligolo_artifact_cleanup_service at stop or listed for manual cleanup) and
+    # opens a local 443/8443 listener that routes traffic into the otherwise
+    # unreachable segment. Gated at that single seam (every WinRM/MSSQL caller
+    # converges there) and in is_pivoting_enabled. A write plus a listener, so it
+    # is off in Production-sensitive; on in Audit behind the scope-expansion ask;
+    # on in Lab/CTF.
+    ModuleCheckDeclaration(
+        check_id=NETWORK_PIVOT_CHECK_ID,
+        family="lateral_movement",
+        title="Network Pivot Tunnel",
+        environment_change_kinds=("file_uploaded",),
+        lockout_risk="not_applicable",
+        service_interference="transient",
+        # The staged agent file on the pivot host (file_uploaded, 5145) and the
+        # remote process that runs it (WinRM / xp_cmdshell, 4688).
+        event_ids=("5145", "4688"),
+    ),
+    # Rotation of an account ADscan already holds a valid password for, when the
+    # domain refuses the logon until the password is changed
+    # (STATUS_PASSWORD_MUST_CHANGE). It is the same write as ForceChangePassword
+    # (ledger kind ``password_changed``), so it shares that family and the policy
+    # decides both in one place. Gated in adscan.py
+    # (_maybe_change_password_after_must_change) through
+    # directory_change_consent.confirm_directory_change(check_id=...).
+    ModuleCheckDeclaration(
+        check_id="module:password_rotation_on_required_change",
+        family="password_changes",
+        title="Password Rotation When the Domain Requires a New Password",
+        environment_change_kinds=("password_changed",),
+        lockout_risk="none",
+        service_interference="none",
+        event_ids=("4723", "4724"),
+    ),
+    # Detection confirmations that change the environment. The passive ADCS
+    # detector finds the ESC15 / ESC9 / ESC10 candidates by reading; confirming
+    # one enrolls a self-subject certificate on the client's CA (ledger kind
+    # ``issued_certificate``: revoked at the final pass when a credential may,
+    # listed for manual revocation otherwise). Their own checks, so the policy decides the write apart
+    # from the detection: off, the finding is reported confirmation-pending.
+    # Attack-steps group (the module default): a vulnerability check never writes,
+    # and the policy summary's write sentence names attack steps only, so a write
+    # filed under vulnerabilities would be hidden from the client's disclosure.
+    # Gated by services/detection_change_gate.authorize_detection_change.
+    ModuleCheckDeclaration(
+        check_id="module:adcs_esc15_confirmation",
+        family="adcs",
+        title="ADCS ESC15 Confirmation Enrollment",
+        environment_change_kinds=("issued_certificate",),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        event_ids=("4886", "4887"),
+    ),
+    # The ESC9 / ESC10 canary also authenticates with the issued certificate
+    # (PKINIT as the scan account) to observe the domain's binding enforcement.
+    # It runs only when the registry read of that setting was indeterminate.
+    ModuleCheckDeclaration(
+        check_id="module:adcs_esc9_confirmation",
+        family="adcs",
+        title="ADCS ESC9 / ESC10 Confirmation Enrollment",
+        environment_change_kinds=("issued_certificate",),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        event_ids=("4886", "4887", "4768"),
+    ),
+    # ── Connection posture probes (services/posture_probe.py) ────────────────
+    # U1: a TCP connection and TLS handshake on 636. No LDAP message is sent and
+    # nobody signs in, so no Security event records it.
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_LDAPS_AVAILABLE,
+        family="connection_posture",
+        title="LDAPS Availability Probe",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        group="vulnerabilities",
+        no_native_events=True,
+    ),
+    # U4: an anonymous LDAP session on 389 and the StartTLS extended request. It
+    # never binds, so no sign-in event.
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_STARTTLS,
+        family="connection_posture",
+        title="StartTLS Availability Probe",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        group="vulnerabilities",
+        no_native_events=True,
+    ),
+    # U2: an unsigned NTLM LDAP bind on 389 as a random account that does not
+    # exist (``adscan-probe-<hex>``), so the DC logs a failed logon (4625) and an
+    # NTLM credential validation (4776) for that name. Nothing can lock: the
+    # account does not exist. A5 (authenticated tiebreaker, with credentials)
+    # binds as the scan account with its verified credential: 4624, and over
+    # Kerberos 4768 / 4769.
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_LDAP_SIGNING,
+        family="connection_posture",
+        title="LDAP Signing Probe",
+        environment_change_kinds=(),
+        lockout_risk="none",
+        service_interference="none",
+        group="vulnerabilities",
+        event_ids=("4625", "4776", "4624", "4768", "4769"),
+    ),
+    # U3 (LDAPS) and U3b (StartTLS, only when 636 is closed): the same
+    # non-existent-account NTLM bind without channel binding (4625, 4776). A6,
+    # only when NTLM is disabled, binds over LDAPS with Kerberos as the scan
+    # account (4768, 4769, 4624).
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_LDAP_CHANNEL_BINDING,
+        family="connection_posture",
+        title="LDAP Channel Binding Probe",
+        environment_change_kinds=(),
+        lockout_risk="none",
+        service_interference="none",
+        group="vulnerabilities",
+        event_ids=("4625", "4776", "4624", "4768", "4769"),
+    ),
+    # A3: an SMB session setup with NTLM on the DC as a random account that does
+    # not exist; the scan account's credential is not used. 4625 and 4776 for
+    # that name; nothing can lock.
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_NTLM_ENABLED,
+        family="connection_posture",
+        title="NTLM Availability Probe",
+        environment_change_kinds=(),
+        lockout_risk="none",
+        service_interference="none",
+        group="vulnerabilities",
+        event_ids=("4625", "4776"),
+    ),
+    # A1: one AS-REQ as the scan account offering only RC4, with its verified
+    # password; the answer settles both RC4 support and AES-only enforcement.
+    # 4768 (issued with encryption type 0x17, or refused with "encryption type
+    # not supported").
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_KERBEROS_RC4,
+        family="connection_posture",
+        title="Kerberos RC4 and AES-only Probe",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        group="vulnerabilities",
+        event_ids=("4768",),
+    ),
+    # A2: an AS-REQ for the scan account with no pre-authentication, to read the
+    # salt the KDC advertises in its "pre-authentication required" answer. No
+    # password is sent, and that answer is part of every normal Kerberos logon,
+    # so domain controllers do not record it as a failure.
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_KERBEROS_SALT,
+        family="connection_posture",
+        title="Kerberos Salt Probe",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        group="vulnerabilities",
+        no_native_events=True,
+    ),
+    # A4: an SMB NEGOTIATE with the DC, read before any sign-in (no event). Only
+    # when the negotiate read fails, a session setup as the scan account with its
+    # verified credential (4624).
+    ModuleCheckDeclaration(
+        check_id=POSTURE_PROBE_SMB_SIGNING,
+        family="connection_posture",
+        title="SMB Signing Probe",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        group="vulnerabilities",
+        event_ids=("4624",),
+    ),
+    # ── Checks run with each credential obtained ──────────────────────────────
+    # Signs in as the account on every in-scope host over SMB, WinRM, RDP
+    # (CredSSP / NLA) and SQL Server, one session per service per host, and
+    # reads what it may do there. Only with a credential the domain already
+    # accepted: the sweep mints one ticket first (sweep_credential.resolve_sweep_credential)
+    # and a failed mint aborts it, and the auth attempt guard never re-sends a
+    # secret the domain rejected, so a password changed during the scan costs at
+    # most one failed attempt for that account, not one per host. Each host logs
+    # the network logon (4624, 4625 on a rejection); the DC logs the ticket
+    # requests (4768, 4769) or the NTLM validation (4776).
+    ModuleCheckDeclaration(
+        check_id=NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID,
+        family="new_credential",
+        title="Host Access Check for Each Credential",
+        environment_change_kinds=(),
+        lockout_risk="not_applicable",
+        service_interference="none",
+        event_ids=("4624", "4625", "4768", "4769", "4776"),
+    ),
+    # Re-runs the share collection (listing and effective access) as each
+    # account obtained. Same action as the collector's share collection, so its
+    # traffic, events, lockout and interference are that check's.
+    ModuleCheckDeclaration(
+        check_id=NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID,
+        family="new_credential",
+        title="Share Access Mapping for Each Credential",
+        environment_change_kinds=(),
+        lockout_risk="",
+        same_action_as="module:domain_collection.shares",
+    ),
+    # Sprays the obtained account's own password across the domain's other
+    # accounts. Same action as the owned-credential reuse spray, so its traffic,
+    # events and lockout guard (spray eligibility) are that check's.
+    ModuleCheckDeclaration(
+        check_id=NEW_CREDENTIAL_PASSWORD_REUSE_CHECK_ID,
+        family="new_credential",
+        title="Password Reuse Spray for Each Credential",
+        environment_change_kinds=(),
+        lockout_risk="",
+        same_action_as="module:password_spraying.reuse",
+    ),
+)
+
+#: Network actions inside the proactive posture phase that are NOT a posture
+#: probe check, each with the reason. ``probe_password_policy`` reads the domain
+#: password policy over LDAP as the scan account: the same directory read the
+#: mandatory collection makes, and the lockout guard depends on it, so no policy
+#: switches it off. Locked by ``tests/unit/scan_policy/test_network_actions_are_checks.py``.
+POSTURE_PHASE_ACTIONS_NOT_CHECKS: dict[str, str] = {
+    "probe_password_policy": (
+        "LDAP read of the domain password policy as the scan account, the same "
+        "directory read the mandatory collection makes; the lockout guard needs it."
+    ),
+}

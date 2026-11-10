@@ -59,6 +59,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from adscan_core.reporting.remediation_scope_view import (
+    PATH_DERIVED_BLOCKS_KEY as _PATH_DERIVED_BLOCKS_KEY,
+)
 from adscan_internal.services.attack_graph_core import is_traversable_attack_edge
 from adscan_internal.services.graph_queries.filters import is_tombstoned
 
@@ -78,7 +81,7 @@ _PRINCIPAL_KINDS: frozenset[str] = frozenset({"User", "Computer", "Group"})
 #: presence means "derived", its ``attack_paths_considered`` says what it had to
 #: work with, and its two booleans say honestly whether each sub-block came out
 #: non-empty.
-PATH_DERIVED_BLOCKS_KEY = "path_derived_blocks"
+PATH_DERIVED_BLOCKS_KEY = _PATH_DERIVED_BLOCKS_KEY
 
 
 def chokepoint_block_is_derived(block: Any) -> bool:
@@ -314,16 +317,26 @@ def exposure_source_count(graph: dict[str, Any], *, value_terminals: set[str]) -
 
 
 def _node_is_tier_zero(node: dict[str, Any]) -> bool:
-    """Return ``True`` when the node is flagged Tier 0 (control-plane).
+    """Return ``True`` when the node is Tier 0 (control-plane).
 
-    The stamp lands under either the top-level ``isTierZero`` or
-    ``properties.isTierZero`` (the collector writes the latter, the graph
-    materializer often mirrors it to the top level). Either being truthy is
-    enough. A Tier-0 principal is excluded from the "standard user" denominator:
-    a Domain Admin reaching full domain compromise is the directory's own
-    hierarchy restated, and counting it inflates the ratio toward 100% by
-    construction (mirrors ``DomainUserReach.ordinary_*`` doctrine).
+    Reads the STAMPED, membership-aware ``privilege_tier`` first (the tier SSOT,
+    :func:`compromise_class.node_stamped_privilege_tier`): a member of Backup
+    Operators is Tier 0 escalation-capable and a member of BUILTIN\\Administrators
+    Tier 0 direct whatever the collector's legacy ``isTierZero`` flag says, and
+    that flag is RID-gated and misses both. The raw flag is the fallback only for
+    a node that carries no stamp (an older graph). A Tier-0 principal is excluded
+    from the "standard user" denominator: a Domain Admin reaching full domain
+    compromise is the directory's own hierarchy restated, and counting it
+    inflates the ratio toward 100% by construction (mirrors
+    ``DomainUserReach.ordinary_*`` doctrine).
     """
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        node_stamped_privilege_tier,
+    )
+
+    stamped = node_stamped_privilege_tier(node)
+    if stamped is not None:
+        return stamped.is_tier0
     if bool(node.get("isTierZero")):
         return True
     props = node.get("properties")
@@ -356,14 +369,49 @@ def _node_is_standard_user(node: dict[str, Any]) -> bool:
     permissive ``exposure_source_count`` counts those — machine accounts fold in
     via ``Authenticated Users`` and dominate the figure), disabled accounts,
     Tier-0 principals, and synthetic well-known SIDs.
+
+    It also drops the two account classes the population SSOT drops
+    (``account_population`` / ``graph_queries.inventories``), so this ratio and
+    the population breakdown printed beside it count the same people: an
+    inter-domain TRUST account, which the collector surfaces as a ``User`` node
+    named after the trusted domain (``SEVENKINGDOMS$`` made "11 of 11" sit next
+    to a population of 10), and a managed service account, whose password is
+    machine-managed and not exposed by anything this ratio measures.
     """
     if str(node.get("kind") or "").strip() != "User":
         return False
     if _node_is_disabled(node):
         return False
-    if _node_is_tier_zero(node):
+    if _node_is_tier_zero(node) or _node_is_tier_one(node):
+        return False
+    props = node.get("properties")
+    props = props if isinstance(props, dict) else {}
+    from adscan_internal.services.graph_queries.inventories import (  # noqa: PLC0415
+        is_machine_or_trust_user,
+        is_managed_service_account,
+    )
+
+    if is_machine_or_trust_user(props) or is_managed_service_account(props):
         return False
     return not _node_label_is_wellknown(node)
+
+
+def _node_is_tier_one(node: dict[str, Any]) -> bool:
+    """Return ``True`` when the node's STAMPED tier is Tier 1.
+
+    A Tier 1 account (local administrator of a server, a grade the stamp reads
+    from host rights no group closure sees) is not an ordinary user: the
+    findings badge it Tier 1 and the account-population grader counts it Tier 1
+    (``attack_graph_service._classify_accounts_by_privilege_tier`` reads the same
+    stamp), so this ratio must not count it among the Tier 2 people either. Only
+    the stamp decides; an unstamped node has no Tier 1 signal.
+    """
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        PrivilegeTier,
+        node_stamped_privilege_tier,
+    )
+
+    return node_stamped_privilege_tier(node) == PrivilegeTier.TIER1
 
 
 @dataclass(frozen=True)
@@ -1102,44 +1150,63 @@ def _build_remediation_start_here_for_domain(
     Returns the JSON/Jinja-safe render model, or ``None`` when the domain has no
     attack paths or no technique carries client exposure.
     """
-    from adscan_internal.services.path_state import _PROVEN_STATUSES  # noqa: PLC0415
     from adscan_internal.services.remediation_start_here import (  # noqa: PLC0415
-        build_remediation_start_here,
-        compute_remediation_priorities,
+        build_start_here_for_domains,
     )
 
     raw_paths = domain_data.get("attack_paths")
     if not isinstance(raw_paths, list) or not raw_paths:
         return None
 
-    total_mapped_paths = 0
-    total_executed_paths = 0
-    for _p in raw_paths:
-        if not isinstance(_p, dict):
-            continue
-        total_mapped_paths += 1
-        if str(_p.get("status") or "").strip().lower() in _PROVEN_STATUSES:
-            total_executed_paths += 1
-
-    if total_mapped_paths == 0:
-        return None
-
-    priorities = compute_remediation_priorities(
+    return build_start_here_for_domains(
         [{"name": domain, "attack_paths": raw_paths}],
-        total_mapped_paths,
-    )
-    if not priorities:
-        return None
-
-    node_cardinality = _node_cardinality_map_from_summary(summary)
-
-    return build_remediation_start_here(
-        priorities,
-        total_executed_paths=total_executed_paths,
-        total_mapped_paths=total_mapped_paths,
-        node_cardinality=node_cardinality,
+        node_cardinality=_node_cardinality_map_from_summary(summary),
         bounded=bounded,
     )
+
+
+def _ranking_population_exclusions(
+    shell: Any, domain: str, domain_data: dict[str, Any]
+) -> list[str]:
+    """The accounts the exposure KPIs leave out of their population.
+
+    So "Most Exposed Accounts" counts the SAME population as the headline: a
+    gMSA the KPI excluded (``services/account_population``) is not ranked. Read
+    from the domain's in-memory KPI block when present, else resolved through
+    the same population SSOT the KPI stamp uses. Best-effort: an unreadable
+    population returns no exclusion, which keeps the ranking exactly as before.
+    """
+    from adscan_core.reporting.user_exposure_ranking import (  # noqa: PLC0415
+        population_exclusions,
+    )
+
+    persisted = population_exclusions([domain_data])
+    if persisted:
+        return sorted(persisted)
+    try:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from adscan_internal.services.account_population import (  # noqa: PLC0415
+            resolve_account_population,
+        )
+
+        population = resolve_account_population(
+            SimpleNamespace(
+                current_workspace_dir=str(
+                    getattr(shell, "current_workspace_dir", "") or ""
+                ),
+                domains_dir="domains",
+            ),
+            domain,
+        )
+        return population.sorted_excluded()
+    except Exception as exc:  # noqa: BLE001 - the ranking never depends on it
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
 
 
 def stamp_chokepoint_cardinality_for_domain(
@@ -1150,6 +1217,7 @@ def stamp_chokepoint_cardinality_for_domain(
     value_terminals: set[str],
     bounded: bool,
     domain_data: dict[str, Any],
+    no_cache: bool = False,
 ) -> None:
     """Build + rank + persist the choke-point cardinality summary for one domain.
 
@@ -1185,11 +1253,19 @@ def stamp_chokepoint_cardinality_for_domain(
     derived on demand, never persisted).
 
     Idempotency: a block that :func:`chokepoint_block_is_derived` accepts is
-    left untouched — the graph is not re-loaded and nothing is recomputed or
-    overwritten, so a PRO-stamped block always wins. A ranked block written
-    before the attack paths reached this seam lacks the derivation marker and is
-    re-stamped exactly once, after which it carries the marker and is skipped
-    like any other.
+    left untouched — nothing is recomputed or overwritten. A ranked block
+    written before the attack paths reached this seam lacks the derivation
+    marker and is re-stamped exactly once.
+
+    ``no_cache=True`` BYPASSES that guard and always recomputes + overwrites.
+    The guard exists for COST only (the choke set algebra over the graph): every
+    caller derives the block from the same canonical domain listing, so a
+    recompute yields the same block, never a different input set. But the guard
+    keys only on "a derived block exists", so it cannot tell a block stamped
+    THIS run from one a PREVIOUS run left in ``technical_report.json``, and that
+    is how a stale ranking survives. A caller holding a freshly recomputed
+    listing (the scan-end seam, the LITE render) passes ``no_cache=True``; the
+    guard then only saves the repeat within one in-memory generation (PRO).
 
     Args:
         shell: A shell namespace carrying ``current_workspace_dir`` (the same
@@ -1200,14 +1276,17 @@ def stamp_chokepoint_cardinality_for_domain(
         bounded: The already-resolved capped-run caveat (see
             :func:`resolve_choke_bounded`).
         domain_data: The in-memory report entry to stamp the summary onto.
+        no_cache: Recompute and overwrite even when a derived block exists (see
+            the idempotency note above).
     """
-    # Idempotency guard: a block that is ranked AND carries the path-derivation
-    # marker was stamped by a prior seam (PRO, or an earlier LITE pass) with the
-    # attack paths in scope, so there is nothing left to add. Do not
-    # recompute/overwrite. A ranked block WITHOUT the marker predates the paths
-    # reaching this seam and is re-stamped once; see
-    # :func:`chokepoint_block_is_derived`.
-    if chokepoint_block_is_derived(domain_data.get("chokepoint_cardinality")):
+    # Idempotency guard (cost only): a block that is ranked AND carries the
+    # path-derivation marker was already derived from the attack paths, so there
+    # is nothing left to add WITHIN one generation. ``no_cache`` bypasses it for
+    # a caller whose listing is fresh, because a block persisted by an earlier
+    # run satisfies the same predicate. See :func:`chokepoint_block_is_derived`.
+    if not no_cache and chokepoint_block_is_derived(
+        domain_data.get("chokepoint_cardinality")
+    ):
         return
 
     try:
@@ -1318,7 +1397,10 @@ def stamp_chokepoint_cardinality_for_domain(
             _ue_paths = domain_data.get("attack_paths")
             if isinstance(_ue_paths, list) and _ue_paths:
                 _user_exposure = build_user_exposure_ranking(
-                    [_p for _p in _ue_paths if isinstance(_p, dict)]
+                    [_p for _p in _ue_paths if isinstance(_p, dict)],
+                    excluded_users=_ranking_population_exclusions(
+                        shell, domain, domain_data
+                    ),
                 )
                 if _user_exposure.get("top_users"):
                     summary["user_exposure"] = _user_exposure

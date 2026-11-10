@@ -56,13 +56,14 @@ _PROOF_TIER_UNPROVEN = 2
 # canonical CompromiseClass values — do NOT hand-roll a parallel taxonomy.
 _COMPROMISE_REACH_RANK: dict[str, int] = {
     CompromiseClass.DOMAIN_BREAKER.value: 0,
-    CompromiseClass.TIER0_FOOTHOLD.value: 1,
-    CompromiseClass.PRIVILEGED_ESCALATOR.value: 2,
-    CompromiseClass.COMPROMISE_ENABLER.value: 3,
-    CompromiseClass.UNAUTHENTICATED_PRINCIPAL.value: 4,
-    CompromiseClass.NONE.value: 5,
+    CompromiseClass.TIER0_CONTROL.value: 1,
+    CompromiseClass.TIER0_FOOTHOLD.value: 2,
+    CompromiseClass.PRIVILEGED_ESCALATOR.value: 3,
+    CompromiseClass.COMPROMISE_ENABLER.value: 4,
+    CompromiseClass.UNAUTHENTICATED_PRINCIPAL.value: 5,
+    CompromiseClass.NONE.value: 6,
 }
-_REACH_RANK_DEFAULT = 6
+_REACH_RANK_DEFAULT = 7
 
 
 def _proof_tier(record: dict[str, Any]) -> int:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from pathlib import Path
 from typing import Any
 import json
@@ -35,11 +37,7 @@ def _should_skip_ntlm_hash_validation_for_ctf_pwned(*, shell: Any, domain: str) 
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    auth_state = str(
-        getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "") or ""
-    ).strip().lower()
-    return workspace_type == "ctf" and auth_state == "pwned"
+    return policy_settings.domain_compromise_reached(shell, domain)
 
 
 def _summarize_ntlm_hash_sources(
@@ -174,6 +172,13 @@ def _offer_ntlm_hash_domain_validation(
         print_info(
             "Skipping NTLM hash domain validation because the CTF domain is already pwned."
         )
+        return
+
+    from adscan_internal.cli.spraying import gate_domain_reuse
+
+    # Trying recovered hashes against domain accounts is the
+    # ``module:password_spraying.reuse`` check: off in the policy, nothing is asked.
+    if not gate_domain_reuse(shell):
         return
 
     confirmer = getattr(shell, "_questionary_confirm", None)

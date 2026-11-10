@@ -471,6 +471,50 @@ class MeasureApplicability:
         }
 
 
+def _as_dimension(value: object) -> Dimension:
+    """Fold a declared dimension key onto :class:`Dimension`, or refuse it.
+
+    Accepts the enum member and the initial a declaration file carries, which
+    is the same token (Anexo II names the dimensions by initial). Anything else
+    raises: a key that is not one of the five governs no measure, so reading it
+    as a sixth dimension, or dropping it, would both change what is exigible
+    without saying so.
+    """
+    if isinstance(value, Dimension):
+        return value
+    token = str(value or "").strip().upper()
+    try:
+        return Dimension(token)
+    except ValueError:
+        named = ", ".join(dimension.value for dimension in DIMENSION_ORDER)
+        raise ValueError(
+            f"{value!r} is not an ENS security dimension. The five are: {named}."
+        ) from None
+
+
+def _as_level(value: object) -> Level:
+    """Fold a declared level onto :class:`Level`, or refuse it.
+
+    Accepts the enum member and the token the declaration file persists. It is
+    deliberately STRICTER than :func:`parse_level`, which reads anything it
+    does not recognise as "not affected": that is the right conservative
+    default for a file somebody else wrote and routes through it on the way in,
+    and the wrong one here, where an unrecognised token is a mistake in code
+    and withholding the measures a dimension governs would be a fabricated
+    declaration nobody made.
+    """
+    if isinstance(value, Level):
+        return value
+    token = str(value or "").strip().lower()
+    try:
+        return Level(token)
+    except ValueError:
+        named = ", ".join(level.value for level in Level)
+        raise ValueError(
+            f"{value!r} is not an ENS level. The levels are: {named}."
+        ) from None
+
+
 @dataclass(frozen=True)
 class EnsScope:
     """A system's declared ENS scope: the resolver's whole input.
@@ -497,6 +541,34 @@ class EnsScope:
     ens_version: str = ENS_VERSION
     compensatory_measures: frozenset[str] = frozenset()
     system_label: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Fold the declared levels onto the enums, or refuse the scope.
+
+        A value object of a public SSOT gets hand-built from a mapping of plain
+        strings, which is also the form it is persisted in, so it accepts that
+        form rather than half-working in it. Before this, a scope built from
+        strings resolved the right applicability and then raised an
+        ``AttributeError`` out of the scope header, which is the worst place to
+        find out: the counts were already correct, so it looked like a renderer
+        bug rather than a malformed declaration.
+
+        Coerced, not merely validated, so there is one representation inside
+        the object and every reader of :attr:`dimension_levels` sees enums. An
+        unrecognised token raises here instead: this is the one input that is
+        the client's categorisation decision, and guessing at it is what the
+        whole subsystem exists to refuse. :attr:`category` stays derived, so
+        declaring a category this coercion disagrees with remains
+        inexpressible.
+        """
+        object.__setattr__(
+            self,
+            "dimension_levels",
+            {
+                _as_dimension(dimension): _as_level(level)
+                for dimension, level in dict(self.dimension_levels or {}).items()
+            },
+        )
 
     def level(self, dimension: Dimension) -> Level:
         """The declared level of one dimension; not affected when absent."""
@@ -1912,6 +1984,37 @@ def measure_apartado(measure_id: str) -> str:
     return row.apartado if row else ""
 
 
+#: The three marcos Anexo II is organised into, keyed by the first segment of a
+#: measure id, and named as the norm names them. Anexo II groups its measures
+#: into the organisational framework, the operational framework and the
+#: protection measures, and that grouping is the only way 73 rows read as
+#: anything other than a list. Derived from the id rather than transcribed per
+#: measure, because the id's first segment IS the marco.
+_MARCO_BY_PREFIX: dict[str, str] = {
+    "org": "Marco Organizativo",
+    "op": "Marco Operacional",
+    "mp": "Medidas de Protección",
+}
+
+
+def measure_family(measure_id: str) -> str:
+    """The Anexo II family a measure belongs to (``op.acc``), or an empty string."""
+    row = _ANEXO_II_GENERAL.get(measure_id)
+    return row.family if row else ""
+
+
+def measure_marco(measure_id: str) -> str:
+    """The marco a measure belongs to, in the language of the norm.
+
+    Empty for an id the table does not hold, so an unknown measure reads as
+    ungrouped rather than being filed under a marco it was never in.
+    """
+    family = measure_family(measure_id)
+    if not family:
+        return ""
+    return _MARCO_BY_PREFIX.get(family.split(".", 1)[0], "")
+
+
 def lowest_required_label(measure_id: str) -> str:
     """The lowest column at which a measure is exigible, as the norm labels it.
 
@@ -2287,13 +2390,17 @@ def _resolve_undeclared() -> EnsScopeResolution:
         category=None,
         dimension_levels={},
         measures=measures,
+        # The footnote under the declared-scope card, and the ONE fact that card
+        # does not already carry. It used to restate the card's own opening
+        # paragraph and the pending-measure clause from its second, so one card
+        # stated the same two facts three times, with the third rendering at the
+        # weight of the first. What is left is the action: what declaring the
+        # scope would change. The arithmetic stays in the paragraph above it.
         note=(
-            "No ENS scope was declared for this system, so conformance is "
-            f"stated against the {len(core)} measures Anexo II requires from the "
-            "lowest level upward, which hold at every category. The remaining "
-            f"{len(_ANEXO_II_GENERAL) - len(core)} depend on the system's "
-            "category and on which security dimensions are affected, and are "
-            "reported as pending that declaration rather than assumed."
+            "Declaring the system's category and the level of each of the five "
+            f"security dimensions resolves the other "
+            f"{len(_ANEXO_II_GENERAL) - len(core)} measures and moves the "
+            f"exigible total up or down from {len(core)}."
         ),
         profile_name=PROFILES[PROFILE_GENERAL].name,
         profile_citation=PROFILES[PROFILE_GENERAL].citation,
@@ -2593,6 +2700,8 @@ __all__ = (
     "lowest_required_label",
     "measure_apartado",
     "measure_dimensions",
+    "measure_family",
+    "measure_marco",
     "measure_name",
     "measure_selector",
     "parse_ens_scope",

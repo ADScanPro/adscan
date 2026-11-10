@@ -10,7 +10,7 @@ calls via ``run_async_sync``.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -141,11 +141,17 @@ def _modify_ca_right(
     nt_hash: Optional[str] = None,
     ccache_path: Optional[str] = None,
     posture_snapshot=None,
+    outcome: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Add or remove a CA right (ManageCA=1 or ManageCertificates=2) for target_username.
 
     Native aiosmb DCOM (GetCASecurity → winacl SD edit → SetCASecurity).
     Synchronous — call via ``asyncio.to_thread`` from async contexts or directly.
+
+    ``outcome``, when given, receives ``changed``: True when the security
+    descriptor was rewritten, False when the right was already in the requested
+    state. A grant that was already there is not ADscan's change: the caller
+    must neither record it nor remove it afterwards.
     """
     try:
         from winacl.dtyp.sid import SID
@@ -154,6 +160,10 @@ def _modify_ca_right(
         if not sid_bytes:
             return False, f"User {target_username!r} not found in LDAP"
         user_sid = SID.from_bytes(sid_bytes)
+        if outcome is not None:
+            # The revert reuses it: a cleanup or privileged account removing the
+            # right does not need to resolve the trustee again.
+            outcome["target_sid_hex"] = sid_bytes.hex()
 
         smb_config = _build_ca_smb_config(
             ca_host=ca_host, domain=domain, username=username, password=password,
@@ -181,6 +191,8 @@ def _modify_ca_right(
                 return True, int(error_code)
 
         did_write, error_code = run_async_sync(_run())
+        if outcome is not None:
+            outcome["changed"] = bool(did_write)
 
         if not did_write:
             if add:
@@ -205,11 +217,68 @@ def _modify_ca_right(
         return False, str(exc)
 
 
+def ca_right_present(sd_bytes: bytes, user_sid: Any, right: int) -> bool:
+    """True when an allow-ACE in the CA security descriptor grants ``right`` to ``user_sid``."""
+    from winacl.dtyp.ace import ACCESS_ALLOWED_ACE
+    from winacl.dtyp.security_descriptor import SECURITY_DESCRIPTOR
+
+    sd = SECURITY_DESCRIPTOR.from_bytes(sd_bytes)
+    if sd.Dacl is None:
+        return False
+    return any(
+        isinstance(ace, ACCESS_ALLOWED_ACE) and ace.Sid == user_sid and bool(ace.Mask & right)
+        for ace in sd.Dacl.aces
+    )
+
+
+def revoke_ca_right_confirmed(
+    *, smb_config: Any, ca_name: str, target_sid_hex: str, right: int
+) -> tuple[bool, Optional[str]]:
+    """Remove ``right`` from a trustee on the CA and confirm it by re-reading the SD.
+
+    ``smb_config`` authenticates as whoever performs the revert (the shared
+    revert precedence builds it per candidate). GetCASecurity, edit, then
+    SetCASecurity, then GetCASecurity again: ``(True, None)`` only when the
+    re-read no longer grants the right. Synchronous; never raises.
+    """
+    try:
+        from winacl.dtyp.sid import SID
+
+        user_sid = SID.from_bytes(bytes.fromhex(target_sid_hex))
+
+        async def _run() -> tuple[bool, Optional[str]]:
+            from adscan_internal.services.smb_transport import smb_machine_with_fallback
+
+            async with smb_machine_with_fallback(smb_config) as machine:
+                sd_bytes, err = await machine.get_ca_security_dcom(ca_name)
+                if err is not None:
+                    return False, f"GetCASecurity failed: {err}"
+                new_sd, changed = _apply_ca_right_to_sd(sd_bytes, user_sid, right, False)
+                if changed:
+                    code, set_err = await machine.set_ca_security_dcom(ca_name, new_sd)
+                    if set_err is not None:
+                        return False, f"SetCASecurity failed: {set_err}"
+                    if int(code or 0) != 0:
+                        return False, f"SetCASecurity returned ErrorCode={code}"
+                reread, err = await machine.get_ca_security_dcom(ca_name)
+                if err is not None or reread is None:
+                    return False, f"GetCASecurity re-read failed: {err}"
+                if ca_right_present(reread, user_sid, right):
+                    return False, "the CA security descriptor still grants the right"
+                return True, None
+
+        return run_async_sync(_run())
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False, str(exc)
+
+
 def add_officer(
     *, ca_host: str, ca_name: str, dc_ip: str, domain: str,
     username: str, password: str, target_username: str,
     nt_hash: Optional[str] = None, ccache_path: Optional[str] = None,
-    posture_snapshot=None,
+    posture_snapshot=None, outcome: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Grant ManageCertificates (officer role) to target_username on ca_name."""
     return _modify_ca_right(
@@ -217,6 +286,7 @@ def add_officer(
         username=username, password=password, target_username=target_username,
         right=CA_RIGHT_MANAGE_CERTIFICATES, add=True,
         nt_hash=nt_hash, ccache_path=ccache_path, posture_snapshot=posture_snapshot,
+        outcome=outcome,
     )
 
 

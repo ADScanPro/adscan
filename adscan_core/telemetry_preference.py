@@ -24,9 +24,9 @@ host, ``/opt/adscan/state/`` in the container). That directory is the
 established home for small cross-run markers AND — the part that matters — it
 is bind-mounted into the runtime container, so a preference set inside the
 container survives the container and is visible to the host launcher (and vice
-versa). ``~/.adscan/config.json`` is deliberately NOT used: it is not mounted
-into the container, so a preference written there from a Docker session would
-be discarded when the container exits.
+versa). ``~/.adscan/config.json`` is deliberately NOT used: it is the operator
+preferences and entitlements file, and small cross-run markers belong in the
+state dir, which is mounted as a whole directory.
 
 A per-workspace preference is persisted in each workspace's ``variables.json``
 under the ``telemetry`` key. A new workspace records NO explicit value (the key

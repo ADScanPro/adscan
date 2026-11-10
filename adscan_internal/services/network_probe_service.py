@@ -23,6 +23,10 @@ import time
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import Outcome, RateLimiter, active_runtime
+
 
 ProbeStatus = Literal["open", "closed", "filtered"]
 
@@ -201,8 +205,8 @@ async def tcp_probe_hosts(
     hosts: list[str],
     port: int,
     *,
-    timeout: float = 3.0,
-    max_concurrency: int = 50,
+    timeout: float | None = None,
+    max_concurrency: int | None = None,
 ) -> dict[str, TCPProbeResult]:
     """Probe ONE port across MANY hosts with bounded concurrency.
 
@@ -214,14 +218,31 @@ async def tcp_probe_hosts(
 
     Returns a mapping ``host -> TCPProbeResult`` preserving order via dict
     insertion semantics (Python 3.7+).
+
+    ``timeout`` / ``max_concurrency`` default to the scan pacing
+    (``probe.tcp_probe_hosts``: 3.0 s and 50 at the default level). Each probe
+    takes a token of the scan-wide request rate and feeds the strain safeguard
+    (an answer, open or refused, is healthy; a timeout is not).
     """
     if not hosts:
         return {}
-    sem = asyncio.Semaphore(max_concurrency)
+    pacing = component_pacing(active_pacing(), "probe.tcp_probe_hosts")
+    probe_timeout = pacing["timeout_s"] if timeout is None else timeout
+    runtime = active_runtime()
+    sem = runtime.semaphore(
+        pacing["max_concurrency"] if max_concurrency is None else max_concurrency
+    )
 
     async def _bounded(h: str) -> TCPProbeResult:
         async with sem:
-            return await tcp_probe(h, port, timeout=timeout)
+            await runtime.before_op(h)
+            result = await tcp_probe(h, port, timeout=probe_timeout)
+        runtime.record(
+            h,
+            Outcome.TIMEOUT if result.status == "filtered" else Outcome.OK,
+            result.elapsed_ms / 1000.0 if result.status == "open" else None,
+        )
+        return result
 
     results = await asyncio.gather(*(_bounded(h) for h in hosts))
     return {r.host: r for r in results}
@@ -264,47 +285,34 @@ _CONNECT_SCAN_HOST_CAP = 4096
 # The earlier 2000-concurrency "measured optimum" was a SPEED number and is
 # rejected as a default for the reason above (it remains reachable via the env
 # override for owned networks).
-_CONNECT_SCAN_SAFE_CONCURRENCY = 64      # global in-flight cap (~nmap -T3 posture)
-_CONNECT_SCAN_SAFE_PER_HOST = 8          # never fan out all ports of one host at once
-_CONNECT_SCAN_CONCURRENCY_FLOOR = 8      # adaptive backoff never drops below this
+#
+# The values live in the scan-pacing SSOT (consumer ``portscan.windows_connect``);
+# these names are the default-level values, kept for the call sites and tests
+# that import them.
+_WINDOWS_CONNECT = _pacing_consumer("portscan.windows_connect")
+_CONNECT_SCAN_SAFE_CONCURRENCY = _WINDOWS_CONNECT.param("concurrency").default  # 64, ~nmap -T3
+_CONNECT_SCAN_SAFE_PER_HOST = _WINDOWS_CONNECT.param("per_host").default  # 8 per host
+_CONNECT_SCAN_CONCURRENCY_FLOOR = _WINDOWS_CONNECT.param("backoff_floor").default  # 8
 # Adaptive backoff: if the rolling share of connect attempts that TIME OUT
 # (status "filtered" — the signal a host/middlebox is dropping under load, not a
 # clean RST) crosses this fraction over a measurement window, halve the effective
 # global concurrency. Eases off instead of plowing ahead when the network chokes.
-_CONNECT_SCAN_BACKOFF_TIMEOUT_RATE = 0.55
-_CONNECT_SCAN_BACKOFF_WINDOW = 200       # attempts per backoff-evaluation window
+_CONNECT_SCAN_BACKOFF_TIMEOUT_RATE = _WINDOWS_CONNECT.param("backoff_timeout_rate").default
+_CONNECT_SCAN_BACKOFF_WINDOW = _WINDOWS_CONNECT.param("backoff_window").default  # attempts per window
 
 # Back-compat public constants (the Windows call sites import these). The
 # concurrency now resolves to the SAFE default, overridable by env.
-CONNECT_SCAN_WINDOWS_TIMEOUT = 2.0
-
-
-def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
-    """Read a positive-int env override; fall back to ``default`` on anything odd."""
-    import os
-
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = int(raw.strip())
-    except (TypeError, ValueError):
-        return default
-    return value if value >= minimum else default
+CONNECT_SCAN_WINDOWS_TIMEOUT = _WINDOWS_CONNECT.param("timeout_s").default
 
 
 def resolve_windows_scan_concurrency() -> int:
-    """Global in-flight cap for the Windows connect scan (safe default + env opt-in).
-
-    Default is the safe, production-polite value; ``ADSCAN_PORTSCAN_CONCURRENCY``
-    lets an operator who owns the network raise it for speed.
-    """
-    return _env_int("ADSCAN_PORTSCAN_CONCURRENCY", _CONNECT_SCAN_SAFE_CONCURRENCY)
+    """Global in-flight cap for the Windows connect scan, from the scan pacing."""
+    return int(component_pacing(active_pacing(), "portscan.windows_connect")["concurrency"])
 
 
 def resolve_windows_scan_per_host() -> int:
-    """Per-host in-flight cap (safe default + ``ADSCAN_PORTSCAN_PER_HOST`` override)."""
-    return _env_int("ADSCAN_PORTSCAN_PER_HOST", _CONNECT_SCAN_SAFE_PER_HOST)
+    """Per-host in-flight cap for the Windows connect scan, from the scan pacing."""
+    return int(component_pacing(active_pacing(), "portscan.windows_connect")["per_host"])
 
 
 # Back-compat alias: the value the Windows call sites pass as ``concurrency=``.
@@ -377,7 +385,7 @@ class ScanPacing:
         backoff_window: number of attempts per backoff evaluation window.
 
     ``ScanPacing.safe()`` is the production-polite default (calibrated to nmap's
-    -T3 posture); ``ScanPacing.aggressive(n)`` is the opt-in owned-network profile.
+    -T3 posture); the ``fast`` pacing level is the opt-in owned-network profile.
     """
 
     concurrency: int = _CONNECT_SCAN_SAFE_CONCURRENCY
@@ -390,15 +398,26 @@ class ScanPacing:
 
     @classmethod
     def safe(cls) -> ScanPacing:
-        """Production-polite default, honoring the env overrides (opt-in speed)."""
+        """The scan pacing's connect-scan policy (production-polite at the default level)."""
+        pacing = component_pacing(active_pacing(), "portscan.windows_connect")
+        concurrency = max(1, int(pacing["concurrency"]))
         return cls(
-            concurrency=resolve_windows_scan_concurrency(),
-            per_host=resolve_windows_scan_per_host(),
+            concurrency=concurrency,
+            per_host=int(pacing["per_host"]),
+            timeout=float(pacing["timeout_s"]),
+            floor=min(int(pacing["backoff_floor"]), concurrency),
+            backoff_timeout_rate=float(pacing["backoff_timeout_rate"]),
+            backoff_window=int(pacing["backoff_window"]),
         )
 
     @classmethod
-    def aggressive(cls, concurrency: int = 2000) -> ScanPacing:
-        """Owned-network speed profile: high concurrency, no per-host cap/backoff."""
+    def aggressive(cls, concurrency: int) -> ScanPacing:
+        """Programmatic owned-network profile: no per-host cap, no backoff.
+
+        No product path uses it: an operator who wants speed picks the ``fast``
+        scan-pacing level, which keeps a per-host cap and the backoff. The
+        caller states the concurrency explicitly.
+        """
         return cls(
             concurrency=max(1, concurrency),
             per_host=0,
@@ -493,6 +512,22 @@ async def connect_scan_open_ports(
         resolved = replace(resolved, timeout=timeout)
 
     results: dict[str, set[int]] = {}
+    nmap_pacing = component_pacing(active_pacing(), "portscan.nmap")
+    # Same port-scan knobs the Linux nmap path gets (--max-rate / --scan-delay);
+    # both are unset at the default level, so the probe loop is unchanged there.
+    packet_rate = RateLimiter(nmap_pacing["max_rate_pps"])
+    scan_delay_s = float(nmap_pacing["scan_delay_ms"] or 0) / 1000.0
+    host_next_at: dict[str, float] = {}
+
+    async def _pace(host: str) -> None:
+        await packet_rate.acquire()
+        if scan_delay_s:
+            now = time.monotonic()
+            start = max(now, host_next_at.get(host, now))
+            host_next_at[host] = start + scan_delay_s
+            if start > now:
+                await asyncio.sleep(start - now)
+
     try:
         gate = _AdaptiveGate(resolved)
 
@@ -501,10 +536,12 @@ async def connect_scan_open_ports(
             async with gate._global:
                 if host_sem is not None:
                     async with host_sem:
+                        await _pace(host)
                         status, _elapsed = await _connect_probe(
                             host, port, resolved.timeout
                         )
                 else:
+                    await _pace(host)
                     status, _elapsed = await _connect_probe(
                         host, port, resolved.timeout
                     )

@@ -75,36 +75,55 @@ class AttackPathCoverage:
         reason: One of :data:`REASON_PREDICTED_EXPLOSION` / :data:`REASON_DFS_ABORTED`
             for a fallback result, or ``""`` for a complete DFS. Operator/telemetry
             facing, never rendered to the client.
-        examined_routes: Candidate routes examined before a hard stop, when known
-            — surfaced to the client as the coverage boundary in the BOUNDED wording.
+        examined_routes: Candidate routes examined. For a hard stop it is the
+            coverage boundary in the BOUNDED wording; for a COMPLETE DFS it is the
+            size of the full candidate set walked. ``None`` (the COMPLETE default)
+            means unknown and is persisted as ``None``, never as a fabricated 0.
         exposure_source_count: For a SAMPLED result, how many principals can reach a
             high-value target — the stable exposure figure the sampled wording
             anchors on. ``None`` still yields a valid declaration, without the number.
         hard_stop: ``True`` only when the fallback engine itself hit the ceiling and
             discovery stopped (empty result, BOUNDED wording). ``False`` for a
             sampled fallback result (SAMPLED wording).
+        reported_routes: How many routes the computation produced, when the
+            recording seam knows it, so the persisted block reconciles with the
+            path set it describes. ``None`` when unknown.
     """
 
     engine_used: Literal["dfs", "fallback"] = ENGINE_DFS
     bounded: bool = False
     declaration: str = ""
     reason: str = ""
-    examined_routes: int = 0
+    examined_routes: int | None = 0
     exposure_source_count: int | None = None
     hard_stop: bool = False
+    reported_routes: int | None = None
 
     @classmethod
-    def complete(cls) -> "AttackPathCoverage":
+    def complete(
+        cls,
+        *,
+        examined_routes: int | None = None,
+        reported_routes: int | None = None,
+    ) -> "AttackPathCoverage":
         """Return the coverage for a full DFS that evaluated every route.
 
-        No gap and no declaration — a complete run reads exactly as it did before
-        this object existed.
+        No gap and no declaration. The counts let the persisted block state the
+        size of the computation it describes (how many candidate routes the DFS
+        walked, how many it reported); a seam that does not know them passes
+        nothing and the block records ``None`` rather than a misleading zero.
         """
         return cls(
             engine_used=ENGINE_DFS,
             bounded=False,
             declaration="",
             reason="",
+            examined_routes=(
+                max(0, int(examined_routes)) if isinstance(examined_routes, int) else None
+            ),
+            reported_routes=(
+                max(0, int(reported_routes)) if isinstance(reported_routes, int) else None
+            ),
         )
 
     @classmethod
@@ -154,10 +173,13 @@ class AttackPathCoverage:
         a memory-gate abort already records — one wording, one shape, no drift.
         """
         if self.engine_used == ENGINE_DFS and not self.bounded:
-            return build_attack_path_coverage()
+            return build_attack_path_coverage(
+                examined_routes=self.examined_routes,
+                reported_routes=self.reported_routes,
+            )
         return _coverage_block(
             hard_stop=self.hard_stop,
-            examined_routes=self.examined_routes,
+            examined_routes=int(self.examined_routes or 0),
             exposure_source_count=self.exposure_source_count,
         )
 

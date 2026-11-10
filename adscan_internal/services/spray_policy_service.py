@@ -47,10 +47,19 @@ _USER_SPRAY_ATTRS = [
     # realcorp: Administrator (Tier-0 PSO) reads 0x10 here while its lockoutTime
     # is a year old, so the manual heuristic wrongly cleared it.
     "msDS-User-Account-Control-Computed",
+    # Fallback lock signal when the computed UAC above is not returned for an
+    # account (hardened DACL): a set lockoutTime is then treated as locked.
+    "lockoutTime",
 ]
 
 # UF_LOCKOUT flag in msDS-User-Account-Control-Computed.
 _UF_LOCKOUT = 0x0010
+
+
+def _escape_ldap_filter_value(value: str) -> str:
+    """Escape an LDAP filter literal (RFC 4515)."""
+    table = {"\\": "\\5c", "*": "\\2a", "(": "\\28", ")": "\\29", "\x00": "\\00"}
+    return "".join(table.get(ch, ch) for ch in str(value or ""))
 
 
 def _cn_from_dn(dn: str) -> str:
@@ -65,6 +74,9 @@ _DOMAIN_POLICY_ATTRS = [
     "lockoutObservationWindow",
     "minPwdLength",
     "maxPwdAge",
+    # Domain functional level: below 3 (Windows Server 2008) fine-grained
+    # password policies cannot exist, which proves a missing PSO assignment.
+    "msDS-Behavior-Version",
 ]
 
 # Attributes to fetch from PSO objects
@@ -104,6 +116,30 @@ class DomainPasswordPolicy:
     lockout_duration_seconds: int | None = None
     observation_window_seconds: int | None = None
     no_lockout_enforced: bool = False
+    functional_level: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveLockout:
+    """The lockout policy that governs ONE account, resolved conservatively.
+
+    Attributes:
+        threshold: Failed attempts that lock the account. ``0`` means this
+            account provably cannot lock. Never ``None``: anything that could not
+            be read resolves to the conservative fallback threshold instead.
+        observation_window_seconds: The window after which ``badPwdCount``
+            stops counting, or ``None`` when it is not known for this account
+            (the stored count must then be kept as it is, never reset).
+        source: Human-readable origin of the threshold for the eligibility UX.
+        assumed: True when a conservative assumption replaced data ADscan could
+            not read (unreadable PSO, unreadable PSO assignment, unknown domain
+            threshold).
+    """
+
+    threshold: int
+    observation_window_seconds: int | None
+    source: str
+    assumed: bool
 
 
 @dataclass(slots=True)
@@ -149,58 +185,153 @@ class SprayPolicyResult:
     not yet elapsed vs the domain lockoutDuration). These reset badPwdCount to 0,
     so they look 'eligible' — spraying them is pointless and extends the lockout."""
     fetch_errors: list[str] = field(default_factory=list)
+    pso_dns_present: set[str] = field(default_factory=set)
+    """Lowercase DNs of the PSO objects that EXIST in the Password Settings
+    Container, from a one-level listing that returns a DN even when the object's
+    attributes are unreadable (the default ACL for a low-privilege principal)."""
+    pso_enumeration_ok: bool = False
+    """True when that listing completed. Until it has, ADscan cannot tell "no PSO
+    exists" from "PSOs exist but are hidden", and resolves conservatively."""
+    dc_current_time: datetime | None = None
+    """The DC's own clock (rootDSE ``currentTime``) at fetch time. ``badPasswordTime``
+    is stamped in this clock, so the observation-window reset is measured against
+    it rather than the host clock, which can be off by hours."""
 
-    def effective_lockout_threshold(self, username_lower: str) -> int | None:
-        """Return the effective lockout threshold for a user.
+    @property
+    def pso_assignment_visible(self) -> bool:
+        """True when a missing ``msDS-ResultantPSO`` provably means "no PSO".
 
-        PSO takes precedence over default domain policy when present.
+        ``msDS-ResultantPSO`` is a constructed attribute: when the spraying
+        principal cannot read it, AD omits it, exactly as when no PSO applies. So
+        absence only proves "no PSO" when one of these holds:
+
+        * some account DID return a resultant PSO (the attribute is readable for
+          this principal);
+        * the domain functional level is below Windows Server 2008, where PSOs
+          cannot exist;
+        * the Password Settings Container listing completed and holds no PSO.
+
+        Otherwise every account's assignment is unknown, and an account the
+        listing cannot place may be under a stricter PSO.
         """
+        if self.pso_dn_by_user:
+            return True
+        level = self.default_policy.functional_level
+        if level is not None and level < 3:
+            return True
+        return bool(
+            self.pso_enumeration_ok and not self.pso_dns_present and not self.pso_by_dn
+        )
+
+    def _unattributed_pso_bound(self, conservative_threshold: int) -> int | None:
+        """Strictest threshold an account with an UNKNOWN PSO assignment may face.
+
+        When every existing PSO is readable, that is the lowest positive PSO
+        threshold (``None`` when none of them locks). When any PSO exists that
+        cannot be read, or none could be listed at all, the conservative
+        fallback is folded in, since a hidden PSO may be stricter than anything
+        visible.
+        """
+        readable = [
+            p.lockout_threshold
+            for p in self.pso_by_dn.values()
+            if p.lockout_threshold is not None
+        ]
+        positive = [int(t) for t in readable if int(t) > 0]
+        all_readable = bool(self.pso_by_dn) and all(
+            (self.pso_by_dn.get(dn) is not None)
+            and self.pso_by_dn[dn].lockout_threshold is not None
+            for dn in (self.pso_dns_present | set(self.pso_by_dn))
+        )
+        if not all_readable:
+            positive.append(int(conservative_threshold))
+        return min(positive) if positive else None
+
+    def effective_lockout(
+        self, username_lower: str, *, conservative_threshold: int
+    ) -> EffectiveLockout:
+        """Resolve the lockout policy for one account (the eligibility SSOT).
+
+        Every unknown resolves to the conservative side, never to "cannot lock":
+
+        * PSO assigned and readable: the PSO's threshold and window.
+        * PSO assigned but unreadable: ``conservative_threshold``, window unknown.
+        * No PSO, and the assignment is provably visible: the domain policy.
+        * No PSO visible, but the assignment cannot be proven (see
+          :attr:`pso_assignment_visible`): the stricter of the domain threshold
+          and the strictest PSO that might apply, window unknown.
+        * Domain threshold unknown: ``conservative_threshold``.
+        """
+        domain_threshold = self.default_policy.lockout_threshold
+        domain_assumed = domain_threshold is None
+        domain_value = (
+            int(conservative_threshold) if domain_assumed else int(domain_threshold)
+        )
         pso_dn = self.pso_dn_by_user.get(username_lower)
         if pso_dn:
             pso = self.pso_by_dn.get(pso_dn.lower())
             if pso and pso.lockout_threshold is not None:
-                return pso.lockout_threshold
-        return self.default_policy.lockout_threshold
+                return EffectiveLockout(
+                    threshold=int(pso.lockout_threshold),
+                    observation_window_seconds=pso.observation_window_seconds,
+                    source=f"PSO '{pso.name or _cn_from_dn(pso_dn)}'",
+                    assumed=False,
+                )
+            return EffectiveLockout(
+                threshold=int(conservative_threshold),
+                # A partially readable PSO may still expose its own window.
+                observation_window_seconds=(
+                    pso.observation_window_seconds if pso is not None else None
+                ),
+                source=f"PSO '{_cn_from_dn(pso_dn)}' unreadable",
+                assumed=True,
+            )
+        if self.pso_assignment_visible:
+            return EffectiveLockout(
+                threshold=domain_value,
+                observation_window_seconds=(
+                    None if domain_assumed else self.default_policy.observation_window_seconds
+                ),
+                source="domain",
+                assumed=domain_assumed,
+            )
+        bound = self._unattributed_pso_bound(conservative_threshold)
+        candidates = [t for t in (domain_value, bound) if t is not None and t > 0]
+        return EffectiveLockout(
+            threshold=min(candidates) if candidates else 0,
+            observation_window_seconds=None,
+            source="PSO assignment unreadable",
+            assumed=True,
+        )
 
     def lockout_threshold_with_source(
         self, username_lower: str, *, unreadable_pso_fallback: int
     ) -> "tuple[int | None, str, bool]":
-        """Resolve a user's lockout threshold AND where it came from.
+        """Back-compatible view of :meth:`effective_lockout`.
 
-        Returns ``(threshold, source_label, is_unreadable_pso_fallback)``:
-
-        * No PSO assigned → ``(domain threshold, "domain", False)``.
-        * PSO assigned and readable → ``(pso threshold, "PSO '<name>'", False)``.
-        * PSO assigned but the PSO object is UNREADABLE (the spraying principal
-          lacks read access to the Password Settings Container — common for
-          low-priv users, and exactly the privileged Tier-0 accounts we must not
-          lock) → ``(unreadable_pso_fallback, "PSO '<cn>' unreadable", True)``.
-          Using the domain default here would be UNSAFE: a stricter PSO threshold
-          would be over-estimated and a spray could lock the account. The
-          conservative fallback (with the 2-attempt safety margin) caps such users
-          at a single attempt.
+        Returns ``(threshold, source_label, is_conservative_assumption)``. Kept
+        for callers and tests written against the earlier tuple shape; the
+        resolution itself lives in :meth:`effective_lockout` only.
         """
-        pso_dn = self.pso_dn_by_user.get(username_lower)
-        if not pso_dn:
-            return self.default_policy.lockout_threshold, "domain", False
-        pso = self.pso_by_dn.get(pso_dn.lower())
-        if pso and pso.lockout_threshold is not None:
-            name = pso.name or _cn_from_dn(pso_dn)
-            return pso.lockout_threshold, f"PSO '{name}'", False
-        return unreadable_pso_fallback, f"PSO '{_cn_from_dn(pso_dn)}' unreadable", True
+        resolved = self.effective_lockout(
+            username_lower, conservative_threshold=unreadable_pso_fallback
+        )
+        return resolved.threshold, resolved.source, resolved.assumed
 
     def effective_observation_window(self, username_lower: str) -> int | None:
-        """Return the effective lockout observation window (seconds) for a user.
+        """Return the lockout observation window (seconds) governing one account.
 
-        PSO takes precedence over the default domain policy when present and the
-        PSO defines its own window; otherwise the domain default applies.
+        ``None`` whenever it is not known for this account (an unreadable PSO, an
+        unprovable PSO assignment, an unread domain policy): falling back to the
+        domain window would be unsafe, because a PSO window longer than the
+        domain's would make a still-counting ``badPwdCount`` look expired (reset
+        to 0) and sprayable. ``None`` makes the observation-window reset keep the
+        raw count. The conservative threshold passed here is irrelevant to the
+        window and only satisfies the resolver's signature.
         """
-        pso_dn = self.pso_dn_by_user.get(username_lower)
-        if pso_dn:
-            pso = self.pso_by_dn.get(pso_dn.lower())
-            if pso and pso.observation_window_seconds is not None:
-                return pso.observation_window_seconds
-        return self.default_policy.observation_window_seconds
+        return self.effective_lockout(
+            username_lower, conservative_threshold=1
+        ).observation_window_seconds
 
 
 def _ci(attrs: Any) -> dict[str, Any]:
@@ -296,6 +427,12 @@ async def _fetch_domain_policy(
             policy.observation_window_seconds = _interval_to_seconds(
                 attrs.get("lockoutobservationwindow")
             )
+            raw_level = attrs.get("msds-behavior-version")
+            if raw_level is not None:
+                try:
+                    policy.functional_level = int(raw_level)
+                except (TypeError, ValueError):
+                    pass
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -344,6 +481,93 @@ async def _fetch_pso_objects(
         # PSO container may not exist on basic AD — non-fatal
         print_info_debug(f"[spray_policy] PSO fetch skipped or failed: {exc}")
     return pso_by_dn
+
+
+async def _enumerate_pso_dns(conn: Any, domain_nc: str) -> tuple[set[str], bool]:
+    """List the PSO objects that EXIST, whether or not their attributes are readable.
+
+    The default ACL on ``msDS-PasswordSettings`` hides every attribute from a
+    low-privilege principal, so the attribute-filtered search in
+    :func:`_fetch_pso_objects` returns nothing and "no PSO" cannot be told from
+    "PSOs I cannot read". A one-level ``(objectClass=*)`` listing of the
+    container still returns each child's DN (verified against a Windows Server
+    DC as a low-privilege user), which is what proves absence.
+
+    Returns ``(lowercase_dns, completed)``. ``completed`` is False on any error,
+    so the caller resolves PSO assignment conservatively.
+    """
+    pso_container = f"CN=Password Settings Container,CN=System,{domain_nc}"
+    dns: set[str] = set()
+    try:
+        async for entry, err in conn.pagedsearch(
+            query="(objectClass=*)",
+            attributes=["distinguishedName"],
+            tree=pso_container,
+            search_scope=1,  # ONE level: the PSO objects, not the container
+        ):
+            if err is not None:
+                print_info_debug(f"[spray_policy] PSO listing error: {err}")
+                return dns, False
+            dn = str(entry.get("objectName") or "").strip()
+            if dn:
+                dns.add(dn.lower())
+    except Exception as exc:  # noqa: BLE001
+        # A missing container (pre-2008 domain) lands here too; the functional
+        # level check covers that case on its own.
+        print_info_debug(f"[spray_policy] PSO listing failed: {exc}")
+        return dns, False
+    return dns, True
+
+
+def _parse_generalized_time(value: Any) -> datetime | None:
+    """Parse an LDAP GeneralizedTime (``20261104133203.0Z``) into UTC, or ``None``."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("ascii", errors="ignore")
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1]
+    text = text.split(".", 1)[0].split(",", 1)[0]
+    try:
+        return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+async def _fetch_dc_current_time(conn: Any) -> datetime | None:
+    """Read the DC's own clock from rootDSE ``currentTime`` (no privilege needed)."""
+    try:
+        async for entry, err in conn.pagedsearch(
+            query="(objectClass=*)",
+            attributes=["currentTime"],
+            tree="",
+            search_scope=0,
+        ):
+            if err is not None:
+                print_info_debug(f"[spray_policy] rootDSE currentTime error: {err}")
+                return None
+            attrs = _ci(entry.get("attributes", {}))
+            return _parse_generalized_time(attrs.get("currenttime"))
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"[spray_policy] rootDSE currentTime failed: {exc}")
+    return None
+
+
+def _lockout_time_is_set(value: Any) -> bool:
+    """True when ``lockoutTime`` records a lockout (non-zero FILETIME)."""
+    if value is None:
+        return False
+    if isinstance(value, datetime):
+        return 1601 < value.year < 9999
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 async def _fetch_user_badpwdcounts(
@@ -412,12 +636,22 @@ async def _fetch_user_badpwdcounts(
             # (PSO-aware, auto-unlock-aware). The UF_LOCKOUT bit is what nxc/Windows
             # report as STATUS_ACCOUNT_LOCKED_OUT.
             uacc = attrs_data.get("msds-user-account-control-computed")
+            computed_known = False
             if uacc is not None:
                 try:
+                    computed_known = True
                     if int(uacc) & _UF_LOCKOUT:
                         locked_users.add(sam_lower)
                 except (TypeError, ValueError):
-                    pass
+                    computed_known = False
+            if not computed_known and _lockout_time_is_set(
+                attrs_data.get("lockouttime")
+            ):
+                # The live lock bit was not returned, so ADscan cannot tell a
+                # current lockout from a stale one. A set lockoutTime is treated
+                # as locked: skipping an unlocked account costs one attempt,
+                # spraying a locked one extends the lockout.
+                locked_users.add(sam_lower)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -502,6 +736,10 @@ async def fetch_spray_policy_native(
     auth_domain: str | None = None,
     auth_kdc: str | None = None,
     account_scope: str = "user",
+    only_account: str | None = None,
+    only_accounts: "list[str] | tuple[str, ...] | None" = None,
+    ccache_path: str | None = None,
+    posture_snapshot: Any = None,
 ) -> SprayPolicyResult:
     """Fetch domain password policy + per-account badPwdCount via native LDAP.
 
@@ -520,12 +758,31 @@ async def fetch_spray_policy_native(
         account_scope: ``"user"`` (default) or ``"computer"``. Selects the LDAP
             account filter for the badPwdCount sweep — computer-pre2k spray
             eligibility needs the machine-account scope.
+        only_account: When set, the badPwdCount read is narrowed to this one
+            sAMAccountName (same policy, PSO and observation-window logic), for
+            callers that only need one account's lockout headroom.
+        only_accounts: Same narrowing for several sAMAccountNames in one LDAP
+            filter (the sign-in guard's batched headroom read).
+        ccache_path: Bind with this Kerberos ccache (the reading principal's,
+            from ``ensure_user_ccache``) instead of a password.
+        posture_snapshot: The domain's posture, so the transport prunes binds
+            the domain is known to refuse.
 
     Returns:
         SprayPolicyResult (partial results on error).
     """
     result = SprayPolicyResult()
     spray_filter = _SCOPE_FILTERS.get(account_scope, _USER_ONLY_FILTER)
+    narrowed = [str(a) for a in ([only_account] if only_account else []) + list(only_accounts or []) if a]
+    if len(narrowed) == 1:
+        spray_filter = (
+            f"(&{spray_filter}(sAMAccountName={_escape_ldap_filter_value(narrowed[0])}))"
+        )
+    elif narrowed:
+        names = "".join(
+            f"(sAMAccountName={_escape_ldap_filter_value(name)})" for name in dict.fromkeys(narrowed)
+        )
+        spray_filter = f"(&{spray_filter}(|{names}))"
     try:
         config = ADscanLDAPConfig(
             domain=domain,
@@ -537,6 +794,8 @@ async def fetch_spray_policy_native(
             kerberos_target_hostname=kerberos_target_hostname,
             auth_domain=auth_domain or domain,
             auth_kdc=auth_kdc,
+            ccache_path=ccache_path,
+            posture_snapshot=posture_snapshot,
         )
         conn, _used_ldaps = await async_connect_with_ldap_fallback(config)
 
@@ -551,13 +810,17 @@ async def fetch_spray_policy_native(
         (
             policy,
             pso_by_dn,
+            (pso_dns_present, pso_enumeration_ok),
             (raw_badpwd_by_user, pso_dn_by_user, badpwdtime_by_user, locked_users),
+            dc_current_time,
         ) = await asyncio.gather(
             _fetch_domain_policy(conn, domain_nc),
             _fetch_pso_objects(conn, domain_nc),
+            _enumerate_pso_dns(conn, domain_nc),
             _fetch_user_badpwdcounts(
                 conn, domain_nc, include_pso=True, spray_filter=spray_filter
             ),
+            _fetch_dc_current_time(conn),
         )
 
         result.default_policy = policy
@@ -566,6 +829,9 @@ async def fetch_spray_policy_native(
         result.pso_dn_by_user = pso_dn_by_user
         result.badpwdtime_by_user = badpwdtime_by_user
         result.locked_users = locked_users
+        result.pso_dns_present = pso_dns_present
+        result.pso_enumeration_ok = pso_enumeration_ok
+        result.dc_current_time = dc_current_time
 
         # Observation-window adjustment: a stored badPwdCount only counts toward
         # lockout within the lockout observation window. Accounts whose last bad
@@ -573,9 +839,19 @@ async def fetch_spray_policy_native(
         # resets the stored attribute only lazily, so it reads stale-high). This
         # is what stops spray over-exclusion of accounts that are not actually
         # near lockout.
-        effective_badpwd, reset_count = _apply_observation_window_reset(
-            result, datetime.now(timezone.utc)
-        )
+        # Measured against the DC's clock: badPasswordTime is stamped in it, and
+        # the host clock may be hours off when ADscan could not step it. Without
+        # the DC time no reset is applied (the raw count stands).
+        if dc_current_time is not None:
+            effective_badpwd, reset_count = _apply_observation_window_reset(
+                result, dc_current_time
+            )
+        else:
+            effective_badpwd, reset_count = dict(raw_badpwd_by_user), 0
+            print_info_debug(
+                "[spray_policy] DC currentTime unavailable; observation-window "
+                "reset skipped (raw badPwdCount kept)."
+            )
         result.badpwd_by_user = effective_badpwd
 
         print_info_debug(
@@ -583,6 +859,8 @@ async def fetch_spray_policy_native(
             f"lockout_duration_s={policy.lockout_duration_seconds}, "
             f"pso_count={len(pso_by_dn)}, users={len(effective_badpwd)}, "
             f"pso_assigned_users={len(pso_dn_by_user)}, "
+            f"pso_listed={len(pso_dns_present)} (listing_ok={pso_enumeration_ok}), "
+            f"pso_assignment_visible={result.pso_assignment_visible}, "
             f"observation_window_resets={reset_count}, "
             f"currently_locked={len(result.locked_users)} "
             f"(currently_locked = DC msDS-User-Account-Control-Computed UF_LOCKOUT, "
@@ -621,6 +899,10 @@ def fetch_spray_policy_sync(
     auth_domain: str | None = None,
     auth_kdc: str | None = None,
     account_scope: str = "user",
+    only_account: str | None = None,
+    only_accounts: "list[str] | tuple[str, ...] | None" = None,
+    ccache_path: str | None = None,
+    posture_snapshot: Any = None,
 ) -> SprayPolicyResult:
     """Synchronous wrapper around fetch_spray_policy_native."""
     try:
@@ -640,6 +922,10 @@ def fetch_spray_policy_sync(
                             auth_domain=auth_domain,
                             auth_kdc=auth_kdc,
                             account_scope=account_scope,
+                            only_account=only_account,
+                            only_accounts=only_accounts,
+                            ccache_path=ccache_path,
+                            posture_snapshot=posture_snapshot,
                         )
                     )
                 )
@@ -658,5 +944,96 @@ def fetch_spray_policy_sync(
             auth_domain=auth_domain,
             auth_kdc=auth_kdc,
             account_scope=account_scope,
+            only_account=only_account,
+            only_accounts=only_accounts,
+            ccache_path=ccache_path,
+            posture_snapshot=posture_snapshot,
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Password-attempt rules from the scan policy (the eligibility SSOT's input)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordAttemptRules:
+    """How close to an account's lockout threshold password guessing may go.
+
+    Resolved once per eligibility computation by
+    :func:`resolve_password_attempt_rules`, from the scan policy's
+    ``password_attempts`` block (founder decision 2026-11-05). The spray
+    eligibility functions are its only consumers; no executor picks a margin.
+
+    Attributes:
+        reserve_margin: Failed attempts kept in reserve below each account's
+            threshold (an account is eligible while ``threshold - badPwdCount``
+            exceeds it, and a flow spends at most the difference). At least 1
+            for a real environment.
+        unknown_threshold: ``conservative`` (assume threshold 3, one attempt per
+            account per hour) or ``attempt_anyway`` (lab only).
+        ignore_threshold: Lab only: spray as if no account could lock.
+        environment: ``lab`` or ``real``, the environment the rules were
+            resolved for.
+        declared: True when the policy set at least one key.
+        unknown_threshold_forced: The policy asked to attempt anyway on a real
+            environment and was held to ``conservative``.
+    """
+
+    reserve_margin: int
+    unknown_threshold: str
+    ignore_threshold: bool
+    environment: str
+    declared: bool = False
+    unknown_threshold_forced: bool = False
+
+    @property
+    def attempt_anyway_when_unknown(self) -> bool:
+        """True when an unreadable threshold does not limit guessing (lab only)."""
+        from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+            UNKNOWN_THRESHOLD_ATTEMPT_ANYWAY,
+        )
+
+        return self.unknown_threshold == UNKNOWN_THRESHOLD_ATTEMPT_ANYWAY
+
+    def to_dict(self) -> dict[str, Any]:
+        """The disclosure shape (``password_attempts_line`` reads it)."""
+        return {
+            "reserve_margin": self.reserve_margin,
+            "unknown_threshold": self.unknown_threshold,
+            "ignore_threshold": self.ignore_threshold,
+            "environment": self.environment,
+            "declared": self.declared,
+            "unknown_threshold_forced": self.unknown_threshold_forced,
+        }
+
+
+def resolve_password_attempt_rules(shell: Any) -> PasswordAttemptRules:
+    """The password-attempt rules in force for ``shell`` (the single resolver).
+
+    The active scan policy decides; without one, the workspace type stands in
+    for the environment (a CTF workspace is a lab), so a run with no
+    ``password_attempts`` block behaves exactly as before the block existed:
+    margin 2, an unreadable threshold attempted anyway in a lab and handled
+    conservatively elsewhere.
+    """
+    from adscan_core.scan_policy.policy import effective_password_attempts  # noqa: PLC0415
+    from adscan_core.scan_policy.settings import policy_environment  # noqa: PLC0415
+
+    policy = getattr(shell, "scan_policy", None)
+    definition = getattr(policy, "definition", None)
+    environment = None
+    if definition is None:
+        # No policy in force: the margin of the environment the workspace's
+        # last policy was for (a cleared policy keeps it), else the real floor.
+        environment = policy_environment(shell)
+    rules = effective_password_attempts(definition, environment=environment)
+    return PasswordAttemptRules(
+        reserve_margin=int(rules["reserve_margin"]),
+        unknown_threshold=str(rules["unknown_threshold"]),
+        ignore_threshold=bool(rules["ignore_threshold"]),
+        environment=str(rules["environment"]),
+        declared=bool(rules["declared"]),
+        unknown_threshold_forced=bool(rules["unknown_threshold_forced"]),
     )

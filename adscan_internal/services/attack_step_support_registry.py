@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
 
+from adscan_core.reporting.attack_step_labels import (
+    COMPROMISE_EFFORT_LABELS as _SHARED_COMPROMISE_EFFORT_LABELS,
+    COMPROMISE_SEMANTICS_LABELS as _SHARED_COMPROMISE_SEMANTICS_LABELS,
+)
 from adscan_internal.services.attack_step_catalog import (
     get_attack_step_catalog,
     get_attack_step_entry,
@@ -40,26 +44,18 @@ SUPPORTED_RELATION_NOTES: dict[str, str] = get_relation_notes_by_support_kind(
     "supported"
 )
 
-PATH_COMPROMISE_LABELS: dict[str, str] = {
-    "direct_target_compromise": "Direct Compromise",
-    "access_capability_only": "Privileged Access",
-    "context_only": "Contextual",
-    "other": "Other",
-}
+# The client labels live in the shared, dependency-light SSOT so the web
+# backend serves the SAME words the report prints (it used to print the raw
+# enum). Re-exported under the historical names.
+PATH_COMPROMISE_LABELS: dict[str, str] = _SHARED_COMPROMISE_SEMANTICS_LABELS
 COMPROMISE_SEMANTICS_PRIORITY: dict[str, int] = {
     "direct_target_compromise": 0,
     "access_capability_only": 1,
     "other": 2,
+    "credential_access_only": 2,
     "context_only": 3,
 }
-COMPROMISE_EFFORT_LABELS: dict[str, str] = {
-    "none": "None",
-    "immediate": "Immediate",
-    "low": "Low",
-    "medium": "Medium",
-    "high": "High",
-    "other": "Other",
-}
+COMPROMISE_EFFORT_LABELS: dict[str, str] = _SHARED_COMPROMISE_EFFORT_LABELS
 COMPROMISE_EFFORT_PRIORITY: dict[str, int] = {
     "none": 0,
     "immediate": 0,
@@ -109,6 +105,12 @@ DISPLAY_TIER_DOMAIN_COMPROMISE = "domain_compromised"
 # DISPLAY_TIER_DOMAIN_COMPROMISE), while still ranking the path above generic
 # enablers because reaching a Tier-0 box is high severity.
 DISPLAY_TIER_TIER0_FOOTHOLD = "tier0_foothold"
+# Tier 0 Control — a route that controls a direct Tier 0 account (Domain Admins,
+# krbtgt, RID 500, a DC) but on which no step to the domain object was found.
+# Normally empty (the engine extends those routes to the domain). Its own tier
+# so the "Domain Compromised" closure marker never lands on it; only shown when
+# it carries a route, like every tier.
+DISPLAY_TIER_TIER0_CONTROL = "tier0_control"
 DISPLAY_TIER_COMPROMISE_ENABLER = "compromise_enabler"
 DISPLAY_TIER_LATERAL_PIVOT = "lateral_pivot"
 
@@ -124,6 +126,7 @@ _OUTCOME_CLASS_TO_DISPLAY_TIER: dict[str, str] = {
 
 DISPLAY_TIER_ORDER: tuple[str, ...] = (
     DISPLAY_TIER_DOMAIN_COMPROMISE,
+    DISPLAY_TIER_TIER0_CONTROL,
     DISPLAY_TIER_TIER0_FOOTHOLD,
     DISPLAY_TIER_COMPROMISE_ENABLER,
     DISPLAY_TIER_LATERAL_PIVOT,
@@ -132,6 +135,11 @@ DISPLAY_TIER_ORDER: tuple[str, ...] = (
 # (label, icon, style_key) — style_key indexes BRAND_COLORS at the call site.
 DISPLAY_TIER_STYLES: dict[str, tuple[str, str, str]] = {
     DISPLAY_TIER_DOMAIN_COMPROMISE: ("Domain Compromised", "🔥", "error"),
+    DISPLAY_TIER_TIER0_CONTROL: (
+        "Tier 0 Control (no route to the domain found)",
+        "👑",
+        "error",
+    ),
     DISPLAY_TIER_TIER0_FOOTHOLD: ("Tier 0 Footholds (post-ex pending)", "🔓", "warning"),
     DISPLAY_TIER_COMPROMISE_ENABLER: ("Compromise Enablers", "🎯", "warning"),
     DISPLAY_TIER_LATERAL_PIVOT: ("Lateral & Pivot", "➜", "info"),
@@ -427,6 +435,10 @@ def get_path_target_outcome_class(record: dict[str, object]) -> str:
 
 def describe_path_target_outcome(record: dict[str, object]) -> str:
     """Return a customer-facing label for one path outcome class."""
+    # Tier 0 control shares the legacy ``direct_compromise`` outcome with full
+    # domain compromise; the engine-stamped class keeps it from reading as one.
+    if str(record.get("compromise_class") or "").strip().lower() == "tier0_control":
+        return "Tier 0 Control"
     return TARGET_OUTCOME_LABELS.get(
         get_path_target_outcome_class(record),
         "Pivot Opportunity",
@@ -440,6 +452,10 @@ def get_path_display_tier(record: dict[str, object]) -> str:
     triage tiers the CLI table sections render (Domain Compromised / Compromise
     Enablers / Lateral & Pivot). See :data:`DISPLAY_TIER_ORDER`.
     """
+    # The engine-stamped class splits Tier 0 control out of the legacy
+    # ``direct_compromise`` outcome it shares with full domain compromise.
+    if str(record.get("compromise_class") or "").strip().lower() == "tier0_control":
+        return DISPLAY_TIER_TIER0_CONTROL
     return _OUTCOME_CLASS_TO_DISPLAY_TIER.get(
         get_path_target_outcome_class(record),
         DISPLAY_TIER_LATERAL_PIVOT,
@@ -460,9 +476,24 @@ def describe_search_mode_label(mode: str | None) -> str:
 
 def build_path_execution_priority_key(
     record: dict[str, object],
-) -> tuple[int, int, int, int, int, int, int, int, int, int, str, str]:
-    """Return the canonical execution-priority key for one path."""
-    return build_path_priority_key(record)
+) -> tuple[int | str, ...]:
+    """Return the canonical execution-priority key for one path.
+
+    The display key (:func:`build_path_priority_key`) with ONE extra term at
+    index 2, right after the target-priority class and the terminal class: a
+    path the active scan policy lets run end to end sorts before one it cuts
+    short, because only the first can prove its terminal in this run. Target
+    criticality and terminal class still dominate.
+
+    The term reads the stamp the executor's readiness overlay writes from the
+    scan-policy enforcement SSOT (``pending_excluded_steps``), so this order and
+    the executor apply one rule. Without an active policy nothing is stamped,
+    the term is 0 on every path and the order is the display order.
+    """
+    base = build_path_priority_key(record)
+    meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    cut_short = 1 if (meta or {}).get("scan_policy_cut_short_at") else 0
+    return (base[0], base[1], cut_short, *base[2:])
 
 
 def build_path_remediation_priority_key(

@@ -39,34 +39,82 @@ _CAP_SYS_TIME = 25
 
 _PROBE_MARKER = "ADSCANPROBE"
 
-# Shell probe run INSIDE the image as the real run user. Emits one marker line.
-# Kept POSIX-sh portable and dependency-free (no python/awk assumptions beyond
-# coreutils that the runtime image ships). uid_map spaces are squeezed to '_'
-# so the marker is trivially splittable.
+# Shell probe run INSIDE the image. Emits one marker line. Kept POSIX-sh
+# portable and dependency-free (coreutils + the setpriv/capsh/gosu the
+# entrypoint already relies on). uid_map spaces are squeezed to '_' so the
+# marker is trivially splittable.
 #
-# ``capeff`` is the SHELL's effective set and is kept for diagnostics only. It
-# is NOT the capability set ADscan runs with: the kernel clears permitted and
-# effective caps when a process runs as a non-root uid, so a plain ``/bin/sh``
-# under ``--user 1000:1000`` reports ``CapEff: 0`` on EVERY runtime, rootful or
-# rootless, no matter what ``--cap-add`` was passed. Reading network caps off
-# that shell declared every host "reduced network mode".
+# The probe starts as container-root and drops to the run user THE SAME WAY
+# ``docker/adscan_entrypoint.sh`` does, then measures from the dropped process.
+# That is the only way to see the capabilities ADscan really runs with, because
+# the two runtime images get them by different mechanisms:
 #
-# ``pycapeff`` is the load-bearing one: the effective set of the venv python
-# AFTER exec, which is where the file capabilities land
-# (``cap_net_raw,cap_net_admin,cap_net_bind_service=ep``) and is exactly the
-# process that opens ADscan's raw sockets and tun devices.
-_PROBE_SCRIPT = (
-    'um=$(head -n1 /proc/self/uid_map 2>/dev/null | tr -s " " | '
-    'sed -e "s/^_//" -e "s/ /_/g" | tr " " "_"); '
-    'ce=$(grep -m1 "^CapEff:" /proc/self/status 2>/dev/null | '
-    "cut -f2 | tr -d ' \t'); "
-    'py=$(readlink -f /opt/adscan/venv/bin/python 2>/dev/null); '
-    'if [ -n "$py" ] && "$py" -c "" 2>/dev/null; then fx=ok; else fx=fail; fi; '
-    'pce=$("$py" -c "print(open(\'/proc/self/status\').read())" 2>/dev/null | '
-    "grep -m1 '^CapEff:' | cut -f2 | tr -d ' \t'); "
-    'printf "%s|uidmap=%s|capeff=%s|pycapeff=%s|filecap_exec=%s\\n" '
-    f'"{_PROBE_MARKER}" "$um" "$ce" "$pce" "$fx"'
+# * LITE: file capabilities on the venv python
+#   (``setcap cap_net_raw,cap_net_admin,cap_net_bind_service+ep``).
+# * PRO: no venv at all (a PyInstaller binary); the entrypoint raises the
+#   network caps present in the bounding set into the INHERITABLE + AMBIENT sets
+#   via ``setpriv`` as it drops privileges.
+#
+# The previous probe ran directly as ``--user <uid>:<gid>`` with
+# ``--entrypoint /bin/sh`` and looked only for the venv python, so it bypassed
+# the ambient-cap drop and, on PRO, found no python: every rootful PRO run was
+# reported "Reduced Network Mode" while the real container held all three caps.
+#
+# Rootless / remapped namespaces are NOT stripped here (the entrypoint strips
+# file caps there): the probe keeps reporting that the capability-bearing python
+# cannot exec, which is the signal for the rootless panel.
+#
+# Fields: ``capeff`` is container-root's shell set (diagnostics only).
+# ``pycapeff`` is the load-bearing set: the venv python's after exec when the
+# image has one (LITE), else the dropped shell's (PRO, ambient caps). The
+# ``filecap_exec`` field is ``ok`` when there is no file-capability python to
+# exec. If the drop itself cannot run, no marker is printed, which the verdict
+# treats as inconclusive (fail-open, no panel).
+#
+# The drop MUST stay in lockstep with the entrypoint; a structural test asserts
+# both use the same setpriv flags and capability list.
+_AMBIENT_NET_CAPS = ("net_bind_service", "net_admin", "net_raw")
+
+_PROBE_INNER = (
+    "py=$(readlink -f /opt/adscan/venv/bin/python 2>/dev/null); "
+    'if [ -n "$py" ] && [ -e "$py" ]; then '
+    'if "$py" -c "" 2>/dev/null; then fx=ok; else fx=fail; fi; '
+    'pce=$("$py" -c "import sys; sys.stdout.write(open(sys.argv[1]).read())" /proc/self/status '
+    '2>/dev/null | grep -m1 "^CapEff:" | cut -f2 | tr -d "[:space:]"); '
+    "else fx=ok; "
+    'pce=$(grep -m1 "^CapEff:" /proc/self/status 2>/dev/null | cut -f2 | tr -d "[:space:]"); '
+    "fi; "
+    'printf "pycapeff=%s|filecap_exec=%s" "$pce" "$fx"'
 )
+
+
+def _build_probe_script(uid: int, gid: int) -> str:
+    """Return the probe script for ``uid:gid`` (ints, so safe to inline)."""
+    uid_i, gid_i = int(uid), int(gid)
+    caps = " ".join(_AMBIENT_NET_CAPS)
+    return (
+        'um=$(head -n1 /proc/self/uid_map 2>/dev/null | tr -s " " | '
+        'sed -e "s/^_//" -e "s/ /_/g" | tr " " "_"); '
+        'ce=$(grep -m1 "^CapEff:" /proc/self/status 2>/dev/null | cut -f2 | tr -d "[:space:]"); '
+        f"inner='{_PROBE_INNER}'; "
+        'amb=""; '
+        'if grep -qE "^[[:space:]]*0[[:space:]]+0[[:space:]]" /proc/self/uid_map 2>/dev/null '
+        "&& command -v setpriv >/dev/null 2>&1 && command -v capsh >/dev/null 2>&1; then "
+        'bnd=$(grep -m1 "^CapBnd:" /proc/self/status 2>/dev/null | cut -f2 | tr -d "[:space:]"); '
+        'names=$(capsh --decode="0x$bnd" 2>/dev/null); '
+        f"for c in {caps}; do "
+        'case "$names" in *"cap_$c"*) amb="${amb:+$amb,}+$c";; esac; done; '
+        "fi; "
+        'if [ -n "$amb" ]; then '
+        f'res=$(setpriv --reuid {uid_i} --regid {gid_i} --clear-groups '
+        '--inh-caps "$amb" --ambient-caps "$amb" -- /bin/sh -c "$inner" 2>/dev/null); '
+        "elif command -v gosu >/dev/null 2>&1; then "
+        f'res=$(gosu {uid_i}:{gid_i} /bin/sh -c "$inner" 2>/dev/null); '
+        'else res=""; fi; '
+        'if [ -n "$res" ]; then '
+        'printf "%s|uidmap=%s|capeff=%s|%s\\n" '
+        f'"{_PROBE_MARKER}" "$um" "$ce" "$res"; fi'
+    )
 
 
 @dataclass(frozen=True)
@@ -207,11 +255,13 @@ def probe_runtime_capability(
 ) -> RuntimeCapabilityVerdict:
     """Probe ``image`` as ``uid:gid`` and return the capability verdict.
 
-    Runs ``docker run --rm --user <uid>:<gid> [--cap-add ...] --entrypoint
-    /bin/sh <image> -c <probe>``. Running as the SAME uid:gid the real container
-    uses is essential: in a remapped userns, file caps may be honored for
-    container-root but NOT for the gosu run user, so probing as root would
-    false-pass. Injecting ``run_docker_fn`` keeps this testable.
+    Runs ``docker run --rm [--cap-add ...] --entrypoint /bin/sh <image> -c
+    <probe>``. The container starts as root, exactly like the real entrypoint,
+    and the probe drops to ``uid:gid`` the way the entrypoint does (ambient caps
+    via setpriv on a rootful runtime, gosu otherwise) before measuring. Measuring
+    as the run user is still essential: in a remapped userns file caps may be
+    honored for container-root but NOT for the run user, so measuring as root
+    would false-pass. Injecting ``run_docker_fn`` keeps this testable.
 
     Returns a fail-open verdict (``probe_ok=False``, ``supported=True``) if the
     probe cannot be run, so a flaky daemon never blocks the user.
@@ -224,10 +274,12 @@ def probe_runtime_capability(
                 args, check=False, capture_output=True, timeout=timeout
             )
 
-    args = ["docker", "run", "--rm", "--user", f"{uid}:{gid}"]
+    args = ["docker", "run", "--rm"]
     for cap in cap_add:
         args.extend(["--cap-add", cap])
-    args.extend(["--entrypoint", "/bin/sh", image, "-c", _PROBE_SCRIPT])
+    args.extend(
+        ["--entrypoint", "/bin/sh", image, "-c", _build_probe_script(uid, gid)]
+    )
 
     try:
         proc = run_docker_fn(args)

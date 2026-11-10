@@ -20,10 +20,11 @@ pre-filter on 445 performed by the caller before the sweep starts.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Iterable, Optional
 
 from adscan_internal import print_info_debug
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.service_access_results import ServiceAccessFinding
 from adscan_internal.services.smb_privilege import (
@@ -39,18 +40,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 SMB_ACCESS_PROBE_BACKEND = "smb-native"
-DEFAULT_SMB_PROBE_WORKERS = 30
+#: Default-level worker count (scan-pacing consumer ``sweep.smb_access``).
+DEFAULT_SMB_PROBE_WORKERS = _pacing_consumer("sweep.smb_access").param("workers").default
 
 
 def get_smb_probe_worker_count() -> int:
-    """Return operator-configurable SMB probe concurrency (clamped 1-128)."""
-    raw_value = os.getenv("ADSCAN_SMB_PROBE_WORKERS", "").strip()
-    if not raw_value:
-        return DEFAULT_SMB_PROBE_WORKERS
-    try:
-        return max(1, min(int(raw_value), 128))
-    except ValueError:
-        return DEFAULT_SMB_PROBE_WORKERS
+    """Return the SMB probe concurrency from the scan pacing."""
+    return int(component_pacing(active_pacing(), "sweep.smb_access")["workers"])
 
 
 def _normalize_target(value: object) -> str:
@@ -137,7 +133,7 @@ async def run_smb_access_probe_sweep(
     kdc_ip: str | None = None,
     use_kerberos: bool = False,
     target_hostnames: Optional[dict[str, str]] = None,
-    timeout: int = 15,
+    timeout: int | None = None,
     max_workers: int | None = None,
     posture_sink: Optional[PostureSink] = None,
     posture_snapshot: Optional["DomainPosture"] = None,
@@ -201,7 +197,13 @@ async def run_smb_access_probe_sweep(
     # high concurrency is safe and keeps the gate to a few seconds even at 1-2k
     # hosts (vs ~60s at the default 50). Dead hosts cost only the 3s probe
     # timeout, not the 45s auth budget they would burn without the gate.
-    gate_concurrency = max(50, min(len(resolved_targets), 256))
+    gate_pacing = component_pacing(active_pacing(), "probe.smb_access_gate")
+    gate_concurrency = max(
+        gate_pacing["min_concurrency"],
+        min(len(resolved_targets), gate_pacing["max_concurrency"]),
+    )
+    if timeout is None:
+        timeout = component_pacing(active_pacing(), "sweep.smb_access")["timeout_s"]
     reach = await filter_reachable_hosts(
         resolved_targets, 445, max_concurrency=gate_concurrency
     )

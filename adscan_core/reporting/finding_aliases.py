@@ -383,21 +383,32 @@ def normalize_technical_report(report: Any) -> bool:
     contract every consumer reads, including the web ingestion — carries one
     entry per weakness.
 
+    It also strips every recovered secret value
+    (:func:`adscan_core.reporting.client_secret_redaction.redact_report_secrets`).
+    This is the one read normalizer the engine loader, the web ingestion and the
+    web live readers share, so a report an older build wrote with an inline
+    value is clean the moment any of them opens it.
+
     Args:
         report: A parsed ``technical_report.json`` payload. Anything else is
             ignored.
 
     Returns:
-        ``True`` when at least one domain's findings list actually changed, so
-        a caller holding the file open can decide whether to persist it.
+        ``True`` when a domain's findings list collapsed or a secret value was
+        removed, so a caller holding the file open can decide whether to
+        persist it.
     """
     if not isinstance(report, dict):
         return False
+    from adscan_core.reporting.client_secret_redaction import (  # noqa: PLC0415
+        redact_report_secrets,
+    )
+
+    changed = redact_report_secrets(report)
     domains = report.get("domains")
     if not isinstance(domains, dict):
-        return False
+        return changed
 
-    changed = False
     for entry in domains.values():
         if not isinstance(entry, dict):
             continue

@@ -5,9 +5,12 @@ Single helper used by both ``start_unauth`` and ``start_auth`` paths in
 panel orchestration and the sink wiring; the lifecycle paths just call
 :func:`run_posture_probe` (sync) or :func:`arun_posture_probe` (async).
 
-Opt-out is environment-only — set ``ADSCAN_NO_POSTURE_PROBE`` to any
-truthy value (``1``, ``true``, ``yes``, ``on``) to skip the probe phase
-silently. There is no CLI flag.
+Each probe is its own scan-policy check (``module:connection_posture.<probe>``,
+``scan_phases.POSTURE_PROBE_CHECK_BY_CATEGORY``): a policy can switch off one
+probe or the whole ``connection_posture`` family, and a probe switched off
+sends nothing and leaves its category UNKNOWN for the reactive layer to learn.
+``ADSCAN_NO_POSTURE_PROBE`` (any truthy value: ``1``, ``true``, ``yes``,
+``on``) still skips the whole probe phase silently.
 """
 
 from __future__ import annotations
@@ -263,6 +266,14 @@ async def arun_posture_probe(
     )
 
     have_creds = bool(username) and bool(password or nt_hash or ccache_path or aes_key)
+    # One scan-policy check per probe (family ``connection_posture``): a probe
+    # switched off sends nothing and its category stays UNKNOWN for the reactive
+    # layer to learn. Each refusal is explained once.
+    from adscan_internal.services.posture_orchestration import (  # noqa: PLC0415
+        posture_categories_excluded_by_policy,
+    )
+
+    disabled_categories = posture_categories_excluded_by_policy(shell)
     started = time.monotonic()
     collected: list[ProbeResult] = []
     # Snapshot the posture BEFORE the probe runs. The summary panel uses
@@ -282,6 +293,7 @@ async def arun_posture_probe(
             on_progress=progress_cb,
             posture=posture_before_unauth,
             force=force,
+            disabled_categories=disabled_categories,
         )
         collected.extend(unauth)
         # Phase 2 — authenticated probes (only when creds available).
@@ -304,6 +316,7 @@ async def arun_posture_probe(
                 posture=posture_before_auth,
                 force=force,
                 dc_fqdn=dc_fqdn,
+                disabled_categories=disabled_categories,
             )
             collected.extend(auth)
             # Password policy probe — runs after AUTH phase so it can reuse

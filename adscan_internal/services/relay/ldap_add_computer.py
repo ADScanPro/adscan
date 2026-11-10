@@ -33,6 +33,9 @@ from adscan_internal.services.machine_account_provisioning_service import (
     generate_machine_account_name,
     generate_machine_account_password,
 )
+from adscan_internal.services.exploitation.machine_account_quota_errors import (
+    is_machine_account_quota_error,
+)
 from adscan_core.rich_output import print_exception
 
 
@@ -101,12 +104,21 @@ class LDAPAddComputerTarget:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            # The same quota classifier every add-computer path uses: a relayed
+            # principal at its machine-account quota is a quota answer, not a
+            # generic failure (the caller records it against that principal).
+            quota_exceeded = is_machine_account_quota_error(exc)
             return RelayTargetResult(
                 target_name=self.name,
                 success=False,
                 technique=self.technique,
                 principal=principal,
-                error=str(exc),
+                error=(
+                    "Machine Account Quota exhausted for the relayed principal"
+                    if quota_exceeded
+                    else str(exc)
+                ),
+                metadata={"quota_exceeded": quota_exceeded, "raw_error": str(exc)},
             )
 
         pwd_note = "" if password else " (password not set — unsigned session)"

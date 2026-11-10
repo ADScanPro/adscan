@@ -65,6 +65,11 @@ from adscan_internal.services.kerberos_transport import (
 )
 from adscan_internal import telemetry
 from adscan_core.interaction import is_non_interactive
+from adscan_core.kerberos_roasting import (
+    ROASTABLE_SPN_LDAP_FILTER,
+    AccountSignals,
+    password_is_ad_managed,
+)
 from adscan_core.tui.patience_notice import (
     PatienceNoticeConfig,
     maybe_show_patience_notice,
@@ -1804,7 +1809,13 @@ class KerberosEnumerationMixin:
 
         print_info("Enumerating SPN-bearing users via LDAP...")
 
-        search_filter = "(&(servicePrincipalName=*)(!(objectCategory=computer)))"
+        # The directory-side form of the cross-tier roastability predicate. A
+        # computer-only negation is NOT enough: a managed service account has
+        # its own objectCategory, so it passes that filter and would have a
+        # service ticket requested for it, producing 4769 noise and a hash
+        # nobody can crack (its password is directory-generated, 240 random
+        # characters). The shared fragment excludes both classes.
+        search_filter = ROASTABLE_SPN_LDAP_FILTER
         attributes = [
             "sAMAccountName",
             "userAccountControl",
@@ -1848,14 +1859,23 @@ class KerberosEnumerationMixin:
                 ).strip()
                 if not sam:
                     continue
+                object_classes = [
+                    str(value).strip().lower()
+                    for value in self._attribute_values(mapping, "objectClass")
+                    if str(value).strip()
+                ]
+                # Defence in depth behind the server-side filter above, on the
+                # objectClass this search already asks for: a directory that
+                # answers the negation loosely must still not get a ticket
+                # requested for an account whose password it generates itself.
+                if password_is_ad_managed(
+                    AccountSignals(object_classes=tuple(object_classes))
+                ):
+                    continue
                 collected.append(
                     {
                         "sAMAccountName": sam,
-                        "objectClass": [
-                            str(value).strip().lower()
-                            for value in self._attribute_values(mapping, "objectClass")
-                            if str(value).strip()
-                        ],
+                        "objectClass": object_classes,
                     }
                 )
             # Raw vs filtered counts disambiguate an intermittent "0 SPN users":

@@ -47,7 +47,10 @@ from adscan_internal.services.compromise_class import (
 )
 from adscan_internal.services.edge_kind import EdgeKind
 
-Outcome = Literal["domain_compromised", "findings", "clean"]
+# ``incomplete``: the core of an authenticated assessment (collection and
+# attack-path discovery) never completed for the subject domain, so the run has
+# no evidence that the domain held and must not say so.
+Outcome = Literal["domain_compromised", "findings", "clean", "incomplete"]
 
 # Width of the hairline separators. Keeps the recap visually aligned with the
 # ~78-col premium panels without hardcoding the terminal width (the panel clips).
@@ -121,6 +124,21 @@ class ScanRecapModel:
     # (:mod:`adscan_internal.services.attack_fanout_rollup`). Empty when no
     # source fans out past the collapse floor.
     fanout: tuple[FanoutStep, ...] = field(default_factory=tuple)
+    # Titles of the core phases that never completed, set only for the
+    # ``incomplete`` outcome (from the phase-catalog SSOT, in pipeline order).
+    missing_phases: tuple[str, ...] = field(default_factory=tuple)
+    # The domain verdict (``compromise_verdict``): its kind and the short phrase
+    # the headline prints. Empty when it could not be resolved, in which case
+    # the headline claims nothing beyond the absence of a proven compromise.
+    verdict_kind: str = ""
+    verdict_phrase: str = ""
+    verdict_sentence: str = ""
+
+
+#: Verdict kinds whose routes to domain compromise were mapped and not run.
+_UNEXECUTED_VERDICTS = frozenset({"routes_awaiting_operator", "routes_not_executed"})
+#: Headline when no verdict was resolved: true without any further evidence.
+_UNJUDGED_PHRASE = "no full compromise proven"
 
 
 def recap_hairline() -> Text:
@@ -139,11 +157,25 @@ def _headline(model: ScanRecapModel) -> Text:
             Text("   "),
             Text(_FULL_COMPROMISE_PHRASE, style="dim"),
         )
-    if model.outcome == "findings":
+    if model.outcome == "incomplete":
+        return Text.assemble(
+            Text("ASSESSMENT INCOMPLETE", style=f"bold {COLOR_AMBER}"),
+            Text("   "),
+            domain,
+        )
+    if model.outcome == "findings" or model.verdict_phrase:
+        # The verdict SSOT (``adscan_core.reporting.compromise_verdict``) words
+        # it. "Held" is only ever its own claim, made when every route was
+        # attempted; a mapped route nobody executed is stated as such, in amber,
+        # because it is the opposite of reassurance.
+        unexecuted = model.verdict_kind in _UNEXECUTED_VERDICTS
         return Text.assemble(
             domain,
             Text("   "),
-            Text("no full compromise: this domain held", style="dim"),
+            Text(
+                model.verdict_phrase or _UNJUDGED_PHRASE,
+                style=COLOR_AMBER if unexecuted else "dim",
+            ),
         )
     return Text.assemble(
         domain,
@@ -238,6 +270,15 @@ def _paths_line(model: ScanRecapModel) -> Text | None:
 
 def _timing_line(model: ScanRecapModel) -> Text | None:
     """Render the dim time-to line beneath the headline."""
+    if model.outcome == "incomplete":
+        missing = " and ".join(model.missing_phases) or "The core assessment phases"
+        verb = "was" if len(model.missing_phases) == 1 else "were"
+        return Text(
+            f"{missing} {verb} not completed for this domain, so this run "
+            "cannot say whether it held. The findings below are what the "
+            "checks that did run observed.",
+            style=COLOR_AMBER,
+        )
     if model.outcome == "domain_compromised":
         if model.ttc_label:
             return Text(f"Proven in {model.ttc_label}", style="dim")
@@ -512,6 +553,11 @@ def build_recap_body(model: ScanRecapModel) -> RenderableType:
     timing = _timing_line(model)
     if timing is not None:
         parts.append(timing)
+
+    # Why the mapped routes did not run, stated once under the headline: a route
+    # awaiting an operator and a route the policy excludes are different facts.
+    if model.verdict_kind in _UNEXECUTED_VERDICTS and model.verdict_sentence:
+        parts.append(Text(model.verdict_sentence, style="dim"))
 
     also = _also_compromised_line(model)
     if also is not None:

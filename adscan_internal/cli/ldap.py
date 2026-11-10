@@ -6,6 +6,8 @@ separate from the LDAP service layer.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -195,10 +197,6 @@ class LdapShell(Protocol):
     def ask_for_spraying(self, domain: str) -> None: ...
 
     def _is_full_adscan_container_runtime(self) -> bool: ...
-
-    def _run_netexec(
-        self, command: str, domain: str | None = None, timeout: int | None = None
-    ) -> subprocess.CompletedProcess[str]: ...
 
     def add_credential(
         self, domain: str, username: str, credential: str, **kwargs: object
@@ -929,7 +927,7 @@ def _record_ldap_security_posture_finding(
             evidence=[
                 {
                     "type": "artifact",
-                    "summary": "NetExec LDAP banner output with signing/channel binding posture",
+                    "summary": "LDAP signing and channel binding posture observed on the domain controller",
                     "artifact_path": artifact_path,
                 }
             ],
@@ -1176,7 +1174,28 @@ def run_obsolete_os_audit(shell: LdapShell, *, domain: str) -> None:
 
 
 def run_ldap_security_audit(shell: LdapShell, *, domain: str) -> None:
-    """Audit LDAP signing / channel-binding posture against known DCs natively."""
+    """Audit LDAP signing / channel-binding posture against known DCs natively.
+
+    Each DC is audited with the LDAP signing and channel binding posture probes
+    (``probe_ldap_security_for_dc``), so the audit runs only when BOTH checks
+    ``module:connection_posture.ldap_signing`` and
+    ``module:connection_posture.ldap_channel_binding`` are on; a policy that
+    switches either off sends nothing here and each refusal is explained once.
+    """
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        POSTURE_PROBE_LDAP_CHANNEL_BINDING,
+        POSTURE_PROBE_LDAP_SIGNING,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    allowed = [
+        gate_check_runner(shell, check_id)
+        for check_id in (POSTURE_PROBE_LDAP_SIGNING, POSTURE_PROBE_LDAP_CHANNEL_BINDING)
+    ]
+    if not all(allowed):
+        return
     targets = _build_ldap_security_targets(shell, domain=domain)
     marked_domain = mark_sensitive(domain, "domain")
     print_info_verbose(
@@ -1986,7 +2005,9 @@ def run_ldap_anonymous(shell: LdapShell, domain: str) -> dict[str, object] | Non
         print_error(f"Unknown domain: {marked_domain}")
         return None
 
-    if shell.type == "ctf" and shell.domains_data[domain].get("auth") in [
+    if policy_settings.aims_at_domain_compromise(shell) and shell.domains_data[domain].get(
+        "auth"
+    ) in [
         "auth",
         "pwned",
     ]:
@@ -2432,7 +2453,7 @@ def _run_enum_domain_auth(
         from adscan_internal.services.scan_phases import emit_chapter
         from adscan_internal.services.scan_timeline import phase_span
 
-        _scan_type = getattr(shell, "type", "default")
+        _scan_type = policy_settings.scan_phase_family(shell)
         emit_chapter("domain_collection", scan_type=_scan_type)
         _collection_phase_cm = phase_span(
             shell,
@@ -2886,8 +2907,15 @@ def get_recursive_user_groups_in_chain(
     if domain not in shell.domains_data:
         return None
 
-    auth_username = auth_username or shell.domains_data[domain].get("username")
-    auth_password = auth_password or shell.domains_data[domain].get("password")
+    # Username and secret from the SAME principal (pairing SSOT): an explicit
+    # auth_username never borrows the domain's active password.
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    auth_username, auth_password = resolve_principal_secret_pair(
+        shell.domains_data, domain=domain, username=auth_username, secret=auth_password
+    )
     pdc = pdc or shell.domains_data[domain].get("pdc")
     if not auth_username or not auth_password or not pdc:
         return None
@@ -2980,47 +3008,25 @@ def get_recursive_user_groups_in_chain(
     return sorted(set(groups), key=str.lower)
 
 
-def get_recursive_principal_group_sids_in_chain(
+def _resolve_principal_dn(
     shell: LdapShell,
     *,
     domain: str,
     target_samaccountname: str,
-    auth_username: str | None = None,
-    auth_password: str | None = None,
-    pdc: str | None = None,
-    timeout: int = 300,
-    retries: int = 3,
-    retry_delay_seconds: float = 1.0,
-    retry_backoff: float = 1.5,
-    retry_on_empty: bool = True,
-    prefer_kerberos: bool = True,
-    allow_ntlm_fallback: bool = True,
-) -> list[str] | None:
-    """Return recursive group SIDs for a principal via LDAP_MATCHING_RULE_IN_CHAIN.
+    auth_username: str,
+    auth_password: str,
+    pdc: str,
+    timeout: int,
+    retries: int,
+    retry_delay_seconds: float,
+    retry_backoff: float,
+    prefer_kerberos: bool,
+    allow_ntlm_fallback: bool,
+) -> str | None:
+    """distinguishedName of a principal: the graph first, then a native LDAP read.
 
-    This is similar to `get_recursive_user_groups_in_chain`, but returns
-    `objectSid` values for each group. This is useful for robust privileged
-    group checks because group names can be localized.
-
-    Args:
-        shell: Shell instance providing LDAP context.
-        domain: Target AD domain.
-        target_samaccountname: Principal sAMAccountName (user or computer).
-        auth_username/auth_password/pdc/timeout: Same meaning as in
-            `get_recursive_user_groups_in_chain`.
-
-    Returns:
-        List of group objectSid strings on success, otherwise None.
+    Returns None when the read failed or found nothing.
     """
-    if domain not in shell.domains_data:
-        return None
-
-    auth_username = auth_username or shell.domains_data[domain].get("username")
-    auth_password = auth_password or shell.domains_data[domain].get("password")
-    pdc = pdc or shell.domains_data[domain].get("pdc")
-    if not auth_username or not auth_password or not pdc:
-        return None
-
     # Resolve principal DN (graph first, fallback native LDAP query).
     user_dn = ""
     try:
@@ -3076,6 +3082,74 @@ def get_recursive_principal_group_sids_in_chain(
         if not user_dn:
             return None
 
+    return user_dn
+
+
+def get_recursive_principal_group_sids_in_chain(
+    shell: LdapShell,
+    *,
+    domain: str,
+    target_samaccountname: str,
+    auth_username: str | None = None,
+    auth_password: str | None = None,
+    pdc: str | None = None,
+    timeout: int = 300,
+    retries: int = 3,
+    retry_delay_seconds: float = 1.0,
+    retry_backoff: float = 1.5,
+    retry_on_empty: bool = True,
+    prefer_kerberos: bool = True,
+    allow_ntlm_fallback: bool = True,
+) -> list[str] | None:
+    """Return recursive group SIDs for a principal via LDAP_MATCHING_RULE_IN_CHAIN.
+
+    This is similar to `get_recursive_user_groups_in_chain`, but returns
+    `objectSid` values for each group. This is useful for robust privileged
+    group checks because group names can be localized.
+
+    Args:
+        shell: Shell instance providing LDAP context.
+        domain: Target AD domain.
+        target_samaccountname: Principal sAMAccountName (user or computer).
+        auth_username/auth_password/pdc/timeout: Same meaning as in
+            `get_recursive_user_groups_in_chain`.
+
+    Returns:
+        List of group objectSid strings on success, otherwise None.
+    """
+    if domain not in shell.domains_data:
+        return None
+
+    # Username and secret from the SAME principal (pairing SSOT): an explicit
+    # auth_username never borrows the domain's active password.
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    auth_username, auth_password = resolve_principal_secret_pair(
+        shell.domains_data, domain=domain, username=auth_username, secret=auth_password
+    )
+    pdc = pdc or shell.domains_data[domain].get("pdc")
+    if not auth_username or not auth_password or not pdc:
+        return None
+
+    user_dn = _resolve_principal_dn(
+        shell,
+        domain=domain,
+        target_samaccountname=target_samaccountname,
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        timeout=timeout,
+        retries=retries,
+        retry_delay_seconds=retry_delay_seconds,
+        retry_backoff=retry_backoff,
+        prefer_kerberos=prefer_kerberos,
+        allow_ntlm_fallback=allow_ntlm_fallback,
+    )
+    if not user_dn:
+        return None
+
     # Resolve recursive group memberships using in-chain on `member`, returning objectSid.
     group_query = (
         f"(&(objectCategory=group)(member:1.2.840.113556.1.4.1941:={user_dn}))"
@@ -3104,6 +3178,85 @@ def get_recursive_principal_group_sids_in_chain(
     if not sids:
         return []
     return sorted(set(sids), key=str.upper)
+
+
+def get_principal_token_group_sids(
+    shell: LdapShell,
+    *,
+    domain: str,
+    target_samaccountname: str,
+    auth_username: str | None = None,
+    auth_password: str | None = None,
+    pdc: str | None = None,
+    timeout: int = 300,
+    prefer_kerberos: bool = True,
+    allow_ntlm_fallback: bool = True,
+) -> list[str] | None:
+    """Every group SID in a principal's token, as a DC of its domain computes it.
+
+    Reads the constructed ``tokenGroups`` attribute with a base-scope read on
+    the principal's own object. A domain controller of the principal's domain
+    expands it transitively and includes what a ``member``-based query can
+    miss: the primary group, domain-local groups and the BUILTIN groups such as
+    ``S-1-5-32-544``. (``tokenGroupsGlobalAndUniversal`` would leave the
+    domain-local and builtin groups out, so it is not used.)
+
+    Returns:
+        The group SIDs, ``[]`` when the read answered with none, or None when
+        it could not be performed (no credential, DN unresolved, the attribute
+        not readable by the scan account).
+    """
+    if domain not in shell.domains_data:
+        return None
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    auth_username, auth_password = resolve_principal_secret_pair(
+        shell.domains_data, domain=domain, username=auth_username, secret=auth_password
+    )
+    pdc = pdc or shell.domains_data[domain].get("pdc")
+    if not auth_username or not auth_password or not pdc:
+        return None
+    user_dn = _resolve_principal_dn(
+        shell,
+        domain=domain,
+        target_samaccountname=target_samaccountname,
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        timeout=timeout,
+        retries=1,
+        retry_delay_seconds=1.0,
+        retry_backoff=1.5,
+        prefer_kerberos=prefer_kerberos,
+        allow_ntlm_fallback=allow_ntlm_fallback,
+    )
+    if not user_dn:
+        return None
+    from adscan_internal.services.ldap_query_service import (  # noqa: PLC0415
+        query_shell_ldap_attribute_values,
+    )
+
+    values = query_shell_ldap_attribute_values(
+        shell,
+        domain=domain,
+        ldap_filter="(objectClass=*)",
+        attribute="tokenGroups",
+        auth_username=str(auth_username),
+        auth_password=str(auth_password),
+        pdc=str(pdc),
+        prefer_kerberos=prefer_kerberos,
+        allow_ntlm_fallback=allow_ntlm_fallback,
+        operation_name="Token group SIDs",
+        search_base=user_dn,
+        search_scope="BASE",
+    )
+    if values is None:
+        return None
+    return sorted(
+        {str(value).strip() for value in values if str(value).strip()}, key=str.upper
+    )
 
 
 def get_recursive_principal_groups_in_chain(
@@ -4731,7 +4884,9 @@ def _build_focused_kerberos_wordlist_for_pattern(
     pattern_key: str,
 ) -> str | None:
     """Build a focused Kerberos username wordlist for one selected format."""
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    # A real organisation has employees to look up; a lab does not (genuinely
+    # environment).
+    real_environment = policy_settings.policy_environment(shell) == "real"
     marked_domain = mark_sensitive(domain, "domain")
     wordlist_service = KerberosUsernameWordlistService()
     kerberos_dir = Path(
@@ -4752,7 +4907,7 @@ def _build_focused_kerberos_wordlist_for_pattern(
         except OSError:
             pass
 
-    if workspace_type == "audit":
+    if real_environment:
         source_options = [
             f"Statistically likely usernames{stat_count_hint}",
             "LinkedIn company employees  (requires browser login)",
@@ -5113,18 +5268,31 @@ def run_ldap_descriptions(
     """
     # The authenticated Phase 3 quick-win is part of ``quick_credential_wins``;
     # honor a scan-config disable. The anonymous/unauth-surface call path is a
-    # different phase and is never gated here.
+    # different phase and still COLLECTS here; signing in with what it finds is
+    # gated on ``step:userdescription`` in ``_analyze_descriptions_for_passwords``.
     if not anonymous:
         from adscan_internal.services.scan_phases import (
             phase_is_enabled,
             subphase_is_enabled,
         )
 
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
         if not phase_is_enabled(shell, "quick_credential_wins"):
+            announce_phase_skip(
+                shell,
+                "quick_credential_wins",
+                label="LDAP description parsing",
+                subphase_id="ldap_descriptions",
+                config_line=False,
+            )
             return
         if not subphase_is_enabled(shell, "quick_credential_wins", "ldap_descriptions"):
-            print_info(
-                "LDAP description parsing skipped (disabled in scan configuration)."
+            announce_phase_skip(
+                shell,
+                "quick_credential_wins",
+                label="LDAP description parsing",
+                subphase_id="ldap_descriptions",
             )
             return
     if target_domain not in shell.domains:
@@ -6380,6 +6548,19 @@ def _analyze_descriptions_for_passwords(
     if not cred_fields:
         return []
 
+    # Every candidate below is verified by signing in with it, which is what
+    # ``step:userdescription`` declares. This function serves the authenticated
+    # LDAP sweep, the anonymous LDAP path and the SMB/SAMR description path, so
+    # the gate lives here: with the check off, no candidate is offered, stored or
+    # signed in with (release gate 14.0.0). The caller still reports what it
+    # read as an unproven observation (no verified outcome is returned).
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_harvested_secret_verification,
+    )
+
+    if not gate_harvested_secret_verification(shell, "userdescription", domain=domain):
+        return []
+
     targets: list[InMemoryCredSweeperTarget] = []
     # file_path → (samaccountname, field_label)
     path_index: dict[str, tuple[str, str]] = {}
@@ -6655,7 +6836,7 @@ def _record_credential_in_ldap_attribute_finding(
             evidence=[
                 {
                     "type": "log",
-                    "summary": "LDAP credential-bearing fields (CredSweeper)",
+                    "summary": "Credentials found in directory account attributes",
                     "artifact_path": source_path,
                 }
             ],

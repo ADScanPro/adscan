@@ -118,40 +118,50 @@ class _AuthCredential:
     is_hash: bool
 
 
-def _select_any_domain_credential(shell: Any, domain: str) -> _AuthCredential | None:
-    """Select a usable domain credential for authenticated roasting.
+def _resolve_roast_auth_credential(
+    shell: Any,
+    domain: str,
+    *,
+    auth_username: str | None = None,
+    auth_secret: str | None = None,
+) -> _AuthCredential | None:
+    """Resolve the NAMED principal a Kerberoast authenticates as.
 
-    Prefers the domain-scoped `username/password` if present; otherwise falls
-    back to the first credential in `domains_data[domain]["credentials"]`.
+    Kerberoasting needs any authenticated principal, but WHICH one is never left
+    to chance: a stored credential picked arbitrarily may be a stale secret for
+    a privileged account, and sending it is a failed logon toward that account's
+    lockout. The caller names the principal (the attack step's executing actor,
+    or the account that just wrote the SPN); otherwise the domain's configured
+    assessment account is used. Both resolve through the pairing SSOT
+    :func:`resolve_principal_credential`, so the secret always belongs to the
+    username it travels with.
+
+    Returns:
+        The credential, or ``None`` when no named principal holds a secret.
     """
-    domains_data = getattr(shell, "domains_data", None)
-    if not isinstance(domains_data, dict):
+    from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+        looks_like_ntlm_hash,
+    )
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_credential,
+    )
+
+    resolved = resolve_principal_credential(
+        getattr(shell, "domains_data", None) or {},
+        domain=domain,
+        username=auth_username or None,
+        secret=auth_secret if auth_username else None,
+    )
+    if resolved is None or not resolved.username:
         return None
-    domain_data = domains_data.get(domain)
-    if not isinstance(domain_data, dict):
+    secret = str(resolved.secret or "").strip()
+    if not secret:
         return None
-
-    username = str(domain_data.get("username") or "").strip()
-    password = str(domain_data.get("password") or "").strip()
-    if username and password:
-        return _AuthCredential(username=username, secret=password, is_hash=False)
-
-    creds = domain_data.get("credentials")
-    if not isinstance(creds, dict) or not creds:
-        return None
-
-    # Prefer a plaintext-looking entry, but accept hashes too.
-    for candidate_user, candidate_secret in creds.items():
-        user = str(candidate_user or "").strip()
-        secret = str(candidate_secret or "").strip()
-        if not user or not secret:
-            continue
-        is_hash = len(secret) == 32 and all(
-            c in "0123456789abcdef" for c in secret.lower()
-        )
-        return _AuthCredential(username=user, secret=secret, is_hash=is_hash)
-
-    return None
+    return _AuthCredential(
+        username=resolved.username,
+        secret=secret,
+        is_hash=looks_like_ntlm_hash(secret),
+    )
 
 
 def _has_domain_credential(shell: Any, domain: str, username: str) -> bool:
@@ -375,6 +385,8 @@ def run_kerberoast_for_user(
     target_user: str,
     target_domain: str | None = None,
     wordlists_dir: str | None = None,
+    auth_username: str | None = None,
+    auth_secret: str | None = None,
 ) -> bool:
     """Run Kerberoasting for a single target user and crack the result.
 
@@ -389,6 +401,11 @@ def run_kerberoast_for_user(
             is byte-identical to the prior behaviour. When it differs, the roast
             runs against the target realm's DC while authenticating with the
             ``domain`` credential over the trust.
+        auth_username: The principal that authenticates the TGS requests (the
+            step's executing actor). Defaults to the domain's configured
+            assessment account; never an arbitrary stored credential.
+        auth_secret: That principal's secret when the caller holds it; resolved
+            from the credential store otherwise.
 
     Returns:
         True if the target credential was recovered (stored), False otherwise.
@@ -409,7 +426,9 @@ def run_kerberoast_for_user(
         return False
     roast_domain = realm.roast_domain
 
-    auth = _select_any_domain_credential(shell, domain)
+    auth = _resolve_roast_auth_credential(
+        shell, domain, auth_username=auth_username, auth_secret=auth_secret
+    )
     if not auth:
         marked_domain = mark_sensitive(domain, "domain")
         print_warning(

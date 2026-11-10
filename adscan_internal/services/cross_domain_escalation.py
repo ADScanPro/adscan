@@ -28,11 +28,12 @@ DFS terminal-lift SSOT and this execution registry cannot drift.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_exception, print_info_debug
+from adscan_core.rich_output import print_exception, print_info, print_info_debug
 from adscan_internal.models.domain import resolve_dc_ip
 from adscan_internal.rich_output import mark_sensitive
 
@@ -327,6 +328,53 @@ def mark_technique_dispatched(
     )
 
 
+#: Accounts that never sign in: their keys forge tickets, the accounts
+#: themselves are disabled by design (``krbtgt``, and the per-RODC
+#: ``krbtgt_<n>`` accounts).
+_NON_SIGNIN_ACCOUNT = re.compile(r"(?i)^krbtgt(_\d+)?$")
+
+
+def is_signin_principal(username: str | None) -> bool:
+    """False for an account that cannot authenticate (krbtgt and its RODC kin)."""
+    name = str(username or "").strip()
+    if "\\" in name:
+        name = name.split("\\", 1)[1]
+    name = name.split("@", 1)[0]
+    return bool(name) and not _NON_SIGNIN_ACCOUNT.match(name)
+
+
+def resolve_escalation_credential(
+    shell: Any, *, domain: str, username: str, credential: str
+) -> tuple[str, str]:
+    """The sign-in credential a cross-domain escalation from ``domain`` runs as.
+
+    A verified domain administrator of the compromised domain, through the
+    local-admin picker SSOT (``pick_credential_for_local_admin``, the same one
+    the post-compromise pipeline uses; it never returns krbtgt). The queued
+    credential is the fallback only when it names a principal that can sign in.
+    Returns ``("", "")`` when no usable credential is held.
+    """
+    try:
+        from adscan_internal.services.credentials import (  # noqa: PLC0415
+            pick_credential_for_local_admin,
+        )
+
+        domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+        best = pick_credential_for_local_admin(
+            shell,
+            domain=domain,
+            target_host=domain_data.get("pdc_hostname") or domain_data.get("pdc"),
+        )
+        if best is not None and is_signin_principal(best[0]) and best[1]:
+            return str(best[0]), str(best[1])
+    except Exception as exc:  # noqa: BLE001 - fall back to the queued credential
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    if is_signin_principal(username) and credential:
+        return username, credential
+    return "", ""
+
+
 def queue_cross_domain_escalation(
     shell: Any, *, domain: str, username: str, credential: str
 ) -> None:
@@ -340,6 +388,11 @@ def queue_cross_domain_escalation(
     dom = str(domain or "").strip()
     if not dom:
         return
+    if not is_signin_principal(username):
+        # The compromise was recorded under an account that cannot sign in
+        # (krbtgt). Queue the domain without it: the drain resolves a verified
+        # domain administrator's credential instead.
+        username, credential = "", ""
     _get_pending(shell)[dom] = {
         "username": str(username or ""),
         "credential": str(credential or ""),
@@ -385,6 +438,13 @@ def execute_cross_domain_escalation(shell: Any, domain: str) -> None:
     dispatched = _get_dispatched(shell)
     username = str(ctx.get("username") or "")
     credential = str(ctx.get("credential") or "")
+    # The escalation authenticates AS a principal of the compromised domain, so
+    # it needs a SIGN-IN credential of a verified domain administrator, never the
+    # name the compromise was recorded under (krbtgt cannot sign in: its key
+    # forges tickets, the account itself is disabled by design).
+    exec_user, exec_secret = resolve_escalation_credential(
+        shell, domain=dom, username=username, credential=credential
+    )
 
     newly_owned: list[tuple[str, str, str]] = []
     for technique in CROSS_DOMAIN_ESCALATION_TECHNIQUES:
@@ -403,6 +463,28 @@ def execute_cross_domain_escalation(shell: Any, domain: str) -> None:
                 # RaiseChild double-fire (and its RC4-degraded re-fire).
                 continue
             dispatched.add(fire_key)
+            # Engagement scope (contractual): never act into a domain the scope
+            # leaves out. The route stays mapped and the report says why.
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                gate_cross_domain_technique,
+            )
+
+            if not gate_cross_domain_technique(
+                shell,
+                technique=technique.relation,
+                source_domain=dom,
+                target_domain=target.target_domain,
+                surface="cross_domain_escalation",
+            ):
+                continue
+            if not exec_user:
+                print_info(
+                    f"{technique.relation} into "
+                    f"{mark_sensitive(target.target_domain, 'domain')} not run: no "
+                    "sign-in credential of a domain administrator of "
+                    f"{mark_sensitive(dom, 'domain')} is held."
+                )
+                continue
             print_info_debug(
                 "[cross-domain-escalation] firing "
                 f"{mark_sensitive(technique.key, 'text')}: "
@@ -410,14 +492,14 @@ def execute_cross_domain_escalation(shell: Any, domain: str) -> None:
                 f"{mark_sensitive(target.target_domain, 'domain')}"
             )
             try:
-                result = technique.fire(shell, dom, username, credential, target)
+                result = technique.fire(shell, dom, exec_user, exec_secret, target)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 continue
             if result.success and result.compromised_domain:
                 newly_owned.append(
-                    (result.compromised_domain, username, credential)
+                    (result.compromised_domain, exec_user, exec_secret)
                 )
 
     # Recurse: promote each newly-owned domain so it runs its own post-compromise
@@ -477,9 +559,11 @@ __all__ = [
     "EscalationResult",
     "CROSS_DOMAIN_ESCALATION_TECHNIQUES",
     "queue_cross_domain_escalation",
+    "resolve_escalation_credential",
     "execute_cross_domain_escalation",
     "has_pending_cross_domain_escalation",
     "drain_pending_cross_domain_escalations",
+    "is_signin_principal",
     "is_technique_dispatched",
     "mark_technique_dispatched",
 ]

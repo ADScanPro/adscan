@@ -37,7 +37,11 @@ from enum import Enum
 
 from adscan_core.rich_output import print_warning
 
-from adscan_internal.services.compromise_class import CompromiseClass, PrivilegeTier
+from adscan_internal.services.compromise_class import (
+    CompromiseClass,
+    PrivilegeTier,
+    is_direct_tier0_control_class,
+)
 from adscan_internal.services.edge_kind import ControlStrength, EdgeKind
 
 
@@ -216,10 +220,19 @@ def _is_low_priv_source(cls: CompromiseClass | None) -> bool:
 
 
 def _target_is_domain_or_breaker(inp: EdgeSeverityInput) -> bool:
-    """Return True when target is the Domain object or a Domain Breaker."""
+    """Return True when target is the Domain object or a Domain Breaker.
+
+    A one-edge path classified ``TIER0_CONTROL`` (control of a direct Tier 0
+    principal that is not the domain object) is in the same direct band as
+    ``DOMAIN_BREAKER`` for severity: the split between the two is a reach
+    distinction, not a severity one.
+    """
     if inp.target_is_domain:
         return True
-    return inp.target_compromise_class is CompromiseClass.DOMAIN_BREAKER
+    return inp.target_compromise_class in (
+        CompromiseClass.DOMAIN_BREAKER,
+        CompromiseClass.TIER0_CONTROL,
+    )
 
 
 def _grade_auth_to_tier0(
@@ -336,8 +349,13 @@ def compute_edge_severity(inp: EdgeSeverityInput) -> Severity:
         return Severity.INFO
 
     # Rule 1 — Domain Breaker as source is always INFO (AD hierarchy).
-    # Applies to control / auth / escalation / derived alike.
-    if inp.source_compromise_class is CompromiseClass.DOMAIN_BREAKER:
+    # Applies to control / auth / escalation / derived alike. The predicate is
+    # shared with the remediability classifier (``remediability.holds_domain_control``
+    # reads the same stamped class through it), so an edge graded INFO here can
+    # never surface as a "Start here" action there.
+    if inp.source_compromise_class is not None and is_direct_tier0_control_class(
+        inp.source_compromise_class
+    ):
         return Severity.INFO
 
     target_is_terminal = _target_is_domain_or_breaker(inp)

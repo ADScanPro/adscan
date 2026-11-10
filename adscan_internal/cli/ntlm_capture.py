@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from adscan_core.scan_policy import settings as policy_settings
+
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -90,6 +92,8 @@ class PreparedNtlmProbe(Protocol):
     secret: str
     proxy_spec: str | None
     match_expected_username: bool
+    listener_ip: str
+    bind_ip: str
 
 
 def _probe_coercion_target_reachable(
@@ -238,20 +242,17 @@ def _summarize_output(text: str, *, max_lines: int = 12) -> str:
 
 
 def _kernel_source_ip_toward(dc_ip: str) -> str | None:
-    """Return the kernel-chosen source IP toward *dc_ip* (UDP-connect trick).
+    """Return the kernel-chosen source IP toward *dc_ip* (no packets sent).
 
-    No packets are sent - ``connect()`` on a UDP socket only resolves the route
-    and binds the local address. Returns ``None`` on any failure.
+    Thin wrapper over the listener-IP SSOT primitive. Returns ``None`` on any
+    failure (heuristic only, never fatal).
     """
 
-    import socket  # noqa: PLC0415
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        kernel_source_ip_toward,
+    )
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((dc_ip, 9))
-            return str(sock.getsockname()[0])
-    except Exception:  # noqa: BLE001 - heuristic only, never fatal
-        return None
+    return kernel_source_ip_toward(dc_ip)
 
 
 def _dc_listener_reachability_warning(
@@ -371,12 +372,6 @@ def _prepare_ntlm_probe(
         )
         return None
 
-    if not shell.myip:
-        print_error(
-            "This probe requires a listener IP. Ensure 'myip' is available."
-        )
-        return None
-
     pdc_ip = str(domain_data.get("pdc") or "").strip()
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip()
     username = str(domain_data.get("username") or "").strip()
@@ -426,6 +421,16 @@ def _prepare_ntlm_probe(
         print_error(
             "This probe requires authenticated domain credentials in the current domain context."
         )
+        return None
+
+    # The coerced host connects BACK to us, so the address we advertise is chosen
+    # per target (declared > pivot egress > kernel route > interface guess). No
+    # startup interface is needed for this: a session with none still resolves it.
+    from adscan_internal.services.listener_ip import resolve_listener_ip  # noqa: PLC0415
+
+    listener = resolve_listener_ip(shell, target=pdc_ip)
+    if not listener.resolved:
+        print_error(listener.failure_message())
         return None
 
     workspace_dir = str(shell.current_workspace_dir or "").strip() or os.getcwd()
@@ -514,7 +519,7 @@ def _prepare_ntlm_probe(
         )
 
     advisory = _dc_listener_reachability_warning(
-        listener_ip=str(shell.myip or "").strip(),
+        listener_ip=str(listener.ip or "").strip(),
         dc_ip=pdc_ip,
         interface=getattr(shell, "interface", None),
     )
@@ -528,7 +533,7 @@ def _prepare_ntlm_probe(
         print_info_debug(f"[ntlm-capture] reachability heuristic (advisory): {advisory}")
         print_info_debug(
             "[ntlm-capture] DC->listener reachability heuristic flagged the return path: "
-            f"listener={mark_sensitive(str(shell.myip or ''), 'ip')} "
+            f"listener={mark_sensitive(str(listener.ip or ''), 'ip')} "
             f"dc={mark_sensitive(pdc_ip, 'ip')} "
             f"interface={mark_sensitive(str(getattr(shell, 'interface', '') or ''), 'text')}"
         )
@@ -544,6 +549,8 @@ def _prepare_ntlm_probe(
     prepared.secret = secret
     prepared.proxy_spec = str(proxy_spec or "").strip() or None
     prepared.match_expected_username = match_expected_username
+    prepared.listener_ip = str(listener.ip)
+    prepared.bind_ip = listener.bind_ip or str(listener.ip)
     return prepared
 
 
@@ -981,7 +988,7 @@ def _execute_ntlm_capture_probe(
         marked_target = mark_sensitive(f"{prepared.pdc_hostname}.{domain}", "hostname")
     else:
         marked_target = mark_sensitive(prepared.pdc_ip, "ip")
-    marked_listener = mark_sensitive(shell.myip, "ip")
+    marked_listener = mark_sensitive(prepared.listener_ip, "ip")
     print_info(
         f"[*] Checking NTLM auth type for target {marked_target} in domain {marked_domain} "
         f"via coerced authentication to listener {marked_listener}"
@@ -1000,6 +1007,7 @@ def _execute_ntlm_capture_probe(
 
     capture_broker = get_or_create_capture_broker(shell)
     trigger = NativeCoercionTrigger()
+    _record_callback_addresses(shell, {prepared.listener_ip})
 
     # Match the specific computer account only when we know the target hostname
     # (PDC path, or an explicit IP that resolves to the known PDC). For an
@@ -1012,10 +1020,10 @@ def _execute_ntlm_capture_probe(
         result = run_ntlm_capture_probe(
             broker=capture_broker,
             broker_consumer_id=f"ntlm_sweep@{prepared.pdc_ip}",
-            broker_bind_ip=shell.myip,
+            broker_bind_ip=prepared.bind_ip,
             trigger=trigger,
             target=prepared.pdc_ip,
-            listener_ip=shell.myip,
+            listener_ip=prepared.listener_ip,
             username=prepared.username,
             secret=prepared.secret,
             domain=domain,
@@ -1041,6 +1049,19 @@ def _execute_ntlm_capture_probe(
             method_filter=method_filter,
         )
         return None
+
+    if result.reason == "listener_start_failed":
+        # Never a silent debug line: the coercion did not run because no listener
+        # could serve the callback address, and the operator needs the cause.
+        refusal = capture_broker.last_refusal(f"ntlm_sweep@{prepared.pdc_ip}") or (
+            "other",
+            "the shared SMB capture listener could not be acquired",
+        )
+        print_warning(
+            f"[~] NTLM auth-type check for {marked_target} did not run: the SMB "
+            f"capture listener for callback address {marked_listener} is "
+            f"unavailable ({refusal[1]})."
+        )
 
     if result.success:
         persisted_status = "captured"
@@ -1168,7 +1189,6 @@ def _materialize_ntlmv1_attack_steps(shell: NtlmCaptureShell, domain: str) -> No
 def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) -> bool:
     """Run the Phase 3 NTLM auth-type quick win and persist its outcome."""
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
     reachable_ip_count = _enabled_computer_ip_count(shell, target_domain)
 
     # POSTURE GATE (single source of truth). The DC-only quick win fires coercion
@@ -1192,7 +1212,7 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
         f"[ntlm-capture] enabled computer IP count for {mark_sensitive(target_domain, 'domain')}: {reachable_ip_count}"
     )
 
-    if workspace_type == "ctf" and reachable_ip_count < 2:
+    if policy_settings.aims_at_domain_compromise(shell) and reachable_ip_count < 2:
         marked_domain = mark_sensitive(target_domain, "domain")
         print_info(
             f"[~] Skipping DC NTLM auth-type check in {marked_domain}: fewer than 2 enabled computer IPs are available for this domain."
@@ -1229,7 +1249,11 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
             str(shell.domains_data.get(target_domain, {}).get("username") or "").strip()
             or "N/A"
         )
-        listener_ip = str(getattr(shell, "myip", "") or "").strip() or "N/A"
+        from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+            resolve_listener_ip,
+        )
+
+        listener_ip = str(resolve_listener_ip(shell, target=pdc).ip or "") or "N/A"
         should_execute = confirm_operation(
             operation_name="DC NTLM Auth-Type Check",
             description=(
@@ -1333,16 +1357,19 @@ def run_ntlm_auth_type_quick_win(shell: NtlmCaptureShell, target_domain: str) ->
 # than full SMB collection, so a moderate default fan-out is safe; it stays
 # bounded and env-overridable for OPSEC (more concurrency = more simultaneous
 # coercions, which MDI/EDR will see — adscan-ad-constraints §10/§11).
-_DEFAULT_SWEEP_CONCURRENCY = 8
-_SWEEP_CONCURRENCY_ENV = "ADSCAN_NTLM_SWEEP_CONCURRENCY"
+# The pacing values live in the scan-pacing SSOT (consumer ``coercion.ntlm_sweep``);
+# the names below are the default-level values.
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer  # noqa: E402
+
+_NTLM_SWEEP_PACING = _pacing_consumer("coercion.ntlm_sweep")
+_DEFAULT_SWEEP_CONCURRENCY = _NTLM_SWEEP_PACING.param("concurrency").default  # 8
 # Global wall-clock budget for the whole sweep. Anything not reached inside the
 # budget is logged explicitly (no silent cap — adscan-ad-constraints §10).
-_DEFAULT_SWEEP_BUDGET_SECONDS = 1800
-_SWEEP_BUDGET_ENV = "ADSCAN_NTLM_SWEEP_BUDGET_SECONDS"
+_DEFAULT_SWEEP_BUDGET_SECONDS = _NTLM_SWEEP_PACING.param("budget_s").default  # 1800
 # Per-host capture/trigger budgets. Kept tight so a non-coercible host fails fast
 # and is marked `unknown` instead of blocking the sweep.
-_SWEEP_CAPTURE_TIMEOUT = 30
-_SWEEP_TRIGGER_TIMEOUT = 60
+_SWEEP_CAPTURE_TIMEOUT = _NTLM_SWEEP_PACING.param("capture_timeout_s").default  # 30
+_SWEEP_TRIGGER_TIMEOUT = _NTLM_SWEEP_PACING.param("trigger_timeout_s").default  # 60
 # Shared-listener fan-out timing. ``_SWEEP_LISTENER_SETTLE_SECONDS`` lets the
 # single bind go live before the first coercion; ``_SWEEP_DRAIN_SECONDS`` is the
 # tail window after the last trigger for in-flight authentications to land on the
@@ -1434,16 +1461,16 @@ _SCOPE_MODE_DCS = "dcs"
 _SCOPE_MODE_ALL = "all"
 
 
-def _default_scope_mode_for_type(workspace_type: str) -> str:
-    """Map the engagement type to the DEFAULT sweep scope mode.
+def _default_scope_mode(shell: NtlmCaptureShell) -> str:
+    """The DEFAULT sweep scope mode, from the scan policy's default reach.
 
-    ``ctf`` defaults to the broad ``"all"`` scope (every reachable host);
-    ``audit`` (and any non-ctf type) defaults to the quiet ``"dcs"`` scope.
-    This is only the default — the operator may override it in either
-    direction through the interactive selection.
+    A wide reach defaults to the broad ``"all"`` scope (every reachable host);
+    a bounded one to the quiet ``"dcs"`` scope. This is only the default: the
+    operator may override it in either direction through the interactive
+    selection.
     """
 
-    return _SCOPE_MODE_ALL if workspace_type == "ctf" else _SCOPE_MODE_DCS
+    return _SCOPE_MODE_ALL if policy_settings.reaches_wide(shell) else _SCOPE_MODE_DCS
 
 
 def _dc_scope_candidates(reachable: list[str], dc_ips: list[str]) -> list[str]:
@@ -1645,7 +1672,6 @@ def _select_sweep_scope_mode(
     shell: NtlmCaptureShell,
     *,
     domain: str,
-    workspace_type: str,
     reachable_count: int,
 ) -> str | None:
     """Let the operator choose the sweep scope; return the mode or ``None`` to skip.
@@ -1659,8 +1685,8 @@ def _select_sweep_scope_mode(
     - idx 1 -> "All reachable hosts (N)"   -> ``"all"`` scope.
     - idx 2 -> "Skip the NTLM auth-type sweep" -> returns ``None``.
 
-    The engagement type seeds the DEFAULT: ``ctf`` -> All reachable hosts
-    (idx 1); ``audit`` and any non-ctf -> DCs only (idx 0). The operator may
+    The scan policy seeds the DEFAULT (:func:`_default_scope_mode`): All
+    reachable hosts (idx 1) or DCs only (idx 0). The operator may
     override the default in either direction in interactive mode.
     """
 
@@ -1696,7 +1722,7 @@ def _select_sweep_scope_mode(
         f"All reachable hosts ({reachable_count})",
         "Skip the NTLM auth-type sweep",
     ]
-    default_mode = _default_scope_mode_for_type(workspace_type)
+    default_mode = _default_scope_mode(shell)
     default_idx = (
         _SWEEP_SCOPE_OPTION_ALL
         if default_mode == _SCOPE_MODE_ALL
@@ -1719,7 +1745,7 @@ def _select_sweep_scope_mode(
     print_info_debug(
         f"[ntlm-capture][sweep] scope selection for {marked_domain}: "
         f"idx={selected_idx} ({chosen_label}) "
-        f"type={workspace_type or 'unknown'} default_idx={default_idx}"
+        f"default_idx={default_idx}"
     )
 
     if selected_idx == _SWEEP_SCOPE_OPTION_SKIP:
@@ -1928,14 +1954,13 @@ def run_ntlm_auth_type_sweep(shell: NtlmCaptureShell, domain: str) -> dict[str, 
     adds operator-chosen scoping, the OPSEC heads-up, a >=2-reachable relay gate,
     bounded concurrency, a global budget, and per-host persistence.
 
-    Scope selection. The engagement type (``shell.type``) seeds the DEFAULT, but
+    Scope selection. The scan policy seeds the DEFAULT, but
     the operator may always CHOOSE the scope via the centralized 3-way select:
         - idx 0 "Domain controllers only"  -> DCs in the reachable set.
         - idx 1 "All reachable hosts (N)"   -> every reachable host.
         - idx 2 "Skip the NTLM auth-type sweep" -> skip; run the DC-only quick win.
-    Default by type: ``ctf`` -> All reachable hosts (idx 1); ``audit`` and any
-    non-ctf -> DCs only (idx 0). Non-interactive/CI auto-resolves to the type
-    default, preserving the prior type-driven behaviour exactly.
+    Default from the policy (:func:`_default_scope_mode`): all reachable hosts
+    (idx 1) or DCs only (idx 0). Non-interactive/CI auto-resolves to it.
 
     Returns a summary dict with the per-host telemetry counters.
     """
@@ -1965,13 +1990,9 @@ def run_ntlm_auth_type_sweep(shell: NtlmCaptureShell, domain: str) -> dict[str, 
         summary["sweep_skipped_reason"] = "ntlm_disabled"
         return summary
 
-    if not getattr(shell, "myip", None):
-        print_warning(
-            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: no listener IP "
-            "available (myip unset)."
-        )
-        summary["sweep_skipped_reason"] = "no_listener"
-        return summary
+    # No sweep-wide "is myip set" gate: the callback address is resolved per host
+    # inside the shared core (``_plan_sweep_callbacks``), so an appliance with one
+    # NIC per segment and no declared myip still sweeps every segment.
 
     reachable = _load_reachable_sweep_ips(shell, domain)
     reachable_count = len(reachable)
@@ -1994,10 +2015,10 @@ def run_ntlm_auth_type_sweep(shell: NtlmCaptureShell, domain: str) -> dict[str, 
         # independent of relay feasibility. Run the single-DC classification for
         # ALL engagement types here in Phase 3 so the DC auth-type is always
         # decided in Domain Intelligence and never deferred to a later phase.
-        # CTF safety: run_ntlm_auth_type_quick_win self-gates for ctf (it returns
-        # early with a persisted "skipped" when workspace_type == "ctf" and fewer
-        # than 2 enabled-computer IPs exist), so ctf domains with too few IPs
-        # still skip cleanly — but that decision is now made IN PHASE 3.
+        # run_ntlm_auth_type_quick_win self-gates (it returns early with a
+        # persisted "skipped" when the policy aims at domain compromise and fewer
+        # than 2 enabled-computer IPs exist), so such domains still skip cleanly,
+        # but that decision is now made IN PHASE 3.
         print_info(
             f"[*] Running DC-only NTLM auth-type classification in {marked_domain} "
             "(reportable independent of relay feasibility)."
@@ -2005,14 +2026,12 @@ def run_ntlm_auth_type_sweep(shell: NtlmCaptureShell, domain: str) -> dict[str, 
         run_ntlm_auth_type_quick_win(shell, domain)
         return summary
 
-    # Operator scope selection. The engagement type seeds the DEFAULT (ctf ->
-    # all reachable; audit -> DCs only) but the operator may CHOOSE either scope
-    # or skip. Non-interactive/CI auto-resolves to the type default, so the
-    # prior type-driven behaviour is preserved exactly.
+    # Operator scope selection. The scan policy's default reach seeds the
+    # DEFAULT (wide -> all reachable; bounded -> DCs only) but the operator may
+    # CHOOSE either scope or skip. Non-interactive/CI auto-resolves to it.
     scope_mode = _select_sweep_scope_mode(
         shell,
         domain=domain,
-        workspace_type=workspace_type,
         reachable_count=reachable_count,
     )
     if scope_mode is None:
@@ -2176,6 +2195,152 @@ def _find_active_poisoning_job(shell: NtlmCaptureShell) -> Any | None:
     return None
 
 
+@dataclass
+class _SweepCallbackPlan:
+    """Per-host callback addresses and the shared listener serving each host.
+
+    ``unresolved`` holds hosts for which no callback address could be chosen,
+    ``refused`` maps hosts to the classified reason no listener could serve
+    their address. Both are dropped from the fan-out and reported, never fired
+    at a listener that does not exist.
+    """
+
+    callback_ip_by_ip: dict[str, str] = field(default_factory=dict)
+    listener_by_ip: dict[str, Any] = field(default_factory=dict)
+    consumer_ids: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+    refused: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    def listeners(self) -> list[Any]:
+        """Distinct listeners in use (one when the wildcard bind is live)."""
+        seen: dict[int, Any] = {}
+        for listener in self.listener_by_ip.values():
+            seen.setdefault(id(listener), listener)
+        return list(seen.values())
+
+
+class _SweepObservationView:
+    """Read-only union of the observation buffers of the sweep's listeners.
+
+    With the wildcard bind there is exactly one listener; when a local service
+    held the wildcard and the broker bound each segment's address instead, every
+    segment has its own, and attribution must see captures from all of them.
+    """
+
+    def __init__(self, listeners: list[Any]) -> None:
+        self._listeners = list(listeners)
+
+    def drain_observations(self) -> list[Any]:
+        observations: list[Any] = []
+        for listener in self._listeners:
+            observations.extend(listener.drain_observations())
+        return observations
+
+    def make_capture_signal(self, expected_usernames: Any = None) -> Any:
+        signals = [
+            listener.make_capture_signal(expected_usernames) for listener in self._listeners
+        ]
+        return lambda: any(signal() for signal in signals)
+
+
+def _plan_sweep_callbacks(
+    shell: NtlmCaptureShell,
+    broker: Any,
+    *,
+    domain: str,
+    candidates: list[str],
+) -> _SweepCallbackPlan:
+    """Resolve each host's callback address and acquire a listener serving it.
+
+    The address comes from the per-target SSOT (``resolve_listener_ip``), never
+    from a sweep-wide ``shell.myip``. Hosts are grouped by the local address
+    their callback lands on and one broker consumer is acquired per group: with
+    the wildcard bind every group shares one listener, and under contention each
+    group gets its own. Never raises.
+    """
+    from adscan_internal.services.listener_ip import resolve_listener_ip  # noqa: PLC0415
+
+    plan = _SweepCallbackPlan()
+    groups: dict[str, list[str]] = {}
+    for ip in candidates:
+        try:
+            selection = resolve_listener_ip(shell, target=ip)
+        except Exception as exc:  # noqa: BLE001 - one host must never kill the sweep
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            selection = None
+        if selection is None or not selection.resolved:
+            plan.unresolved.append(ip)
+            continue
+        plan.callback_ip_by_ip[ip] = str(selection.ip)
+        groups.setdefault(str(selection.bind_ip or selection.ip), []).append(ip)
+
+    for local_address, ips in groups.items():
+        consumer_id = f"ntlm_sweep@{domain}#{local_address}"
+        if not broker.acquire(consumer_id, bind_ip=local_address, on_capture=lambda _obs: None):
+            refusal = broker.last_refusal(consumer_id) or (
+                "other",
+                "the shared SMB capture listener could not be acquired",
+            )
+            for ip in ips:
+                plan.refused[ip] = refusal
+            continue
+        plan.consumer_ids.append(consumer_id)
+        served_by = broker.listener_for(consumer_id)
+        if served_by is None:
+            for ip in ips:
+                plan.refused[ip] = ("other", "the shared SMB capture listener is unavailable")
+            continue
+        for ip in ips:
+            plan.listener_by_ip[ip] = served_by
+    _record_callback_addresses(
+        shell, {plan.callback_ip_by_ip[ip] for ip in plan.listener_by_ip}
+    )
+    return plan
+
+
+def _record_callback_addresses(shell: NtlmCaptureShell, addresses: Any) -> None:
+    """Note which local interfaces targets were told to call back to (best-effort)."""
+    try:
+        from adscan_internal.services.network_segments import (  # noqa: PLC0415
+            record_callback_address,
+        )
+
+        for address in sorted(addresses):
+            record_callback_address(shell, address)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping never blocks a capture
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _report_sweep_callback_drops(plan: _SweepCallbackPlan, *, marked_domain: str) -> None:
+    """Tell the operator which hosts were left out of the sweep, and why."""
+    if plan.unresolved:
+        count = len(plan.unresolved)
+        print_warning(
+            f"[~] NTLM auth-type sweep in {marked_domain}: {count} host(s) skipped, "
+            "no local address they could call back to was found. Declare one with "
+            "'set listener-ip <ip>' only if this host has a single callback address."
+        )
+        print_info_debug(
+            "[ntlm-capture][sweep] no callback address for: "
+            + mark_sensitive(",".join(plan.unresolved), "text")
+        )
+    by_reason: dict[tuple[str, str], list[str]] = {}
+    for ip, refusal in plan.refused.items():
+        by_reason.setdefault(refusal, []).append(ip)
+    for (code, message), ips in by_reason.items():
+        print_warning(
+            f"[~] NTLM auth-type sweep in {marked_domain}: {len(ips)} host(s) skipped, "
+            f"the SMB capture listener for their callback address is unavailable: "
+            f"{message}"
+        )
+        print_info_debug(
+            f"[ntlm-capture][sweep] listener refused ({code}) for: "
+            + mark_sensitive(",".join(ips), "text")
+        )
+
+
 def _execute_sweep_over_candidates(
     shell: NtlmCaptureShell,
     *,
@@ -2216,17 +2381,21 @@ def _execute_sweep_over_candidates(
 
     marked_domain = mark_sensitive(domain, "domain")
     host_count = len(candidates)
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+    from adscan_core.scan_pacing.pacing_runtime import active_runtime  # noqa: PLC0415
+
+    sweep_pacing = component_pacing(active_pacing(), "coercion.ntlm_sweep")
     concurrency = min(
-        _read_int_env(_SWEEP_CONCURRENCY_ENV, _DEFAULT_SWEEP_CONCURRENCY), host_count
+        active_runtime().effective_limit(sweep_pacing["concurrency"]), host_count
     )
-    budget_seconds = _read_int_env(_SWEEP_BUDGET_ENV, _DEFAULT_SWEEP_BUDGET_SECONDS)
+    budget_seconds = int(sweep_pacing["budget_s"])
+    trigger_timeout = int(sweep_pacing["trigger_timeout_s"])
 
     print_info(
         f"[*] NTLM auth-type sweep ({scope_mode}) over {host_count} host(s) in "
         f"{marked_domain} (concurrency={concurrency}, budget={budget_seconds}s)."
     )
 
-    listener_ip = str(getattr(shell, "myip", "") or "").strip()
     domain_data = (shell.domains_data or {}).get(domain) or {}
     username = str(domain_data.get("username") or "").strip()
     secret = str(domain_data.get("password") or "").strip()
@@ -2260,7 +2429,6 @@ def _execute_sweep_over_candidates(
     )
 
     capture_broker = get_or_create_capture_broker(shell)
-    sweep_consumer_id = f"ntlm_sweep@{domain}"
     # Acquire the SHARED :445 capture listener instead of binding a private one:
     # the broker refcounts, so this multi-host sweep coexists with an
     # already-running poisoning / write-share-bait consumer instead of failing
@@ -2268,25 +2436,29 @@ def _execute_sweep_over_candidates(
     # _observed buffer (make_capture_signal + drain_observations) which the broker's
     # queue-draining poll loop does NOT consume — so a no-op sink is correct here;
     # the sweep does its own per-host attribution from _observed.
-    if not capture_broker.acquire(
-        sweep_consumer_id, bind_ip=listener_ip, on_capture=lambda _obs: None
-    ):
-        print_warning(
-            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: the shared SMB "
-            "capture listener could not be acquired (:445 bind failed)."
+    #
+    # The callback address is resolved PER HOST: on a multi-NIC appliance the
+    # hosts of segment A and segment B call back to different local addresses,
+    # and one sweep-wide address (the old raw ``shell.myip``) was wrong for every
+    # segment but one, or empty on an appliance where myip is rightly unset.
+    plan = _plan_sweep_callbacks(shell, capture_broker, domain=domain, candidates=candidates)
+    _report_sweep_callback_drops(plan, marked_domain=marked_domain)
+    if not plan.listener_by_ip:
+        for consumer_id in plan.consumer_ids:
+            capture_broker.release(consumer_id)
+        summary["sweep_skipped_reason"] = (
+            "no_listener" if plan.unresolved and not plan.refused else "listener_start_failed"
         )
-        print_info_debug("NTLM sweep: shared :445 listener acquire failed")
-        summary["sweep_skipped_reason"] = "listener_start_failed"
-        return summary
-    listener = capture_broker.active_listener()
-    if listener is None:
-        capture_broker.release(sweep_consumer_id)
         print_warning(
-            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: "
-            "shared capture listener unavailable."
+            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: no host has a "
+            "callback address with a live SMB capture listener."
         )
-        summary["sweep_skipped_reason"] = "listener_start_failed"
         return summary
+    if plan.unresolved or plan.refused:
+        summary["callback_dropped_count"] = len(plan.unresolved) + len(plan.refused)
+    candidates = [ip for ip in candidates if ip in plan.listener_by_ip]
+    concurrency = max(1, min(concurrency, len(candidates)))
+    listener = _SweepObservationView(plan.listeners())
 
     def _fire(ip: str) -> str | None:
         # A worker that picks this task up after the global budget is spent must
@@ -2303,7 +2475,7 @@ def _execute_sweep_over_candidates(
         # one host's catalog walk does not waste the global budget. Empty filter
         # (unknown hostname) lets the trigger walk the full catalog to timeout.
         expected_account = ip_to_account.get(ip) or ""
-        capture_signal = listener.make_capture_signal(
+        capture_signal = plan.listener_by_ip[ip].make_capture_signal(
             [expected_account] if expected_account else []
         )
         _fire_sweep_coercion(
@@ -2311,11 +2483,11 @@ def _execute_sweep_over_candidates(
             trigger,
             domain=domain,
             target_ip=ip,
-            listener_ip=listener_ip,
+            listener_ip=plan.callback_ip_by_ip[ip],
             username=username,
             secret=secret,
             capture_signal=capture_signal,
-            trigger_timeout=_SWEEP_TRIGGER_TIMEOUT,
+            trigger_timeout=trigger_timeout,
         )
         with fired_lock:
             fired_ips.add(ip)
@@ -2354,7 +2526,8 @@ def _execute_sweep_over_candidates(
             dashboard=dashboard,
         )
     finally:
-        capture_broker.release(sweep_consumer_id)
+        for consumer_id in plan.consumer_ids:
+            capture_broker.release(consumer_id)
 
     # Attribute every captured observation to its coerced host by computer
     # account. A host that fired but produced no matching capture stays unknown.
@@ -2425,8 +2598,8 @@ def _execute_sweep_over_candidates(
         print_warning(
             f"[~] NTLM auth-type sweep hit its {budget_seconds}s budget in "
             f"{marked_domain}: {len(truncated)} host(s) were not classified and "
-            "remain unknown (re-run to finish, or raise "
-            f"{_SWEEP_BUDGET_ENV})."
+            "remain unknown (re-run to finish, or choose a pacing level with "
+            "more patience)."
         )
         print_info_debug(
             "[ntlm-capture][sweep] truncated hosts: "
@@ -2515,15 +2688,8 @@ def run_ntlm_auth_type_sweep_for_hosts(
         "truncated_count": 0,
     }
 
-    if not getattr(shell, "myip", None):
-        print_warning(
-            f"[~] Skipping NTLM auth-type sweep in {marked_domain}: no listener IP "
-            "available (myip unset)."
-        )
-        summary["sweep_skipped_reason"] = "no_listener"
-        return summary
-
-    # De-duplicate while preserving caller order.
+    # De-duplicate while preserving caller order. The callback address is
+    # resolved per host in the shared core, never gated on a sweep-wide myip.
     seen: set[str] = set()
     candidates: list[str] = []
     for raw in candidate_ips or []:

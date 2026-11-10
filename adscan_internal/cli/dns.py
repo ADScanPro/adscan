@@ -7,6 +7,8 @@ import cycles into `adscan.py`.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from typing import Any, Protocol, Literal
 from collections.abc import Callable, Iterable
@@ -747,7 +749,9 @@ def _build_best_effort_prompt_policy(
     overrides the audit branch too: for a paid engagement a degraded-but-real
     result beats nothing.
     """
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    # A broken DNS resolver is usual in a lab and suspicious in a real
+    # environment: genuinely environment.
+    real_environment = policy_settings.policy_environment(shell) == "real"
     marked_candidate = mark_sensitive(candidate_ip, "ip")
     if dc_confirmed_dns_only:
         return BestEffortPromptPolicy(
@@ -771,7 +775,7 @@ def _build_best_effort_prompt_policy(
             ),
             show_risk_panel=False,
         )
-    if workspace_type == "audit":
+    if real_environment:
         return BestEffortPromptPolicy(
             prompt=(
                 f"Continue in best-effort mode with {marked_candidate} as the DC/PDC target "

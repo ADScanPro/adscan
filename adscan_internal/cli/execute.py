@@ -22,7 +22,7 @@ Design (all four properties hold by construction):
 
 3. **Bootstrap via reuse.** Context is established by REUSING the ``adscan ci``
    bootstrap: the shared session preflight, the same auto/non-interactive mode,
-   the same ephemeral-vs-named workspace machinery, the same DNS + credential +
+   the same workspace retention (kept unless --ephemeral), the same DNS + credential +
    posture preflight the interactive shell runs. ``execute`` never reimplements
    any of it.
 
@@ -36,8 +36,6 @@ from __future__ import annotations
 
 import difflib
 import os
-import shutil
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
@@ -45,11 +43,15 @@ from adscan_internal import (
     print_error,
     print_exception,
     print_info,
-    print_success,
     print_warning,
     telemetry,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.workspaces.retention import (
+    add_ephemeral_argument,
+    auto_workspace_name,
+    close_run_workspace,
+)
 from adscan_internal.cli.session_preflight import (
     SessionPreflightConfig,
     SessionPreflightDeps,
@@ -280,9 +282,11 @@ class ExecuteConfig:
             only the resolver, ``dc_ip`` stays the auth/enum target.
         username: Auth username (``-u/--username``).
         password: Auth password / hash (``-p/--password``).
-        workspace: Named workspace to persist into; ``None`` → ephemeral temp.
+        workspace: Named workspace; ``None`` → an auto-named one
+            (``exec-<domain>-<YYYYMMDD-HHMM>``). Either is kept on exit.
         interface: Network interface for myip auto-config.
-        keep_workspace: Retain an auto-created ephemeral workspace on exit.
+        ephemeral: Delete the workspace this run created when it ends
+            (``--ephemeral``; a failed run keeps only its logs).
         requested_pro: PRO licence requested for this run.
     """
 
@@ -295,7 +299,7 @@ class ExecuteConfig:
     password: Optional[str] = None
     workspace: Optional[str] = None
     interface: Optional[str] = None
-    keep_workspace: bool = False
+    ephemeral: bool = False
     requested_pro: bool = False
 
 
@@ -401,7 +405,7 @@ def resolve_execute_verb(
             # ``adscan execute start_unauth`` wants a non-interactive one-shot
             # scan, whose true equivalent is ``adscan ci <mode>``. Name the
             # exact mode (auth/unauth) the verb maps to and point at the
-            # runtime help for the required --type/--interface, then at the
+            # runtime help for the required --type, then at the
             # interactive session.
             ci_mode = "unauth" if verb == "start_unauth" else "auth"
             return VerbResolution(
@@ -412,7 +416,7 @@ def resolve_execute_verb(
                     f"'{verb}' launches a full scan, which is not a standalone "
                     f"`execute` verb. For a non-interactive one-shot scan run "
                     f"`adscan ci {ci_mode}` (run `adscan ci --help` for the "
-                    f"required --type/--interface and auth flags); for an "
+                    f"required --type and auth flags); for an "
                     f"interactive session run `adscan start`."
                 ),
             )
@@ -525,20 +529,33 @@ def list_execute_verbs() -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _install_default_policy(workspace_dir: str) -> None:
+    """A workspace ``execute`` creates starts under the Audit built-in.
+
+    ``execute`` names no policy of its own; a workspace it creates gets the
+    conservative built-in, persisted, exactly as the retired default type did.
+    """
+    from adscan_core.scan_policy.policy import BASE_AUDIT, builtin_definition  # noqa: PLC0415
+    from adscan_internal.cli.workspaces import install_workspace_policy  # noqa: PLC0415
+
+    install_workspace_policy(workspace_dir, builtin_definition(BASE_AUDIT))
+
+
 def _setup_workspace(shell: Any, config: ExecuteConfig) -> bool:
-    """Establish the workspace, reusing the ``adscan ci`` ephemeral machinery.
+    """Establish the workspace, with the same retention rule as ``adscan ci``.
 
-    ``--workspace NAME`` → persist into that named workspace (loot survives,
-    platform-ingestible). Omitted → an ephemeral ``exec-<id>`` temp workspace,
-    auto-cleaned on exit unless ``--keep-workspace``.
+    ``--workspace NAME`` → that workspace (created when missing). Omitted → an
+    auto-named ``exec-<domain>-<YYYYMMDD-HHMM>`` one. Either is kept on exit
+    unless ``--ephemeral`` (``adscan_internal/workspaces/retention.py``).
 
-    Returns ``True`` when the workspace was auto-created (ephemeral or freshly
-    created named) so the caller knows whether to honour the cleanup contract.
+    Returns ``True`` when this run created the workspace, the only kind
+    ``--ephemeral`` may delete.
     """
     from adscan_internal.workspaces import (  # noqa: PLC0415
         create_workspace_dir,
         write_initial_workspace_variables,
     )
+    from adscan_internal.workspaces.session import activate_workspace  # noqa: PLC0415
 
     shell.ensure_workspaces_dir()
     created = False
@@ -549,38 +566,26 @@ def _setup_workspace(shell: Any, config: ExecuteConfig) -> bool:
             write_initial_workspace_variables(
                 workspace_name=config.workspace,
                 workspace_path=ws_dir,
-                workspace_type=getattr(shell, "type", None) or "audit",
+                workspace_type=None,
             )
+            _install_default_policy(ws_dir)
             created = True
-        shell.current_workspace = config.workspace
-        shell.current_workspace_dir = ws_dir
+        # SSOT activation: also initialises the environment-change ledger.
+        # Setting the fields by hand left the ledger None, so every directory
+        # write made by an executed attack path went unrecorded.
+        activate_workspace(
+            shell, workspaces_dir=shell.workspaces_dir, workspace_name=config.workspace
+        )
         shell.load_workspace_data(ws_dir)
     else:
-        ws = f"exec-{uuid.uuid4().hex[:6]}"
+        ws = auto_workspace_name("exec", config.domain, shell.workspaces_dir)
         ws_dir = os.path.join(shell.workspaces_dir, ws)
         os.makedirs(ws_dir, exist_ok=True)
-        shell.current_workspace = ws
-        shell.current_workspace_dir = ws_dir
+        _install_default_policy(ws_dir)
+        activate_workspace(shell, workspaces_dir=shell.workspaces_dir, workspace_name=ws)
         shell.load_workspace_data(ws_dir)
         created = True
     return created
-
-
-def _cleanup_workspace(shell: Any, *, created: bool, keep: bool) -> None:
-    """Honour the ephemeral-workspace retention contract (mirror of ci.py)."""
-    if not created:
-        return
-    marked = mark_sensitive(str(shell.current_workspace or ""), "workspace")
-    if keep:
-        print_info(f"Workspace '{marked}' kept (--keep-workspace specified)")
-        return
-    try:
-        if shell.current_workspace_dir:
-            shutil.rmtree(shell.current_workspace_dir)
-        print_success(f"Ephemeral workspace '{marked}' deleted")
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_warning(f"Could not remove ephemeral workspace '{marked}'.")
 
 
 def _resolve_execute_dc_ip(shell: Any, config: ExecuteConfig) -> str:
@@ -791,58 +796,38 @@ def passthrough_leads_with_domain(
     return bool(first) and first == target
 
 
-# Value-taking flags in ``do_attack_paths`` (mirror of adscan.py); every other
-# ``--flag`` is boolean. Used only to skip flags when locating the positional
-# start principal for the workspace-owned credential gate.
-_ATTACK_PATHS_VALUE_FLAGS: frozenset[str] = frozenset(
-    {"--max", "--depth", "--path-steps"}
-)
-
-
 def _attack_paths_start_principals(
     passthrough: tuple[str, ...], *, domain: str
 ) -> tuple[list[str], bool]:
     """Extract the start principal(s) from an ``attack_paths`` passthrough.
 
-    Mirrors the positional parsing in ``PentestShell.do_attack_paths``: the
-    first positional is the domain, a trailing integer is a path index, and the
-    remaining non-flag tokens are start principals. Flags (and the values of
-    value-taking flags) are skipped so a start principal that follows a flag is
-    still found.
+    Reads the tokens with the same parser ``PentestShell.do_attack_paths`` uses
+    (:func:`adscan_internal.cli.attack_paths_args.parse_attack_paths_args`), so
+    the credential gate and the command can never disagree about which tokens
+    are principals. The domain is prepended when the passthrough does not lead
+    with it, the way :func:`build_verb_arg_string` hands it to the command.
 
     Args:
         passthrough: The verb passthrough tokens (what ``do_attack_paths`` parses).
-        domain: The resolved target domain — dropped when it is the first
-            positional (``attack_paths <domain> <user>``).
+        domain: The resolved target domain.
 
     Returns:
         ``(explicit_users, owned_scope)`` where ``owned_scope`` is True when the
-        special ``owned`` token was requested.
+        special ``owned`` token was requested. An invocation the command would
+        refuse (an unknown option) yields ``([], False)``, so the gate does not
+        lend it a stored credential.
     """
-    positionals: list[str] = []
-    tokens = list(passthrough)
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok in _ATTACK_PATHS_VALUE_FLAGS:
-            i += 2  # skip the flag and its value
-            continue
-        if tok.startswith("--"):
-            i += 1  # boolean flag (or --flag=value)
-            continue
-        positionals.append(tok)
-        i += 1
-
-    start = (
-        positionals[1:]
-        if passthrough_leads_with_domain(positionals, domain=domain)
-        else positionals
+    from adscan_internal.cli.attack_paths_args import (  # noqa: PLC0415
+        parse_attack_paths_args,
     )
-    if start and start[-1].isdigit():
-        start = start[:-1]  # trailing path index
-    users = [t for t in start if not t.isdigit() and t.lower() != "owned"]
-    owned_scope = any(t.lower() == "owned" for t in start)
-    return users, owned_scope
+
+    tokens = [str(tok) for tok in passthrough]
+    if not passthrough_leads_with_domain(tokens, domain=domain):
+        tokens.insert(0, domain)
+    parsed = parse_attack_paths_args(tokens)
+    if parsed.errors:
+        return [], False
+    return parsed.explicit_users, parsed.owned_scope
 
 
 def _resolve_workspace_owned_auth(shell: Any, config: ExecuteConfig) -> bool:
@@ -1022,14 +1007,13 @@ def _add_execute_session_flags(parser: Any) -> None:
     parser.add_argument("-p", "--password", help="Auth password or hash.")
     parser.add_argument(
         "-w", "--workspace",
-        help="Named workspace to persist into (default: ephemeral temp, auto-cleaned).",
+        help=(
+            "Workspace name. Omitted: exec-<domain>-<YYYYMMDD-HHMM>. The workspace "
+            "is kept after the run unless --ephemeral."
+        ),
     )
     parser.add_argument("-i", "--interface", help="Network interface (myip auto-config).")
-    parser.add_argument(
-        "--keep-workspace",
-        action="store_true",
-        help="Keep an auto-created ephemeral workspace on exit.",
-    )
+    add_ephemeral_argument(parser)
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output.")
     parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dev", action="store_true", help=argparse.SUPPRESS)
@@ -1113,9 +1097,8 @@ def config_from_args(args: Any) -> ExecuteConfig:
         password=_pick("password"),
         workspace=_pick("workspace"),
         interface=_pick("interface"),
-        keep_workspace=bool(
-            getattr(args, "keep_workspace", False)
-            or getattr(tail_ns, "keep_workspace", False)
+        ephemeral=bool(
+            getattr(args, "ephemeral", False) or getattr(tail_ns, "ephemeral", False)
         ),
     )
 
@@ -1138,6 +1121,15 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
     os.environ["ADSCAN_NONINTERACTIVE"] = "1"
     deps.enable_auto_mode()
 
+    # Enterprise license gate (same seam as `adscan ci`; no-op outside Enterprise).
+    from adscan_internal.cli.enterprise_license_gate import (
+        LICENSE_BLOCKED_EXIT_CODE,
+        ensure_license_allows_new_scan,
+    )
+
+    if not ensure_license_allows_new_scan("execute"):
+        return LICENSE_BLOCKED_EXIT_CODE
+
     # Shared session preflight (DNS validation, connectivity, tool sanity).
     run_session_preflight(
         config=SessionPreflightConfig(
@@ -1157,22 +1149,26 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
 
     license_mode = deps.resolve_license_mode(config.requested_pro)
     shell = deps.create_shell(deps.console, license_mode)
+    # A non-interactive entry: the policy's execution mode decides whether attack
+    # steps run on their own (execution spec § 4).
+    from adscan_internal.services.scan_controls import stamp_unattended_entry  # noqa: PLC0415
+
+    stamp_unattended_entry(shell, "execute")
     shell.session_command_type = "execute"
     shell.auto = True
-    shell.type = getattr(shell, "type", None) or "audit"
     if config.interface:
         shell.interface = config.interface
 
     telemetry.capture(
         "execute_start",
-        properties={"verb": verb, "ephemeral": not bool(config.workspace)},
+        properties={"verb": verb, "ephemeral": bool(config.ephemeral)},
     )
 
     created = _setup_workspace(shell, config)
     # A verb that WRITES durable workspace state needs to know the workspace is
     # about to be deleted, so it can refuse instead of writing into a directory
     # that does not outlive the command.
-    shell.workspace_is_ephemeral = bool(created and not config.keep_workspace)
+    shell.workspace_is_ephemeral = bool(created and config.ephemeral)
 
     # Best-effort myip auto-config from the interface (mirrors ci.py).
     if config.interface:
@@ -1241,8 +1237,12 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
         print_error(f"Error executing '{verb}'.")
         exit_code = 1
     finally:
-        _cleanup_workspace(
-            shell, created=created, keep=bool(config.keep_workspace)
+        close_run_workspace(
+            name=shell.current_workspace,
+            workspace_dir=shell.current_workspace_dir,
+            created=created,
+            ephemeral=bool(config.ephemeral),
+            failed=exit_code != 0,
         )
         try:
             shell.do_exit(exit=False)

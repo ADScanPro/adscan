@@ -9,6 +9,7 @@ import json
 import os
 from pydantic import BaseModel, Field
 
+from adscan_core.offline import offline_mode_enabled
 from adscan_core.paths import get_state_dir
 
 
@@ -141,8 +142,26 @@ def get_ai_config_path() -> Path:
     return get_state_dir() / "ai_config.json"
 
 
-def load_ai_config() -> AIConfig:
-    """Load AI config from disk or return defaults."""
+AI_OFFLINE_MESSAGE = (
+    "AI is disabled in offline mode (ADSCAN_OFFLINE / --offline): no AI provider, "
+    "local or remote, is contacted."
+)
+
+
+def ai_offline_reason() -> str | None:
+    """Return why AI is unavailable because of offline mode, else ``None``.
+
+    Offline mode means ADscan reaches no external service, and an AI provider
+    receives workspace content (domains, users, findings) in its prompts. So
+    offline disables every provider, a local one included: it is the operator's
+    single switch for "nothing of this engagement leaves this process".
+    """
+    if offline_mode_enabled():
+        return AI_OFFLINE_MESSAGE
+    return None
+
+
+def _load_persisted_ai_config() -> AIConfig:
     path = get_ai_config_path()
     if not path.exists():
         return AIConfig()
@@ -156,8 +175,28 @@ def load_ai_config() -> AIConfig:
         return AIConfig()
 
 
+def load_ai_config() -> AIConfig:
+    """Load AI config from disk or return defaults.
+
+    In offline mode the returned config is always ``enabled=False`` (the file on
+    disk is left untouched), so every consumer gated on ``config.enabled`` (the
+    AI service, share-loot analysis, the backend availability check) stays off.
+    """
+    config = _load_persisted_ai_config()
+    if ai_offline_reason() is not None:
+        return config.model_copy(update={"enabled": False})
+    return config
+
+
 def save_ai_config(config: AIConfig) -> Path:
-    """Persist AI config to disk and return the written path."""
+    """Persist AI config to disk and return the written path.
+
+    Refused in offline mode: what ``load_ai_config`` returns there is the
+    forced-off view, and saving it would silently disable AI for good.
+    """
+    offline_reason = ai_offline_reason()
+    if offline_reason is not None:
+        raise RuntimeError(offline_reason)
     path = get_ai_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:

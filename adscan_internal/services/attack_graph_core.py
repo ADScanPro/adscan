@@ -15,6 +15,7 @@ Notes:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections import defaultdict, deque
@@ -23,9 +24,26 @@ from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from adscan_core import graph_secret_refs
+from adscan_core.attack_graph_edge_identity import (
+    SHARE_ACCESS_RELATION_KEYS,
+    share_access_name_from_notes,
+)
+# Provenance of a persisted engine follow-up (``edge.notes["origin"]``): one SSOT
+# shared with the report and the web backend.
+from adscan_core.reporting.engine_followup import (
+    ENGINE_FOLLOWUP_ORIGIN,
+    ENGINE_FOLLOWUP_ORIGIN_KEY,
+    ENGINE_FOLLOWUP_PARENT_KEY,
+    notes_are_engine_followup,
+)
 from adscan_core.reporting.attack_path_memory_gate import (
     DfsMemoryBudget,
     _AttackPathMemoryBudgetExceeded,
+)
+from adscan_core.reporting.session_held_arrivals import (
+    SESSION_HELD_DETAILS_KEY,
+    SESSION_HELD_VALUE,
 )
 from adscan_core.reporting.unauthenticated_reach import (
     UNAUTHENTICATED_ENTRY_KIND,
@@ -77,9 +95,29 @@ from adscan_internal.services.tier_lattice import (
     stamp_records_domain_compromise_tier,
     stamp_records_target_tier,
 )
+# Already loaded at import time through ``tier_lattice`` (no new import cycle);
+# imported here at module level because the arrival walk runs once per admitted
+# edge in every DFS engine.
+from adscan_internal.services.post_exploitation.access_followups import (
+    PRINCIPAL_COMPROMISE_FOLLOWUP_RELATIONS,
+    AccessLane,
+    get_access_lane,
+    grants_host_system_session,
+)
+
+# Steps after which the route holds a principal outright, so an earlier access
+# arrival no longer limits what follows: the principal-compromise follow-ups
+# (DumpLSA becomes the host machine account; DumpLSASS / ScheduledTask become a
+# session user) and the dumps that recover another principal's secret
+# (``host -> DumpSAM|DumpDPAPI -> principal``). The MSSQL SYSTEM escalations are
+# the other transition (``grants_host_system_session``).
+_OWNERSHIP_TRANSITION_KEYS: frozenset[str] = PRINCIPAL_COMPROMISE_FOLLOWUP_RELATIONS | {
+    "dumpsam",
+    "dumpdpapi",
+}
 
 _LOCAL_REUSE_RELATION_KEY = "localadminpassreuse"
-_SHARE_ACCESS_RELATION_KEYS = {"readshare", "writeshare", "fullcontrolshare"}
+_SHARE_ACCESS_RELATION_KEYS = SHARE_ACCESS_RELATION_KEYS
 
 # ── Target-mode normalization ─────────────────────────────────────────────────
 # Canonical target modes for path computation.  Any value outside this set
@@ -209,6 +247,72 @@ _CONTEXT_RELATIONS_LOWER: frozenset[str] = frozenset(
 # *non-MSSQL* arrival.
 _MSSQL_SESSION_EDGE_KEYS: frozenset[str] = frozenset({_MSSQL_LINKED_KEY})
 
+# Edges that extend an access SESSION rather than the identity of the host it
+# landed on. When a route reaches ANY host through a session that does not own
+# it, these (plus in-session self-loop follow-ups) are the only ways onward: the
+# host's own memberships, ACL rights and machine-account access (AdminTo /
+# CanRDP / HasSession / ... sourced at the host) are not the actor's. Today that
+# is the SQL session's linked-server hop; a future session-scoped pivot is added
+# here, never special-cased in an engine.
+_SESSION_SCOPED_EDGE_KEYS: frozenset[str] = _MSSQL_SESSION_EDGE_KEYS
+
+# What a LOCAL-ADMIN session (AdminTo / ReadLAPSPassword / the RBCD relay) can
+# do on the host without first holding its machine account: read the other
+# logon sessions there (HasSession, then the DumpLSASS / ScheduledTask become
+# step on that user) and dump credential material that names ANOTHER principal
+# (``host -> DumpLSA|DumpLSASS|DumpSAM|DumpDPAPI -> principal``). Whether a
+# given step runs is still decided by the credential-context gate.
+_LOCAL_ADMIN_SESSION_EDGE_KEYS: frozenset[str] = frozenset(
+    {"hassession", "dumplsa", "dumplsass", "dumpsam", "dumpdpapi"}
+)
+
+
+def _edge_continues_session(
+    candidate_relation: str,
+    *,
+    is_self_loop: bool,
+    notes: Mapping[str, Any] | None = None,
+    arrival_lane: AccessLane | None = None,
+) -> bool:
+    """True when an edge out of a session-reached host is session-granted.
+
+    * A self-loop: a follow-up run inside the session on that host (xp_cmdshell,
+      the SYSTEM escalations, DumpLSA). Whether the session can run it is still
+      decided by the normal gates (a user-level session cannot run a dump that
+      needs local admin). A follow-up that reaches SYSTEM makes the route own
+      the host, and from then on the host's own edges are the actor's.
+    * A session-scoped hop (``_SESSION_SCOPED_EDGE_KEYS``).
+    * The engine-manufactured direct-replication bridge on a writable DC
+      (``implicit_dc_dcsync_bridge``): the capability a SYSTEM context on the DC
+      already holds. The arrival gate still withholds it until an in-session
+      follow-up has reached SYSTEM, so it is only ever taken after one.
+
+    * With a LOCAL-ADMIN ``arrival_lane`` (one that unlocks the self-credential
+      DumpLSA bridge), the session's own reach on the host
+      (``_LOCAL_ADMIN_SESSION_EDGE_KEYS``): the other logon sessions there and
+      credential material naming another principal. A user-level session holds
+      neither.
+
+    Everything else sourced at the host (its MemberOf, its ACL rights, its
+    machine account's AdminTo / CanRDP / delegation elsewhere) belongs to the
+    machine account, which the route holds only after the host's DumpLSA
+    self-loop (or an in-session SYSTEM escalation): ``_route_access_arrival``.
+    """
+    if is_self_loop:
+        return True
+    rel = str(candidate_relation or "").strip().lower()
+    if rel in _SESSION_SCOPED_EDGE_KEYS:
+        return True
+    if isinstance(notes, Mapping) and (
+        notes.get("synthesized_from") == "implicit_dc_dcsync_bridge"
+    ):
+        return True
+    return (
+        arrival_lane is not None
+        and arrival_lane.unlocks_self_credential
+        and rel in _LOCAL_ADMIN_SESSION_EDGE_KEYS
+    )
+
 
 def _mssql_session_edge_withheld_off_non_mssql_arrival(
     path_relations: list[str],
@@ -253,15 +357,17 @@ def _mssql_session_edge_withheld_off_non_mssql_arrival(
 # "becomes" the host Computer principal).  It is unlocked ONLY by LOCAL-ADMIN
 # access (AdminTo / ReadLAPSPassword), never by a user-level WinRM / RDP session.
 #
-# Implementation note on the AdminTo case: a *direct* host control edge after a
-# bare AdminTo (no DumpLSA) is already blocked by the credential-context guard
-# (AdminTo provides local_admin_session; a control edge requires user_credentials,
-# which local_admin_session does not satisfy), and the implicit DumpLSA overlay
-# re-enables it.  The gate below closes the remaining gap: the *user-level* access
-# edges (CanPSRemote / CanRDP / ExecuteDCOM / SQLAccess) were context-transparent,
-# so a credential recovered BEFORE the access edge leaked the host's control edges
+# The local-admin lanes are held to the same rule: local admin on a host is not
+# its machine account, so ``AdminTo -> DC01 -> MemberOf -> ...`` is withheld and
+# the route reads ``AdminTo -> DC01 -> DumpLSA -> DC01 -> MemberOf -> ...``
+# (``_route_access_arrival``). The user-level access edges (CanPSRemote / CanRDP
+# / ExecuteDCOM / SQLAccess) are context-transparent, so without this gate a
+# credential recovered BEFORE the access edge leaked the host's control edges
 # straight through the pivot.  This is the HTB Pirate false-positive factory:
 #   ReadGMSAPassword → CanPSRemote → DC01$ → ADCSESC7 → DOMAIN ADMINS.
+# Edges a session grants WITHOUT the machine account (in-session follow-ups,
+# the SQL linked-server hop, and for a local-admin session the other logon
+# sessions and credential dumps) are ``_edge_continues_session``.
 #
 # EdgeKinds that represent traversing the HOST's own outbound privileges (and so
 # must be withheld after a non-self-credential access arrival).  AUTH and TRUST
@@ -286,56 +392,172 @@ def _candidate_is_host_control_edge(candidate_relation: str) -> bool:
     )
 
 
+def _route_access_arrival(
+    path_relations: list[str],
+) -> tuple[bool, AccessLane | None]:
+    """Return ``(owns, lane)`` for the host the route last reached by an access edge.
+
+    Walks back from the end of ``path_relations``. The first ownership
+    transition seen means the route holds what it stands on:
+
+    * the self-credential DumpLSA self-loop (reads the machine account secret);
+    * an in-session MSSQL SYSTEM escalation (SeImpersonate / Token-Theft):
+      running as NT AUTHORITY\\SYSTEM IS the machine account;
+    * a step that recovers or becomes ANOTHER principal (DumpLSASS /
+      ScheduledTask on a session user, DumpSAM / DumpDPAPI, a lateral DumpLSA):
+      the route now acts as that principal, whose own edges are its own
+      (``_OWNERSHIP_TRANSITION_KEYS``).
+
+    Otherwise the first access edge seen decides, and NO access edge owns the
+    host by itself: a user-level session (CanRDP / CanPSRemote / ExecuteDCOM /
+    SQLAccess / SQLAdmin / a linked-server hop) never does, and a LOCAL-ADMIN
+    lane (AdminTo / ReadLAPSPassword / the RBCD relay) holds the host, not its
+    machine account, until its DumpLSA self-loop runs (the overlay adds one after
+    every such arrival). That lane is returned so the caller can grant what a
+    local-admin session reaches on its own (``_edge_continues_session``). No
+    access edge at all: ``(True, None)``, the principal holds its own rights.
+
+    Single source of the arrival != ownership walk: the per-edge gates, the
+    Tier-0 frontier closure check (``_closure_respects_arrival_ownership``) and
+    the frontier stop (``_close_route_at_frontier``) all read it, so they cannot
+    disagree.
+    """
+    for rel in reversed(path_relations):
+        if rel in _OWNERSHIP_TRANSITION_KEYS or grants_host_system_session(rel):
+            return True, None
+        lane = get_access_lane(rel)
+        if lane is None:
+            continue
+        return False, lane
+    return True, None
+
+
+def _route_owns_access_target(path_relations: list[str]) -> bool:
+    """Return True when the route holds the machine account of the host it last
+    reached by an access edge (``_route_access_arrival``)."""
+    return _route_access_arrival(path_relations)[0]
+
+
+def stamp_session_held_targets(record: dict[str, Any]) -> None:
+    """Mark the steps whose target the route holds only as an access session.
+
+    A route that reaches a host through an access edge (CanRDP, CanPSRemote,
+    ExecuteDCOM, SQLAccess, SQLAdmin, a linked-server hop, AdminTo,
+    ReadLAPSPassword, the RBCD relay) stands on a SESSION there, not on the host's
+    machine account (``_route_access_arrival``). The engines already refuse to
+    continue such a route along the host's own edges. A view that merges several
+    routes into one graph has no such rule: it draws one node per object, so
+    ``group -CanRDP-> DC01$`` from one route and ``DC01$ -MemberOf-> Domain
+    Controllers -DCSync-> domain`` from another meet on the same node and read
+    as one route to the domain that no route contains.
+
+    This stamps, from the record's own relation chain, which arrivals are held
+    as a session, so a merging view can draw those as presence on the host
+    (``adscan_core.reporting.route_overlay``). A run of self-loops on the reached
+    node (xp_cmdshell, a SYSTEM escalation) belongs to the arrival; when the run
+    ends owning the host (the DumpLSA self-credential, an in-session SYSTEM
+    escalation) the whole run is control of the host and nothing is stamped,
+    because from there on its own edges are the route's. Only an access-lane arrival is stamped: a principal
+    reached any other way (a recovered secret, a HasSession pivot, a delegation)
+    is unchanged.
+
+    Recomputed from the record it is given (idempotent; a sliced record is
+    corrected), never raises.
+    """
+    steps = record.get("steps") if isinstance(record, dict) else None
+    nodes = record.get("nodes") if isinstance(record, dict) else None
+    if not isinstance(steps, list) or not isinstance(nodes, list):
+        return
+    relations = [
+        str((s.get("action") if isinstance(s, dict) else "") or "").strip().lower()
+        for s in steps
+    ]
+    count = min(len(relations), max(len(nodes) - 1, 0))
+    held_as_session = [False] * count
+    position = 1
+    while position <= count:
+        # The run of positions standing on the same node through self-loops.
+        run_end = position
+        while run_end < count and nodes[run_end + 1] == nodes[run_end]:
+            run_end += 1
+        arrival = relations[position - 1]
+        if get_access_lane(arrival) is not None:
+            owns_at_end, _lane = _route_access_arrival(relations[:run_end])
+            if not owns_at_end:
+                for pos in range(position, run_end + 1):
+                    held_as_session[pos - 1] = True
+        position = run_end + 1
+
+    # Copy-on-write: minimisation slices and copies records, so a step dict (and
+    # its ``details``) can be shared with another record whose chain decides the
+    # mark differently (a prefix that stops at the session vs. the full route that
+    # goes on through DumpLSA). Writing in place would let the last record
+    # stamped decide for both.
+    new_steps: list[Any] | None = None
+    for index, step in enumerate(steps):
+        details = step.get("details") if isinstance(step, dict) else None
+        if not isinstance(details, dict):
+            continue
+        want = index < count and held_as_session[index]
+        has = details.get(SESSION_HELD_DETAILS_KEY) == SESSION_HELD_VALUE
+        if want == has and (want or SESSION_HELD_DETAILS_KEY not in details):
+            continue
+        new_details = dict(details)
+        if want:
+            new_details[SESSION_HELD_DETAILS_KEY] = SESSION_HELD_VALUE
+        else:
+            new_details.pop(SESSION_HELD_DETAILS_KEY, None)
+        if new_steps is None:
+            new_steps = list(steps)
+        new_steps[index] = {**step, "details": new_details}
+    if new_steps is not None:
+        record["steps"] = new_steps
+
+
 def _host_control_withheld_after_access(
     path_relations: list[str],
     candidate_relation: str,
 ) -> bool:
     """Return True when ``candidate_relation`` must be withheld as a host-control
     edge traversed off a host reached via an access edge that has not "become"
-    the host.
-
-    Walks back from the end of ``path_relations``.  If a self-credential DumpLSA
-    follow-up is seen before any access edge, the path has already "become" the
-    host machine account, so the candidate is allowed.  If a LOCAL-ADMIN access
-    edge that unlocks the self-credential bridge is seen, the candidate is allowed
-    (the credential-context guard + DumpLSA overlay handle that lane).  If a
-    user-level access edge (which does NOT unlock the bridge) is the most recent
-    access-relevant relation, the host-control candidate is withheld.
+    the host (``_route_owns_access_target``).
     """
-    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
-        access_unlocks_self_credential,
-        get_access_lane,
-        grants_host_system_session,
-        is_self_credential_followup,
-    )
-
     if not _candidate_is_host_control_edge(candidate_relation):
         return False
+    return not _route_owns_access_target(path_relations)
 
-    for rel in reversed(path_relations):
-        # A self-credential follow-up "becomes" the host machine account →
-        # the host's own outbound control edges are legitimately available. The
-        # MSSQL SYSTEM-escalation self-loops (SeImpersonate / Token-Theft) reach
-        # NT AUTHORITY\SYSTEM, which IS the host machine account — the same
-        # ownership, so they likewise stop the walk-back and re-enable the host's
-        # outbound control edges (incl. the synthetic direct-DCSync bridge on a
-        # writable DC). They must be seen BEFORE the SQL access lane that unlocked
-        # them (SQLAccess / SQLAdmin / MssqlLinkedServerLateral), which does not
-        # itself confer self-credential and would otherwise withhold the bridge.
-        if is_self_credential_followup(rel) or grants_host_system_session(rel):
-            return False
-        lane = get_access_lane(rel)
-        if lane is None:
-            continue
-        # First (most recent) access edge encountered with no intervening
-        # self-credential follow-up.  LOCAL-ADMIN access that unlocks the
-        # self-credential bridge is allowed through here (the credential-context
-        # guard + DumpLSA overlay enforce the correct DumpLSA step); a user-level
-        # access edge withholds the host-control candidate.
-        return not access_unlocks_self_credential(rel)
 
-    # No access edge in the path → the principal still owns its own privileges.
-    return False
+def _session_edge_withheld_after_access(
+    path_relations: list[str],
+    candidate_relation: str,
+    *,
+    is_self_loop: bool,
+    notes: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True when an edge must be withheld because the route only holds a
+    SESSION on the host it last reached, and the edge is not one that session
+    grants (``_edge_continues_session``).
+
+    The session-scope rule, applied at every non-owning arrival on any host
+    (Tier 0 or not). Where ``_host_control_withheld_after_access`` withholds the
+    host's control / escalation / membership edges, this also withholds its
+    ACCESS edges: ``user -CanRDP-> WS01 -AdminTo-> SRV02`` would treat WS01's
+    machine-account admin right as the RDP user's. It needs the edge's geometry
+    (a self-loop is an in-session follow-up), so it runs where the engines see
+    the edge (``admit_frontier_edge``) and in the closure replay
+    (``_closure_respects_arrival_ownership``), never on relation names alone.
+
+    Only an ownership transition (the host's DumpLSA self-loop, or an
+    in-session follow-up that reached SYSTEM) gives the route the host's own
+    edges: ``user -AdminTo-> DC01 -DumpLSA-> DC01 -MemberOf-> ...``, never
+    ``user -AdminTo-> DC01 -MemberOf-> ...`` (``_route_access_arrival``).
+    """
+    owns, lane = _route_access_arrival(path_relations)
+    if owns:
+        return False
+    return not _edge_continues_session(
+        candidate_relation, is_self_loop=is_self_loop, notes=notes, arrival_lane=lane
+    )
 
 
 # Session-become follow-ups: the two techniques that turn a ``HasSession``
@@ -348,6 +570,227 @@ def _host_control_withheld_after_access(
 _SESSION_BECOME_RELATION_KEYS: frozenset[str] = frozenset(
     {"dumplsass", "scheduledtask"}
 )
+
+def is_implicit_followup_self_loop(from_id: str, to_id: str, relation: str) -> bool:
+    """True when the edge is an engine-manufactured follow-up self-loop.
+
+    Such a step acts ON the node it starts from: it is how the path takes
+    control of that node (runs as the session user, reads the host's own
+    secrets, escalates the SQL session to SYSTEM), so it never extends reach past
+    a principal the path already owns. The relation set is the follow-up SSOT
+    (``access_followups.ENGINE_MANUFACTURED_FOLLOWUP_RELATIONS``).
+    """
+    from adscan_internal.services.post_exploitation.access_followups import (  # noqa: PLC0415
+        ENGINE_MANUFACTURED_FOLLOWUP_RELATIONS,
+    )
+
+    src = str(from_id or "").strip()
+    return bool(src) and src == str(to_id or "").strip() and (
+        str(relation or "").strip().lower() in ENGINE_MANUFACTURED_FOLLOWUP_RELATIONS
+    )
+
+
+# ── Engine follow-ups persisted in the stored graph ─────────────────────────
+#
+# The follow-up self-loops the engine adds after an access (DumpLSA after a
+# local-admin arrival on a host, ScheduledTask / DumpLSASS after a HasSession on
+# a user, XpCmdshell after a sysadmin arrival on a SQL host) are written into
+# ``attack_graph.json`` as ordinary edges by the one graph writer
+# (``save_attack_graph`` -> :func:`materialize_engine_followup_edges`), so a
+# status, a note or a reason recorded for one always has its edge, and every
+# reader (the engine, the report, the web ingestion and edge detail) sees one
+# representation. Each carries ``notes.origin = engine_followup`` and the
+# ``parent_edge`` it was derived from, so it is never read as collected
+# directory data.
+#
+# Path set: the DFS still derives these steps from their parent through the
+# overlay (that is what decides WHERE they may be traversed, and the overlay is
+# built on the in-memory graph the DFS runs on, merged and enriched). A
+# persisted copy is folded INTO its overlay twin by key (status and notes carried
+# over) and never enters the adjacency itself, so a follow-up is traversed once,
+# in the same slot as before. A persisted follow-up the overlay does not
+# regenerate is traversable only when it records an outcome, exactly like the
+# runtime edges the status writer created before this change.
+
+#: ``edge_type`` of an engine follow-up the writer materialized.
+ENGINE_FOLLOWUP_EDGE_TYPE = "engine_followup"
+
+#: Overlay provenances persisted eagerly: the self-loop follow-ups only. The
+#: ``Computer -> DCSync -> Domain`` bridge (``implicit_dc_dcsync_bridge``) is NOT
+#: persisted: an unexecuted copy would read as a replication right to every
+#: consumer that inventories DCSync holders (findings, compliance, exposure), and
+#: its outcome already lands when it runs (both endpoints are collected nodes and
+#: a Domain target is exempt from the Tier-0-source filter).
+_PERSISTED_FOLLOWUP_PROVENANCES: frozenset[str] = frozenset(
+    {
+        "implicit_dumplsa_bridge",
+        "implicit_session_followup_bridge",
+        "implicit_xpcmdshell_bridge",
+    }
+)
+
+#: Statuses that mean no outcome has been recorded on a follow-up yet.
+_UNRECORDED_FOLLOWUP_STATUSES: frozenset[str] = frozenset({"", "discovered"})
+
+
+def edge_ref(edge: Mapping[str, Any]) -> str:
+    """Stable reference to a graph edge: its ``id``, else ``from|relation|to``."""
+    edge_id = str(edge.get("id") or "").strip()
+    if edge_id:
+        return edge_id
+    return "|".join(
+        str(edge.get(key) or "").strip() for key in ("from", "relation", "to")
+    )
+
+
+def _followup_key(edge: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(edge.get("from") or "").strip(),
+        str(edge.get("relation") or "").strip().lower(),
+        str(edge.get("to") or "").strip(),
+    )
+
+
+def edge_is_engine_followup(edge: Mapping[str, Any] | None) -> bool:
+    """True when ``edge`` is a follow-up the engine added (provenance marker)."""
+    if not isinstance(edge, Mapping):
+        return False
+    return notes_are_engine_followup(edge.get("notes"))
+
+
+def engine_followup_outcome_recorded(edge: Mapping[str, Any]) -> bool:
+    """True when a run recorded something on the step: a status or a not-run reason."""
+    status = str(edge.get("status") or "").strip().lower()
+    if status not in _UNRECORDED_FOLLOWUP_STATUSES:
+        return True
+    notes = edge.get("notes")
+    return isinstance(notes, Mapping) and bool(notes.get("not_executed_reason"))
+
+
+def is_unrecorded_engine_followup(edge: Mapping[str, Any] | None) -> bool:
+    """An engine follow-up no run has touched: derived data, not an observation.
+
+    Raw-edge consumers (traversal adjacency, reachability floods, the finding
+    derivation) skip it, because before the writer persisted it no such edge
+    existed for them; the DFS reaches it through its overlay twin.
+    """
+    return edge_is_engine_followup(edge) and not engine_followup_outcome_recorded(
+        edge  # type: ignore[arg-type]
+    )
+
+
+def _graph_without_unrecorded_followups(graph: dict[str, Any]) -> dict[str, Any]:
+    """Shallow view of ``graph`` whose edges exclude unrecorded engine follow-ups.
+
+    The overlay builders read their PARENT edges from this view, so a persisted
+    follow-up never parents another derivation it did not parent before.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list) or not any(
+        is_unrecorded_engine_followup(edge) for edge in edges if isinstance(edge, dict)
+    ):
+        return graph
+    view = dict(graph)
+    view["edges"] = [
+        edge
+        for edge in edges
+        if not (isinstance(edge, dict) and is_unrecorded_engine_followup(edge))
+    ]
+    return view
+
+
+def materialize_engine_followup_edges(graph: dict[str, Any]) -> tuple[int, int]:
+    """Write the engine's self-loop follow-ups into ``graph`` as ordinary edges.
+
+    Idempotent, keyed by ``(from, relation, to)`` with the engine origin:
+    re-running adds nothing. Reconciles three cases against the follow-ups the
+    overlay derives from the CURRENT graph:
+
+    * derived and absent -> appended, ``status = discovered``, with the overlay's
+      notes (minus ``virtual``), ``origin = engine_followup`` and ``parent_edge``;
+    * derived and present -> provenance (re)stamped, status and notes kept. A
+      runtime edge the status writer created for the same step before this
+      existed is adopted the same way; a collected edge is never touched;
+    * persisted but no longer derived (its parent left the graph) -> removed
+      when no run recorded anything on it, kept as history when one did.
+
+    Returns:
+        ``(added, removed)``.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return 0, 0
+    view = _graph_without_unrecorded_followups(graph)
+    derived: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for builder in (
+        _build_implicit_dumplsa_overlay,
+        _build_implicit_session_followup_overlay,
+        _build_implicit_xpcmdshell_overlay,
+    ):
+        for overlay_edges in builder(view).values():
+            for overlay_edge in overlay_edges:
+                notes = overlay_edge.get("notes") or {}
+                if notes.get("synthesized_from") not in _PERSISTED_FOLLOWUP_PROVENANCES:
+                    continue
+                derived.setdefault(_followup_key(overlay_edge), overlay_edge)
+
+    kept: list[Any] = []
+    present: set[tuple[str, str, str]] = set()
+    removed = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            kept.append(edge)
+            continue
+        key = _followup_key(edge)
+        twin = derived.get(key)
+        if twin is not None:
+            is_runtime_record = str(edge.get("edge_type") or "") == "runtime"
+            if edge_is_engine_followup(edge) or is_runtime_record:
+                notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+                twin_notes = twin.get("notes") or {}
+                notes = dict(notes)
+                notes[ENGINE_FOLLOWUP_ORIGIN_KEY] = ENGINE_FOLLOWUP_ORIGIN
+                notes[ENGINE_FOLLOWUP_PARENT_KEY] = twin_notes.get(
+                    ENGINE_FOLLOWUP_PARENT_KEY
+                )
+                notes.setdefault("synthesized_from", twin_notes.get("synthesized_from"))
+                edge["notes"] = notes
+            present.add(key)
+            kept.append(edge)
+            continue
+        if edge_is_engine_followup(edge) and not engine_followup_outcome_recorded(edge):
+            removed += 1
+            continue
+        kept.append(edge)
+
+    added = 0
+    for key, twin in derived.items():
+        if key in present:
+            continue
+        twin_notes = {
+            k: v for k, v in (twin.get("notes") or {}).items() if k != "virtual"
+        }
+        twin_notes[ENGINE_FOLLOWUP_ORIGIN_KEY] = ENGINE_FOLLOWUP_ORIGIN
+        relation = str(twin.get("relation") or "")
+        kept.append(
+            {
+                "id": hashlib.md5(  # noqa: S324 - an identity, not a security hash
+                    f"{key[0]}|{relation}|{key[2]}|{ENGINE_FOLLOWUP_EDGE_TYPE}".encode()
+                ).hexdigest(),
+                "from": key[0],
+                "to": key[2],
+                "relation": relation,
+                "kind": str(twin.get("kind") or "derived"),
+                "edge_type": ENGINE_FOLLOWUP_EDGE_TYPE,
+                "status": "discovered",
+                "notes": twin_notes,
+            }
+        )
+        added += 1
+
+    if added or removed:
+        graph["edges"] = kept
+    return added, removed
 
 
 def _session_user_edge_withheld_before_become(
@@ -446,13 +889,19 @@ def _edges_chain_ok(
     cand_rel = str(candidate_relation or "").strip().lower()
 
     # Gate 1 — access-edge host-control withholding (runs before the transparent
-    # early-return so a host's own MemberOf is also gated after a user-level
-    # access arrival).  This gate is intentionally LEFT ACTIVE for the synthetic
-    # DCSync bridge too: it is exactly what restricts the direct DCSync to a
-    # LOCAL-ADMIN arrival on the DC (AdminTo / AllowedToDelegate+T2A4D / SPNJack /
-    # NTLMv1RelayRBCD) and withholds it after a user-level CanRDP / CanPSRemote
-    # session — which has no replication capability.
-    if _host_control_withheld_after_access(path_relations, cand_rel):
+    # early-return so a host's own MemberOf is also gated after an access
+    # arrival, local-admin included, until the host's DumpLSA self-loop).
+    # The synthetic DCSync bridge is the ADMIN SESSION's replication capability
+    # on a writable DC, not the machine account's: it is admitted after a
+    # LOCAL-ADMIN arrival on the DC (AdminTo / NTLMv1RelayRBCD, and the
+    # non-lane AllowedToDelegate+T2A4D / SPNJack arrivals) or once the route
+    # owns the host, and withheld after a user-level CanRDP / CanPSRemote
+    # session, which has no replication capability.
+    if _candidate_is_dc_dcsync_bridge(candidate_edge):
+        owns, lane = _route_access_arrival(path_relations)
+        if not owns and not (lane is not None and lane.unlocks_self_credential):
+            return False
+    elif _host_control_withheld_after_access(path_relations, cand_rel):
         return False
 
     # Gate 1.5 — MSSQL-session edges (linked-server lateral) chain ONLY off an
@@ -553,11 +1002,68 @@ def _self_loop_relation_already_used(
     return False
 
 
+def _closure_respects_arrival_ownership(
+    prefix_steps: list[AttackPathStep],
+    closure_steps: list[AttackPathStep],
+) -> bool:
+    """Return True when a precomputed closure may be appended after ``prefix_steps``.
+
+    A Tier-0 frontier stop appends the node's shortest closure to a Domain object
+    (``_frontier_closure_branches``). That closure is built ONCE per node by a
+    reverse BFS with no prefix, so the per-frontier admission gates the DFS runs
+    (``admit_frontier_edge`` -> ``_edges_chain_ok``) never saw it. Every engine
+    then emitted, for a Tier-0 host reached by a user-level session, the host's
+    OWN edges as if the actor had become the machine account::
+
+        user -CanRDP-> DC01$ -MemberOf-> Domain Controllers -DCSync-> domain
+
+    This replays, step by step over ``prefix + closure``, the gates that
+    encode arrival != ownership as LANE facts:
+
+    * Gate 1, ``_host_control_withheld_after_access``: a host's own control /
+      escalation / membership edge after a user-level access arrival.
+    * Gate 1.5, ``_mssql_session_edge_withheld_off_non_mssql_arrival``: a SQL
+      linked-server hop off a non-SQL arrival.
+    * The session-scope rule, ``_session_edge_withheld_after_access``: any edge
+      of the host the session does not grant (its machine account's access
+      edges included), the same check ``admit_frontier_edge`` runs per edge.
+
+    It deliberately does NOT replay the credential-context gate (Gate 2) or the
+    session-become gate (Gate 1.6). A closure elides the implicit become
+    self-loops by construction (the DumpLSA a LOCAL-ADMIN arrival unlocks, the
+    DumpLSASS on a session user, the synthetic direct-DCSync bridge), so those
+    gates would reject legitimate local-admin routes the frontier stop has always
+    closed. Gate 1 already lets a local-admin lane through for that same reason.
+
+    Relations are compared lower-cased, matching the DFS's ``path_rels``.
+    """
+    path_rels = [str(s.relation or "").strip().lower() for s in prefix_steps]
+    for step in closure_steps:
+        cand_rel = str(step.relation or "").strip().lower()
+        if _host_control_withheld_after_access(path_rels, cand_rel):
+            return False
+        if _mssql_session_edge_withheld_off_non_mssql_arrival(path_rels, cand_rel):
+            return False
+        if _session_edge_withheld_after_access(
+            path_rels,
+            cand_rel,
+            is_self_loop=step.from_id == step.to_id,
+            notes=step.notes,
+        ):
+            return False
+        path_rels.append(cand_rel)
+    return True
+
+
 @dataclass(frozen=True)
 class AttackPath:
     steps: list[AttackPathStep]
     source_id: str
     target_id: str
+    #: ``(domain_node_id, closure_length)`` for every OTHER Domain object the
+    #: route's Tier-0 frontier node also reaches (``annotate_also_reaches_domains``).
+    #: Empty for a route with no frontier, or whose frontier reaches one domain.
+    also_reaches_domains: tuple[tuple[str, int], ...] = ()
 
     @property
     def length(self) -> int:
@@ -645,15 +1151,7 @@ def display_record_signature(
 
 def _extract_share_access_name_from_notes(notes: dict[str, Any] | None) -> str:
     """Return the SMB share name persisted on a share-access edge."""
-    if not isinstance(notes, dict):
-        return ""
-    share_name = str(notes.get("share_name") or notes.get("share") or "").strip()
-    if share_name:
-        return share_name
-    collector_method = str(notes.get("collector_method") or "").strip()
-    if collector_method.lower().startswith("share_acl:"):
-        return collector_method.split(":", 1)[1].strip()
-    return ""
+    return share_access_name_from_notes(notes)
 
 
 def share_access_step_signature_component(
@@ -775,6 +1273,11 @@ def _is_nontraversable_attack_edge(
             still apply), so callers without node context degrade safely.
     """
     if _is_excluded_share_access_edge(edge):
+        return True
+    if is_unrecorded_engine_followup(edge):
+        # A follow-up the graph writer persisted and no run has touched: the DFS
+        # reaches it through its overlay twin, and no flood or count saw it
+        # before it was persisted. See ``materialize_engine_followup_edges``.
         return True
     if str(edge.get("relation") or "").strip().lower() == "hasshadowcredentials":
         # Existing shadow credential = persistence IoC finding, not an attack edge
@@ -1283,7 +1786,9 @@ def _display_record_exact_signature(
     return nodes_sig, rels_sig
 
 
-def load_attack_graph(path: Path) -> dict[str, Any] | None:
+def load_attack_graph(
+    path: Path, *, domain_data: Any = None
+) -> dict[str, Any] | None:
     """Load an attack graph from an `attack_graph.json` file path.
 
     Phase 2 (schema 1.2): every edge carries a top-level ``kind`` field
@@ -1296,6 +1801,11 @@ def load_attack_graph(path: Path) -> dict[str, Any] | None:
 
     Args:
         path: Path to `attack_graph.json`.
+        domain_data: The ``domains_data[<domain>]`` entry, when the caller holds
+            one. Only the privileged-group escalation backfill consumes it (to
+            pin a DC-targeted escalation to the domain's recorded primary
+            controller); omitting it degrades that one resolution and changes
+            nothing else.
 
     Returns:
         The parsed graph dict when readable/valid, otherwise None.
@@ -1314,19 +1824,36 @@ def load_attack_graph(path: Path) -> dict[str, Any] | None:
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return None
     data, migrated = migrate_legacy_attack_graph(data)
+    # Never hand a recovered secret to a consumer: replace inline values with
+    # references in memory (the web's live compute and the report read this
+    # loader). The key is only read, never created, here.
+    extracted = graph_secret_refs.redact_graph_secrets(
+        data,
+        key=graph_secret_refs.read_fingerprint_key(
+            graph_secret_refs.workspace_root_for_graph_path(path)
+        ),
+    )
     if migrated:
-        try:
-            write_json_file(str(path), data)
-        except OSError:
-            # Best-effort normalisation; in-memory data is already correct.
-            pass
+        # A rewrite would drop an inline value that nothing has retained yet:
+        # write only when the values are safe in the sidecar (or there were none).
+        retained = not extracted or graph_secret_refs.retain_extracted_secrets(
+            graph_secret_refs.sidecar_path_for_graph(path), extracted
+        )
+        if retained:
+            try:
+                write_json_file(str(path), data)
+            except OSError:
+                # Best-effort normalisation; in-memory data is already correct.
+                pass
     _backfill_edge_kinds(data)
     _backfill_privilege_tier(data)
-    _backfill_privileged_group_escalations(data)
+    _backfill_privileged_group_escalations(data, domain_data)
     return data
 
 
-def _backfill_privileged_group_escalations(graph: dict[str, Any]) -> None:
+def _backfill_privileged_group_escalations(
+    graph: dict[str, Any], domain_data: Any = None
+) -> None:
     """In-memory backfill of the privileged-group escalation edges.
 
     A fresh scan derives these at collection time
@@ -1340,12 +1867,19 @@ def _backfill_privileged_group_escalations(graph: dict[str, Any]) -> None:
 
     Calls the SAME emitter as the collector, which is additive and idempotent,
     so a graph that already carries the edges is left unchanged.
+
+    Args:
+        graph: The attack-graph dict, mutated in place.
+        domain_data: The ``domains_data[<domain>]`` entry when the caller has one.
+            A shell-bearing caller passes it so a DC-targeted escalation can pin
+            the domain's recorded primary controller; a path-only caller passes
+            nothing and the emitter degrades rather than guessing.
     """
     from adscan_internal.services.privileged_group_escalation import (  # noqa: PLC0415
         derive_privileged_group_escalation_edges,
     )
 
-    derive_privileged_group_escalation_edges(graph)
+    derive_privileged_group_escalation_edges(graph, domain_data=domain_data)
 
 
 def _backfill_privilege_tier(graph: dict[str, Any]) -> None:
@@ -2134,6 +2668,24 @@ def fold_origin_stories(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _first_trust_step_index(core_steps: tuple[tuple[str, str], ...]) -> int | None:
+    """Index of the first cross-domain trust step in an attack core, if any."""
+    for idx, step in enumerate(core_steps):
+        relation = str(step[0] if step else "").strip().lower()
+        if relation in _CROSS_DOMAIN_ESCALATION_RELATIONS:
+            return idx
+    return None
+
+
+def _trust_relation_indices(relations: tuple[str, ...] | list[str]) -> tuple[int, ...]:
+    """Indices of the cross-domain trust-escalation steps in a relation list."""
+    return tuple(
+        idx
+        for idx, rel in enumerate(relations)
+        if str(rel or "").strip().lower() in _CROSS_DOMAIN_ESCALATION_RELATIONS
+    )
+
+
 def filter_contained_paths_for_domain_listing(
     records: list[dict[str, Any]],
     *,
@@ -2251,6 +2803,21 @@ def filter_contained_paths_for_domain_listing(
                 # Same max-affected level — keep the most-proven (lowest) rank.
                 covered[sub] = (aff, min(prev[1], rank))
 
+        # Sub-paths covered ONLY by super-paths that carry a cross-domain trust
+        # step, and that carry that step themselves.
+        covered_by_trust: dict[
+            tuple[tuple[str, ...], tuple[str, ...]], tuple[int, int]
+        ] = {}
+
+        def _mark_covered_by_trust(
+            sub: tuple[tuple[str, ...], tuple[str, ...]], aff: int, rank: int
+        ) -> None:
+            prev = covered_by_trust.get(sub)
+            if prev is None or aff > prev[0]:
+                covered_by_trust[sub] = (aff, rank)
+            elif aff == prev[0]:
+                covered_by_trust[sub] = (aff, min(prev[1], rank))
+
         # Pass 1 — longest-first: keep the longest path and drop its strict
         # sub-paths, rescuing a broader-origin / more-proven sub-path (the
         # affected-widening carve-out). ``kept_entries`` carries each survivor with
@@ -2262,8 +2829,19 @@ def filter_contained_paths_for_domain_listing(
         removed = 0
         for nodes_t, rels_t, record in normalized:
             sig = (nodes_t, rels_t)
-            if sig in covered:
-                cov_aff, cov_rank = covered[sig]
+            # A route with no cross-domain trust step is never covered by a
+            # longer route that adds one (``covered_by_trust``): stopping at a
+            # domain and crossing its trust are two root causes with two fixes.
+            cover = covered.get(sig)
+            if _trust_relation_indices(rels_t):
+                trust_cover = covered_by_trust.get(sig)
+                if trust_cover is not None and (
+                    cover is None or trust_cover[0] > cover[0]
+                    or (trust_cover[0] == cover[0] and trust_cover[1] < cover[1])
+                ):
+                    cover = trust_cover
+            if cover is not None:
+                cov_aff, cov_rank = cover
                 sub_aff = _record_affected_principal_count(record)
                 rescue = False
                 if affected_widening_carveout:
@@ -2293,20 +2871,32 @@ def filter_contained_paths_for_domain_listing(
                 continue
             aff = _record_affected_principal_count(record)
             rank = _path_proof_rank(record)
+            trust_idx = _trust_relation_indices(rels_t)
+
+            def _mark(start: int, end: int) -> None:
+                sub = (nodes_t[start : end + 1], rels_t[start:end])
+                if trust_idx and any(start <= i < end for i in trust_idx):
+                    _mark_covered_by_trust(sub, aff, rank)
+                elif trust_idx:
+                    # The sub-path stops before (or starts after) the trust step:
+                    # it is a different finding from this super-path, never
+                    # covered by it.
+                    return
+                else:
+                    _mark_covered(sub, aff, rank)
+
             if preserve_prefix_paths:
                 # O(L): only strict suffixes share the same terminal by definition.
                 # s=0 would be the full path itself — start from 1.
                 for s in range(1, rel_len):
-                    _mark_covered((nodes_t[s:], rels_t[s:]), aff, rank)
+                    _mark(s, rel_len)
             else:
                 # O(L²): mark every strict contiguous sub-sequence as covered.
                 for start in range(0, rel_len):
                     for end in range(start + 1, rel_len + 1):
                         if end - start >= rel_len:
                             continue
-                        _mark_covered(
-                            (nodes_t[start : end + 1], rels_t[start:end]), aff, rank
-                        )
+                        _mark(start, end)
 
         # Pass 2 (the MIRROR of the keep_shortest branch's Pass 2) — remove a
         # LONGER kept path A when a SHORTER kept path B (a strict sub-path of A on
@@ -2349,6 +2939,7 @@ def filter_contained_paths_for_domain_listing(
                 a_aff = _record_affected_principal_count(record)
                 a_proof = _path_proof_rank(record)
                 a_unauth = _record_is_unauthenticated_reachable(record)
+                a_has_trust = bool(_trust_relation_indices(a_rels))
                 probed: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
                 for start in range(0, a_rel_len):
                     if dominated:
@@ -2363,8 +2954,12 @@ def filter_contained_paths_for_domain_listing(
                         bucket = kept_sig_index.get(sub_sig)
                         if not bucket:
                             continue
-                        for b_nodes, _b_rels, other in bucket:
+                        for b_nodes, b_rels, other in bucket:
                             if other is record:
+                                continue
+                            # A trust-escalation route is never collapsed into a
+                            # shorter route without that trust step.
+                            if a_has_trust and not _trust_relation_indices(b_rels):
                                 continue
                             # Never drop a proven no-credential foothold for an
                             # authenticated twin that lacks the flag.
@@ -2424,9 +3019,14 @@ def filter_contained_paths_for_domain_listing(
 
         cores_by_id: dict[int, AttackCore | None] = {}
         tiers_by_id: dict[int, int] = {}
+        # A route that crosses a domain trust (CrossOrgTgtDelegation, RaiseChild)
+        # and a route that does not are two root causes with two fixes: neither is
+        # ever collapsed into the other, in either pass.
+        has_trust_by_id: dict[int, bool] = {}
         for _nt, _rt, record in normalized:
             cores_by_id[id(record)] = _entry_core(record)
             tiers_by_id[id(record)] = domain_compromise_tier_from_record(record)
+            has_trust_by_id[id(record)] = bool(_trust_relation_indices(_rt))
 
         # DISTINCT-TERMINAL preservation set (domain listing only). A terminal is an
         # INDEPENDENT finding — a separately compromisable target, not a mere waypoint
@@ -2576,6 +3176,10 @@ def filter_contained_paths_for_domain_listing(
                         if not bucket:
                             continue
                         for kept_core, kept_rec in bucket:
+                            if has_trust_by_id[id(record)] != has_trust_by_id[
+                                id(kept_rec)
+                            ]:
+                                continue
                             contained = attack_core_is_prefix(
                                 kept_core, cand_core
                             ) or attack_core_is_subsequence(kept_core, cand_core)
@@ -2714,6 +3318,8 @@ def filter_contained_paths_for_domain_listing(
                 a_endpoints = (a_core[1][0], a_core[1][-1])
                 for b_core, other in super_by_endpoints.get(a_endpoints, ()):
                     if other is record:
+                        continue
+                    if has_trust_by_id[id(other)] != has_trust_by_id[id(record)]:
                         continue
                     if not (
                         attack_core_is_prefix(a_core, b_core)
@@ -2992,6 +3598,10 @@ def filter_domain_listing_paths(
 _OUTCOME_CLASS_RANK: dict[str, int] = {
     "direct_compromise": 100,
     "domain_breaker": 100,  # alias used in some callers
+    # Same band as domain_breaker: the class split is display metadata only
+    # (tier0_control records keep the ``direct_compromise`` outcome), so the
+    # collapse must rank them identically or the path set would move.
+    "tier0_control": 100,
     "tier0_foothold": 80,
     "privileged_escalator": 60,
     "compromise_enabler": 50,
@@ -3068,12 +3678,20 @@ def filter_prefix_paths_dominated_by_super_path(
     # lookup that replaces the inner all-pairs loop.  A never registers its own full
     # key (only strictly shorter prefixes), so it can never dominate itself and two
     # equal-core paths never dominate each other (matching the strict-prefix guard).
+    #
+    # A super-path whose extra steps cross a domain trust (CrossOrgTgtDelegation,
+    # RaiseChild) never dominates a prefix that stops before the trust: stopping
+    # at a domain and crossing its trust are two root causes with two fixes. A
+    # trust step is a real technique, so it survives in the attack core.
     prefix_dominator_tier: dict[tuple[str, tuple[tuple[str, str], ...]], int] = {}
-    for b_core, b_tier, _b_record in cores:
+    for b_core, b_tier, b_record in cores:
         if b_core is None:
             continue
         b_start, b_steps = b_core[0], b_core[1]
+        b_trust_k = _first_trust_step_index(b_steps)
         for k in range(1, len(b_steps)):
+            if b_trust_k is not None and k <= b_trust_k:
+                continue
             key = (b_start, b_steps[:k])
             cur = prefix_dominator_tier.get(key)
             if cur is None or b_tier > cur:
@@ -3319,7 +3937,12 @@ def _build_local_reuse_virtual_state(
         if not isinstance(node_ids_set, set):
             continue
         node_ids = tuple(
-            sorted({str(node_id) for node_id in node_ids_set}, key=str.lower)
+            # ``(lower, exact)`` is a TOTAL key: ``str.lower`` alone ties two ids
+            # that differ only in case and leaves them in set (hash-seed) order.
+            sorted(
+                {str(node_id) for node_id in node_ids_set},
+                key=lambda value: (value.lower(), value),
+            )
         )
         if len(node_ids) < 2:
             continue
@@ -3417,6 +4040,7 @@ def _build_implicit_dumplsa_overlay(
                     "virtual": True,
                     "theoretical": True,
                     "synthesized_from": "implicit_dumplsa_bridge",
+                    "parent_edge": edge_ref(edge),
                 },
             }
         )
@@ -4191,6 +4815,7 @@ def _build_implicit_dc_dcsync_overlay(
                     "virtual": True,
                     "theoretical": True,
                     "synthesized_from": "implicit_dc_dcsync_bridge",
+                    "parent_edge": edge_ref(edge),
                 },
             }
         )
@@ -4278,6 +4903,7 @@ def _build_implicit_session_followup_overlay(
                         "virtual": True,
                         "theoretical": True,
                         "synthesized_from": "implicit_session_followup_bridge",
+                        "parent_edge": edge_ref(edge),
                     },
                 }
             )
@@ -4351,6 +4977,7 @@ def _build_implicit_xpcmdshell_overlay(
             "virtual": True,
             "theoretical": True,
             "synthesized_from": "implicit_xpcmdshell_bridge",
+            "parent_edge": edge_ref(edge),
         }
         if exec_identity:
             loop_notes["execution_identity"] = exec_identity
@@ -4411,9 +5038,79 @@ def _build_implicit_path_overlays(
         _build_implicit_session_followup_overlay,
         _build_implicit_xpcmdshell_overlay,
     ):
-        for node_id, edges in builder(graph).items():
+        for node_id, edges in builder(_graph_without_unrecorded_followups(graph)).items():
             merged.setdefault(node_id, []).extend(edges)
-    return merged
+    return _fold_persisted_followup_twins(graph, merged)
+
+
+def _fold_persisted_followup_twins(
+    graph: dict[str, Any],
+    overlay: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Carry a persisted follow-up's record onto its overlay twin.
+
+    A follow-up the graph stores (materialized by the writer, or the runtime edge
+    a status write created) and the same follow-up the overlay derives are one
+    step. The overlay copy is the one the DFS traverses, so it takes the stored
+    edge's notes and, when a run recorded an outcome, its status; the stored copy
+    stays out of the adjacency (see :func:`followup_overlay_keys`).
+    """
+    keys = followup_overlay_keys(overlay)
+    if not keys:
+        return overlay
+    persisted: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for edge in graph.get("edges") or []:
+        if isinstance(edge, dict) and is_followup_step_record(edge):
+            key = _followup_key(edge)
+            if key in keys:
+                persisted.setdefault(key, edge)
+    if not persisted:
+        return overlay
+    folded: dict[str, list[dict[str, Any]]] = {}
+    for node_id, edges in overlay.items():
+        out: list[dict[str, Any]] = []
+        for edge in edges:
+            stored = persisted.get(_followup_key(edge))
+            if stored is None:
+                out.append(edge)
+                continue
+            twin = dict(edge)
+            stored_notes = stored.get("notes") if isinstance(stored.get("notes"), dict) else {}
+            twin["notes"] = {**(edge.get("notes") or {}), **stored_notes}
+            if engine_followup_outcome_recorded(stored):
+                twin["status"] = stored.get("status")
+            if stored.get("id"):
+                twin["id"] = stored["id"]
+            out.append(twin)
+        folded[node_id] = out
+    return folded
+
+
+def is_followup_step_record(edge: Mapping[str, Any]) -> bool:
+    """A stored edge that IS an engine follow-up step, not collected data.
+
+    Either it carries the engine origin, or it is a follow-up self-loop (the
+    runtime edge a status write created before the writer persisted these). A
+    collected edge that happens to share a key with an overlay edge (a real
+    ``DC$ -> DCSync -> domain`` grant) is neither, and keeps its own traversal.
+    """
+    return edge_is_engine_followup(edge) or is_implicit_followup_self_loop(
+        str(edge.get("from") or ""),
+        str(edge.get("to") or ""),
+        str(edge.get("relation") or ""),
+    )
+
+
+def followup_overlay_keys(
+    overlay: dict[str, list[dict[str, Any]]],
+) -> set[tuple[str, str, str]]:
+    """``(from, relation, to)`` of every follow-up the overlay derives.
+
+    A stored edge with one of these keys is the SAME step as its overlay twin,
+    so :func:`build_expansion_view` leaves it out of the adjacency and the DFS
+    traverses the step once.
+    """
+    return {_followup_key(edge) for edges in overlay.values() for edge in edges}
 
 
 def _iter_outgoing_edges_with_virtual_local_reuse(
@@ -4702,40 +5399,175 @@ def _closures_tie(
     ) or len(existing) == len(candidate)
 
 
-def _build_tier0_to_domain_closure(
+def _domain_seed_order_key(
+    node_id: str, nodes_map: Mapping[str, Any], home_domain: str | None
+) -> tuple[int, str, str]:
+    """Total, hash-seed independent order for Domain nodes (closure BFS seeds).
+
+    Key: ``(0 if the node is the graph's home domain else 1, lower-cased label,
+    node id)``. The home domain is matched against the node's label and its
+    ``properties.domain``, case-insensitively.
+    """
+    node = nodes_map.get(node_id)
+    node = node if isinstance(node, dict) else {}
+    label = str(node.get("label") or node.get("name") or "").strip().lower()
+    props = node.get("properties")
+    prop_domain = (
+        str(props.get("domain") or "").strip().lower() if isinstance(props, dict) else ""
+    )
+    home = str(home_domain or "").strip().lower()
+    is_home = bool(home) and home in {label, prop_domain}
+    return (0 if is_home else 1, label, str(node_id))
+
+
+def _graph_home_domain(graph: Mapping[str, Any]) -> str | None:
+    """The domain a graph is being listed for, or ``None`` when unknown.
+
+    A single-domain graph carries it as ``domain`` (the on-disk field). A
+    forest-merged graph (``load_merged_attack_graph``) has no ``domain`` and
+    records ``_merged_domains`` in primary-first order, so the primary is the
+    first entry.
+    """
+    direct = str(graph.get("domain") or "").strip()
+    if direct:
+        return direct
+    merged = graph.get("_merged_domains")
+    if isinstance(merged, (list, tuple)) and merged:
+        first = str(merged[0] or "").strip()
+        return first or None
+    return None
+
+
+@dataclass(frozen=True)
+class Tier0DomainClosures:
+    """Phase-2 closures from every node to EACH Domain object it can reach.
+
+    ``by_domain[node][domain_id]`` is the shortest forward step-chain from
+    ``node`` to that Domain object (``[]`` for the domain itself). It never
+    passes THROUGH another Domain object: a domain-to-domain hop
+    (``CrossOrgTgtDelegation``, ``RaiseChild``) is a phase-3 continuation with
+    its own root cause and its own fix, so it must never become, displace, or be
+    displaced by a node's direct closure to a domain.
+
+    ``preferred[node]`` is the ONE closure the frontier stop appends: the
+    closure to the home domain (the domain being listed) whenever the node can
+    reach it, otherwise the nearest domain (the behaviour before per-domain
+    closures, see :func:`_select_preferred_closure`). ``home_domain_id`` is the
+    node id of the listed domain, ``None`` when the graph does not name one.
+    ``domain_order`` is every Domain node id in seed order
+    (``_domain_seed_order_key``), the order every consumer iterates in.
+    """
+
+    preferred: dict[str, list[AttackPathStep]]
+    by_domain: dict[str, dict[str, list[AttackPathStep]]]
+    home_domain_id: str | None
+    domain_order: tuple[str, ...]
+
+    def other_domains_reached(
+        self, node_id: str, *, exclude: "set[str] | frozenset[str]" = frozenset()
+    ) -> list[tuple[str, int]]:
+        """Domain objects ``node_id`` reaches (seed order) with closure length."""
+        reach = self.by_domain.get(node_id) or {}
+        return [
+            (dom_id, len(reach[dom_id]))
+            for dom_id in self.domain_order
+            if dom_id in reach and dom_id not in exclude and reach[dom_id]
+        ]
+
+
+def _empty_tier0_domain_closures(
+    preferred: dict[str, list[AttackPathStep]] | None = None,
+) -> Tier0DomainClosures:
+    """A closure plan carrying only a preferred map (legacy callers / tests)."""
+    return Tier0DomainClosures(
+        preferred=preferred or {},
+        by_domain={},
+        home_domain_id=None,
+        domain_order=(),
+    )
+
+
+def _select_preferred_closure(
+    reach: Mapping[str, list[AttackPathStep]],
+    domain_order: tuple[str, ...],
+    home_domain_id: str | None,
+) -> list[AttackPathStep] | None:
+    """Choose the ONE closure the frontier stop appends for a node.
+
+    The home domain wins whenever it is reachable, whatever its length: a
+    domain's listing ends its routes in that domain, never in a foreign one it
+    happens to reach sooner. The foreign domains are carried on the route as
+    ``also_reaches_domains``, and each foreign domain's own listing ends the
+    same route in itself.
+
+    When the home domain is NOT reachable the rule is the one the shared
+    multi-source BFS applied before per-domain closures existed: the shortest
+    raw closure, the seed order (``_domain_seed_order_key``) deciding a length
+    tie, and an EQUIVALENT executable closure (``_closures_tie``) displacing an
+    abstention.
+    """
+    if not reach:
+        return None
+    if home_domain_id is not None and home_domain_id in reach:
+        return reach[home_domain_id]
+    rank = {dom_id: idx for idx, dom_id in enumerate(domain_order)}
+    ordered = sorted(
+        reach.items(), key=lambda item: (len(item[1]), rank.get(item[0], len(rank)))
+    )
+    incumbent = ordered[0][1]
+    for _dom_id, candidate in ordered[1:]:
+        if _closures_tie(incumbent, candidate) and _closure_abstention_rank(
+            incumbent
+        ) > _closure_abstention_rank(candidate):
+            incumbent = candidate
+    return incumbent
+
+
+def _build_tier0_closures_by_domain(
     view: Any,
     nodes_map: dict[str, Any],
     *,
     local_reuse_by_node: dict[str, list[dict[str, Any]]],
     local_reuse_existing_pairs: set[tuple[str, str]],
     local_reuse_useful_nodes: set[str],
-) -> dict[str, list[AttackPathStep]]:
-    """Shortest forward step-chain from every node to the AD Domain object.
+    home_domain: str | None = None,
+) -> Tier0DomainClosures:
+    """Shortest forward step-chain from every node to EACH AD Domain object.
 
-    A reverse-BFS from the domain node over the SAME DFS-visible adjacency the
-    DFS walks (so it inherits share-edge / non-traversable exclusion). For each
-    node reachable to the domain, stores the ordered ``AttackPathStep`` list of
-    the shortest forward path node -> ... -> domain. The domain maps to ``[]``;
-    an unreachable node has no key. O(V+E), computed once per DFS call.
+    One reverse-BFS per Domain object over the SAME DFS-visible adjacency the
+    DFS walks (so it inherits share-edge / non-traversable exclusion). Each BFS
+    treats every OTHER Domain object as a barrier, so a closure never routes
+    through a domain-to-domain escalation (phase 3 owns those). Cost is
+    ``O(D x (V+E))`` for ``D`` domains, computed once per DFS call. With one
+    Domain object the result is byte-identical to the former shared BFS.
 
-    Ties are broken toward EXECUTABILITY. When two EQUIVALENT closures exist
-    (see ``_closures_tie``: the same number of real techniques, or the same raw
-    step count), one carrying a step ADscan will not execute (a safety
-    abstention such as ``DnsAdminAbuse``, or an unsupported avenue such as
-    ``PrintOperatorAbuse``) and one fully executable, the executable one wins.
-    Without that, an equally good abstention avenue silently REPLACES a real
-    route in the client deliverable, which would read as "not executed for
-    safety" where a validated avenue exists. Shortest-path semantics are
-    untouched in substance: BFS still assigns the raw-shortest closure first,
-    and the only thing that can displace it is an equivalent EXECUTABLE one.
+    Ties are broken toward EXECUTABILITY, per domain. When two EQUIVALENT
+    closures to the same domain exist (see ``_closures_tie``: the same number of
+    real techniques, or the same raw step count), one carrying a step ADscan
+    will not execute (a safety abstention such as ``DnsAdminAbuse``, or an
+    unsupported avenue such as ``PrintOperatorAbuse``) and one fully
+    executable, the executable one wins. Without that, an equally good
+    abstention avenue silently REPLACES a real route in the client deliverable,
+    which would read as "not executed for safety" where a validated avenue
+    exists. BFS still assigns the raw-shortest closure first, and the only
+    thing that can displace it is an equivalent EXECUTABLE one.
+
+    Every iteration order is a function of the graph alone (the seed order is
+    the total key ``_domain_seed_order_key``: home domain first, then label,
+    then id), so the output never depends on PYTHONHASHSEED.
     """
-    domain_ids = {
-        str(nid)
-        for nid, node in nodes_map.items()
-        if isinstance(node, dict) and _node_is_domain(node)
-    }
+    domain_ids = sorted(
+        (
+            str(nid)
+            for nid, node in nodes_map.items()
+            if isinstance(node, dict) and _node_is_domain(node)
+        ),
+        key=lambda nid: _domain_seed_order_key(nid, nodes_map, home_domain),
+    )
     if not domain_ids:
-        return {}
+        return _empty_tier0_domain_closures()
+    domain_id_set = set(domain_ids)
+    home_domain_id = _resolve_home_domain_id(domain_ids, nodes_map, home_domain)
     # Reverse adjacency carrying the FORWARD edge (so a step can be reconstructed).
     reverse: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for node_id, node in nodes_map.items():
@@ -4752,12 +5584,75 @@ def _build_tier0_to_domain_closure(
             to_id = str(edge.get("to") or "").strip()
             if to_id:
                 reverse.setdefault(to_id, []).append((str(node_id), edge))
-    # BFS out from the domain(s); first time we reach a node is its shortest path.
-    closure: dict[str, list[AttackPathStep]] = {d: [] for d in domain_ids}
-    queue: deque[str] = deque(domain_ids)
+
+    by_domain: dict[str, dict[str, list[AttackPathStep]]] = {}
+    for domain_id in domain_ids:
+        closure = _bfs_closure_to_domain(domain_id, reverse, domain_id_set)
+        for node_id, steps in closure.items():
+            by_domain.setdefault(node_id, {})[domain_id] = steps
+
+    domain_order = tuple(domain_ids)
+    preferred: dict[str, list[AttackPathStep]] = {d: [] for d in domain_ids}
+    for node_id, reach in by_domain.items():
+        if node_id in domain_id_set:
+            continue
+        chosen = _select_preferred_closure(reach, domain_order, home_domain_id)
+        if chosen is not None:
+            preferred[node_id] = chosen
+    return Tier0DomainClosures(
+        preferred=preferred,
+        by_domain=by_domain,
+        home_domain_id=home_domain_id,
+        domain_order=domain_order,
+    )
+
+
+def _resolve_home_domain_id(
+    domain_ids: list[str], nodes_map: Mapping[str, Any], home_domain: str | None
+) -> str | None:
+    """The Domain node id of the listed domain, or ``None``.
+
+    A Domain object's label IS its FQDN, so a label match wins. ``properties.domain``
+    is only a fallback: on a merged graph a foreign Domain node read from another
+    domain's file can carry that file's domain there.
+    """
+    home = str(home_domain or "").strip().rstrip(".").lower()
+    if not home:
+        return None
+    by_prop: str | None = None
+    for dom_id in domain_ids:
+        node = nodes_map.get(dom_id)
+        node = node if isinstance(node, dict) else {}
+        label = str(node.get("label") or node.get("name") or "").strip().rstrip(".").lower()
+        if label == home:
+            return dom_id
+        props = node.get("properties")
+        prop = (
+            str(props.get("domain") or "").strip().rstrip(".").lower()
+            if isinstance(props, dict)
+            else ""
+        )
+        if by_prop is None and prop == home:
+            by_prop = dom_id
+    return by_prop
+
+
+def _bfs_closure_to_domain(
+    domain_id: str,
+    reverse: Mapping[str, list[tuple[str, dict[str, Any]]]],
+    domain_id_set: set[str],
+) -> dict[str, list[AttackPathStep]]:
+    """Reverse BFS from ONE Domain object; every other Domain object is a barrier."""
+    closure: dict[str, list[AttackPathStep]] = {domain_id: []}
+    queue: deque[str] = deque([domain_id])
     while queue:
         current = queue.popleft()
         for predecessor, fwd_edge in reverse.get(current, ()):
+            # A Domain object is never an intermediate hop of a closure: reaching
+            # this domain THROUGH another one is a cross-domain escalation, which
+            # phase 3 owns (a distinct technique with a distinct fix).
+            if predecessor in domain_id_set:
+                continue
             # The forward edge's OWN notes travel with the step, exactly as
             # ``admit_frontier_edge`` hands the DFS ``edge["notes"]``. A closure
             # step is a real graph edge the path walks, so dropping its notes
@@ -4782,44 +5677,25 @@ def _build_tier0_to_domain_closure(
             existing = closure.get(predecessor)
             if existing is not None:
                 # Already closed at this or a shorter length. Upgrade ONLY on a
-                # tie in REAL TECHNIQUE COUNT where the incumbent carries an
+                # tie (``_closures_tie``) where the incumbent carries an
                 # abstention and this one does not. FIFO level order means every
                 # competing assignment for a node completes before that node is
                 # popped, so its own predecessors read the final value.
                 #
-                # The tie is measured on real techniques, NOT on ``len(steps)``.
-                # BFS guarantees ``len(candidate) >= len(existing)``, so a raw
-                # length comparison only ever fires when the two closures carry
-                # the SAME number of contextual hops too — which is why the
-                # tie-break was latently dead for every pair that reached the
-                # domain through identical techniques but a different number of
-                # MemberOf/Contains hops.
-                #
-                # The call made deliberately here: the two closures tie when
-                # they are equivalent by EITHER measure (``_closures_tie``), and
-                # NOT "equal real count" alone. Two reasons.
-                #
-                # Real-count alone would REGRESS a case that works today: an
-                # incumbent of three steps carrying one technique and two
-                # membership hops ties a candidate of three steps carrying two
-                # techniques under the current raw comparison, and the executable
-                # one correctly wins. Narrowing to real-count would call those
-                # unequal and leave the abstention standing. The seam must only
-                # ever gain ties, never lose one.
-                #
-                # Nor is the candidate guarded against being longer in raw
-                # terms. BFS makes it longer or equal by construction, so such a
-                # guard collapses back to the raw comparison and the fix becomes
-                # a no-op. And a closure reaching the domain through the same
-                # techniques with more contextual hops is not meaningfully worse
-                # to render: those hops are dropped from the narrated step list
-                # by every surface that renders one (the report, the LITE
-                # document and the web CTEM all filter contextual relations
-                # out), whereas letting a safety abstention stand in for an
-                # executable avenue costs the client a real validated finding
-                # and reads as "not executed for safety" where a route exists.
-                # Executability is the axis worth protecting; a few invisible
-                # membership hops are not.
+                # The tie is "equivalent by EITHER measure" (same real-technique
+                # count OR same raw length), deliberately. BFS makes
+                # ``len(candidate) >= len(existing)`` by construction, so a raw
+                # comparison alone only fires when both closures also carry the
+                # same number of contextual hops (MemberOf/Contains), which left
+                # the tie-break dead for closures reaching the domain through
+                # identical techniques. Real-count alone would in turn lose ties
+                # the raw comparison serves (three steps with one technique
+                # against three with two). The union only ever ADDS ties. A few
+                # invisible membership hops cost nothing on any surface (every
+                # renderer filters contextual relations out), whereas letting a
+                # safety abstention stand in for an executable avenue costs the
+                # client a validated finding and reads as "not executed for
+                # safety" where a route exists.
                 if _closures_tie(existing, candidate) and _closure_abstention_rank(
                     existing
                 ) > _closure_abstention_rank(candidate):
@@ -4828,6 +5704,324 @@ def _build_tier0_to_domain_closure(
             closure[predecessor] = candidate
             queue.append(predecessor)
     return closure
+
+
+def _build_tier0_to_domain_closure(
+    view: Any,
+    nodes_map: dict[str, Any],
+    *,
+    local_reuse_by_node: dict[str, list[dict[str, Any]]],
+    local_reuse_existing_pairs: set[tuple[str, str]],
+    local_reuse_useful_nodes: set[str],
+    home_domain: str | None = None,
+) -> dict[str, list[AttackPathStep]]:
+    """The ONE closure per node the Tier-0 frontier stop appends.
+
+    Thin view over :func:`_build_tier0_closures_by_domain` (its ``preferred``
+    map): the home domain's closure whenever the node reaches it, otherwise the
+    nearest domain. Each Domain object maps to ``[]``; a node that reaches no
+    domain has no key.
+    """
+    return _build_tier0_closures_by_domain(
+        view,
+        nodes_map,
+        local_reuse_by_node=local_reuse_by_node,
+        local_reuse_existing_pairs=local_reuse_existing_pairs,
+        local_reuse_useful_nodes=local_reuse_useful_nodes,
+        home_domain=home_domain,
+    ).preferred
+
+
+def _frontier_closure_branches(
+    plan: Tier0DomainClosures,
+    frontier_id: str,
+    *,
+    acc_steps: list[AttackPathStep],
+    visited: set[str],
+    adjacency: Mapping[str, list[dict[str, Any]]],
+) -> list[tuple[list[AttackPathStep], bool, str | None]]:
+    """How a route that reached a Tier-0 frontier node is closed.
+
+    Shared by every engine (sequential, parallel worker, single-start) so the
+    frontier semantics cannot drift between them. Returns ``(closure_steps,
+    continue_from_domain, required_terminal)`` branches:
+
+    * The preferred closure (home domain when reachable). When its domain can
+      escalate across a trust (``_domain_has_cross_domain_escalation_out``), the
+      branch CONTINUES from that domain (phase 3): the walk records the
+      domain's own compromise and then follows the trust onward.
+    * Trust continuations INTO the home domain: for every OTHER domain this
+      node reaches whose Domain object escalates across a trust, a branch that
+      continues from it and keeps only routes ending in the home domain. That is
+      a different root cause from the direct closure (the trust attribute), so
+      it is reported alongside it, never instead of it.
+
+    An empty list means "emit the prefix as is": no closure, the preferred
+    closure would revisit a node already on the route (a path never repeats a
+    node), or the preferred closure is not admissible after THIS route's prefix
+    (``_closure_respects_arrival_ownership``: a Tier-0 host reached through a
+    user-level access edge, whose own edges are not the actor's).
+    """
+    closure = plan.preferred.get(frontier_id)
+    if not closure:
+        return []
+    span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
+    if any(s.to_id in span for s in closure):
+        return []
+    # Arrival != ownership: a Tier-0 HOST reached through a user-level access
+    # edge (CanRDP / CanPSRemote / ExecuteDCOM / SQLAccess / SQLAdmin) gives a
+    # session there, not the machine account, so its own membership/control
+    # edges are not the actor's. The closure was built with no prefix and never
+    # saw that gate, so it is checked here against THIS route's prefix. Like the
+    # revisit rule above, an unusable preferred closure ends the route AT the
+    # frontier (a Tier-0 foothold, control pending): every closure out of this
+    # node leaves through one of the host's own edges.
+    if not _closure_respects_arrival_ownership(acc_steps, closure):
+        return []
+    branches: list[tuple[list[AttackPathStep], bool, str | None]] = []
+    preferred_domain = closure[-1].to_id
+    preferred_seen = visited | {s.to_id for s in closure}
+    branches.append(
+        (
+            closure,
+            _domain_has_cross_domain_escalation_out(
+                preferred_domain, adjacency, preferred_seen
+            ),
+            None,
+        )
+    )
+    home_id = plan.home_domain_id
+    if home_id is None:
+        return branches
+    reach = plan.by_domain.get(frontier_id) or {}
+    for dom_id in plan.domain_order:
+        if dom_id in (preferred_domain, home_id) or dom_id not in reach:
+            continue
+        foreign = reach[dom_id]
+        if not foreign or any(s.to_id in span for s in foreign):
+            continue
+        if not _closure_respects_arrival_ownership(acc_steps, foreign):
+            continue
+        if _domain_has_cross_domain_escalation_out(
+            dom_id, adjacency, visited | {s.to_id for s in foreign}
+        ):
+            branches.append((foreign, True, home_id))
+    return branches
+
+
+def frontier_session_continues(
+    plan: Tier0DomainClosures,
+    frontier_id: str,
+    *,
+    acc_steps: list[AttackPathStep],
+) -> bool:
+    """True when a route at a Tier-0 node keeps going in session scope.
+
+    Two cases, both decided from the route itself:
+
+    * The route reached the node through a session that does not own it
+      (``_route_owns_access_target`` is False): the node is a Tier-0 FOOTHOLD, and
+      only what that session grants may follow (a SQL linked-server hop, an
+      in-session follow-up), never the host's own edges.
+    * An in-session follow-up just ran on the node (the last step is a self-loop
+      on it), it gave the route ownership, and the node has no closure to a
+      domain: the session may still take the host-owned direct capability (the
+      writable-DC replication bridge) the closure, built without overlays,
+      cannot see.
+
+    Shared by every engine and by the per-terminal parity check.
+    """
+    if not acc_steps:
+        return False
+    rels = [str(s.relation or "").strip().lower() for s in acc_steps]
+    if not _route_owns_access_target(rels):
+        return True
+    last = acc_steps[-1]
+    return (
+        last.from_id == frontier_id
+        and last.to_id == frontier_id
+        and not plan.preferred.get(frontier_id)
+    )
+
+
+def _arrival_continues_to_ownership(
+    acc_steps: list[AttackPathStep], *, has_closure: bool
+) -> bool:
+    """True when a Tier-0 arrival through a LOCAL-ADMIN lane is not a final stop.
+
+    The DumpLSA self-loop the overlay adds after every local-admin arrival always
+    passes the gates, so when the host has a closure to a domain the route goes
+    on to own it and close (``AdminTo -> DC01 -> DumpLSA -> DC01 -> MemberOf ->
+    ...``); a bare ``AdminTo -> DC01`` row would be a "control pending" foothold
+    for a host the same route then controls. With NO closure the bare arrival is
+    the route's finding, exactly as before this rule, and it is emitted (an
+    executed relay onto a Tier-0 host must keep its own row). A user-level
+    session has no such step, so its arrival always stays a Tier-0 foothold.
+    Read by the frontier stop and by the per-terminal parity check.
+    """
+    if not acc_steps or not has_closure:
+        return False
+    owns, lane = _route_access_arrival(
+        [str(s.relation or "").strip().lower() for s in acc_steps]
+    )
+    return (not owns) and lane is not None and lane.unlocks_self_credential
+
+
+def _close_route_at_frontier(
+    plan: Tier0DomainClosures,
+    stop_node: str,
+    *,
+    acc_steps: list[AttackPathStep],
+    visited: set[str],
+    adjacency: Mapping[str, list[dict[str, Any]]],
+    emit: Callable[[list[AttackPathStep]], None],
+    resume: Callable[[str, set[str], list[AttackPathStep]], None],
+    required_terminal: list[str | None],
+) -> bool:
+    """Close a route at a Tier-0 frontier node, the SAME way in every DFS engine.
+
+    A plain branch (``_frontier_closure_branches``) is emitted as ``prefix +
+    closure``. A continuing branch walks the closure and resumes the engine's
+    own DFS (``resume``) at the closure's Domain object, under the branch's
+    required terminal (``required_terminal`` is the engine's one-slot cell, read
+    by its ``emit``). No branch: the prefix is emitted as is.
+
+    Returns True when the route is closed here. Returns False, after emitting the
+    prefix as a Tier-0 foothold, when the route continues in session scope
+    (``frontier_session_continues``): the engine then keeps expanding the node
+    through ``admit_frontier_edge(session_scope_only=True)``, so a real
+    continuation the SESSION grants (a SQL linked-server hop, an in-session
+    follow-up that reaches SYSTEM and then closes) is still found. Re-entry
+    through an in-session self-loop does not re-emit the foothold.
+    """
+    if frontier_session_continues(plan, stop_node, acc_steps=acc_steps):
+        last = acc_steps[-1]
+        if not (last.from_id == stop_node and last.to_id == stop_node):
+            if not _arrival_continues_to_ownership(
+                acc_steps, has_closure=bool(plan.preferred.get(stop_node))
+            ):
+                emit(acc_steps)
+        elif _route_owns_access_target(
+            [str(s.relation or "").strip().lower() for s in acc_steps]
+        ):
+            # The in-session follow-up reached SYSTEM: that is a finding even
+            # when nothing further is admissible.
+            emit(acc_steps)
+        return False
+    branches = _frontier_closure_branches(
+        plan, stop_node, acc_steps=acc_steps, visited=visited, adjacency=adjacency
+    )
+    if not branches:
+        emit(acc_steps)
+        return True
+    for closure, continue_from_domain, required in branches:
+        if not continue_from_domain:
+            emit([*acc_steps, *closure])
+            continue
+        outer_required = required_terminal[0]
+        required_terminal[0] = outer_required or required
+        added = [s.to_id for s in closure if s.to_id not in visited]
+        visited.update(added)
+        acc_steps.extend(closure)
+        try:
+            resume(closure[-1].to_id, visited, acc_steps)
+        finally:
+            del acc_steps[-len(closure):]
+            visited.difference_update(added)
+            required_terminal[0] = outer_required
+    return True
+
+
+#: Display-record key carrying the other domains a route's frontier also reaches.
+#: A list of ``{"domain": "<plain.dotted.name>", "closure_length": <steps>}``,
+#: present only when non-empty. Every re-projection allow-list that rebuilds a
+#: record (service display pipeline, report SSOT, PRO report, web CTEM) carries
+#: it by this name.
+ALSO_REACHES_DOMAINS_KEY = "also_reaches_domains"
+
+
+def also_reaches_domains_payload(
+    reached: tuple[tuple[str, int], ...] | list[Any],
+    nodes_map: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Render ``AttackPath.also_reaches_domains`` as plain-domain records."""
+    payload: list[dict[str, Any]] = []
+    for item in reached or ():
+        try:
+            dom_id, length = item
+        except (TypeError, ValueError):
+            continue
+        node = nodes_map.get(str(dom_id))
+        name = ""
+        if isinstance(node, dict):
+            # A Domain object's label IS its FQDN. ``properties.domain`` is not
+            # used: on a merged graph a foreign Domain node can carry the domain
+            # of the file it was read from.
+            name = str(node.get("label") or node.get("name") or "")
+        name = (name or str(dom_id)).strip().rstrip(".").lower()
+        if name:
+            payload.append({"domain": name, "closure_length": int(length)})
+    return payload
+
+
+def annotate_also_reaches_domains(
+    paths: list[AttackPath],
+    plan: Tier0DomainClosures,
+    nodes_map: Mapping[str, Any],
+) -> list[AttackPath]:
+    """Stamp each route with the OTHER domains its Tier-0 frontier node reaches.
+
+    The frontier node is the FIRST Tier-0 object on the route (where phase 1
+    stopped). A route only carries the note when it ends at a Domain object;
+    the domains already on the route (its terminal, or one it crossed through a
+    trust) are excluded, so the note only ever names a compromise the route's
+    own listing does not show. Pure, engine-independent post-pass: every engine
+    feeds it the same plan.
+    """
+    # A graph with one Domain object has no OTHER domain to name.
+    if len(plan.domain_order) <= 1 or not plan.by_domain or not paths:
+        return paths
+    tier0_cache: dict[str, bool] = {}
+
+    def _is_frontier(node_id: str) -> bool:
+        cached = tier0_cache.get(node_id)
+        if cached is None:
+            node = nodes_map.get(node_id)
+            cached = bool(
+                isinstance(node, dict)
+                and not _node_is_domain(node)
+                and _node_is_tier0(node)
+            )
+            tier0_cache[node_id] = cached
+        return cached
+
+    out: list[AttackPath] = []
+    for path in paths:
+        if not path.steps:
+            out.append(path)
+            continue
+        terminal = nodes_map.get(path.target_id)
+        if not (isinstance(terminal, dict) and _node_is_domain(terminal)):
+            out.append(path)
+            continue
+        node_seq = [path.source_id, *(s.to_id for s in path.steps)]
+        frontier = next((n for n in node_seq if _is_frontier(n)), None)
+        if frontier is None:
+            out.append(path)
+            continue
+        others = plan.other_domains_reached(frontier, exclude=set(node_seq))
+        if not others:
+            out.append(path)
+            continue
+        out.append(
+            AttackPath(
+                steps=path.steps,
+                source_id=path.source_id,
+                target_id=path.target_id,
+                also_reaches_domains=tuple(others),
+            )
+        )
+    return out
 
 
 def _build_high_value_reachable_node_ids(
@@ -4936,6 +6130,7 @@ _W_REACHABLE_NODE_IDS: set[str] = set()
 # like ``_W_TERMINAL_SET``.
 _W_TIER0_IDS: frozenset[str] = frozenset()
 _W_TIER0_CLOSURE: dict[str, list[AttackPathStep]] = {}
+_W_TIER0_PLAN: "Tier0DomainClosures | None" = None
 
 
 def _dfs_worker_init(
@@ -4948,6 +6143,7 @@ def _dfs_worker_init(
     reachable_node_ids: set[str],
     tier0_ids: frozenset[str] | None = None,
     tier0_closure: dict[str, list[AttackPathStep]] | None = None,
+    tier0_plan: "Tier0DomainClosures | None" = None,
 ) -> None:
     """Populate per-worker globals. Called once per worker process by the pool initializer.
 
@@ -4955,11 +6151,13 @@ def _dfs_worker_init(
     callers that pre-date the Tier-0 frontier invariant, e.g. direct
     in-process worker tests) — an empty ``tier0_ids`` means the frontier-stop
     never fires, which is byte-identical to the pre-Task-4 worker behaviour.
+    *tier0_plan* carries the per-domain closures; when omitted the worker
+    builds a plan from *tier0_closure* alone (no trust continuations).
     """
     global _W_ADJACENCY, _W_LOCAL_REUSE_BY_NODE  # noqa: PLW0603
     global _W_LOCAL_REUSE_EXISTING_PAIRS, _W_LOCAL_REUSE_USEFUL_NODES, _W_TERMINAL_SET  # noqa: PLW0603
     global _W_IMPLICIT_EDGE_OVERLAY, _W_REACHABLE_NODE_IDS  # noqa: PLW0603
-    global _W_TIER0_IDS, _W_TIER0_CLOSURE  # noqa: PLW0603
+    global _W_TIER0_IDS, _W_TIER0_CLOSURE, _W_TIER0_PLAN  # noqa: PLW0603
     _W_ADJACENCY = adjacency
     _W_LOCAL_REUSE_BY_NODE = local_reuse_by_node
     _W_LOCAL_REUSE_EXISTING_PAIRS = local_reuse_existing_pairs
@@ -4969,6 +6167,7 @@ def _dfs_worker_init(
     _W_REACHABLE_NODE_IDS = reachable_node_ids
     _W_TIER0_IDS = tier0_ids if tier0_ids is not None else frozenset()
     _W_TIER0_CLOSURE = tier0_closure if tier0_closure is not None else {}
+    _W_TIER0_PLAN = tier0_plan
 
 
 def _dfs_sources_batch_worker(
@@ -4987,7 +6186,11 @@ def _dfs_sources_batch_worker(
     terminal_set = _W_TERMINAL_SET
     reachable_node_ids = _W_REACHABLE_NODE_IDS
     tier0_ids = _W_TIER0_IDS
-    tier0_closure = _W_TIER0_CLOSURE
+    tier0_plan = (
+        _W_TIER0_PLAN
+        if _W_TIER0_PLAN is not None
+        else _empty_tier0_domain_closures(_W_TIER0_CLOSURE)
+    )
     # Rebuild the shared expansion view (concern 1) from the per-worker globals
     # the pool initializer populated. The worker path carries no gentime-collapse
     # state (it is not passed to workers), so those fields are empty — byte-
@@ -5010,11 +6213,19 @@ def _dfs_sources_batch_worker(
     # mid-recursion OOM into the SAME declared coverage-bounded stop the outer gate
     # raises, instead of a kernel SIGKILL. Never fires on a graph that fits in RAM.
     _budget = DfsMemoryBudget()
+    # Required terminal of a phase-3 trust continuation (mirrors the sequential
+    # DFS; see ``_close_route_at_frontier``).
+    required_terminal: list[str | None] = [None]
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if (
+            required_terminal[0] is not None
+            and acc_steps[-1].to_id != required_terminal[0]
+        ):
             return
         # Tier-0 frontier carve (mirrors the sequential DFS's ``emit``): a Tier-0
         # node with no forward closure to the domain object is itself a valid
@@ -5036,43 +6247,34 @@ def _dfs_sources_batch_worker(
             )
         )
 
-    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
-        """Emit acc_steps extended by the shortest closure stop_node -> domain.
-
-        Mirrors the sequential DFS's ``_emit_with_closure``: drops the closure
-        (emits the prefix as-is) when it would revisit a node already in the
-        prefix span, so a path never repeats a node.
-        """
-        closure = tier0_closure.get(stop_node)
-        if not closure:
-            emit(acc_steps)
-            return
-        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
-        if any(s.to_id in span for s in closure):
-            emit(acc_steps)
-            return
-        emit([*acc_steps, *closure])
-
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if acc_steps and current == required_terminal[0]:
+            emit(acc_steps)
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
         # A Domain terminal normally stops the DFS, but a compromised domain
         # that can escalate cross-forest (CrossOrgTgtDelegation etc.) into an
         # unvisited domain is NOT the end — keep traversing (mirrors the
-        # sequential DFS's ``terminal_here`` carve).
+        # sequential DFS's ``terminal_here`` carve, including emitting the
+        # domain's own compromise first).
         terminal_here = bool(acc_steps) and current in terminal_set
         if terminal_here and _domain_has_cross_domain_escalation_out(
             current, _W_ADJACENCY, visited
         ):
+            emit(acc_steps)
             terminal_here = False
         # Tier-0 frontier-terminal (mirrors the sequential DFS): once the walk
         # reaches a Tier-0 node (not the domain itself — ``terminal_here``
         # handles that), stop expanding and close with the shortest path to
         # the domain instead of fanning out past it. Gated to non-lowpriv
         # targets, same as the sequential engine.
+        # A Tier-0 host reached through a session that does not own it keeps
+        # expanding, in session scope only (see ``_close_route_at_frontier``).
+        session_scope_only = False
         if (
             target != "lowpriv"
             and acc_steps
@@ -5082,27 +6284,30 @@ def _dfs_sources_batch_worker(
                 current, _W_ADJACENCY, visited
             )
         ):
-            closure_here = tier0_closure.get(current)
-            closure_domain_id = closure_here[-1].to_id if closure_here else None
-            closure_domain_escalates = bool(
-                closure_domain_id
-                and _domain_has_cross_domain_escalation_out(
-                    closure_domain_id, _W_ADJACENCY, visited
-                )
-            )
-            if not closure_domain_escalates:
-                _emit_with_closure(acc_steps, current)
+            if _close_route_at_frontier(
+                tier0_plan,
+                current,
+                acc_steps=acc_steps,
+                visited=visited,
+                adjacency=_W_ADJACENCY,
+                emit=emit,
+                resume=dfs,
+                required_terminal=required_terminal,
+            ):
                 return
+            session_scope_only = True
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
             or terminal_here
         ):
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
         next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
         extended = False
         _path_rels = [str(s.relation or "").strip().lower() for s in acc_steps]
@@ -5117,6 +6322,7 @@ def _dfs_sources_batch_worker(
                 reachable_node_ids=reachable_node_ids,
                 terminal_set=terminal_set,
                 chokepoint_root_set=set(),
+                session_scope_only=session_scope_only,
             )
             if verdict != "admit":
                 continue
@@ -5136,7 +6342,7 @@ def _dfs_sources_batch_worker(
             if not is_self_loop:
                 visited.remove(to_id)
             extended = True
-        if not extended:
+        if not extended and not session_scope_only:
             emit(acc_steps)
 
     for source in sources_batch:
@@ -5181,6 +6387,7 @@ def _run_parallel_domain_dfs(
     reachable_node_ids: set[str] | None = None,
     tier0_ids: frozenset[str] | None = None,
     tier0_closure: dict[str, list[AttackPathStep]] | None = None,
+    tier0_plan: "Tier0DomainClosures | None" = None,
 ) -> list[AttackPath]:
     """Distribute the DFS over *n_workers* spawn-context processes.
 
@@ -5226,6 +6433,7 @@ def _run_parallel_domain_dfs(
                 reachable_node_ids or set(),
                 tier0_ids or frozenset(),
                 tier0_closure or {},
+                tier0_plan,
             ),
         ) as pool:
             futures = [
@@ -5749,6 +6957,11 @@ def build_expansion_view(
         A populated :class:`AttackPathExpansionView`.
     """
     suppressed_memberof = _build_priority_memberof_suppression(edges, nodes_map)
+    # The implicit follow-ups, with any stored record folded onto its overlay
+    # twin; that stored record stays out of the adjacency so the step is
+    # traversed once (see ``materialize_engine_followup_edges``).
+    implicit_edge_overlay = _build_implicit_path_overlays(graph)
+    folded_followup_keys = followup_overlay_keys(implicit_edge_overlay)
 
     adjacency: dict[str, list[dict[str, Any]]] = {}
     incoming: dict[str, int] = {}
@@ -5768,7 +6981,12 @@ def build_expansion_view(
             continue
         if rel.lower() == "memberof" and (from_id, to_id) in suppressed_memberof:
             continue
-        adjacency.setdefault(from_id, []).append(edge)
+        if not (
+            folded_followup_keys
+            and _followup_key(edge) in folded_followup_keys
+            and is_followup_step_record(edge)
+        ):
+            adjacency.setdefault(from_id, []).append(edge)
         if track_degrees:
             outgoing[from_id] = outgoing.get(from_id, 0) + 1
             # MemberOf edges (persisted or runtime) should not change which nodes
@@ -5782,7 +7000,6 @@ def build_expansion_view(
         nodes_map, edges
     )
     local_reuse_useful_nodes = _build_local_reuse_useful_node_ids(nodes_map, edges)
-    implicit_edge_overlay = _build_implicit_path_overlays(graph)
 
     gentime_suppressed: set[tuple[str, str]] = set()
     gentime_representatives: dict[tuple[str, str], list[str]] = {}
@@ -5837,6 +7054,7 @@ def admit_frontier_edge(
     reachable_node_ids: set[str],
     terminal_set: set[str] | None,
     chokepoint_root_set: set[str],
+    session_scope_only: bool = False,
 ) -> tuple[str, bool, dict[str, Any]]:
     """Apply the shared per-frontier prefix predicates to one candidate edge (concern 2).
 
@@ -5864,6 +7082,10 @@ def admit_frontier_edge(
             ``to_id in reachable_node_ids`` form.
         chokepoint_root_set: The rooted choke-point group ids; empty disables the
             leading-hop suppression (only the domain sequential path uses it).
+        session_scope_only: Set by the engines when ``current`` is a Tier-0 node
+            the route reached through a session that does not own it
+            (``_close_route_at_frontier`` returned False). Only edges that
+            session grants are admitted (``_edge_continues_session``).
 
     Returns:
         ``(verdict, is_self_loop, step_notes)`` where ``verdict`` is one of
@@ -5883,6 +7105,20 @@ def admit_frontier_edge(
 
     to_id = str(edge.get("to") or "")
     if not to_id:
+        return "skip", False, empty_notes
+
+    # Session scope (arrival != ownership, every host): a route that holds only
+    # a session on ``current`` continues through what that session grants,
+    # never through the host's own edges. ``session_scope_only`` additionally
+    # forces it for an OWNING route parked at a Tier-0 node with no closure
+    # (``frontier_session_continues``).
+    owns_host, arrival_lane = _route_access_arrival(path_rels)
+    if (session_scope_only or not owns_host) and not _edge_continues_session(
+        cand_rel,
+        is_self_loop=to_id == current,
+        notes=edge.get("notes"),
+        arrival_lane=arrival_lane,
+    ):
         return "skip", False, empty_notes
 
     # Layer 3: suppress the redundant LEADING (depth-0) MemberOf hop from a real
@@ -5931,10 +7167,23 @@ def admit_frontier_edge(
     return "admit", is_self_loop, step_notes
 
 
+def _steps_start_with(
+    following: list[AttackPathStep], closure: list[AttackPathStep]
+) -> bool:
+    """True when ``following`` begins with ``closure`` (relation and target)."""
+    if len(following) < len(closure):
+        return False
+    return all(
+        actual.relation == wanted.relation and actual.to_id == wanted.to_id
+        for actual, wanted in zip(following[: len(closure)], closure)
+    )
+
+
 def _perterminal_path_respects_tier0_frontier(
     steps: list[AttackPathStep],
     tier0_ids: frozenset[str],
     tier0_closure: dict[str, list[AttackPathStep]],
+    tier0_plan: "Tier0DomainClosures | None" = None,
 ) -> bool:
     """Return True iff ``steps`` respects the Tier-0 frontier-terminal invariant.
 
@@ -5963,9 +7212,16 @@ def _perterminal_path_respects_tier0_frontier(
     independently re-validated by this same rule as the scan continues. When a
     Tier-0 node has NO closure to any domain, the path is only valid if it
     stops exactly there (the DFS's own "no closure exists" bare-terminal case).
+
+    With *tier0_plan*, a Tier-0 node may also be followed by its closure to
+    ANOTHER domain when the route then crosses a trust into the home domain and
+    ends there: the phase-3 trust continuation ``_frontier_closure_branches``
+    emits.
     """
     if not tier0_ids or not steps:
         return True
+    home_id = tier0_plan.home_domain_id if tier0_plan is not None else None
+    ends_at_home = home_id is not None and steps[-1].to_id == home_id
     node_seq: list[str] = [steps[0].from_id, *[s.to_id for s in steps]]
     for idx, node_id in enumerate(node_seq):
         if node_id not in tier0_ids:
@@ -5976,18 +7232,57 @@ def _perterminal_path_respects_tier0_frontier(
         # Tier-0 it subsequently passes through.
         following_steps = steps[idx:]
         closure = tier0_closure.get(node_id) or []
+        # Mirror ``_close_route_at_frontier``: a closure that is not admissible
+        # after this route's prefix (a Tier-0 host reached by a session that does
+        # not own it) is not taken. The route either stops at the node (the
+        # Tier-0 foothold) or continues along an edge that session grants; a
+        # self-loop re-enters the node and is re-checked with the longer prefix.
+        prefix_owns, prefix_lane = _route_access_arrival(
+            [str(s.relation or "").strip().lower() for s in steps[:idx]]
+        )
+        if (not prefix_owns and idx > 0) or (
+            tier0_plan is not None
+            and frontier_session_continues(tier0_plan, node_id, acc_steps=steps[:idx])
+        ):
+            nxt = following_steps[0] if following_steps else None
+            if nxt is None:
+                # The DFS never ends a local-admin arrival bare: its DumpLSA
+                # self-loop always follows (``_arrival_continues_to_ownership``).
+                if _arrival_continues_to_ownership(
+                    steps[:idx], has_closure=bool(closure)
+                ):
+                    return False
+                continue
+            if not _edge_continues_session(
+                nxt.relation,
+                is_self_loop=nxt.from_id == nxt.to_id,
+                notes=nxt.notes,
+                arrival_lane=prefix_lane,
+            ):
+                return False
+            continue
+        if closure and not _closure_respects_arrival_ownership(steps[:idx], closure):
+            if following_steps:
+                return False
+            continue
         if not closure:
             if following_steps:
                 return False
             continue
-        if len(following_steps) < len(closure):
+        if _steps_start_with(following_steps, closure):
+            continue
+        if not ends_at_home or tier0_plan is None:
             return False
-        for actual_step, closure_step in zip(following_steps[: len(closure)], closure):
-            if (
-                actual_step.relation != closure_step.relation
-                or actual_step.to_id != closure_step.to_id
-            ):
-                return False
+        preferred_domain = closure[-1].to_id
+        reach = tier0_plan.by_domain.get(node_id) or {}
+        if not any(
+            dom_id not in (preferred_domain, home_id)
+            and len(following_steps) > len(foreign)
+            and _steps_start_with(following_steps, foreign)
+            and _closure_respects_arrival_ownership(steps[:idx], foreign)
+            for dom_id, foreign in reach.items()
+        ):
+            return False
     return True
 
 
@@ -6009,11 +7304,10 @@ def _perterminal_path_respects_domain_frontier(
     ``CrossOrgTgtDelegation``/``RaiseChild`` edge to an as-yet-unvisited node
     (``_domain_has_cross_domain_escalation_out``), and once that clears the
     terminal, ANY of the domain's forward edges become explorable — not only
-    the escalation edge itself. So the per-terminal reconstruction can diverge
-    two ways: it can stop BARE at a domain that DOES escalate (the DFS never
-    stops there — it always keeps going), or it can continue PAST a domain
-    that does NOT escalate (the DFS never gets past it at all). Both are
-    rejected here, mirroring the DFS's own ``terminal_here`` clearing exactly.
+    the escalation edge itself. A domain that escalates is ALSO a valid stop
+    (the DFS emits the domain's own compromise before crossing the trust), so
+    the one divergence left to reject is a route continuing PAST a domain that
+    does NOT escalate (the DFS never gets past it at all).
     """
     if not steps:
         return True
@@ -6029,8 +7323,6 @@ def _perterminal_path_respects_domain_frontier(
             node_id, adjacency, visited_so_far
         )
         has_following_step = idx < len(steps)
-        if escalates and not has_following_step:
-            return False  # the DFS would have kept going past this domain
         if not escalates and has_following_step:
             return False  # the DFS would have stopped dead at this domain
     return True
@@ -6049,6 +7341,7 @@ def compute_perterminal_attack_paths(
     enforce_terminal_floor: bool = True,
     tier0_ids: frozenset[str] = frozenset(),
     tier0_closure: dict[str, list[AttackPathStep]] | None = None,
+    tier0_plan: "Tier0DomainClosures | None" = None,
 ) -> list[AttackPath]:
     """Per-terminal, budgeted, REVERSE-reachability-first path materialization.
 
@@ -6110,6 +7403,10 @@ def compute_perterminal_attack_paths(
             domain-frontier check (``_perterminal_path_respects_domain_frontier``)
             — a second Tier-0 is only ever reachable through a domain re-entry
             point, so the two filters run together.
+        tier0_plan: The per-domain closures (``_build_tier0_closures_by_domain``).
+            Lets the Tier-0 filter admit the phase-3 trust continuation into the
+            home domain the DFS engines emit. ``None`` admits only the preferred
+            closure.
 
     Returns:
         The list of materialized :class:`AttackPath` routes (deduped by step
@@ -6554,7 +7851,9 @@ def compute_perterminal_attack_paths(
         paths = [
             p
             for p in paths
-            if _perterminal_path_respects_tier0_frontier(p.steps, tier0_ids, _closure_map)
+            if _perterminal_path_respects_tier0_frontier(
+                p.steps, tier0_ids, _closure_map, tier0_plan
+            )
             and _perterminal_path_respects_domain_frontier(p.steps, nodes_map, adjacency)
         ]
 
@@ -6618,6 +7917,16 @@ def _unauth_entry_reached_via(notes: dict[str, Any]) -> str:
     return reached_via_from_notes(notes)
 
 
+def note_secret_group_key(notes: Mapping[str, Any]) -> str:
+    """Return the value-free identity of the secret an edge's notes record.
+
+    Two reads of the SAME secret are one foothold. The keyed fingerprint of the
+    secret reference says that without the value; a legacy inline value (an old
+    graph not yet loaded through the redacting seam) still groups by itself.
+    """
+    return graph_secret_refs.note_secret_identity(notes, "secret")
+
+
 def _prepend_unauthenticated_entry_nodes(graph: dict[str, Any]) -> set[str]:
     """Prepend synthetic ``Unauthenticated`` entry nodes for proven no-cred reads.
 
@@ -6654,7 +7963,7 @@ def _prepend_unauthenticated_entry_nodes(graph: dict[str, Any]) -> set[str]:
         relation = str(edge.get("relation") or "").strip()
         if not to_id or not relation:
             continue
-        secret = str(notes.get("secret") or "").strip()
+        secret = note_secret_group_key(notes)
         artifact = str(notes.get("artifact") or "").strip()
         key = (to_id, relation, secret, artifact)
         bucket = groups.get(key)
@@ -6904,14 +8213,17 @@ def compute_maximal_attack_paths(
     # Tier-0 node to the domain object, precomputed once (Task 1's
     # ``_build_tier0_to_domain_closure``). The sequential DFS below stops
     # expanding at a Tier-0 node and appends this closure instead of walking
-    # every subtree past it.
-    tier0_closure = _build_tier0_to_domain_closure(
+    # every subtree past it. The plan holds one closure per reachable domain;
+    # ``tier0_closure`` is the one the frontier appends (home domain first).
+    tier0_plan = _build_tier0_closures_by_domain(
         view,
         nodes_map,
         local_reuse_by_node=view.local_reuse_by_node,
         local_reuse_existing_pairs=view.local_reuse_existing_pairs,
         local_reuse_useful_nodes=view.local_reuse_useful_nodes,
+        home_domain=_graph_home_domain(graph),
     )
+    tier0_closure = tier0_plan.preferred
     # The Tier-0 predicate result, precomputed once and shipped to the parallel
     # worker via the pool initializer (Task 4) — mirrors the per-node check the
     # sequential DFS runs inline (``not _node_is_domain(node) and
@@ -7016,17 +8328,22 @@ def compute_maximal_attack_paths(
     # switch's call-scoped route (predictor / abort backstop) — same effect,
     # without mutating the process-wide env var.
     if _perterminal_engine_selected() or force_perterminal:
-        return compute_perterminal_attack_paths(
-            view=view,
-            nodes_map=nodes_map,
-            sources=sources,
-            is_terminal=is_terminal,
-            allowed_reachable_ids=allowed_reachable_ids,
-            max_depth=max_depth,
-            max_paths_cap=max_paths_cap,
-            budget=DfsMemoryBudget(),
-            tier0_ids=tier0_ids,
-            tier0_closure=tier0_closure,
+        return annotate_also_reaches_domains(
+            compute_perterminal_attack_paths(
+                view=view,
+                nodes_map=nodes_map,
+                sources=sources,
+                is_terminal=is_terminal,
+                allowed_reachable_ids=allowed_reachable_ids,
+                max_depth=max_depth,
+                max_paths_cap=max_paths_cap,
+                budget=DfsMemoryBudget(),
+                tier0_ids=tier0_ids,
+                tier0_closure=tier0_closure,
+                tier0_plan=tier0_plan,
+            ),
+            tier0_plan,
+            nodes_map,
         )
 
     # --- Parallel DFS (domain scope) -----------------------------------------
@@ -7073,9 +8390,10 @@ def compute_maximal_attack_paths(
             allowed_reachable_ids,
             tier0_ids,
             tier0_closure,
+            tier0_plan,
         )
         if parallel_paths or not sources:
-            return parallel_paths
+            return annotate_also_reaches_domains(parallel_paths, tier0_plan, nodes_map)
         # Fall through to sequential if parallel returned nothing unexpectedly.
         from adscan_internal.rich_output import print_info_debug  # noqa: PLC0415
 
@@ -7101,11 +8419,21 @@ def compute_maximal_attack_paths(
     # coverage-bounded stop the outer gate raises, instead of a kernel SIGKILL.
     # Never fires on a graph that fits in RAM (byte-identical coverage there).
     _budget = DfsMemoryBudget()
+    # Phase-3 trust continuation INTO the listed domain (see
+    # ``_frontier_closure_branches``): while set, only a route ending at this
+    # node id is emitted, so a walk that crosses a foreign domain's trust never
+    # adds that foreign domain's own compromise to this listing.
+    required_terminal: list[str | None] = [None]
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if (
+            required_terminal[0] is not None
+            and acc_steps[-1].to_id != required_terminal[0]
+        ):
             return
         last_node = nodes_map.get(acc_steps[-1].to_id)
         # Tier-0 frontier carve: a Tier-0 node with no forward closure to the
@@ -7144,25 +8472,13 @@ def compute_maximal_attack_paths(
             )
         )
 
-    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
-        """Emit acc_steps extended by the shortest closure stop_node -> domain.
-
-        Drops the closure (emits the prefix as-is) when the closure would revisit
-        a node already in the prefix span, so a path never repeats a node.
-        """
-        closure = tier0_closure.get(stop_node)
-        if not closure:
-            emit(acc_steps)
-            return
-        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
-        if any(s.to_id in span for s in closure):
-            emit(acc_steps)
-            return
-        emit([*acc_steps, *closure])
-
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if acc_steps and current == required_terminal[0]:
+            # A trust continuation reached the listed domain: that is its end.
+            emit(acc_steps)
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
@@ -7170,23 +8486,31 @@ def compute_maximal_attack_paths(
         # can escalate cross-forest (CrossOrgTgtDelegation etc.) into an unvisited
         # domain is NOT the end — keep traversing so the cross-domain step chains
         # onto the kill chain (… → DCSync → EXT → CrossOrgTgtDelegation → HTB).
+        # The domain's OWN compromise is still a finding of its own (a different
+        # root cause from the trust), so the route that stops there is emitted
+        # first and the walk then continues across the trust.
         terminal_here = bool(acc_steps) and is_terminal(current)
         if terminal_here and _domain_has_cross_domain_escalation_out(
             current, adjacency, visited
         ):
+            emit(acc_steps)
             terminal_here = False
         # Tier-0 frontier-terminal (two-phase invariant): once the walk reaches a
         # Tier-0 object (not the domain itself, which the existing terminal path
-        # handles), stop expanding and close with the shortest path to the domain.
-        # The cross-domain-escalation carve already cleared ``terminal_here`` for a
-        # domain that must keep chaining cross-forest; mirror it here so a Tier-0
-        # with a cross-forest escalation out is NOT frontier-stopped.
+        # handles), stop expanding and close with the closure to the listed
+        # domain (``_close_at_frontier``); a closure whose domain escalates
+        # cross-forest continues from that domain (phase 3) rather than fanning
+        # out past the Tier-0 node. A Tier-0 with a cross-forest escalation of
+        # its own is NOT frontier-stopped.
         # The invariant is defined only for a highvalue-terminal walk: for
         # ``target == "lowpriv"`` a Tier-0 midpoint is not the goal (the goal is a
         # LOW-priv endpoint reached THROUGH it), so stopping there would truncate
         # and drop the real low-priv path past the Tier-0. Gate the frontier stop
         # to non-lowpriv targets so lowpriv stays byte-identical to before.
         node_here = nodes_map.get(current)
+        # A Tier-0 host reached through a session that does not own it keeps
+        # expanding, in session scope only (see ``_close_route_at_frontier``).
+        session_scope_only = False
         if (
             target != "lowpriv"
             and acc_steps
@@ -7198,34 +8522,31 @@ def compute_maximal_attack_paths(
                 current, adjacency, visited
             )
         ):
-            # The Tier-0's own closure lands on a Domain object; if THAT domain
-            # can still escalate cross-forest (the same carve as ``terminal_here``
-            # above, applied to the closure target rather than ``current``), the
-            # kill chain must keep chaining through it instead of being cut short
-            # at the Tier-0 with a bare closure — mirrors
-            # ``… -> DCSync -> EXT -> CrossOrgTgtDelegation -> HTB`` reaching HTB.
-            closure_here = tier0_closure.get(current)
-            closure_domain_id = closure_here[-1].to_id if closure_here else None
-            closure_domain_escalates = bool(
-                closure_domain_id
-                and _domain_has_cross_domain_escalation_out(
-                    closure_domain_id, adjacency, visited
-                )
-            )
-            if not closure_domain_escalates:
-                _emit_with_closure(acc_steps, current)
+            if _close_route_at_frontier(
+                tier0_plan,
+                current,
+                acc_steps=acc_steps,
+                visited=visited,
+                adjacency=adjacency,
+                emit=emit,
+                resume=dfs,
+                required_terminal=required_terminal,
+            ):
                 return
+            session_scope_only = True
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
             or terminal_here
         ):
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
 
         next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
 
         extended = False
@@ -7246,6 +8567,7 @@ def compute_maximal_attack_paths(
                 reachable_node_ids=allowed_reachable_ids,
                 terminal_set=None,
                 chokepoint_root_set=chokepoint_root_set,
+                session_scope_only=session_scope_only,
             )
             if verdict != "admit":
                 continue
@@ -7286,7 +8608,7 @@ def compute_maximal_attack_paths(
         ):
             emit(acc_steps)
 
-        if not extended:
+        if not extended and not session_scope_only:
             emit(acc_steps)
 
     # Per-principal progress for the live compute panel. The sequential DFS is
@@ -7323,7 +8645,7 @@ def compute_maximal_attack_paths(
     active_guard_members = None
     attack_path_progress.notify_principal(_dfs_done, _dfs_total)
 
-    return paths
+    return annotate_also_reaches_domains(paths, tier0_plan, nodes_map)
 
 
 def compute_maximal_attack_paths_from_start(
@@ -7396,13 +8718,15 @@ def compute_maximal_attack_paths_from_start(
     # frontier-stops exactly like the domain-scope engine (no Tier-0→Tier-2
     # descents, no lateral mega-hub explosion). See the two-phase design spec
     # ``2026-09-23-attack-path-tier0-terminal-two-phase-engine-design.md``.
-    tier0_closure = _build_tier0_to_domain_closure(
+    tier0_plan = _build_tier0_closures_by_domain(
         view,
         nodes_map,
         local_reuse_by_node=view.local_reuse_by_node,
         local_reuse_existing_pairs=view.local_reuse_existing_pairs,
         local_reuse_useful_nodes=view.local_reuse_useful_nodes,
+        home_domain=_graph_home_domain(graph),
     )
+    tier0_closure = tier0_plan.preferred
     tier0_ids: frozenset[str] = frozenset(
         nid
         for nid, node in nodes_map.items()
@@ -7421,17 +8745,22 @@ def compute_maximal_attack_paths_from_start(
     # per-terminal filter re-validates the frontier at EVERY Tier-0 including a
     # Tier-0 START node, so the degenerate Tier-0-start case is handled here too.
     if _perterminal_engine_selected() or force_perterminal:
-        return compute_perterminal_attack_paths(
-            view=view,
-            nodes_map=nodes_map,
-            sources=[start_node_id],
-            is_terminal=is_terminal,
-            allowed_reachable_ids=allowed_reachable_ids,
-            max_depth=max_depth,
-            max_paths_cap=max_paths_cap,
-            budget=DfsMemoryBudget(),
-            tier0_ids=tier0_ids if target != "lowpriv" else frozenset(),
-            tier0_closure=tier0_closure,
+        return annotate_also_reaches_domains(
+            compute_perterminal_attack_paths(
+                view=view,
+                nodes_map=nodes_map,
+                sources=[start_node_id],
+                is_terminal=is_terminal,
+                allowed_reachable_ids=allowed_reachable_ids,
+                max_depth=max_depth,
+                max_paths_cap=max_paths_cap,
+                budget=DfsMemoryBudget(),
+                tier0_ids=tier0_ids if target != "lowpriv" else frozenset(),
+                tier0_closure=tier0_closure,
+                tier0_plan=tier0_plan,
+            ),
+            tier0_plan,
+            nodes_map,
         )
 
     paths: list[AttackPath] = []
@@ -7440,11 +8769,19 @@ def compute_maximal_attack_paths_from_start(
     # coverage-bounded stop the outer gate raises, instead of a kernel SIGKILL.
     # Never fires on a graph that fits in RAM (byte-identical coverage there).
     _budget = DfsMemoryBudget()
+    # Required terminal of a phase-3 trust continuation (mirrors the domain
+    # engine; see ``_close_route_at_frontier``).
+    required_terminal: list[str | None] = [None]
 
     def emit(acc_steps: list[AttackPathStep]) -> None:
         if not acc_steps:
             return
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if (
+            required_terminal[0] is not None
+            and acc_steps[-1].to_id != required_terminal[0]
+        ):
             return
         last_node = nodes_map.get(acc_steps[-1].to_id)
         # Tier-0 frontier carve (mirrors the domain engine's ``emit``): a Tier-0
@@ -7474,26 +8811,12 @@ def compute_maximal_attack_paths_from_start(
             )
         )
 
-    def _emit_with_closure(acc_steps: list[AttackPathStep], stop_node: str) -> None:
-        """Emit acc_steps extended by the shortest closure stop_node -> domain.
-
-        Drops the closure (emits the prefix as-is) when the closure would revisit
-        a node already in the prefix span, so a path never repeats a node. Exact
-        mirror of the domain engine's ``_emit_with_closure``.
-        """
-        closure = tier0_closure.get(stop_node)
-        if not closure:
-            emit(acc_steps)
-            return
-        span = {acc_steps[0].from_id} | {s.to_id for s in acc_steps}
-        if any(s.to_id in span for s in closure):
-            emit(acc_steps)
-            return
-        emit([*acc_steps, *closure])
-
     def dfs(current: str, visited: set[str], acc_steps: list[AttackPathStep]) -> None:
         _budget.tick()
         if max_paths_cap is not None and len(paths) >= max_paths_cap:
+            return
+        if acc_steps and current == required_terminal[0]:
+            emit(acc_steps)
             return
         actionable_depth = _count_actionable_edges(acc_steps)
         structural_depth = len(acc_steps) - actionable_depth
@@ -7505,6 +8828,9 @@ def compute_maximal_attack_paths_from_start(
         if terminal_here and _domain_has_cross_domain_escalation_out(
             current, adjacency, visited
         ):
+            # The domain's own compromise is a finding of its own; the walk then
+            # continues across the trust (mirrors the domain engine).
+            emit(acc_steps)
             terminal_here = False
         # Tier-0 frontier-terminal (two-phase invariant) — exact mirror of the
         # domain engine's block in ``compute_maximal_attack_paths``. Once the walk
@@ -7515,6 +8841,9 @@ def compute_maximal_attack_paths_from_start(
         # lowpriv walk (goal = a low-priv endpoint reached THROUGH the Tier-0)
         # stays byte-identical to before.
         node_here = nodes_map.get(current)
+        # A Tier-0 host reached through a session that does not own it keeps
+        # expanding, in session scope only (see ``_close_route_at_frontier``).
+        session_scope_only = False
         if (
             target != "lowpriv"
             and acc_steps
@@ -7526,28 +8855,31 @@ def compute_maximal_attack_paths_from_start(
                 current, adjacency, visited
             )
         ):
-            closure_here = tier0_closure.get(current)
-            closure_domain_id = closure_here[-1].to_id if closure_here else None
-            closure_domain_escalates = bool(
-                closure_domain_id
-                and _domain_has_cross_domain_escalation_out(
-                    closure_domain_id, adjacency, visited
-                )
-            )
-            if not closure_domain_escalates:
-                _emit_with_closure(acc_steps, current)
+            if _close_route_at_frontier(
+                tier0_plan,
+                current,
+                acc_steps=acc_steps,
+                visited=visited,
+                adjacency=adjacency,
+                emit=emit,
+                resume=dfs,
+                required_terminal=required_terminal,
+            ):
                 return
+            session_scope_only = True
         if (
             actionable_depth >= max_depth
             or structural_depth >= _MAX_STRUCTURAL_HOPS
             or terminal_here
         ):
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
 
         next_edges = iter_view_frontier(view, current, acc_steps)
         if not next_edges:
-            emit(acc_steps)
+            if not session_scope_only:
+                emit(acc_steps)
             return
 
         extended = False
@@ -7566,6 +8898,7 @@ def compute_maximal_attack_paths_from_start(
                 reachable_node_ids=allowed_reachable_ids,
                 terminal_set=None,
                 chokepoint_root_set=set(),
+                session_scope_only=session_scope_only,
             )
             if verdict != "admit":
                 continue
@@ -7586,7 +8919,7 @@ def compute_maximal_attack_paths_from_start(
                 visited.remove(to_id)
             extended = True
 
-        if not extended:
+        if not extended and not session_scope_only:
             emit(acc_steps)
 
     # Degenerate case — the explicit start node is ITSELF Tier-0 (e.g.
@@ -7611,10 +8944,10 @@ def compute_maximal_attack_paths_from_start(
         closure_from_start = tier0_closure.get(start_node_id)
         if closure_from_start:
             emit(list(closure_from_start))
-        return paths
+        return annotate_also_reaches_domains(paths, tier0_plan, nodes_map)
 
     dfs(start_node_id, visited={start_node_id}, acc_steps=[])
-    return paths
+    return annotate_also_reaches_domains(paths, tier0_plan, nodes_map)
 
 
 def collect_source_step_signatures_on_high_value_paths(
@@ -7801,6 +9134,7 @@ def path_to_display_record(
     from adscan_internal.services.remediability import (
         classify_edge_remediability,
         principal_facts_from_node,
+        refine_chain_remediability,
     )
 
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
@@ -7834,14 +9168,26 @@ def path_to_display_record(
         _graph_domain.split(".", 1)[0].upper() if _graph_domain else ""
     )
 
+    # The DC's DNS name (Kerberos ``-k`` invocations need it as the SPN host)
+    # and the account the scan authenticated as (the principal a read-only
+    # verify query runs as), both stamped by ``save_attack_graph``. Neither is a
+    # secret. Absent on an older graph -> unset, and the catalog degrades to an
+    # honest ``<...>`` fill-in.
+    _graph_dc_fqdn = str(graph.get("dc_fqdn") or "").strip()
+    _graph_scan_principal = str(graph.get("scan_principal") or "").strip()
+
     def _stamp_env(details: dict[str, Any]) -> None:
-        """Attach dc_ip/domain/netbios_domain to a step's details."""
+        """Attach the environment coordinates to a step's details."""
         if _graph_dc_ip:
             details["dc_ip"] = _graph_dc_ip
         if _graph_domain:
             details["domain"] = _graph_domain
         if _stamp_netbios:
             details["netbios_domain"] = _stamp_netbios
+        if _graph_dc_fqdn:
+            details["dc_fqdn"] = _graph_dc_fqdn
+        if _graph_scan_principal:
+            details["scan_principal"] = _graph_scan_principal
 
     def label(node_id: str) -> str:
         node = nodes_map.get(node_id)
@@ -8003,8 +9349,12 @@ def path_to_display_record(
     # ``decorate_display_record`` seam from the POST-minimisation step list, so a
     # record whose steps were sliced never keeps an actor from a dropped step.
     step_actor_resolution.resolve_path_step_actors(steps_for_ui)
+    # A host-scoped change (a dump, a borrowed session) needs the HOST, which a
+    # session-borne step only carries through its chain. No-op on a light record
+    # (no stamp yet); the decorate seam runs it on the final step list.
+    refine_chain_remediability(steps_for_ui)
 
-    return {
+    record = {
         "nodes": nodes,
         "relations": relations,
         "_exact_signature": (
@@ -8033,6 +9383,22 @@ def path_to_display_record(
         "status": derived_status,
         "steps": steps_for_ui,
     }
+    # The OTHER domains this route's Tier-0 frontier node also reaches (plain
+    # dotted names), so a report can say "this route also reaches <domain>" and
+    # that fixing the shared step closes both. Absent when there are none, so a
+    # single-domain record is byte-identical to before.
+    also_reaches = also_reaches_domains_payload(path.also_reaches_domains, nodes_map)
+    # Belt and braces against a duplicated Domain node (same domain under two
+    # ids): never name a domain the route itself already shows.
+    _on_route = {str(n).strip().rstrip(".").lower() for n in nodes}
+    also_reaches = [e for e in also_reaches if e["domain"] not in _on_route]
+    if also_reaches:
+        record[ALSO_REACHES_DOMAINS_KEY] = also_reaches
+    # Which arrivals the route holds only as a session (for views that merge
+    # routes into one graph). Recomputed at the deferred decorate seam on the
+    # final, post-minimisation step list.
+    stamp_session_held_targets(record)
+    return record
 
 
 def decorate_display_record(
@@ -8156,6 +9522,14 @@ def decorate_display_record(
     # after every minimisation/collapse stage, so the chain it walks is the chain
     # the client is shown.
     step_actor_resolution.resolve_path_step_actors(decorated_steps)
+    # Host-scoped verbs completed from the chain, on the same final step list.
+    from adscan_internal.services.remediability import (  # noqa: PLC0415
+        refine_chain_remediability,
+    )
+
+    refine_chain_remediability(decorated_steps)
+    # Session-held arrivals, recomputed on the same final chain.
+    stamp_session_held_targets(record)
     return record
 
 

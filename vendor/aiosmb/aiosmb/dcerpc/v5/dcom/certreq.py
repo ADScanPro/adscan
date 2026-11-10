@@ -213,6 +213,8 @@ class ICertRequestD(IRemUnknown):
         """
         IRemUnknown.__init__(self, interface)
         self._iid = IID_ICertRequestD
+        # certsrv refuses anything below an encrypted binding (Certipy parity).
+        self.require_packet_privacy()
     
     async def __aenter__(self):
         """

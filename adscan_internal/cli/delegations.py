@@ -11,6 +11,8 @@ The service layer performs the tool execution and basic parsing; this module:
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 import os
 import subprocess
 from typing import Protocol
@@ -35,11 +37,9 @@ from adscan_core.theme import (
     COLOR_CRIMSON,
     COLOR_SAGE,
 )
-from rich.prompt import Confirm
 
-from adscan_internal.services.machine_account_provisioning_service import (
-    record_machine_account_creation_result,
-    register_managed_machine_account,
+from adscan_internal.services.machine_account_quota_state_service import (
+    is_machine_account_quota_exhausted,
 )
 
 
@@ -266,7 +266,6 @@ class DelegationShell(Protocol):
 
     def is_computer_dc(self, domain: str, hostname: str) -> bool: ...
 
-    def return_credentials(self, domain: str) -> tuple[str | None, str | None]: ...
 
     def update_report_field(self, domain: str, field: str, value: object) -> None: ...
 
@@ -300,43 +299,6 @@ class DelegationShell(Protocol):
         allow_empty_credential: bool = False,
         trusted_manual_validation: bool = False,
     ) -> None: ...
-
-
-def ask_for_exploit_delegation(
-    shell: DelegationShell,
-    domain: str,
-    username: str,
-    password: str,
-    delegation_type: str,
-    delegation_to: str,
-) -> None:
-    """Prompt user to exploit a delegation."""
-    from adscan_internal.rich_output import mark_sensitive
-
-    marked_delegation_to = mark_sensitive(delegation_to, "service")
-    marked_username = mark_sensitive(username, "user")
-
-    # Pre-flight context: render the vector + AD changes + OPSEC + Next step
-    # so the operator decides with the full picture rather than from the
-    # one-liner Confirm.ask string.
-    _print_delegation_preflight_panel(
-        delegation_kind=delegation_type,
-        marked_username=marked_username,
-        marked_target=marked_delegation_to,
-    )
-
-    respuesta = Confirm.ask(
-        f"Exploit {delegation_type} delegation on {marked_delegation_to} "
-        f"as {marked_username}?",
-        default=True,
-    )
-    if respuesta:
-        if delegation_type.lower() == "constrained":
-            exploit_delegation_rbcd(shell, domain, username, password, delegation_to)
-        elif delegation_type == "Constrained w/ Protocol Transition":
-            exploit_delegation_constrained(
-                shell, domain, username, password, delegation_to
-            )
 
 
 def _run_s4u_native(
@@ -589,131 +551,6 @@ def _handle_constrained_native_result(
 
 
 
-def exploit_delegation_rbcd(
-    shell: DelegationShell, domain: str, username: str, password: str, target: str
-) -> None:
-    """Coordinates the exploitation of constrained delegation."""
-    from adscan_internal.rich_output import mark_sensitive
-
-    try:
-        # Telemetry: track delegation exploitation attempt
-        try:
-            properties = {
-                "delegation_type": "resource_based_constrained",
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                "workspace_type": shell.type,
-                "auto_mode": shell.auto,
-            }
-            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
-            telemetry.capture("delegation_exploitation_started", properties)
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_exception(exception=e)
-
-        # First, check MAQ
-        maq = shell.check_maq(domain, username, password)
-        success = False
-
-        if maq > 0:
-            # If MAQ allows creating computers, continue with the original flow
-            computer_name = "rbcd_computer$"
-            computer_pass = "Password12321"
-
-            marked_username = mark_sensitive(username, "user")
-            print_success(
-                f"Starting RBCD exploitation as {marked_username}"
-            )
-
-            # Step 1: Create new computer
-            if shell.add_computer_to_domain(
-                domain, computer_name, computer_pass, username, password
-            ):
-                # Step 2: Configure RBCD
-                if shell.set_rbcd_delegation(
-                    domain, computer_name, target, computer_pass, username, password
-                ):
-                    # Step 3: Create forwardable ticket
-                    if shell.create_forwardable_ticket(
-                        domain, computer_name, username, computer_pass
-                    ):
-                        # Step 4: Launch S4Proxy
-                        if shell.launch_s4proxy(domain, target, username, password):
-                            success = True
-
-        else:
-            # If MAQ does not allow creating computers, use an existing one
-            print_warning("MachineAccountQuota is 0, new computers cannot be created")
-            print_info("Select an existing user to configure RBCD")
-
-            selected_user, selected_cred = shell.return_credentials(domain)
-            if selected_user and selected_cred:
-                # Configure RBCD with the selected user
-                if shell.set_rbcd_delegation(
-                    domain, selected_user, target, selected_cred, username, password
-                ):
-                    # Create forwardable ticket
-                    if shell.create_forwardable_ticket(
-                        domain, selected_user, username, selected_cred
-                    ):
-                        # Launch S4Proxy
-                        if shell.launch_s4proxy(domain, target, username, password):
-                            success = True
-
-        # Telemetry: track exploitation result
-        try:
-            if success:
-                properties = {
-                    "delegation_type": "resource_based_constrained",
-                    "used_new_computer": maq > 0,
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                }
-                properties.update(
-                    build_lab_event_fields(shell=shell, include_slug=True)
-                )
-                telemetry.capture("delegation_exploitation_success", properties)
-            else:
-                properties = {
-                    "delegation_type": "resource_based_constrained",
-                    "maq_available": maq > 0,
-                    "scan_mode": getattr(shell, "scan_mode", None),
-                    "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                    "workspace_type": shell.type,
-                    "auto_mode": shell.auto,
-                }
-                properties.update(
-                    build_lab_event_fields(shell=shell, include_slug=True)
-                )
-                telemetry.capture("delegation_exploitation_failed", properties)
-        except Exception as e:
-            telemetry.capture_exception(e)
-            print_exception(exception=e)
-
-    except Exception as e:
-        telemetry.capture_exception(e)
-        print_error("Error during constrained delegation exploitation.")
-        print_exception(show_locals=False, exception=e)
-
-        # Telemetry: track exception during exploitation
-        try:
-            properties = {
-                "delegation_type": "resource_based_constrained",
-                "error": True,
-                "scan_mode": getattr(shell, "scan_mode", None),
-                "auth_type": shell.domains_data[domain].get("auth", "unknown"),
-                "workspace_type": shell.type,
-                "auto_mode": shell.auto,
-            }
-            properties.update(build_lab_event_fields(shell=shell, include_slug=True))
-            telemetry.capture("delegation_exploitation_failed", properties)
-        except Exception as e2:
-            telemetry.capture_exception(e2)
-            print_exception(exception=e2)
-
-
 def add_computer_to_domain(
     shell: DelegationShell,
     domain: str,
@@ -721,8 +558,20 @@ def add_computer_to_domain(
     computer_pass: str,
     username: str,
     password: str,
-) -> bool:
-    """Adds a new computer to the domain."""
+):
+    """Get a computer account the RBCD route controls, through the provisioning SSOT.
+
+    Routed through ``acquire_controlled_machine_account`` like every other
+    creator: the actor's capacity is re-read, the retained account is reused
+    under ``retain_one``, and a created account is recorded in the ledger and
+    the managed registry there. ``computer_name`` / ``computer_pass`` are what
+    a NEW account is created with.
+
+    Returns:
+        The :class:`MachineAccountLease` (truthy) on success; its
+        ``sam_account_name`` / ``password`` may differ from the requested ones
+        when the retained account was reused. ``False`` on failure.
+    """
     try:
         if domain not in shell.domains:
             marked_target_domain = mark_sensitive(domain, "domain")
@@ -732,74 +581,36 @@ def add_computer_to_domain(
             return None
 
         inventory = _load_ip_hostname_inventory(shell, domain)
-        outcome = _run_addcomputer_native(
+        lease = _acquire_machine_account(
+            shell,
             domain=domain,
-            domains_data=shell.domains_data,
-            ip_hostname_inventory=inventory,
             username=username,
             password=password,
             computer_name=computer_name,
             computer_password=computer_pass,
+            ip_hostname_inventory=inventory,
         )
 
-        if outcome.success:
-            record_machine_account_creation_result(
-                shell,
-                domain=domain,
-                actor_username=username,
-                success=True,
+        if lease is not None:
+            machine_account = normalize_machine_account(
+                str(getattr(lease, "sam_account_name", "") or computer_name)
             )
-            print_success(f"Computer {computer_name}$ added successfully")
-            machine_account = normalize_machine_account(computer_name)
-            register_managed_machine_account(
-                shell,
-                domain=domain,
-                sam_account_name=machine_account,
-                password=computer_pass,
-                created_by=username,
-                source="authenticated_ldap",
-            )
-            # Inject the new machine account's primary-group membership into
-            # the workspace snapshot.  Windows assigns primaryGroupID=515
-            # (Domain Computers) automatically when SamrCreateUser2InDomain
-            # is called with USER_WORKSTATION_TRUST_ACCOUNT, known by
-            # construction, no LDAP roundtrip needed.  Without this, every
-            # subsequent attack-path render falls back to LDAP queries that
-            # return 0 results (computer primaryGroupID is not in the LDAP
-            # ``member`` attribute the IN_CHAIN matching rule traverses).
-            try:
-                from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
-                    add_runtime_computer_group_membership,
+            machine_secret = str(getattr(lease, "password", "") or computer_pass)
+            if getattr(lease, "created", True):
+                print_success(f"Computer {machine_account} added successfully")
+                _inject_new_machine_primary_group(
+                    shell, domain=domain, machine_account=machine_account, username=username
                 )
-                add_runtime_computer_group_membership(
-                    shell,
-                    domain,
-                    computer_name=machine_account,
-                    group_rid=515,
-                    source="adscan_addcomputer_native",
-                    evidence={
-                        "primary_group_rid": 515,
-                        "creation_method": "samr_create_user2",
-                        "actor_username": username,
-                    },
-                    origin_kind="machine_account_creation",
-                    origin_technique="addcomputer_samr",
-                    origin_relation="AddComputer",
-                    cleanup_behavior="remove_directory_and_runtime",
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                marked_machine = mark_sensitive(machine_account, "user")
-                print_info_debug(
-                    "[delegations] failed to inject primary-group membership for "
-                    f"{marked_machine}: {type(exc).__name__}: {exc}"
+            else:
+                print_info(
+                    "Reusing the retained ADscan computer account "
+                    f"{mark_sensitive(machine_account, 'user')} (retain_one policy)."
                 )
             try:
                 shell.add_credential(
                     domain,
                     machine_account,
-                    computer_pass,
+                    machine_secret,
                     prompt_for_user_privs_after=False,
                     skip_user_privs_enumeration=True,
                     ui_silent=True,
@@ -813,26 +624,18 @@ def add_computer_to_domain(
                 print_exception(exception=exc)
                 marked_machine = mark_sensitive(machine_account, "user")
                 print_warning(
-                    "The computer was created successfully, but ADscan could not "
+                    "The computer account is available, but ADscan could not "
                     f"persist the machine credential bootstrap for {marked_machine}."
                 )
-            return True
-        if outcome.quota_exceeded:
-            record_machine_account_creation_result(
-                shell,
-                domain=domain,
-                actor_username=username,
-                success=False,
-                quota_exceeded=True,
-                reason=outcome.output or "MachineAccountQuota exceeded for actor.",
-            )
+            return lease
+        if is_machine_account_quota_exhausted(shell, domain=domain, username=username):
             marked_user = mark_sensitive(username, "user")
             marked_domain = mark_sensitive(domain, "domain")
             print_warning(
                 "MachineAccountQuota exhausted for the current actor: "
                 f"{marked_user} can no longer create additional machine accounts in {marked_domain}."
             )
-        print_error(f"Error adding computer: {outcome.output or 'unknown error'}")
+        print_error("Error adding computer: no computer account could be obtained.")
         return False
 
     except Exception as e:
@@ -840,6 +643,138 @@ def add_computer_to_domain(
         print_error("Error adding computer.")
         print_exception(show_locals=False, exception=e)
         return False
+
+
+def _inject_new_machine_primary_group(
+    shell: DelegationShell, *, domain: str, machine_account: str, username: str
+) -> None:
+    """Record a new machine account's Domain Computers membership in the snapshot.
+
+    Windows assigns primaryGroupID=515 (Domain Computers) to every new computer
+    account, known by construction, so no LDAP round trip is needed. Without it
+    every later attack-path render falls back to LDAP queries that return 0
+    results (a computer's primaryGroupID is not in the ``member`` attribute the
+    IN_CHAIN matching rule traverses).
+    """
+    try:
+        from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
+            add_runtime_computer_group_membership,
+        )
+
+        add_runtime_computer_group_membership(
+            shell,
+            domain,
+            computer_name=machine_account,
+            group_rid=515,
+            source="adscan_addcomputer_native",
+            evidence={
+                "primary_group_rid": 515,
+                "creation_method": "samr_create_user2",
+                "actor_username": username,
+            },
+            origin_kind="machine_account_creation",
+            origin_technique="addcomputer_samr",
+            origin_relation="AddComputer",
+            cleanup_behavior="remove_directory_and_runtime",
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        marked_machine = mark_sensitive(machine_account, "user")
+        print_info_debug(
+            "[delegations] failed to inject primary-group membership for "
+            f"{marked_machine}: {type(exc).__name__}: {exc}"
+        )
+
+
+def _acquire_machine_account(
+    shell: DelegationShell,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+    computer_name: str,
+    computer_password: str,
+    ip_hostname_inventory: dict | None = None,
+):
+    """The provisioning SSOT for the authenticated RBCD delegate (patchable seam).
+
+    A durable delegate: kept for the rest of the session and resolved at
+    workspace exit (``operator_confirmed``), or kept as THE retained account
+    under ``retain_one``.
+    """
+    from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
+        build_ldap_config_for_domain,
+    )
+    from adscan_internal.services.machine_account_provisioning_service import (  # noqa: PLC0415
+        acquire_controlled_machine_account,
+    )
+
+    ldap_config = build_ldap_config_for_domain(
+        shell.domains_data,
+        domain,
+        username=username,
+        password=password,
+        use_ldaps=True,
+        ip_hostname_inventory=ip_hostname_inventory,
+    )
+    return acquire_controlled_machine_account(
+        shell,
+        domain=domain,
+        actor_ldap_config=ldap_config,
+        actor_username=username,
+        purpose="rbcd_delegate",
+        method="Machine account created for resource-based constrained delegation",
+        computer_name=str(computer_name or "").rstrip("$") or None,
+        password=computer_password or None,
+    )
+
+
+def _record_rbcd_delegation_added(
+    shell: DelegationShell,
+    *,
+    domain: str,
+    target: str,
+    outcome,
+    exec_username: str,
+) -> str | None:
+    """Record an RBCD delegation ADscan wrote, in the relay path's ledger shape.
+
+    The prior security descriptor travels in ``detail`` so the exit revert
+    restores the attribute byte for byte (or clears it when it was unset).
+    Only called when ADscan actually wrote it: a pre-existing delegation is
+    never recorded and therefore never removed.
+    """
+    ledger = ledger_or_warn(shell)
+    if ledger is None:
+        return None
+    from adscan_internal.services.environment_change_ledger import (  # noqa: PLC0415
+        CHANGE_CLASS_OPERATOR_CONFIRMED,
+    )
+
+    prior_sd_hex = getattr(outcome, "prior_sd_hex", None)
+    try:
+        return ledger.register_change(
+            kind="rbcd_delegation_added",
+            domain=domain,
+            target=target,
+            detail={
+                "target_dn": getattr(outcome, "target_dn", None),
+                "actor_sid": getattr(outcome, "actor_sid", None),
+                "prior_attribute_empty": not prior_sd_hex,
+                "prior_sd_hex": prior_sd_hex,
+                "prior_sd_hex_present": bool(prior_sd_hex),
+                "exec_username": exec_username,
+                "executor_username": exec_username,
+                "executor_auth_domain": domain,
+            },
+            method="msDS-AllowedToActOnBehalfOfOtherIdentity write (RBCD)",
+            change_class=CHANGE_CLASS_OPERATOR_CONFIRMED,
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
 
 
 def _load_ip_hostname_inventory(shell, domain: str) -> dict | None:
@@ -860,15 +795,6 @@ def _load_ip_hostname_inventory(shell, domain: str) -> dict | None:
         )
     except Exception:
         return None
-
-
-def _run_addcomputer_native(**kwargs):
-    """Deferred native add-computer wrapper to keep CLI tests patchable."""
-    from adscan_internal.services.exploitation.delegation_native import (  # noqa: PLC0415
-        run_addcomputer_native,
-    )
-
-    return run_addcomputer_native(**kwargs)
 
 
 def set_rbcd_delegation(
@@ -900,11 +826,20 @@ def set_rbcd_delegation(
 
         if outcome.success:
             if outcome.already_had_delegation:
+                # The delegation was already there: ADscan changed nothing, so it
+                # records nothing and will never remove it at cleanup.
                 print_success(
                     "RBCD was already configured: this machine account already had "
                     "the delegation privileges needed for this target (no changes were required)."
                 )
             else:
+                _record_rbcd_delegation_added(
+                    shell,
+                    domain=domain,
+                    target=target,
+                    outcome=outcome,
+                    exec_username=username,
+                )
                 # Verdict-first panel with the exact attribute write and the
                 # Next move, matching the backup_operators_escalation pattern.
                 marked_actor = mark_sensitive(computer_name, "user")

@@ -9,6 +9,7 @@ from adscan_core.telemetry_preference import (
     resolve_effective_telemetry,
 )
 from adscan_internal.models.domain import CaseInsensitiveDict
+from adscan_internal.services import cleanup_credential_store
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +172,75 @@ def _apply_telemetry_preference_to_shell(shell: Any, raw_value: Any) -> None:
     )
 
 
+def _workspace_pacing_for_save(shell: Any) -> dict[str, Any] | None:
+    """The persisted form of ``shell.scan_pacing_request`` (``None`` = unset)."""
+    from adscan_internal.services.scan_controls import pacing_request_for_save
+
+    try:
+        return pacing_request_for_save(shell)
+    except Exception:  # noqa: BLE001 - a pace that cannot be serialised is not persisted
+        return None
+
+
+def _apply_workspace_pacing_to_shell(
+    shell: Any, variables: dict[str, Any], *, reset_missing_to_defaults: bool
+) -> None:
+    """Load the persisted pace request into ``shell.scan_pacing_request``.
+
+    It is only loaded here; the pace is resolved and published by the
+    workspace loader, once the workspace policy (its ceiling) is known.
+    """
+    from adscan_internal.services.scan_controls import (
+        ATTR_PACING_REQUEST,
+        pacing_request_from_saved,
+    )
+
+    if "pacing" in variables:
+        setattr(shell, ATTR_PACING_REQUEST, pacing_request_from_saved(variables.get("pacing")))
+    elif reset_missing_to_defaults:
+        setattr(shell, ATTR_PACING_REQUEST, None)
+
+
+def _workspace_auto_revert_for_save(shell: Any) -> bool | None:
+    """The operator's explicit ``set auto_revert`` choice (``None`` = unset)."""
+    value = getattr(shell, "auto_revert", None)
+    return value if isinstance(value, bool) else None
+
+
+#: ``variables.json`` keys this seam writes to disk but never keeps on
+#: ``shell.variables`` (the in-memory mirror every module can read). The client
+#: cleanup account is the only one: its owner module serializes it on save and
+#: takes it back on load, and nothing else may see it (spec 8.1).
+_CLEANUP_CREDENTIALS_KEY = cleanup_credential_store.WORKSPACE_VARIABLES_KEY
+WRITE_ONLY_WORKSPACE_KEYS: tuple[str, ...] = (_CLEANUP_CREDENTIALS_KEY,)
+
+
+def _cleanup_credentials_for_save() -> dict[str, Any] | None:
+    """The cleanup store's own serialization (``None`` = nothing saved)."""
+    return cleanup_credential_store.export_workspace_state()
+
+
+def _restore_cleanup_credentials(
+    variables: dict[str, Any], *, reset_missing_to_defaults: bool
+) -> None:
+    """Hand the saved cleanup account to its store and drop it from ``variables``.
+
+    Popped so that the loaded dict, which becomes ``shell.variables``, never
+    carries the secret.
+    """
+    present = _CLEANUP_CREDENTIALS_KEY in variables
+    raw = variables.pop(_CLEANUP_CREDENTIALS_KEY, None)
+    cleanup_credential_store.restore_workspace_state(
+        raw, present=present, reset=reset_missing_to_defaults
+    )
+
+
 def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
     """Collect workspace-level variables from the CLI shell instance."""
     workspace_vars = {
         "hosts": getattr(shell, "hosts", None),
         "myip": getattr(shell, "myip", None),
+        "myip_source": getattr(shell, "myip_source", None),
         "interface": getattr(shell, "interface", None),
         "pdc": getattr(shell, "pdc", None),
         "pdc_hostname": getattr(shell, "pdc_hostname", None),
@@ -198,6 +263,9 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         # user had disabled telemetry for this engagement specifically. ``None``
         # (unset) is dropped below so the workspace keeps inheriting the global.
         "telemetry": _workspace_telemetry_preference_for_save(shell),
+        # A derived mirror of the policy's environment (``scan_controls.workspace_type``)
+        # for the web and older readers. It is never read back as the type: on
+        # load it is only a migration input for a workspace without a policy.
         "type": getattr(shell, "type", None),
         "lab_provider": getattr(shell, "lab_provider", None),
         "lab_name": getattr(shell, "lab_name", None),
@@ -207,7 +275,25 @@ def collect_workspace_variables_from_shell(shell: Any) -> dict[str, Any]:
         "lab_inference_confidence": getattr(shell, "lab_inference_confidence", None),
         "password_spraying_history": getattr(shell, "password_spraying_history", {}),
         "cracking_history": getattr(shell, "cracking_history", {}),
+        "listener_callback_history": getattr(shell, "listener_callback_history", {}),
+        # The workspace's scan pace REQUEST (level + knob overrides), set with
+        # ``set pacing`` or by a run. Dropped below when unset, so a workspace
+        # without one keeps following the default and any policy's pace.
+        "pacing": _workspace_pacing_for_save(shell),
+        # Automatic reversion of ADscan's directory changes, set with
+        # ``set auto_revert on|off``. Dropped when unset so the workspace keeps
+        # the type default (on for audit, off for ctf).
+        "auto_revert": _workspace_auto_revert_for_save(shell),
     }
+    # The client's cleanup-only account, serialized by its own store (the only
+    # reader and writer of the value). Absent when the workspace saved none.
+    cleanup_state = _cleanup_credentials_for_save()
+    if cleanup_state is not None:
+        workspace_vars[_CLEANUP_CREDENTIALS_KEY] = cleanup_state
+    if workspace_vars.get("pacing") is None:
+        workspace_vars.pop("pacing", None)
+    if workspace_vars.get("auto_revert") is None:
+        workspace_vars.pop("auto_revert", None)
 
     domains_data = workspace_vars.get("domains_data")
     if isinstance(domains_data, dict):
@@ -254,6 +340,7 @@ def collect_domain_variables_from_shell(shell: Any) -> dict[str, Any]:
     variables: dict[str, Any] = {
         "hosts": getattr(shell, "hosts", None),
         "myip": getattr(shell, "myip", None),
+        "myip_source": getattr(shell, "myip_source", None),
         "interface": getattr(shell, "interface", None),
         "pdc": getattr(shell, "pdc", None),
         "pdc_hostname": getattr(shell, "pdc_hostname", None),
@@ -319,9 +406,13 @@ def apply_workspace_variables_to_shell(
             print_info_verbose(
                 f"Migrated legacy BloodHound/Neo4j state keys for {workspace_label}"
             )
+        _restore_cleanup_credentials(
+            variables, reset_missing_to_defaults=reset_missing_to_defaults
+        )
     defaults: dict[str, Any] = {
         "hosts": None,
         "myip": None,
+        "myip_source": None,
         "interface": None,
         "pdc": None,
         "pdc_hostname": None,
@@ -343,6 +434,9 @@ def apply_workspace_variables_to_shell(
         # Handled out of band by ``_apply_telemetry_preference_to_shell`` below;
         # listed here so the schema stays complete.
         "telemetry": True,
+        # Never applied to the shell: the type is derived from the scan policy.
+        # The stored value reaches ``apply_workspace_scan_controls`` as a
+        # migration input only (``workspaces/loader.py``).
         "type": None,
         "lab_provider": None,
         "lab_name": None,
@@ -352,10 +446,12 @@ def apply_workspace_variables_to_shell(
         "lab_inference_confidence": None,
         "password_spraying_history": {},
         "cracking_history": {},
+        "listener_callback_history": {},
+        "auto_revert": None,
     }
 
     for key, default in defaults.items():
-        if key == "telemetry":
+        if key in ("telemetry", "type"):
             continue
         if key in variables:
             value = variables.get(key)
@@ -376,6 +472,9 @@ def apply_workspace_variables_to_shell(
     # previous workspace's resolved value in place would be wrong, and a boolean
     # preference is not part of the data-loss class the flag guards.
     _apply_telemetry_preference_to_shell(shell, variables.get("telemetry"))
+    _apply_workspace_pacing_to_shell(
+        shell, variables, reset_missing_to_defaults=reset_missing_to_defaults
+    )
 
     domains_data = getattr(shell, "domains_data", None)
     if isinstance(domains_data, dict):
@@ -386,6 +485,7 @@ def apply_workspace_variables_to_shell(
 
 __all__ = [
     "DOMAIN_SNAPSHOT_NOTE",
+    "WRITE_ONLY_WORKSPACE_KEYS",
     "apply_workspace_variables_to_shell",
     "collect_domain_variables_from_shell",
     "collect_workspace_variables_from_shell",

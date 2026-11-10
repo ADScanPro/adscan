@@ -68,6 +68,7 @@ from adscan_internal.services.smb_transport import (
     smb_machine_with_fallback,
 )
 from adscan_core.rich_output import print_exception
+from adscan_core.scan_policy import settings as policy_settings
 
 
 @dataclass(slots=True)
@@ -730,9 +731,9 @@ async def powershell_search(
 
     host_intel_cache = getattr(shell, "host_intel_cache", None)
     edr_intel = getattr(shell, "edr_intel", None)
-    workspace_type = getattr(shell, "type", None)
+    prefer_speed = policy_settings.prefers_fast_remote_execution(shell)
     on_intel = (
-        _make_panel_callback(shell, host_intel_cache, workspace_type)
+        _make_panel_callback(shell, host_intel_cache, prefer_speed)
         if host_intel_cache is not None else None
     )
 
@@ -743,7 +744,7 @@ async def powershell_search(
             methods=None if host_intel_cache is not None else STDOUT_CASCADE,
             intel_cache=host_intel_cache,
             intel=edr_intel,
-            workspace_type=workspace_type,
+            prefer_speed=prefer_speed,
             on_intel_resolved=on_intel,
             timeout=timeout_seconds,
         )

@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from adscan_core import telemetry
+from adscan_core.kerberos_roasting import AccountSignals
+from adscan_core.kerberos_roasting import (
+    is_managed_service_account as _node_is_managed_service_account,
+)
+from adscan_core.kerberos_roasting import (
+    password_is_ad_managed as _password_is_ad_managed,
+)
 from adscan_core.reporting.well_known_principals import is_worthless_victim_principal
 from adscan_core.rich_output import print_info_debug, print_warning
 from adscan_internal.rich_output import mark_sensitive
@@ -86,6 +93,13 @@ _ESC_TO_DOMAIN_ADMINS: frozenset[str] = frozenset(
 # ESC relations whose target is Domain Controllers after NTLM relay.
 _ESC_TO_DOMAIN_CONTROLLERS: frozenset[str] = frozenset({"ADCSESC8", "ADCSESC11"})
 
+# ESC relations where the CA SIGNING KEY itself is usable by whoever controls the
+# CA host: ESC12 (the YubiHSM KSP password stored in clear text in the CA host
+# registry). A forged certificate can name any principal, so the derived edge
+# targets Domain Admins like the SAN-arbitrary ESCs, with its own impersonation
+# method so reporting does not describe it as a template enrollment.
+_ESC_CA_KEY_TO_DOMAIN_ADMINS: frozenset[str] = frozenset({"ADCSESC12"})
+
 # ESC relations whose target is the VICTIM principal itself (NOT an arbitrary
 # Tier-0 account). ESC14 variant A abuses the altSecurityIdentities attribute on
 # a puppet's OWN account, so a certificate maps to that puppet and the actor
@@ -101,7 +115,10 @@ _ESC_TO_VICTIM: frozenset[str] = frozenset({"ADCSESC14"})
 # ADCSESC13 is intentionally excluded until issuance-policy OID resolution lands —
 # its target group is per-template and not yet derivable from raw edge notes.
 _ESC_DERIVED_RELATIONS: frozenset[str] = (
-    _ESC_TO_DOMAIN_ADMINS | _ESC_TO_DOMAIN_CONTROLLERS | _ESC_TO_VICTIM
+    _ESC_TO_DOMAIN_ADMINS
+    | _ESC_TO_DOMAIN_CONTROLLERS
+    | _ESC_TO_VICTIM
+    | _ESC_CA_KEY_TO_DOMAIN_ADMINS
 )
 
 # Replication-rights extended rights that are evidence-only when targeting the
@@ -554,11 +571,27 @@ class CollectorPersistence:
             if persisted:
                 edge_count += 1
 
+        # Enumerated-surface census. Created BEFORE the derivation passes so
+        # each one counts the population it already walks, and finalized after
+        # them because the ACL half needs the stamped privilege tiers these
+        # payloads carry. Best-effort throughout: a census failure must never
+        # cost the client their graph.
+        surface_tallies: dict[str, Any] = {}
+        is_tier0: Callable[[str], bool] | None = None
+        try:
+            surface_tallies = _new_surface_tallies()
+            is_tier0 = _tier0_predicate(payload_by_sid)
+        except Exception as exc:  # noqa: BLE001 - never break persistence
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
         derived_edges = _persist_derived_attack_steps(
             graph,
             domain=domain,
             result=result,
             sid_to_graph_id=sid_to_graph_id,
+            surface_tallies=surface_tallies or None,
+            is_tier0=is_tier0,
         )
         # SPN-jacking + KCD escalation: derived from delegation + ACL state already
         # in the graph (runs after the raw ACL edges and AllowedToDelegate are
@@ -571,9 +604,30 @@ class CollectorPersistence:
         # (``attack_graph_core.load_attack_graph``), so a reopened workspace
         # carries an identical edge set. Parity is locked by
         # tests/unit/services/test_privileged_group_escalation_edges.py.
-        derived_edges += derive_privileged_group_escalation_edges(graph)
+        # ``domain_data`` carries the domain's RECORDED primary controller, which
+        # is what pins the Backup Operators escalation's target deterministically
+        # (see ``resolve_escalation_target_node_id``). The load-time backfill has
+        # no shell and degrades without it, which is why the emitter guards on
+        # ``(group, relation)`` and never lets the two author the same edge.
+        _domains_data = getattr(shell, "domains_data", None)
+        _domain_entry = (
+            _domains_data.get(domain) if isinstance(_domains_data, dict) else None
+        )
+        derived_edges += derive_privileged_group_escalation_edges(
+            graph,
+            domain_data=_domain_entry if isinstance(_domain_entry, dict) else None,
+        )
 
         _drop_redundant_direct_compromise_to_domain_edges(graph)
+
+        if surface_tallies and is_tier0 is not None:
+            try:
+                result.enumerated_surfaces = _finalize_enumerated_surface_census(
+                    result, surface_tallies, is_tier0
+                )
+            except Exception as exc:  # noqa: BLE001 - never break persistence
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
 
         attack_graph_service.save_attack_graph(shell, domain, graph)
         membership_edges = self._write_memberships(
@@ -825,8 +879,17 @@ def _persist_derived_attack_steps(
     domain: str,
     result: CollectionResult,
     sid_to_graph_id: dict[str, str],
+    surface_tallies: dict[str, Any] | None = None,
+    is_tier0: Callable[[str], bool] | None = None,
 ) -> int:
-    """Persist attack steps derived from collected account properties."""
+    """Persist attack steps derived from collected account properties.
+
+    ``surface_tallies`` / ``is_tier0`` let the passes below count the population
+    they are ALREADY walking into the enumerated-surface census, which is what
+    makes the recorded denominator the one the derivation really examined. Both
+    optional, so an existing caller (and the unit suite) keeps working unchanged
+    and simply records no census.
+    """
     # Kerberoasting and AS-REP Roasting only require the requester to be
     # *authenticated* against the target realm — NOT to be a member of the
     # target domain's local Domain Users group. The correct broadest actor is
@@ -844,9 +907,14 @@ def _persist_derived_attack_steps(
     # host identifiers up front so the generic HTTP-SPN surface finding below is
     # suppressed there — otherwise the same asset is reported twice.
     adcs_ca_hosts = _adcs_ca_web_enrollment_hosts(result)
+    kerberos_tally = (surface_tallies or {}).get("kerberos")
     created = 0
     created += _persist_dcsync_steps(
-        graph, result=result, sid_to_graph_id=sid_to_graph_id
+        graph,
+        result=result,
+        sid_to_graph_id=sid_to_graph_id,
+        surface_tally=(surface_tallies or {}).get("credential_access"),
+        is_tier0=is_tier0,
     )
     created += _persist_esc_compromise_steps(
         graph, domain=domain, result=result, sid_to_graph_id=sid_to_graph_id
@@ -900,12 +968,14 @@ def _persist_derived_attack_steps(
         # by account type (not the fragile trailing-``$`` heuristic) so no
         # false-positive Kerberoasting / ASREPRoasting edge is derived on an
         # account nobody can crack offline.
-        if (
-            node.kind == "User"
-            and account_type != "gmsa"
-            and authenticated_users_id
-            and _node_is_enabled(node)
-        ):
+        roastable_candidate = _node_is_roastable_candidate(node)
+        # Census of the offline-cracking surface, counted on the SAME walk and
+        # behind the SAME predicate as the derivation below, and deliberately
+        # independent of whether the Authenticated Users node resolved: the two
+        # attributes were read off this account either way.
+        if kerberos_tally is not None and roastable_candidate:
+            kerberos_tally.record(qualifying=_node_is_roastable(node))
+        if roastable_candidate and authenticated_users_id:
             if _node_bool_property(node, "hasspn"):
                 created += _upsert_derived_edge(
                     graph,
@@ -948,6 +1018,8 @@ def _persist_dcsync_steps(
     *,
     result: CollectionResult,
     sid_to_graph_id: dict[str, str],
+    surface_tally: Any | None = None,
+    is_tier0: Callable[[str], bool] | None = None,
 ) -> int:
     """Derive DCSync edges using intrinsic-token rights evaluation.
 
@@ -993,6 +1065,14 @@ def _persist_dcsync_steps(
         oid.upper() for oid, n in result.nodes.items() if n.kind == "Domain"
     }
     if not domain_target_sids:
+        # The replication right has nothing to be held over, so the surface is
+        # NOT APPLICABLE here. Recorded as such rather than left empty, because
+        # an absent precondition must never read as a healthy one.
+        if surface_tally is not None:
+            surface_tally.note_precondition_absent(
+                "No domain object was collected, so directory replication "
+                "rights could not be evaluated."
+            )
         return 0
 
     # Build (target, source) → frozenset(rights) index from collected ACEs.
@@ -1015,6 +1095,19 @@ def _persist_dcsync_steps(
         "ManagedServiceAccount",
     }
     token_cache: dict[str, frozenset[str]] = {}
+    # Census of the replication-rights surface: the catalogued replication
+    # rights, lowercased, read off the SAME definition the client-facing
+    # sentence is built from. Broader than the DCSync compound on purpose, since
+    # holding GetChanges alone is itself a catalogued technique on this surface.
+    replication_rights: set[str] = set()
+    if surface_tally is not None:
+        from adscan_core.reporting.enumerated_surface_evidence import (  # noqa: PLC0415
+            ENUMERATED_SURFACE_DEFINITIONS,
+        )
+
+        replication_rights = set(
+            ENUMERATED_SURFACE_DEFINITIONS["credential_access"].covered_techniques
+        )
 
     created = 0
     for principal_oid, principal_node in result.nodes.items():
@@ -1027,6 +1120,23 @@ def _persist_dcsync_steps(
                 principal_oid,
                 nodes=result.nodes,
             )
+
+        if surface_tally is not None:
+            # Counted on the SAME intrinsic token the derivation evaluates, so
+            # the census covers the rights a principal carries through its own
+            # well-known group membership exactly as the client sentence says.
+            held: set[str] = set()
+            for token_sid in token_cache[principal_upper]:
+                for target_sid in domain_target_sids:
+                    held |= {
+                        str(right).strip().lower()
+                        for right in rights_index.get(
+                            (target_sid, str(token_sid).upper()), frozenset()
+                        )
+                    }
+            holds_replication = bool(held & replication_rights)
+            outside_tier0 = is_tier0 is None or not is_tier0(principal_upper)
+            surface_tally.record(qualifying=holds_replication and outside_tier0)
 
         for target_sid in domain_target_sids:
             if not evaluate_compound_right(
@@ -1507,6 +1617,9 @@ def _persist_esc_compromise_steps(
           the writer, not the enroll-principal (which is often Domain Users).
         * ``ADCSESC8/11`` target Domain Controllers (NTLM relay → cert as a
           DC computer account).
+        * ``ADCSESC12`` is sourced at the CA HOST (its administrators can use
+          the CA signing key held in the YubiHSM) and targets Domain Admins
+          (a certificate forged with the CA key can name any principal).
         * ``ADCSESC13`` is deferred until issuance-policy OID resolution lands —
           its target group is per-template and cannot be inferred from raw
           edge notes alone.
@@ -1705,6 +1818,13 @@ def _persist_esc_compromise_steps(
             )
             target_id = domain_admins_id
             impersonation_method = "san_arbitrary_subject"
+            impersonated_principal_hint = "Administrator"
+        elif relation in _ESC_CA_KEY_TO_DOMAIN_ADMINS:
+            domain_admins_id = _resolve_well_known_target(
+                domain_admins_id, _DOMAIN_ADMINS_RID, relation
+            )
+            target_id = domain_admins_id
+            impersonation_method = "forged_certificate_with_ca_signing_key"
             impersonated_principal_hint = "Administrator"
         elif relation in _ESC_TO_DOMAIN_CONTROLLERS:
             domain_controllers_id = _resolve_well_known_target(
@@ -2379,11 +2499,179 @@ def _exclude_adcs_ca_http_spns(
     return kept
 
 
+def _node_is_roastable_candidate(node: Any) -> bool:
+    """Return whether this node belongs to the offline-Kerberos-cracking surface.
+
+    ONE rule with two readers: :func:`_persist_derived_attack_steps` gates its
+    Kerberoasting / ASREPRoasting derivation on it, and
+    :func:`_finalize_enumerated_surface_census` completes the census it feeds,
+    counting the same population as the
+    denominator of the ``kerberos`` positive control. Keeping them as one
+    predicate is what makes the recorded count the count of what the derivation
+    actually walked, rather than a second similar-looking walk that can drift
+    away from it.
+
+    A managed service account is excluded through the cross-tier predicate
+    ``adscan_core.kerberos_roasting`` (never the fragile trailing-``$``
+    heuristic): its password is directory-generated and 240 characters of
+    random, so it is not crackable offline and belongs to neither the numerator
+    nor the denominator. That predicate is the SAME one the inventory queries
+    and the web product's identity views apply, so the edge this derivation
+    writes and the lists those surfaces render cannot disagree about who is
+    exposed.
+
+    Both attributes must be PRESENT on the node, not merely falsy. An account
+    whose userAccountControl or SPN list was never read cannot be declared clear
+    of a surface derived from them, and reading a missing key as ``False`` is how
+    a partial collection would manufacture a green. The one site that builds a
+    user payload writes both, so this costs nothing on the real path and closes
+    the hole on any future one.
+    """
+    return (
+        node.kind == "User"
+        and not _password_is_ad_managed(_node_account_signals(node))
+        and _node_is_enabled(node)
+        and "hasspn" in node.properties
+        and "dontreqpreauth" in node.properties
+    )
+
+
+def _node_is_roastable(node: Any) -> bool:
+    """Return whether a candidate account is exposed to offline ticket cracking.
+
+    The abusable condition behind both techniques the ``kerberos`` surface
+    covers: a published service principal name (a service ticket anyone
+    authenticated can request) or Kerberos pre-authentication disabled (an
+    AS-REP anyone can request).
+    """
+    return _node_bool_property(node, "hasspn") or _node_bool_property(
+        node, "dontreqpreauth"
+    )
+
+
+def _new_surface_tallies() -> dict[str, Any]:
+    """Return one empty :class:`SurfaceTally` per declared enumerated surface.
+
+    Created BEFORE the derivation passes run, so each pass counts the population
+    it is already walking instead of a later pass walking a similar-looking one.
+    An empty tally resolves to ``not_assessed``, which is the correct state for a
+    pass that never ran.
+    """
+    from adscan_core.reporting.enumerated_surface_evidence import (  # noqa: PLC0415
+        ENUMERATED_SURFACE_DEFINITIONS,
+        SurfaceTally,
+    )
+
+    return {
+        surface: SurfaceTally(surface=surface)
+        for surface in ENUMERATED_SURFACE_DEFINITIONS
+    }
+
+
+def _tier0_predicate(
+    payload_by_sid: dict[str, dict[str, Any]],
+) -> Callable[[str], bool]:
+    """Return a SID -> "is this principal Tier 0" predicate over stamped payloads.
+
+    Reads the membership-aware ``privilege_tier`` stamp
+    (:func:`_stamp_privilege_tier_on_payloads`), never the legacy ``isTierZero``
+    boolean. An unstamped or unknown principal answers ``False``: a delegated
+    right whose holder cannot be graded must withhold the positive control
+    rather than be waved through as administrative.
+    """
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        node_is_tier0_by_stamped_label,
+    )
+
+    def _is_tier0(sid: str) -> bool:
+        payload = payload_by_sid.get(str(sid or "").upper())
+        return bool(payload) and node_is_tier0_by_stamped_label(payload)
+
+    return _is_tier0
+
+
+def _finalize_enumerated_surface_census(
+    result: CollectionResult,
+    tallies: dict[str, Any],
+    is_tier0: Callable[[str], bool],
+) -> dict[str, dict[str, Any]]:
+    """Complete the census the derivation passes filled, and serialize it.
+
+    The ``kerberos`` and ``credential_access`` tallies arrive already counted by
+    the passes that enumerated them. The ``acl_ace`` surface is completed here
+    because its two halves are produced in different layers: the LDAP collector
+    counts the security descriptors it READ (the denominator, and the only layer
+    that knows it), while whether a derived right is abusable depends on its
+    holder's stamped privilege tier, which first exists at this pass.
+
+    See ``adscan_core.reporting.enumerated_surface_evidence`` for the three-state
+    resolution this feeds, and for why a zero denominator can never resolve to a
+    pass.
+    """
+    from adscan_core.reporting.enumerated_surface_evidence import (  # noqa: PLC0415
+        ENUMERATED_SURFACE_DEFINITIONS,
+    )
+
+    acl = tallies.get("acl_ace")
+    if acl is not None:
+        acl.note_enumerated(
+            examined=result.security_descriptors_parsed,
+            secondary=result.access_control_entries_examined,
+        )
+        # Matched against the surface definition's own technique list, so there
+        # is no second taxonomy of "which relations count" to keep in step with
+        # the catalogue. The catalogue keys ARE the lowercased relation names,
+        # and a drift test fails if that stops being true.
+        acl_relations = set(
+            ENUMERATED_SURFACE_DEFINITIONS["acl_ace"].covered_techniques
+        )
+        for edge in result.edges:
+            if str(edge.source or "") != "acl_parser":
+                continue
+            if str(edge.relation or "").strip().lower() not in acl_relations:
+                continue
+            if not is_tier0(edge.source_object_id):
+                acl.record_qualifying()
+        # A descriptor that parsed with no DACL is an unresolved object, not a
+        # clean one (under MS-DTYP a NULL DACL grants everyone full control), so
+        # it withholds the green.
+        acl.record_qualifying(result.security_descriptors_without_dacl)
+
+    return {
+        surface: tally.as_census()
+        for surface, tally in tallies.items()
+        if tally is not None
+    }
+
+
+def _node_account_signals(node: Any) -> AccountSignals:
+    """Build the cross-tier account-class signals for a collector node.
+
+    A :class:`CollectorNode` keeps ``kind`` and ``distinguished_name`` beside
+    its property bag rather than inside it, so the generic
+    :meth:`AccountSignals.from_properties` adapter would miss both. Filling them
+    in here is what lets the collector, the inventory queries and the web
+    product reach the same verdict from three different record shapes.
+    """
+    props = node.properties if isinstance(node.properties, dict) else {}
+    signals = AccountSignals.from_properties(props)
+    return AccountSignals(
+        account_type=signals.account_type,
+        is_gmsa=signals.is_gmsa,
+        object_classes=signals.object_classes,
+        distinguished_name=signals.distinguished_name
+        or str(getattr(node, "distinguished_name", "") or ""),
+        kind=signals.kind or str(getattr(node, "kind", "") or ""),
+    )
+
+
 def _node_account_type(node: Any) -> str:
     """Human account-type label for the HTTP-SPN finding evidence."""
     explicit = str(node.properties.get("account_type") or "").strip().lower()
     if explicit:
         return explicit
+    if _node_is_managed_service_account(_node_account_signals(node)):
+        return "gmsa"
     return "computer" if node.kind == "Computer" else "user"
 
 

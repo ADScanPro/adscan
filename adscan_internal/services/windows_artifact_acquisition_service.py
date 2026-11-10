@@ -106,22 +106,30 @@ class WindowsArtifactAcquisitionService:
         *,
         file_targets: list[tuple[str, str]],
         download_dir: str,
-        workspace_type: str | None = None,
+        environment: str | None = None,
         batch_threshold: int = 8,
         batch_fetcher: BatchFetcher | None = None,
         file_fetcher: FileFetcher,
         is_auth_invalid_error: AuthInvalidPredicate | None = None,
     ) -> WindowsArtifactAcquisitionResult:
-        """Acquire files using batch or per-file backends when available."""
+        """Acquire files using batch or per-file backends when available.
+
+        ``environment`` is the scan policy's (``lab`` / ``real``). A lab resets its
+        credentials, so an auth-invalid error there stops the remaining fetches
+        (genuinely environment).
+        """
         if not file_targets:
             return WindowsArtifactAcquisitionResult(downloaded_files=[])
+        from adscan_core.scan_policy.policy import ENVIRONMENT_LAB  # noqa: PLC0415
+
+        lab_environment = str(environment or "").strip().lower() == ENVIRONMENT_LAB
 
         if batch_fetcher is not None and len(file_targets) >= batch_threshold:
             try:
                 return batch_fetcher(file_targets, download_dir)
             except Exception as exc:  # noqa: BLE001
                 if (
-                    workspace_type == "ctf"
+                    lab_environment
                     and callable(is_auth_invalid_error)
                     and is_auth_invalid_error(str(exc))
                 ):
@@ -145,7 +153,7 @@ class WindowsArtifactAcquisitionService:
                 downloaded_files.append(file_fetcher(remote_path, save_path))
             except Exception as exc:  # noqa: BLE001
                 if (
-                    workspace_type == "ctf"
+                    lab_environment
                     and callable(is_auth_invalid_error)
                     and is_auth_invalid_error(str(exc))
                 ):

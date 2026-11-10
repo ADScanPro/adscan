@@ -17,13 +17,16 @@ Any other arguments are passed through to the container.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import platform
 import re
 from io import StringIO
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,11 +36,17 @@ from adscan_core.cli_passthrough_spec import (
     CI_PASSTHROUGH,
     DOCTOR_PASSTHROUGH,
     EXECUTE_PASSTHROUGH,
+    ENGAGEMENT_PASSTHROUGH,
+    RECHECK_PASSTHROUGH,
+    PACE_PASSTHROUGH,
+    POLICY_PASSTHROUGH,
+    RUN_PASSTHROUGH,
     render_passthrough_epilog,
 )
 from adscan_core.interrupts import emit_interrupt_debug
 from adscan_core.outbound_links import cta_display_url, cta_url
 from adscan_core.theme import ADSCAN_THEME
+from adscan_core.report_options import forward_report_options as _forward_report_options
 from adscan_launcher import __version__
 from adscan_launcher.docker_commands import (
     get_docker_image_name,
@@ -244,6 +253,8 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
         # catalog ever adds a second automation command.
         automation_descriptions: dict[str, str] = {
             "ci": "Autonomous, non-interactive scanning",
+            "execute": "One REPL command from a shell or a script",
+            "recheck": "Re-verify findings, steps and attack paths",
         }
         automation_names = [
             name for name in automation_descriptions if _tier_for_command(name) == "PRO"
@@ -677,8 +688,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # REMAINDER catch-all and never re-declares the flags (no drift).
     execute_p = sub.add_parser(
         "execute",
-        help="Run a single REPL command non-interactively (scripting / smoke-test).",
-        description="Run ONE ADscan REPL verb non-interactively, then exit.",
+        help=(
+            "Run a single REPL command non-interactively (scripting / smoke-test)"
+            f"  [{_ci_tier_for_command('execute')}]"
+        ),
+        description=(
+            "Run ONE ADscan REPL verb non-interactively, then exit. PRO: every "
+            "verb is also available interactively in `adscan start` (LITE)."
+        ),
         # Forwarded verbatim via REMAINDER; the epilog surfaces the container
         # flags + examples from the shared SSOT (no drift, no re-declaration).
         epilog=render_passthrough_epilog(EXECUTE_PASSTHROUGH),
@@ -703,6 +720,111 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         help="Arguments forwarded to the container health check.",
     )
+    engagement_p = sub.add_parser(
+        "engagement",
+        help="[PRO] Engagement history: findings and attack steps across runs.",
+        description=(
+            "Read a workspace's engagement ledger: what is open, what was fixed, what "
+            "the latest run could not re-check, and when each item was last verified."
+        ),
+        epilog=render_passthrough_epilog(ENGAGEMENT_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    engagement_p.add_argument(
+        "engagement_args",
+        nargs=argparse.REMAINDER,
+        help="Subcommand and arguments forwarded to the container.",
+    )
+    recheck_p = sub.add_parser(
+        "recheck",
+        help="[PRO] Re-verify findings, attack steps and attack paths from a workspace.",
+        description=(
+            "Re-verify what a previous scan found, without a full scan: re-read a "
+            "condition (read-only), re-perform one attack step, or walk one attack path. "
+            "Results update the workspace's engagement history."
+        ),
+        epilog=render_passthrough_epilog(RECHECK_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    recheck_p.add_argument(
+        "recheck_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to the container.",
+    )
+    policy_p = sub.add_parser(
+        "policy",
+        help="Create and manage saved scan policies, without opening the shell.",
+        description=(
+            "Saved scan policies: which checks ADscan may run and at what pace. "
+            "Create, edit, export and apply them here, with the same prompts as the shell. "
+            "Use one with `adscan ci --policy <name>` or pick it when `start` asks."
+        ),
+        epilog=render_passthrough_epilog(POLICY_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    policy_p.add_argument(
+        "policy_args",
+        nargs=argparse.REMAINDER,
+        help="Subcommand and arguments forwarded to the container.",
+    )
+
+    pace_p = sub.add_parser(
+        "pace",
+        help="Create and manage saved pace profiles, without opening the shell.",
+        description=(
+            "Saved pace profiles: a named scan pace you reuse with any scan policy. "
+            "Create, edit, export and apply them here, with the same prompts as the shell. "
+            "Use one with `adscan ci --pace-profile <name>` or `pace use` in `start`."
+        ),
+        epilog=render_passthrough_epilog(PACE_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pace_p.add_argument(
+        "pace_args",
+        nargs=argparse.REMAINDER,
+        help="Subcommand and arguments forwarded to the container.",
+    )
+
+    # ── adscan run --plan (engine contract) ───────────────────────────
+    # One RunPlan file in: the same run `ci` / `doctor` / `deliver` flags
+    # describe. The launcher validates the plan host-side, mounts its directory
+    # read-only and the events file's directory read-write, and rewrites both
+    # paths; every other token is forwarded (the container parser is the SSOT).
+    run_p = sub.add_parser(
+        "run",
+        help="Run one engine plan (adscan.run_plan/1): a scan, a validation or a deliverable kit.",
+        description=(
+            "Run the engine from a RunPlan file. The plan names the run kind "
+            "(scan, doctor, deliver), the target and the options. Credentials "
+            "are references (env:NAME, or file:<path> relative to the plan's "
+            "directory), never values, so a plan can be stored and reviewed."
+        ),
+        epilog=render_passthrough_epilog(RUN_PASSTHROUGH),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run_p.add_argument(
+        "--offline",
+        action="store_true",
+        help="Offline mode: disable every external lookup (sets ADSCAN_OFFLINE=1 inside the container).",
+    )
+    run_p.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        dest="no_telemetry",
+        help="Disable anonymous usage telemetry for this run (sets ADSCAN_TELEMETRY=0).",
+    )
+    run_p.add_argument(
+        "--partner-tag",
+        dest="partner_tag",
+        default=None,
+        metavar="TAG",
+        help=_PARTNER_TAG_FLAG_HELP,
+    )
+    run_p.add_argument(
+        "run_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to the container after `run` (see below).",
+    )
 
     # ── Client Deliverables (Pass C) — passthrough into container ─────
     # Tier badges come from `adscan_core.cli_catalog` so the launcher and
@@ -711,6 +833,7 @@ def _build_parser() -> argparse.ArgumentParser:
         DELIVERABLE_COMMAND_ORDER as _DELIV_ORDER,
         tier_for_command as _tier_for_command,
     )
+    from adscan_core.report_options import add_report_arguments as _add_report_arguments
 
     _DELIVERABLE_HELP: dict[str, str] = {
         "deliver":         "Generate full Client Deliverable Kit (4 PDFs + ZIP)",
@@ -769,69 +892,36 @@ def _build_parser() -> argparse.ArgumentParser:
             continue
         _deliv_p.add_argument("--output", dest="output_path", default=None,
                               help="Override the output PDF path.")
-        _deliv_p.add_argument("--no-open", action="store_true",
-                              help="Do not prompt to open the PDF.")
-        _deliv_p.add_argument("--no-render", action="store_true",
-                              help="Smoke / dry-run only — skip PDF render.")
+        if _deliv_name != "deliver":
+            # Single-PDF deliverables only. ``deliver`` neither opens the kit
+            # nor has a dry run, and its container parser rejects both flags:
+            # declaring them here let ``adscan deliver --no-open`` start the
+            # container and then exit 2 inside it.
+            _deliv_p.add_argument("--no-open", action="store_true",
+                                  help="Do not prompt to open the PDF.")
+            _deliv_p.add_argument("--no-render", action="store_true",
+                                  help="Smoke / dry-run only — skip PDF render.")
         if _deliv_name == "deliver":
-            _deliv_p.add_argument(
-                "--theme",
-                dest="theme",
-                default="",
-                choices=["", "dark", "premium_dark", "light", "corporate_light"],
-                help=(
-                    "Report theme. 'dark'/'premium_dark' = operator dark mode. "
-                    "'light'/'corporate_light' = corporate white (for printing/board). "
-                    "Default: env var ADSCAN_PDF_THEME or system default."
-                ),
-            )
-            # The remaining flags are interpreted inside the container. The
-            # launcher only needs to (a) recognise them so ``adscan deliver
-            # --help`` lists them and (b) forward them verbatim through the
-            # passthrough below. New flags added in deliver.py also need a
-            # one-line entry both here and in the forwarding block.
+            # The container interprets every deliverable option; the launcher
+            # declares them (so ``adscan deliver --help`` lists them and an
+            # unknown-flag check passes) from the SAME shared model the container
+            # ``deliver`` and ``ci`` parsers use, under ``ws_*`` dests so they
+            # never collide with the launcher's own --output/--no-open, and
+            # forwards them with ``forward_report_options`` below. A new
+            # deliverable option is added to ``adscan_core.report_options``
+            # once, never here.
             _deliv_p.add_argument(
                 "--workspace", dest="ws_workspace", default=None,
                 help="Workspace name or path (default: prompt or most-recent).",
             )
+            _add_report_arguments(_deliv_p, dest_prefix="ws_")
             _deliv_p.add_argument(
-                "--client", dest="ws_client", default=None,
-                help="Client name embedded in the kit metadata.",
-            )
-            _deliv_p.add_argument(
-                "--engagement", dest="ws_engagement", default=None,
-                help="Engagement code embedded in the kit metadata.",
-            )
-            _deliv_p.add_argument(
-                "--only", dest="ws_only", default=None,
-                help=(
-                    "Comma-separated deliverables: "
-                    "report, playbook, checklist, coverage-matrix."
-                ),
-            )
-            _deliv_p.add_argument(
-                "--frameworks", dest="ws_frameworks", default=None,
-                help=(
-                    "Comma-separated compliance frameworks: "
-                    "ens, nis2, iso27001, dora, pci_dss, cis. "
-                    "Default: none — pick the regimes that apply."
-                ),
-            )
-            _deliv_p.add_argument(
-                "--no-navigator", dest="ws_no_navigator", action="store_true",
-                help="Skip the MITRE ATT&CK Navigator extras in the ZIP.",
-            )
-            _deliv_p.add_argument(
-                "--report-theme", dest="ws_report_theme", default="",
-                help="Legacy alias for --theme (kept for back-compat).",
-            )
-            _deliv_p.add_argument(
-                "--client-logo", dest="ws_client_logo", default=None,
+                "--progress-model", dest="ws_progress_model", default=None,
                 metavar="PATH",
                 help=(
-                    "Client logo (PNG/SVG/JPG) placed beside the ADscan mark on "
-                    "the report cover. Copied into ~/.adscan and reused on later "
-                    "runs. The ADscan mark stays; full white-label is a paid tier."
+                    "Render the Executive Progress Report from a progress "
+                    "report model (JSON) instead of the kit. PATH is relative "
+                    "to the workspace."
                 ),
             )
 
@@ -962,7 +1052,7 @@ def _apply_image_overrides(args: argparse.Namespace) -> None:
 
 
 def _consume_trailing_global_flags(
-    ns: argparse.Namespace, unknown: list[str]
+    ns: argparse.Namespace, unknown: list[str], *, force: bool = False
 ) -> list[str]:
     """Consume global launcher flags that appear after a known subcommand.
 
@@ -976,7 +1066,7 @@ def _consume_trailing_global_flags(
     # trailing global flags (--dev, --debug, --verbose, --image) consumed,
     # otherwise typing `adscan deliver --dev` silently falls through to
     # the prod image because `--dev` never reaches _apply_image_overrides.
-    if cmd not in (_KNOWN_LAUNCHER_COMMANDS | _DELIVERABLE_PASSTHROUGH_COMMANDS):
+    if not force and cmd not in (_KNOWN_LAUNCHER_COMMANDS | _DELIVERABLE_PASSTHROUGH_COMMANDS):
         return unknown
 
     remaining: list[str] = []
@@ -1048,6 +1138,27 @@ def _consume_ci_remainder_global_flags(ns: argparse.Namespace) -> None:
         return
 
     setattr(ns, "args", _consume_trailing_global_flags(ns, remainder))
+
+
+def _consume_run_passthrough(ns: argparse.Namespace, unknown: list[str]) -> list[str]:
+    """Join `adscan run`'s forwarded tokens and lift the launcher-global flags out.
+
+    ``run`` forwards through ``argparse.REMAINDER``, and its first token
+    (``--plan``) is option-shaped, so argparse splits the run's tokens between
+    ``unknown`` and ``ns.run_args``. They are rejoined in order into
+    ``ns.run_args``, and the launcher-global flags among them (``--dev``,
+    ``--debug``, ``-v``, ``--image``, ``--channel``) are consumed so they select
+    the image here instead of reaching the container parser. Returns the
+    ``unknown`` left for the caller (always empty for ``run``).
+    """
+    if str(getattr(ns, "command", "") or "") != "run":
+        return unknown
+    tokens = list(unknown) + list(getattr(ns, "run_args", []) or [])
+    if tokens and tokens[0] == "--":
+        setattr(ns, "run_args", tokens[1:])
+        return []
+    setattr(ns, "run_args", _consume_trailing_global_flags(ns, tokens, force=True))
+    return []
 
 
 def _posture_env_from_flags(
@@ -1349,6 +1460,372 @@ def _ci_scan_config_from_flags(
     return extra_env, extra_mounts, cleaned
 
 
+#: Container directory the files of `adscan policy import` / `export --output`
+#: are mounted under. Outside the ADscan home so nothing is left on the volume.
+from adscan_core.container_io import POLICY_IO_CONTAINER_DIR  # noqa: E402
+
+
+class _HostOutput:
+    """A host ``--output`` made writable from the container, safely.
+
+    The container is removed when the command ends, so a host path forwarded
+    verbatim was written inside the container and lost with it (a kit "saved"
+    to a folder that never appeared on the host). The launcher instead creates
+    a FRESH staging folder next to the destination, bind-mounts only that folder
+    read-write at :data:`OUTPUT_IO_CONTAINER_DIR`, forwards the container-side
+    path, and moves the results into place when the container exits. Mounting
+    the destination's parent instead would hand the container write access to
+    it (``--output ~/report.pdf`` would have mounted the whole home folder).
+
+    A ``:`` in the path cannot be expressed in a Docker ``-v`` spec, so such a
+    path is refused up front with a clear message.
+    """
+
+    def __init__(self, value: str, *, is_file: bool) -> None:
+        from adscan_core.container_io import OUTPUT_IO_CONTAINER_DIR  # noqa: PLC0415
+        from adscan_core.deliverable_destination import plan_host_output  # noqa: PLC0415
+
+        try:
+            plan = plan_host_output(value, is_file=is_file)
+        except ValueError as exc:
+            print_error(str(exc))
+            raise SystemExit(2) from exc
+        self.final = plan.final
+        self.is_file = is_file
+        os.makedirs(plan.dest_dir, exist_ok=True)
+        self.dest_dir = plan.dest_dir
+        self.staging = tempfile.mkdtemp(prefix=".adscan-output-", dir=plan.dest_dir)
+        self.container_arg = plan.container_arg
+        self.mount = (self.staging, OUTPUT_IO_CONTAINER_DIR)
+
+    def finalize(self) -> None:
+        """Move what the container wrote into the destination; drop staging."""
+        from adscan_core.deliverable_destination import move_staged_into  # noqa: PLC0415
+
+        move_staged_into(self.staging, self.dest_dir)
+
+
+def _host_output_mount(value: str, *, is_file: bool) -> _HostOutput:
+    """Prepare a host ``--output`` for a containerised command (see _HostOutput)."""
+    return _HostOutput(value, is_file=is_file)
+
+
+def _policy_file_mounts(
+    passthrough: list[str],
+) -> tuple[list[str], list[tuple[str, str]], list[tuple[str, str]]]:
+    """Make the host files of ``adscan policy`` and ``adscan pace`` visible in the container.
+
+    ``import FILE`` reads a host file: it is mounted read-only (one file, never
+    its directory) under :data:`POLICY_IO_CONTAINER_DIR` with its own name, so
+    a policy without a ``name`` still takes the file stem. ``export --output
+    FILE`` writes one: the launcher creates it empty on the host and mounts that
+    file read-write (the engine writes in place, not through a rename).
+
+    Returns:
+        ``(rewritten_args, read_only_mounts, read_write_mounts)``.
+    """
+    args = list(passthrough)
+    ro: list[tuple[str, str]] = []
+    rw: list[tuple[str, str]] = []
+    action = next((a for a in args if not a.startswith("-")), "")
+
+    def _container_path(host_path: str, slot: str) -> str:
+        return f"{POLICY_IO_CONTAINER_DIR}/{slot}/{os.path.basename(host_path)}"
+
+    if action == "import":
+        index = args.index("import")
+        target_index = next(
+            (i for i in range(index + 1, len(args)) if not args[i].startswith("-")), None
+        )
+        if target_index is not None:
+            host = os.path.abspath(os.path.expanduser(args[target_index]))
+            if not os.path.isfile(host):
+                print_error(f"File not found: {host}")
+                raise SystemExit(2)
+            container = _container_path(host, "in")
+            ro.append((host, container))
+            args[target_index] = container
+
+    for index, token in enumerate(list(args)):
+        value: str | None = None
+        value_index = index
+        if token in ("--output", "-o") and index + 1 < len(args):
+            value = args[index + 1]
+            value_index = index + 1
+        elif token.startswith("--output="):
+            value = token.split("=", 1)[1]
+        if not value:
+            continue
+        host = os.path.abspath(os.path.expanduser(value))
+        parent = os.path.dirname(host)
+        if not os.path.isdir(parent):
+            print_error(f"Folder not found: {parent}")
+            raise SystemExit(2)
+        if not os.path.exists(host):
+            with open(host, "w", encoding="utf-8"):
+                pass
+        container = _container_path(host, "out")
+        rw.append((host, container))
+        args[value_index] = container if value_index != index else f"--output={container}"
+        break
+    return args, ro, rw
+
+
+# Container paths for `adscan run --plan`, fixed and outside the ADscan home so
+# nothing is left behind on the host volume. Nothing is mounted wholesale: the
+# plan FILE and each file it references (read-only), the events FILE
+# (read-write), a private directory holding env: secrets (read-only), and the
+# dedicated operator-decision directory of the file sink (read-write).
+RUN_PLAN_CONTAINER_DIR = "/opt/adscan-io/plan"
+RUN_EVENTS_CONTAINER_DIR = "/opt/adscan-io/events"
+RUN_ENV_SECRETS_CONTAINER_DIR = "/opt/adscan-io/env-secrets"
+RUN_INTERACTIVE_CONTAINER_DIR = "/opt/adscan-io/interactive"
+_RUN_EVENTS_CONTAINER_FILE = f"{RUN_EVENTS_CONTAINER_DIR}/events.jsonl"
+
+#: Legacy command each RunPlan kind normalises from (tier gate, session label).
+#: Mirrors ``adscan_internal.cli.run_plan.KIND_COMMAND``; the launcher cannot
+#: import the engine, and ``tests/unit/launcher/test_run_plan_launcher.py``
+#: locks the two together.
+_RUN_KIND_COMMAND = {"scan": "ci", "doctor": "doctor", "deliver": "deliver"}
+
+
+@dataclass(frozen=True)
+class RunPlanIo:
+    """What the launcher derived from ``adscan run`` flags before the container.
+
+    Reading the plan writes nothing secret: ``env_names`` lists the env:
+    references, and :meth:`with_env_secrets` materialises them, which the
+    dispatch calls only AFTER the tier and partner-tag gates (either may exit)
+    and inside the ``try`` whose ``finally`` calls :meth:`cleanup`.
+    """
+
+    passthrough: list[str]
+    ro_mounts: list[tuple[str, str]]
+    rw_mounts: list[tuple[str, str]]
+    kind: str
+    command: str
+    extra_env: list[tuple[str, str]] = field(default_factory=list)
+    env_exclude_keys: tuple[str, ...] = ()
+    cleanup_paths: tuple[str, ...] = ()
+    env_names: tuple[str, ...] = ()
+
+    def with_env_secrets(self) -> "RunPlanIo":
+        """Return this I/O plan with the env: secrets written and mounted."""
+        if not self.env_names:
+            return self
+        secrets_dir, secret_mounts = _materialise_env_secrets(list(self.env_names))
+        return dataclasses.replace(
+            self,
+            ro_mounts=list(self.ro_mounts) + secret_mounts,
+            extra_env=list(self.extra_env) + [("ADSCAN_RUN_ENV_SECRETS_DIR", RUN_ENV_SECRETS_CONTAINER_DIR)],
+            env_exclude_keys=tuple(self.env_names),
+            cleanup_paths=tuple(self.cleanup_paths) + (secrets_dir,),
+        )
+
+    def cleanup(self) -> None:
+        """Remove every materialised secret; best-effort, never raises."""
+        import shutil
+
+        for path in self.cleanup_paths:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _take_flag_value(tokens: list[str], flag: str) -> tuple[str | None, list[str]]:
+    """Remove ``flag VALUE`` / ``flag=VALUE`` from ``tokens``; return the value."""
+    value: str | None = None
+    rest: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == flag:
+            if index + 1 >= len(tokens):
+                print_error(f"{flag} requires a file path argument.")
+                raise SystemExit(2)
+            value = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith(f"{flag}="):
+            value = token.split("=", 1)[1]
+            index += 1
+            continue
+        rest.append(token)
+        index += 1
+    return value, rest
+
+
+def _plan_references(node: Any) -> list[str]:
+    """Every ``{"ref": "..."}`` value in a plan document, in document order."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        ref = node.get("ref")
+        if isinstance(ref, str) and set(node) == {"ref"}:
+            found.append(ref)
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                found.extend(_plan_references(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_plan_references(value))
+    return found
+
+
+def _refuse_run(message: str) -> None:
+    print_error(message)
+    raise SystemExit(2)
+
+
+def _materialise_env_secrets(names: list[str]) -> tuple[str, list[tuple[str, str]]]:
+    """Write each ``env:`` secret to a 0600 file in a private 0700 directory.
+
+    ``docker run -e NAME`` would keep the value off the command line but still
+    copy it into the container's configuration, which ``docker inspect`` prints,
+    so the value travels as a file mounted read-only instead.
+    """
+    import tempfile
+
+    import shutil
+
+    directory = tempfile.mkdtemp(prefix="adscan-run-env-")
+    try:
+        os.chmod(directory, 0o700)
+        for name in names:
+            target = os.path.join(directory, name)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(os.environ[name])
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return directory, [(directory, RUN_ENV_SECRETS_CONTAINER_DIR)]
+
+
+#: System top-level directories a decision directory may never be or contain.
+_SYSTEM_TOP_LEVEL_DIRS = ("/etc", "/var", "/usr", "/home", "/root", "/opt", "/srv", "/boot", "/proc", "/sys", "/dev")
+
+
+def _refuse_unsafe_interactive_dir(directory: Path, *, plan_dir: Path) -> None:
+    """Refuse a decision directory that is, or contains, something it must not expose.
+
+    It is mounted read-write, so it may not be the filesystem root, the home
+    directory, a system top-level directory, or any directory containing one of
+    those or the run plan. A dedicated directory INSIDE such a tree is fine.
+    """
+    resolved = Path(os.path.abspath(os.path.expanduser(str(directory)))).resolve()
+    protected = [Path(resolved.anchor), Path.home().resolve(), plan_dir.resolve()]
+    protected += [Path(item) for item in _SYSTEM_TOP_LEVEL_DIRS]
+    if any(item == resolved or item.is_relative_to(resolved) for item in protected):
+        _refuse_run(
+            "ADSCAN_INTERACTIVE_DIR must be a dedicated directory: not the filesystem "
+            "root, your home directory, a system directory, or one that contains any "
+            "of those or the run plan."
+        )
+
+
+def _interactive_dir_mount(plan_dir: Path) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Mount the file-sink decision directory, when the run uses that sink."""
+    sink = str(os.environ.get("ADSCAN_INTERACTIVE_SINK", "") or "").strip().lower()
+    raw = str(os.environ.get("ADSCAN_INTERACTIVE_DIR", "") or "").strip()
+    if sink != "file" or not raw:
+        return [], []
+    directory = Path(os.path.abspath(os.path.expanduser(raw)))
+    _refuse_unsafe_interactive_dir(directory, plan_dir=plan_dir)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return (
+        [(str(directory.resolve()), RUN_INTERACTIVE_CONTAINER_DIR)],
+        [("ADSCAN_INTERACTIVE_DIR", RUN_INTERACTIVE_CONTAINER_DIR)],
+    )
+
+
+def _run_plan_io_from_flags(passthrough: list[str]) -> RunPlanIo:
+    """Validate the host plan file and translate its paths for the container.
+
+    The plan is validated HOST-side against the shared contract schema
+    (``adscan_core.engagement.contract``), so a malformed plan, or one carrying
+    an inline secret, fails before a ``docker run`` is spent. The per-kind rules
+    are re-checked inside the container, which owns them.
+
+    Exposure is minimal: the plan file and the files it references are mounted
+    one by one (a reference that resolves outside the plan's directory, a
+    symlink included, is refused), the events file is created and mounted as a
+    single file, and env: secrets never appear on the command line.
+
+    Raises:
+        SystemExit: code 2 when ``--plan`` is missing, unreadable or invalid, a
+            reference cannot be satisfied, or a path is unsafe to mount.
+    """
+    import json
+
+    from adscan_core.engagement.contract import ContractError, validate
+
+    plan_value, rest = _take_flag_value(list(passthrough), "--plan")
+    events_value, rest = _take_flag_value(rest, "--events-file")
+    if not plan_value:
+        _refuse_run("adscan run needs --plan FILE (a RunPlan, schema adscan.run_plan/1).")
+    plan_path = Path(os.path.abspath(os.path.expanduser(plan_value)))
+    if not plan_path.is_file():
+        _refuse_run(f"Run plan file not found: {plan_path}")
+    try:
+        doc = json.loads(plan_path.read_text(encoding="utf-8"))
+        validate("run_plan", doc)
+    except ContractError as exc:
+        _refuse_run(f"Invalid run plan: {exc}")
+    except (OSError, ValueError) as exc:
+        _refuse_run(f"Invalid run plan: {exc}")
+
+    run_dir = plan_path.parent.resolve()
+    plan_real = plan_path.resolve()
+    ro_mounts: list[tuple[str, str]] = [(str(plan_real), f"{RUN_PLAN_CONTAINER_DIR}/{plan_path.name}")]
+    referenced: set[Path] = {plan_real}
+    env_names: list[str] = []
+    for ref in _plan_references(doc):
+        scheme, _, name = ref.partition(":")
+        if scheme == "env":
+            if name not in os.environ:
+                _refuse_run(f"The run plan references environment variable {name}, which is not set.")
+            if name not in env_names:
+                env_names.append(name)
+        elif scheme == "file":
+            target = (run_dir / name).resolve()
+            if not target.exists():
+                _refuse_run(f"The run plan references {name}, which is not in the plan's directory.")
+            if not target.is_relative_to(run_dir):
+                _refuse_run(f"The run plan reference {name} resolves outside the plan's directory.")
+            if target not in referenced:
+                referenced.add(target)
+                ro_mounts.append((str(target), f"{RUN_PLAN_CONTAINER_DIR}/{name}"))
+
+    out = ["--plan", f"{RUN_PLAN_CONTAINER_DIR}/{plan_path.name}"]
+    rw_mounts: list[tuple[str, str]] = []
+    if events_value:
+        events_path = Path(os.path.abspath(os.path.expanduser(events_value)))
+        if events_path.is_symlink() or (events_path.exists() and not events_path.is_file()):
+            _refuse_run(f"--events-file must be a regular file: {events_path}")
+        if events_path.resolve() in referenced:
+            _refuse_run("--events-file cannot be the run plan or a file the plan references.")
+        # Create it host-side so docker does not create the bind source as root,
+        # and mount that ONE file, never its directory.
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        events_path.touch(mode=0o600, exist_ok=True)
+        rw_mounts.append((str(events_path.resolve()), _RUN_EVENTS_CONTAINER_FILE))
+        out += ["--events-file", _RUN_EVENTS_CONTAINER_FILE]
+
+    extra_env: list[tuple[str, str]] = []
+    interactive_mounts, interactive_env = _interactive_dir_mount(run_dir)
+    rw_mounts.extend(interactive_mounts)
+    extra_env.extend(interactive_env)
+
+    kind = str(doc.get("kind") or "")
+    return RunPlanIo(
+        passthrough=out + rest,
+        ro_mounts=ro_mounts,
+        rw_mounts=rw_mounts,
+        kind=kind,
+        command=_RUN_KIND_COMMAND.get(kind, kind),
+        extra_env=extra_env,
+        env_names=tuple(env_names),
+    )
+
+
 # Accepted client-logo suffixes. The AUTHORITATIVE set lives in the container SSOT
 # ``adscan_internal.services.client_logo.SUPPORTED_LOGO_SUFFIXES``; the launcher
 # (host-only, must not import ``adscan_internal``) keeps this small mirror purely
@@ -1405,6 +1882,32 @@ def _stage_client_logo(host_path: str) -> str | None:
         print_error(f"Could not stage the client logo into the ADscan volume: {exc}")
         return None
     return f"{_CLIENT_LOGO_DIRNAME}/{dest_name}"
+
+
+def _ci_output_from_flags(passthrough: list[str]) -> tuple[list[str], "_HostOutput | None"]:
+    """Stage ``ci --output <host-dir>`` (the report copy) like a deliverable.
+
+    ``ci`` forwards its arguments verbatim, so a host folder would reach the
+    container as a path it cannot see. The folder is staged and mounted
+    (:class:`_HostOutput`) and the container path substituted.
+    """
+    tokens = list(passthrough)
+    for index, token in enumerate(tokens):
+        value: str | None = None
+        if token == "--output":
+            if index + 1 >= len(tokens):
+                print_error("--output requires a folder argument.")
+                raise SystemExit(2)
+            value = tokens[index + 1]
+            host_output = _host_output_mount(value, is_file=False)
+            tokens[index + 1] = host_output.container_arg
+            return tokens, host_output
+        if token.startswith("--output="):
+            value = token.split("=", 1)[1]
+            host_output = _host_output_mount(value, is_file=False)
+            tokens[index] = f"--output={host_output.container_arg}"
+            return tokens, host_output
+    return tokens, None
 
 
 def _ci_client_logo_from_flags(
@@ -2131,6 +2634,12 @@ def _build_update_context_for_launcher(
     )
 
 
+# Host exit code for a PRO-gated command run on LITE. Same value the LITE
+# container emits. Never 0: ``ci``/``execute`` are unattended entry points and
+# a pipeline that scanned nothing must not read as success.
+PRO_GATE_EXIT_CODE = 42
+
+
 def _render_pro_upsell_and_record(
     cmd: str,
     *,
@@ -2189,6 +2698,7 @@ def _run_pro_passthrough_with_upsell_gate(
     verbose: bool,
     debug: bool,
     pull_timeout_seconds: int | None,
+    extra_rw_mounts: list[tuple[str, str]] | None = None,
 ) -> int:
     """Run a deliverable command in the container and honor the exit-42 protocol.
 
@@ -2210,11 +2720,15 @@ def _run_pro_passthrough_with_upsell_gate(
     # Run the container with stdout/stderr captured — we need to inspect
     # exit-42 + the trailing JSON line. The container's own Rich output is
     # replayed on the host TTY so the user sees the same lines either way.
+    passthrough_kwargs: dict[str, Any] = {}
+    if extra_rw_mounts:
+        passthrough_kwargs["extra_rw_mounts"] = list(extra_rw_mounts)
     rc = run_adscan_passthrough_docker(
         adscan_args=adscan_args,
         verbose=verbose,
         debug=debug,
         pull_timeout_seconds=pull_timeout_seconds,
+        **passthrough_kwargs,
     )
 
     # Streaming passthrough does not capture stdout, so the exit-42 JSON
@@ -2224,14 +2738,35 @@ def _run_pro_passthrough_with_upsell_gate(
     if rc == 42 and is_pro_only(cmd):
         try:
             _render_pro_upsell_and_record(cmd)
-            return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
             capture_exception(exc)
             print_exception(exception=exc)
-            return rc
+        return PRO_GATE_EXIT_CODE
 
     # Defensive: a malformed exit 42 (e.g. PRO container emitting 42 by
     # accident, or a future protocol change) should not eat user output.
+    return int(rc)
+
+
+def _pro_passthrough_rc(cmd: str, rc: int) -> int:
+    """Map a PRO-only passthrough's container rc to a host exit code (exit-42 aware).
+
+    LITE exits 42 (+ the pro_required JSON) for a PRO-only command. Render the
+    role/OS-aware upsell (``_render_pro_upsell_and_record``) and exit
+    ``PRO_GATE_EXIT_CODE`` (42), even if the panel fails to render: an unattended
+    caller (pipeline, script) reads the exit code, and 0 would read a scan that
+    never ran as a success. Any other rc, or a command that is not PRO-only, is
+    propagated verbatim.
+    """
+    from adscan_core.cli_catalog import is_pro_only
+
+    if rc == 42 and is_pro_only(cmd):
+        try:
+            _render_pro_upsell_and_record(cmd)
+        except Exception as exc:  # noqa: BLE001 — best-effort upsell render
+            capture_exception(exc)
+            print_exception(exception=exc)
+        return PRO_GATE_EXIT_CODE
     return int(rc)
 
 
@@ -2239,19 +2774,20 @@ def _ci_handle_passthrough_rc(rc: int) -> int:
     """Map the `ci` container rc to a host exit code, honoring exit-42.
 
     LITE exits 42 (+ the pro_required JSON) when `ci` is PRO-gated. Render the
-    canonical PRO upsell and exit 0 — the user tried a PRO feature, not a broken
-    command. Any other rc (including a clean PRO run) is propagated verbatim.
+    canonical PRO upsell and exit ``PRO_GATE_EXIT_CODE`` (42): the message stays
+    friendly, but an unattended caller reads the exit code and 0 would read a scan
+    that never ran as a success. Any other rc (including a clean PRO run) is
+    propagated verbatim.
     """
     from adscan_core.cli_catalog import is_pro_only
 
     if rc == 42 and is_pro_only("ci"):
         try:
             _render_pro_upsell_and_record("ci")
-            return 0
         except Exception as exc:  # noqa: BLE001 — best-effort upsell render
             capture_exception(exc)
             print_exception(exception=exc)
-            return rc
+        return PRO_GATE_EXIT_CODE
     return int(rc)
 
 
@@ -2265,7 +2801,9 @@ def _maybe_pregate_pro_command(
     PRO-only command (``is_pro_only(cmd)``) known to be running against a
     LITE image, spending a full container start (entrypoint, Unbound, DNS,
     capability setup) just to have it exit 42 is wasted work. Render the
-    canonical upsell panel and exit 0 immediately instead.
+    canonical upsell panel and exit 42 immediately instead (the same code the
+    container would have produced; an unattended caller must not read a scan
+    that never ran as a success).
 
     This is a **pre-gate**, not a replacement for the exit-42 protocol: it is
     fail-safe by construction and only fires on a CONFIRMED ``"LITE"``. Any
@@ -2276,7 +2814,7 @@ def _maybe_pregate_pro_command(
     ``_ci_handle_passthrough_rc`` remain the backstop.
 
     The upsell is rendered through the shared tee'd console and the launcher
-    session is captured HERE, before the ``SystemExit(0)`` — this pre-gate
+    session is captured HERE, before the ``SystemExit(42)`` — this pre-gate
     fires before :func:`_run_host_command_with_session_capture` ever runs, so
     without an explicit capture the peak-value LITE->PRO activation moment (a
     free user reaching for the paid autonomous scan) never reaches the session
@@ -2291,7 +2829,7 @@ def _maybe_pregate_pro_command(
             still renders (through the tee'd console) but no session is flushed.
 
     Raises:
-        SystemExit: With code 0, when the pre-gate fires.
+        SystemExit: With code ``PRO_GATE_EXIT_CODE`` (42), when the pre-gate fires.
     """
     from adscan_core.cli_catalog import is_pro_only
 
@@ -2303,7 +2841,7 @@ def _maybe_pregate_pro_command(
     _render_pro_upsell_and_record(
         cmd, telemetry_console=telemetry_console, capture_session=True
     )
-    raise SystemExit(0)
+    raise SystemExit(PRO_GATE_EXIT_CODE)
 
 
 def _render_host_welcome() -> None:
@@ -2341,9 +2879,18 @@ def main(argv: list[str] | None = None) -> None:
             parser.print_help()
         raise SystemExit(0)
 
+    # A removed ci/execute/doctor flag fails here, before a container starts,
+    # with what to pass instead (adscan_core/cli_removed_flags.py).
+    from adscan_core.cli_removed_flags import removed_flag_message  # noqa: PLC0415
+
+    removed_flag = removed_flag_message(raw_argv)
+    if removed_flag:
+        parser.error(removed_flag)
+
     ns, unknown = parser.parse_known_args(raw_argv)
     unknown = _consume_trailing_global_flags(ns, unknown)
     _consume_ci_remainder_global_flags(ns)
+    unknown = _consume_run_passthrough(ns, unknown)
     if (
         getattr(ns, "command", None) in _KNOWN_LAUNCHER_COMMANDS
         and unknown
@@ -2365,6 +2912,16 @@ def main(argv: list[str] | None = None) -> None:
         debug=bool(getattr(ns, "debug", False)),
         telemetry_console=telemetry_console,
     )
+    # Log files: only a maintenance command (install/update/check/version) gets
+    # the global log. Everything else this launcher logs is held in memory and
+    # dropped at exit, so no engagement detail (the ci target, credentials)
+    # lands outside a workspace. See adscan_core.logging_config.
+    try:
+        from adscan_core.logging_config import enable_global_log_for_command
+
+        enable_global_log_for_command("version" if show_version else cmd)
+    except Exception:  # noqa: BLE001 — logging setup must never block a command
+        pass
     if bool(getattr(ns, "debug", False)) and _should_print_debug_enabled_banner(
         "version" if show_version else cmd
     ):
@@ -2623,22 +3180,31 @@ def main(argv: list[str] | None = None) -> None:
         # flag to the container-visible path, so the post-scan report co-brands
         # its cover. Consumed at the seam, like --scan-config.
         passthrough = _ci_client_logo_from_flags(ns, passthrough)
+        # --output <host-dir>: the report copy lands on the host (staged mount).
+        passthrough, ci_output = _ci_output_from_flags(passthrough)
         ci_extra_env = list(posture_env) + list(scan_config_env)
-        _ci_rc = _run_host_command_with_session_capture(
-            command_type="ci",
-            telemetry_console=telemetry_console,
-            runner=lambda: run_adscan_passthrough_docker(
-                adscan_args=["ci"] + passthrough,
-                verbose=bool(getattr(ns, "verbose", False)),
-                debug=bool(getattr(ns, "debug", False)),
-                pull_timeout_seconds=int(ns.pull_timeout),
-                allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
-                extra_env=ci_extra_env,
-                extra_mounts=scan_config_mounts,
-            ),
-            extra={"mode": "docker", "session_scope": "launcher_preflight"},
-            allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
-        )
+        try:
+            _ci_rc = _run_host_command_with_session_capture(
+                command_type="ci",
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=["ci"] + passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=int(ns.pull_timeout),
+                    allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                    extra_env=ci_extra_env,
+                    extra_mounts=scan_config_mounts,
+                    extra_rw_mounts=[ci_output.mount] if ci_output else None,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+            )
+        finally:
+            if ci_output is not None:
+                ci_output.finalize()
+        if ci_output is not None and os.listdir(ci_output.dest_dir):
+            print_info(f"Report folder: {ci_output.dest_dir}")
         raise SystemExit(_ci_handle_passthrough_rc(int(_ci_rc)))
 
     if cmd == "report":
@@ -2705,7 +3271,52 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
 
-    if cmd in ("execute", "doctor"):
+    if cmd == "run":
+        # Engine contract entry. The plan decides the tier (a `scan` plan is the
+        # `ci` gate, a `deliver` plan the `deliver` gate, `doctor` is free), so
+        # the plan is read and validated host-side first.
+        passthrough = list(getattr(ns, "run_args", []) or [])
+        posture_env, passthrough = _posture_env_from_flags(ns, passthrough)
+        passthrough = _apply_partner_tag_flag(ns, passthrough)
+        run_io = _run_plan_io_from_flags(passthrough)
+        # Both gates may exit; they run before any env: secret touches the disk.
+        _maybe_pregate_pro_command(run_io.command, telemetry_console=telemetry_console)
+        if run_io.command == "ci":
+            _enforce_partner_tag_before_container()
+        try:
+            run_io = run_io.with_env_secrets()
+            _run_rc = _run_host_command_with_session_capture(
+                command_type=run_io.command,
+                telemetry_console=telemetry_console,
+                runner=lambda: run_adscan_passthrough_docker(
+                    adscan_args=["run"] + run_io.passthrough,
+                    verbose=bool(getattr(ns, "verbose", False)),
+                    debug=bool(getattr(ns, "debug", False)),
+                    pull_timeout_seconds=3600,
+                    extra_env=list(posture_env) + list(run_io.extra_env),
+                    extra_mounts=run_io.ro_mounts,
+                    extra_rw_mounts=run_io.rw_mounts,
+                    env_exclude_keys=run_io.env_exclude_keys,
+                ),
+                extra={"mode": "docker", "session_scope": "launcher_preflight", "entry": "run_plan"},
+                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS) | {run_io.command},
+            )
+        finally:
+            # The env: secrets were materialised for this container only.
+            run_io.cleanup()
+        if int(_run_rc) == 42:
+            from adscan_core.cli_catalog import is_pro_only
+
+            if is_pro_only(run_io.command):
+                try:
+                    _render_pro_upsell_and_record(run_io.command)
+                except Exception as exc:  # noqa: BLE001 — best-effort upsell render
+                    capture_exception(exc)
+                    print_exception(exception=exc)
+                raise SystemExit(PRO_GATE_EXIT_CODE)
+        raise SystemExit(int(_run_rc))
+
+    if cmd in ("execute", "doctor", "recheck"):
         # Container passthrough with launcher preflight + session capture.
         # The REMAINDER args were captured on the dest named "<cmd>_args"; any
         # leading option-looking token (e.g. `execute --list`) lands in
@@ -2715,18 +3326,71 @@ def main(argv: list[str] | None = None) -> None:
         passthrough = list(unknown) + list(getattr(ns, f"{cmd}_args", []) or [])
         if passthrough and passthrough[0] == "--":
             passthrough = passthrough[1:]
+        # `execute` and `recheck` are PRO: skip the container under a confirmed
+        # LITE license, and honour exit-42 otherwise. A no-op for `doctor`,
+        # which stays free.
+        _maybe_pregate_pro_command(str(cmd), telemetry_console=telemetry_console)
+        _passthrough_rc = _run_host_command_with_session_capture(
+            command_type=str(cmd),
+            telemetry_console=telemetry_console,
+            runner=lambda: run_adscan_passthrough_docker(
+                adscan_args=[cmd] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=3600,
+            ),
+            extra={"mode": "docker", "session_scope": "launcher_preflight"},
+            allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+        )
+        raise SystemExit(_pro_passthrough_rc(str(cmd), int(_passthrough_rc)))
+
+    if cmd == "engagement":
+        # PRO: the engagement ledger. Gate host-side (a confirmed LITE licence
+        # never starts the container), then forward verbatim like ``policy``;
+        # the command reads and writes only inside the workspace mount.
+        _maybe_pregate_pro_command(cmd, telemetry_console=telemetry_console)
+        passthrough = list(unknown) + list(getattr(ns, "engagement_args", []) or [])
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
         raise SystemExit(
-            _run_host_command_with_session_capture(
-                command_type=str(cmd),
-                telemetry_console=telemetry_console,
-                runner=lambda: run_adscan_passthrough_docker(
-                    adscan_args=[cmd] + passthrough,
-                    verbose=bool(getattr(ns, "verbose", False)),
-                    debug=bool(getattr(ns, "debug", False)),
-                    pull_timeout_seconds=3600,
-                ),
-                extra={"mode": "docker", "session_scope": "launcher_preflight"},
-                allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
+            run_adscan_passthrough_docker(
+                adscan_args=["engagement"] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=3600,
+            )
+        )
+
+    if cmd == "pace":
+        passthrough = list(unknown) + list(getattr(ns, "pace_args", []) or [])
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
+        # Same file seam as `policy`: import reads a host file, export writes one.
+        passthrough, ro_mounts, rw_mounts = _policy_file_mounts(passthrough)
+        raise SystemExit(
+            run_adscan_passthrough_docker(
+                adscan_args=["pace"] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=3600,
+                extra_mounts=ro_mounts,
+                extra_rw_mounts=rw_mounts,
+            )
+        )
+
+    if cmd == "policy":
+        passthrough = list(unknown) + list(getattr(ns, "policy_args", []) or [])
+        if passthrough and passthrough[0] == "--":
+            passthrough = passthrough[1:]
+        passthrough, ro_mounts, rw_mounts = _policy_file_mounts(passthrough)
+        raise SystemExit(
+            run_adscan_passthrough_docker(
+                adscan_args=["policy"] + passthrough,
+                verbose=bool(getattr(ns, "verbose", False)),
+                debug=bool(getattr(ns, "debug", False)),
+                pull_timeout_seconds=3600,
+                extra_mounts=ro_mounts,
+                extra_rw_mounts=rw_mounts,
             )
         )
 
@@ -2736,15 +3400,18 @@ def main(argv: list[str] | None = None) -> None:
         # container for `deliver` under a confirmed LITE license.
         _maybe_pregate_pro_command(cmd, telemetry_console=telemetry_console)
         deliv_args: list[str] = [cmd]
+        deliv_outputs: list[_HostOutput] = []
         output_path = getattr(ns, "output_path", None)
         if output_path:
-            deliv_args.extend(["--output", str(output_path)])
+            # ``deliver --output`` names a folder; the single-PDF deliverables
+            # (cheatsheet) name a file. Either way it is a HOST path: stage it.
+            host_output = _host_output_mount(str(output_path), is_file=cmd != "deliver")
+            deliv_outputs.append(host_output)
+            deliv_args.extend(["--output", host_output.container_arg])
         if bool(getattr(ns, "no_open", False)):
             deliv_args.append("--no-open")
         if bool(getattr(ns, "no_render", False)):
             deliv_args.append("--no-render")
-        if hasattr(ns, "theme") and ns.theme:
-            deliv_args.extend(["--theme", str(ns.theme)])
         # ``deliver``-specific flags. Using ``ws_*`` dests on the host parser
         # avoids clobbering the launcher's own ``output_path``/``no_render``
         # while still surfacing the container's full flag set in --help.
@@ -2752,31 +3419,21 @@ def main(argv: list[str] | None = None) -> None:
             ws_workspace = getattr(ns, "ws_workspace", None)
             if ws_workspace:
                 deliv_args.extend(["--workspace", str(ws_workspace)])
-            ws_client = getattr(ns, "ws_client", None)
-            if ws_client:
-                deliv_args.extend(["--client", str(ws_client)])
-            ws_engagement = getattr(ns, "ws_engagement", None)
-            if ws_engagement:
-                deliv_args.extend(["--engagement", str(ws_engagement)])
-            ws_only = getattr(ns, "ws_only", None)
-            if ws_only:
-                deliv_args.extend(["--only", str(ws_only)])
-            ws_frameworks = getattr(ns, "ws_frameworks", None)
-            if ws_frameworks:
-                deliv_args.extend(["--frameworks", str(ws_frameworks)])
-            if bool(getattr(ns, "ws_no_navigator", False)):
-                deliv_args.append("--no-navigator")
-            ws_report_theme = getattr(ns, "ws_report_theme", "") or ""
-            if ws_report_theme:
-                deliv_args.extend(["--report-theme", str(ws_report_theme)])
-            # Copy the host logo into the mounted volume and forward the
-            # container-visible path, so the report cover co-brands and later
-            # runs reuse it.
+            # Every deliverable option, re-emitted from the shared model. Cover,
+            # back and progress-model paths are read inside the container (a
+            # path under the mounted volume or the workspace); the client logo
+            # is a HOST file, so it is staged into the volume first.
+            deliv_args.extend(
+                _forward_report_options(ns, dest_prefix="ws_", exclude=("client_logo",))
+            )
             ws_client_logo = getattr(ns, "ws_client_logo", None)
             if ws_client_logo:
                 staged_logo = _stage_client_logo(str(ws_client_logo))
                 if staged_logo:
                     deliv_args.extend(["--client-logo", staged_logo])
+            ws_progress_model = getattr(ns, "ws_progress_model", None)
+            if ws_progress_model:
+                deliv_args.extend(["--progress-model", str(ws_progress_model)])
         # ``mitre-navigator``-specific flags. Distinct ``nav_*`` dests so the
         # navigator's directory ``--output`` and boolean flags never clash
         # with the PDF deliverables' ``output_path``/``no_open``/``no_render``.
@@ -2789,7 +3446,9 @@ def main(argv: list[str] | None = None) -> None:
                 deliv_args.extend(["--workspace", str(nav_workspace)])
             nav_output = getattr(ns, "nav_output", None)
             if nav_output:
-                deliv_args.extend(["--output", str(nav_output)])
+                host_output = _host_output_mount(str(nav_output), is_file=False)
+                deliv_outputs.append(host_output)
+                deliv_args.extend(["--output", host_output.container_arg])
             nav_client = getattr(ns, "nav_client", None)
             if nav_client:
                 deliv_args.extend(["--client", str(nav_client)])
@@ -2804,15 +3463,19 @@ def main(argv: list[str] | None = None) -> None:
                 deliv_args.append("--no-history")
             if bool(getattr(ns, "nav_verbose", False)):
                 deliv_args.append("--verbose")
-        raise SystemExit(
-            _run_pro_passthrough_with_upsell_gate(
+        try:
+            deliv_rc = _run_pro_passthrough_with_upsell_gate(
                 cmd=str(cmd),
                 adscan_args=deliv_args,
                 verbose=bool(getattr(ns, "verbose", False)),
                 debug=bool(getattr(ns, "debug", False)),
                 pull_timeout_seconds=3600,
+                extra_rw_mounts=[output.mount for output in deliv_outputs],
             )
-        )
+        finally:
+            for output in deliv_outputs:
+                output.finalize()
+        raise SystemExit(deliv_rc)
 
     if cmd == "demo":
         # Reconstruct the demo CLI args from the parsed namespace and forward

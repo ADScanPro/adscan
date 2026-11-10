@@ -25,6 +25,9 @@ from rich.console import RenderableType
 from rich.text import Text
 
 from adscan_core import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 from adscan_core.rich_output import (
     print_info,
     print_info_debug,
@@ -77,6 +80,7 @@ from adscan_internal.services.collector.well_known_sids import (
     NON_GRANTEE_SIDS,
     _node_primary_group_id,
 )
+from adscan_internal.services.registry_read_state import registry_value_absent
 from adscan_core.rich_output import print_exception
 
 
@@ -86,8 +90,12 @@ from adscan_core.rich_output import print_exception
 _DC_PRIMARY_GROUP_RIDS = frozenset({516, 521})
 
 
-_HOST_CONCURRENCY_DEFAULT = 20
-_HOST_TIMEOUT_DEFAULT = 20
+# Pacing values live in the scan-pacing SSOT (consumer ``collector.smb_hosts``).
+# The ``_DEFAULT`` names below are the default-level values, kept for the call
+# sites and tests that import them; the live values come from ``_pacing()``.
+_SMB_HOSTS = _pacing_consumer("collector.smb_hosts")
+_HOST_CONCURRENCY_DEFAULT = _SMB_HOSTS.param("concurrency").default  # 20
+_HOST_TIMEOUT_DEFAULT = _SMB_HOSTS.param("per_host_timeout_s").default  # 20
 
 # Hard wall-clock bound on the AUTHENTICATED SMB connect (the per-host
 # `smb_machine_with_fallback` enter: Kerberos getST + negotiate + session-setup,
@@ -110,7 +118,7 @@ _HOST_TIMEOUT_DEFAULT = 20
 # cuts a healthy host while capping a stalled one ~tightly — between NetExec's
 # 5s and an audit-tool completeness margin (we prefer not to skip a real-but-slow
 # host the way bloodhound's 1s would). Tune via ``ADSCAN_COLLECTOR_CONNECT_TIMEOUT``.
-_HOST_CONNECT_TIMEOUT_DEFAULT = 10
+_HOST_CONNECT_TIMEOUT_DEFAULT = _SMB_HOSTS.param("connect_timeout_s").default  # 10
 
 # Hard wall-clock bound on the per-host SMB connection TEARDOWN
 # (``machine_cm.__aexit__``). Teardown runs INSIDE the worker's semaphore slot but
@@ -124,7 +132,7 @@ _HOST_CONNECT_TIMEOUT_DEFAULT = 10
 # Teardown of a healthy host is near-instant (the vendor already tries 5s+1s), so a
 # 10s outer bound never cuts a real teardown while it guarantees a wedged one frees
 # the slot fast. Tune via ``ADSCAN_COLLECTOR_TEARDOWN_TIMEOUT``.
-_HOST_TEARDOWN_TIMEOUT_DEFAULT = 10
+_HOST_TEARDOWN_TIMEOUT_DEFAULT = _SMB_HOSTS.param("teardown_timeout_s").default  # 10
 
 # Hard per-host wall-clock SAFETY NET for the full collection of one host
 # (negotiate + auth-connect + SAMR + shares). Every per-op step is already a hard
@@ -134,7 +142,7 @@ _HOST_TEARDOWN_TIMEOUT_DEFAULT = 10
 # respects the intended per-op limits (their worst-case sum, ~140s with the
 # fallback, sits below this). It is a safety net, not a perf knob — tune it DOWN
 # via the env var only once a measured per-host duration distribution is in hand.
-_HOST_BUDGET_DEFAULT = 180
+_HOST_BUDGET_DEFAULT = _SMB_HOSTS.param("per_host_budget_s").default  # 180
 
 # Lever C -- RTT-adaptive per-host ENUMERATION timeout.
 #
@@ -169,17 +177,16 @@ def _adaptive_enum_timeout(rtt_ms: float | None, per_host_timeout: int) -> int:
     per-host timeout, so this can only ever REDUCE dead-wait, never extend it).
 
     Best-effort: any unparsable override or bad input falls back to
-    ``per_host_timeout``. Env escape hatches:
-      - ``ADSCAN_COLLECTOR_ENUM_TIMEOUT``  -- explicit int, wins over adaptation.
-      - ``ADSCAN_COLLECTOR_ENUM_ADAPTIVE=0`` -- disable adaptation entirely.
+    ``per_host_timeout``. Overrides come from the scan pacing
+    (``collector.smb_hosts``), which still honours the deprecated
+    ``ADSCAN_COLLECTOR_ENUM_TIMEOUT`` (explicit int, wins over adaptation) and
+    ``ADSCAN_COLLECTOR_ENUM_ADAPTIVE=0`` (disable adaptation).
     """
-    override = os.getenv("ADSCAN_COLLECTOR_ENUM_TIMEOUT")
-    if override:
-        try:
-            return max(1, int(override))
-        except (TypeError, ValueError):
-            pass
-    if os.getenv("ADSCAN_COLLECTOR_ENUM_ADAPTIVE", "1").strip().lower() in ("0", "false", "no", "off"):
+    pacing = _pacing()
+    override = pacing["enum_timeout_override_s"]
+    if override is not None:
+        return int(override)
+    if not pacing["enum_adaptive"]:
         return per_host_timeout
     # No proof the link is fast -> stay generous.
     if rtt_ms is None or rtt_ms <= 0:
@@ -456,30 +463,22 @@ class HostPhaseProgress:
 # Phase 2 reachability gate (445/tcp) -- pre-filter unreachable hosts before
 # paying the full per-host SMB collection timeout. The connect probe is cheap,
 # so concurrency runs far above the ~20 used for full collection.
-_GATE_CONCURRENCY_DEFAULT = 256
-_GATE_CONCURRENCY_FLOOR = 1
-_GATE_TIMEOUT_DEFAULT = 5.0  # seconds; above L2's 3.0 default for VPN RTT budget
-_GATE_TIMEOUT_FLOOR = 0.5
+_GATE_CONCURRENCY_DEFAULT = _SMB_HOSTS.param("gate_concurrency").default  # 256
+_GATE_TIMEOUT_DEFAULT = _SMB_HOSTS.param("gate_timeout_s").default  # 5.0 s, above L2's 3.0 for VPN RTT
+
+
+def _pacing() -> Any:
+    """The SMB host collector's resolved pacing parameters."""
+    return component_pacing(active_pacing(), "collector.smb_hosts")
 _GATE_PORT = 445
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-        return value if value > 0 else default
-    except ValueError:
-        return default
-
-
 def _env_int_floor0(name: str, default: int) -> int:
-    """Like :func:`_env_int` but accepts ``0`` (the "unlimited" sentinel).
+    """Read a non-negative int env var; ``0`` is the "unlimited" sentinel.
 
-    ``_env_int`` rejects ``0``/negatives and falls back to its default — that is
-    correct for a concurrency knob but wrong for ``host_cap`` where ``0`` is a
-    meaningful value (unlimited). A negative value still falls back to ``default``.
+    Used for ``host_cap`` only (scope, not pacing: the pacing knobs resolve in
+    ``adscan_core.scan_pacing``). A negative or unparsable value falls back to
+    ``default``.
     """
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -491,58 +490,32 @@ def _env_int_floor0(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float, *, floor: float) -> float:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-        return value if value >= floor else default
-    except ValueError:
-        return default
-
-
 @dataclass
 class HostCollectorConfig:
     """Combined credentials + tuning for the unified host phase."""
 
     smb: SMBCollectorConfig
     share: ShareCollectorConfig
-    concurrency: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_COLLECTOR_HOST_CONCURRENCY", _HOST_CONCURRENCY_DEFAULT
-        )
-    )
+    # Pacing fields resolve through the scan-pacing SSOT (level, overrides, the
+    # deprecated ADSCAN_COLLECTOR_* env vars, the policy ceiling).
+    concurrency: int = field(default_factory=lambda: _pacing()["concurrency"])
     per_host_timeout: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_COLLECTOR_PER_HOST_TIMEOUT", _HOST_TIMEOUT_DEFAULT
-        )
+        default_factory=lambda: _pacing()["per_host_timeout_s"]
     )  # seconds; applied per SMB host operation (negotiate + SAMR + shares combined)
     connect_timeout: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_COLLECTOR_CONNECT_TIMEOUT", _HOST_CONNECT_TIMEOUT_DEFAULT
-        )
+        default_factory=lambda: _pacing()["connect_timeout_s"]
     )  # seconds; HARD bound on the authenticated SMB connect (incl. Kerberos→NTLM
     # fallback) — the one step that otherwise rides only the soft transport
     # timeout, so a TCP-open-but-SMB-stalled host fails fast instead of summing
     # ~2-3× per-op. Frees the worker slot at scale; per_host_budget is the net.
     per_host_budget: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_COLLECTOR_PER_HOST_BUDGET", _HOST_BUDGET_DEFAULT
-        )
+        default_factory=lambda: _pacing()["per_host_budget_s"]
     )  # seconds; hard wall-clock ceiling for the WHOLE per-host collection (safety net)
     gate_concurrency: int = field(
-        default_factory=lambda: max(
-            _GATE_CONCURRENCY_FLOOR,
-            _env_int("ADSCAN_COLLECTOR_GATE_CONCURRENCY", _GATE_CONCURRENCY_DEFAULT),
-        )
+        default_factory=lambda: _pacing()["gate_concurrency"]
     )  # 445/tcp reachability-gate probe fan-out (cheap connect probe)
     gate_timeout: float = field(
-        default_factory=lambda: _env_float(
-            "ADSCAN_COLLECTOR_GATE_TIMEOUT",
-            _GATE_TIMEOUT_DEFAULT,
-            floor=_GATE_TIMEOUT_FLOOR,
-        )
+        default_factory=lambda: _pacing()["gate_timeout_s"]
     )  # seconds; per-host 445 connect-probe budget
     host_cap: int = field(
         default_factory=lambda: _env_int_floor0("ADSCAN_COLLECTOR_HOST_CAP", 0)
@@ -701,6 +674,12 @@ class HostPhaseTiming:
     # and host-cap fields so the surfaces read "enriched N new; K already collected
     # in a prior run" rather than conflating resume with a fresh partial sweep.
     resumed_skipped: int = 0
+    # Object ids of the hosts this sweep FULLY examined: reached, authenticated,
+    # every stage answered (outcome ``ok``). Feeds the run's coverage record so
+    # a host-scoped item (an AdminTo edge, a session) on one of these hosts can
+    # be closed by its absence; any other host's items stay unclosable. A list,
+    # never a set (JSON-safe, mirrors ``shares_aborted_hosts``).
+    examined_host_ids: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> float:
@@ -1100,6 +1079,11 @@ async def _do_samr(
 _REG_HKLM_LSA = r"SYSTEM\CurrentControlSet\Control\Lsa"
 _REG_HKLM_WDIGEST = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"
 _REG_HKLM_MSV1_0 = r"SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+#: Where Group Policy writes the Credential Guard setting. The direct setting
+#: is ``LsaCfgFlags`` under ``_REG_HKLM_LSA``. Both are CONFIGURATION: whether
+#: Credential Guard is running needs WMI ``Win32_DeviceGuard``, which this stage
+#: deliberately does not query (see adscan_core.reporting.endpoint_capability).
+_REG_HKLM_DEVICEGUARD_POLICY = r"SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
 
 #: Registry-read spec: (property_key, subkey_path, value_name). The property_key
 #: is the ``smb_props`` namespace the Computer node carries into the audit stage.
@@ -1111,6 +1095,9 @@ _REGISTRY_READS: tuple[tuple[str, str, str], ...] = (
     ("reg_msv1_0_ntlmminclientsec", _REG_HKLM_MSV1_0, "NTLMMinClientSec"),
     ("reg_msv1_0_ntlmminserversec", _REG_HKLM_MSV1_0, "NTLMMinServerSec"),
     ("reg_lsa_allowcustomsspsaps", _REG_HKLM_LSA, "AllowCustomSSPsAPs"),
+    # Credential Guard configuration, two more value reads on the same pipe.
+    ("reg_lsa_lsacfgflags", _REG_HKLM_LSA, "LsaCfgFlags"),
+    ("reg_deviceguard_policy_lsacfgflags", _REG_HKLM_DEVICEGUARD_POLICY, "LsaCfgFlags"),
 )
 
 #: The per-key read state written alongside each value (see the docstring above).
@@ -1119,20 +1106,10 @@ REG_STATE_ABSENT = "absent"
 REG_STATE_ERROR = "error"
 
 
-def _reg_value_absent(err: Any) -> bool:
-    """True when a registry-value read failed because the value does not exist.
-
-    The vendor ``RRPRPC`` surfaces a not-found as an ``OSError`` whose ``errno`` is
-    ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3). Anything else is a real
-    read error (denied / transport), which must NOT be conflated with absence — an
-    absent value can be a *secure* verdict (WDigest) or an *insecure* one
-    (RunAsPPL), whereas an error is simply NOT_ASSESSED.
-    """
-    errno = getattr(err, "errno", None)
-    if errno in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
-        return True
-    text = str(err).upper()
-    return "NOT_FOUND" in text or "FILE_NOT_FOUND" in text or "ERROR_FILE_NOT" in text
+#: The classifier lives in ``services/registry_read_state`` so the LSASS
+#: fingerprint's ``RunAsPPL`` read and this stage share one definition of
+#: "absent" versus "failed".
+_reg_value_absent = registry_value_absent
 
 
 async def _do_registry(
@@ -1265,15 +1242,23 @@ async def _do_endpoint_protection_inventory(
             )
             return
         detected = fp.detected_products
+        # ``active`` is OBSERVED active only. A product whose real-time
+        # protection state could not be read carries ``activity_unconfirmed``
+        # instead, so reporting never reads an assumed "on" as protection.
         out.smb_props["endpoint_products"] = [
-            {"name": p.name, "category": p.category, "active": p.active}
+            {
+                "name": p.name,
+                "category": p.category,
+                "active": p.observed_active,
+                "activity_unconfirmed": p.activity_unconfirmed,
+            }
             for p in detected
         ]
         out.smb_props["edr_active"] = any(
-            p.category == "edr" and p.active for p in detected
+            p.category == "edr" and p.observed_active for p in detected
         )
         out.smb_props["av_active"] = any(
-            p.category == "av" and p.active for p in detected
+            p.category == "av" and p.observed_active for p in detected
         )
         out.smb_props["endpoint_posture_assessed"] = True
         print_info_debug(
@@ -1443,9 +1428,7 @@ async def _bounded_teardown(machine_cm: Any, target_ip: str) -> None:
     cleanup must never propagate). All other exceptions are swallowed too — teardown of
     a dead host commonly errors, and the connection is being discarded regardless.
     """
-    teardown_budget = _env_int(
-        "ADSCAN_COLLECTOR_TEARDOWN_TIMEOUT", _HOST_TEARDOWN_TIMEOUT_DEFAULT
-    )
+    teardown_budget = _pacing()["teardown_timeout_s"]
     try:
         await asyncio.wait_for(
             machine_cm.__aexit__(None, None, None),  # pylint: disable=no-member
@@ -1560,7 +1543,21 @@ async def collect_one_host(
             stage_report(name)
 
     out = HostCollectionResult()
+    runtime = active_runtime()
 
+    async def _paced(stage: str) -> bool:
+        """Pace the next SEQUENTIAL stage on this host; False if the safeguard paused it."""
+        if await runtime.before_op(target_ip):
+            return True
+        out.errors.setdefault(
+            "paused",
+            f"paused_by_safeguard: {target_ip} stopped responding earlier in the "
+            f"assessment; '{stage}' and later stages were not run",
+        )
+        return False
+
+    if not await _paced("negotiate"):
+        return out
     _stage("negotiate")
     await _do_negotiate(target_ip, config.smb, out, timing)
 
@@ -1599,13 +1596,21 @@ async def collect_one_host(
         # __aenter__/__aexit__ through the decorator (false-positive no-member).
         # `connect` is the stage the stall investigation suspects is stuck (the
         # wait_for that times out but may not cancel the native connect coroutine).
+        if not await _paced("connect"):
+            return out
         _stage("connect")
-        machine = await asyncio.wait_for(
-            machine_cm.__aenter__(),  # pylint: disable=no-member
-            timeout=config.connect_timeout,
-        )
+        connect_started = time.monotonic()
         try:
-            if config.collect_samr:
+            machine = await asyncio.wait_for(
+                machine_cm.__aenter__(),  # pylint: disable=no-member
+                timeout=config.connect_timeout,
+            )
+        except BaseException as connect_exc:
+            runtime.record_exception(target_ip, connect_exc)
+            raise
+        runtime.record(target_ip, Outcome.OK, time.monotonic() - connect_started)
+        try:
+            if config.collect_samr and await _paced("samr"):
                 _stage("samr")
                 await _do_samr(
                     machine,
@@ -1616,7 +1621,7 @@ async def collect_one_host(
                     target_ip=target_ip,
                     enum_timeout=_adaptive_enum_timeout(rtt_ms, config.per_host_timeout),
                 )
-            if config.collect_shares:
+            if config.collect_shares and await _paced("shares"):
                 _stage("shares")
                 await _do_shares_with_retry(
                     machine,
@@ -1628,7 +1633,7 @@ async def collect_one_host(
                     out,
                     timing,
                 )
-            if config.collect_registry:
+            if config.collect_registry and await _paced("registry"):
                 # Admin-gated HKLM credential-protection reads over \winreg — LAST
                 # stage on the shared connection, run SEQUENTIALLY after shares
                 # (one op in flight per connection; never gathered).
@@ -2340,7 +2345,9 @@ async def _collect_domain_hosts_async(
         if sam:
             samaccount_to_node[sam] = n
 
-    sem = asyncio.Semaphore(config.concurrency)
+    # Shrinks under the scan-wide strain safeguard; identical to
+    # asyncio.Semaphore(config.concurrency) while no host is strained.
+    sem = active_runtime().semaphore(config.concurrency)
 
     # Serialises the mid-sweep checkpoint persist against the per-host graph merge.
     # The checkpoint (``_checkpoint`` in the orchestrator) READS ``result`` — it
@@ -2562,6 +2569,10 @@ async def _collect_domain_hosts_async(
                 timing.outcome_counts[_outcome] = (
                     timing.outcome_counts.get(_outcome, 0) + 1
                 )
+                if _outcome == "ok":
+                    _oid = str(getattr(node, "object_id", "") or "").strip().upper()
+                    if _oid:
+                        timing.examined_host_ids.append(_oid)
                 # Dashboard ✓/⚠: a host is only a FAILURE for hard problems — an
                 # expected no-local-admin denial (or a clean collect) is success.
                 # Denied-but-collected hosts (shares/admins gathered) stay ✓.

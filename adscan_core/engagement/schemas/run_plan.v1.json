@@ -1,0 +1,518 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.run_plan/1",
+  "title": "ADscan RunPlan v1",
+  "description": "What one engine run does. Credentials only by reference. No field carries a command, a binary path or a filesystem path outside the run directory: every object is closed and every free string is pattern-bound.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "kind"],
+  "properties": {
+    "schema": {"const": "adscan.run_plan/1"},
+    "kind": {"enum": ["scan", "recheck", "postprocess", "doctor", "deliver"]},
+    "run_id": {"$ref": "#/$defs/token"},
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"$ref": "#/$defs/workspace_name"},
+        "type": {"enum": ["ctf", "audit"]},
+        "ephemeral": {"type": "boolean"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"enum": ["auth", "unauth"]},
+        "domain": {"$ref": "#/$defs/domain"},
+        "dc_ip": {"$ref": "#/$defs/host"},
+        "dns_server": {"$ref": "#/$defs/host"},
+        "hosts": {"$ref": "#/$defs/host_list"},
+        "interface": {"$ref": "#/$defs/interface"}
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["username", "secret"],
+      "properties": {
+        "username": {"$ref": "#/$defs/username"},
+        "secret": {"$ref": "#/$defs/reference"}
+      }
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "read_only": {"type": "boolean"},
+        "show_structural": {"type": "boolean"},
+        "scan_config": {"$ref": "#/$defs/scan_config"},
+        "pacing": {"$ref": "#/$defs/pacing_level"},
+        "pacing_set": {
+          "type": "array",
+          "$comment": "The --pacing-set KNOB=VALUE flags, canonical form (one entry per knob, last wins).",
+          "maxItems": 32,
+          "items": {"type": "string", "pattern": "^[a-z_]+(\\.[a-z_]+)?=[A-Za-z0-9_.+-]{1,32}$"}
+        },
+        "policy": {
+          "type": "string",
+          "$comment": "The --policy flag: a saved scan policy by name (adscan_internal/services/saved_scan_policies.py). Not together with scan_config.checks.",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "pace_profile": {
+          "type": "string",
+          "$comment": "The --pace-profile flag: a saved pace profile by name (adscan_internal/services/saved_pace_profiles.py). Not together with scan_config.pacing.",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "auto_revert": {
+          "enum": ["on", "off"],
+          "$comment": "The --auto-revert flag: automatic reversion of ADscan's directory changes (default by workspace type: on for audit, off for ctf)."
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generate": {"type": "boolean"},
+        "only": {"$ref": "#/$defs/slug_list"},
+        "format": {"enum": ["pdf"]},
+        "frameworks": {"$ref": "#/$defs/frameworks"},
+        "engine": {"enum": ["chromium"]},
+        "renderer": {"enum": ["cytoscape"]},
+        "template": {"enum": ["premium"]},
+        "theme": {"$ref": "#/$defs/token", "$comment": "The --report-theme flag."},
+        "kit_theme": {"$ref": "#/$defs/token", "$comment": "The --theme flag (deliver.theme in a deliver plan)."},
+        "display_name": {"$ref": "#/$defs/label"},
+        "client": {"$ref": "#/$defs/label"},
+        "engagement": {"$ref": "#/$defs/label"},
+        "branding": {"enum": ["adscan", "cobrand", "whitelabel"]},
+        "emit": {"$ref": "#/$defs/slug_list"},
+        "no_navigator": {"type": "boolean"},
+        "client_logo": {"$ref": "#/$defs/file_reference"},
+        "client_cover": {"$ref": "#/$defs/file_reference"},
+        "client_back": {"$ref": "#/$defs/file_reference"}
+      }
+    },
+    "recheck": {
+      "type": "object",
+      "$comment": "kind=recheck (adscan_core/engagement/recheck.py). One shape per target level; each level lists the depths it supports (DEPTHS_BY_LEVEL).",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "depth"],
+          "properties": {
+            "target": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["level"],
+              "properties": {
+                "level": {"const": "all"},
+                "filter": {"$ref": "#/$defs/recheck_filter"}
+              }
+            },
+            "depth": {"const": "observe"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "depth"],
+          "properties": {
+            "target": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["level", "finding"],
+              "properties": {
+                "level": {"const": "finding"},
+                "finding": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,127}$"},
+                "objects": {
+                  "type": "array",
+                  "maxItems": 512,
+                  "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$"}
+                },
+                "filter": {"$ref": "#/$defs/recheck_filter"}
+              }
+            },
+            "depth": {"const": "observe"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "depth"],
+          "properties": {
+            "target": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["level", "step"],
+              "properties": {
+                "level": {"const": "step"},
+                "step": {"$ref": "#/$defs/recheck_id"}
+              }
+            },
+            "depth": {"enum": ["observe", "exercise"]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target", "depth"],
+          "properties": {
+            "target": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["level", "path"],
+              "properties": {
+                "level": {"const": "path"},
+                "path": {"$ref": "#/$defs/recheck_id"}
+              }
+            },
+            "depth": {"enum": ["observe", "walk"]}
+          }
+        }
+      ]
+    },
+    "doctor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trust_scope": {"enum": ["origin_only", "all", "selected", "interactive"]},
+        "trust_domains": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/domain"}},
+        "json": {"type": "boolean"}
+      }
+    },
+    "deliver": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "client": {"$ref": "#/$defs/label"},
+        "engagement": {"$ref": "#/$defs/label"},
+        "only": {"$ref": "#/$defs/slug_list"},
+        "frameworks": {"$ref": "#/$defs/frameworks"},
+        "no_navigator": {"type": "boolean"},
+        "theme": {"$ref": "#/$defs/token"},
+        "report_theme": {"$ref": "#/$defs/token"},
+        "branding": {"enum": ["adscan", "cobrand", "whitelabel"]},
+        "emit": {"$ref": "#/$defs/slug_list"},
+        "client_logo": {"$ref": "#/$defs/file_reference"},
+        "client_cover": {"$ref": "#/$defs/file_reference"},
+        "client_back": {"$ref": "#/$defs/file_reference"},
+        "progress_model": {"$ref": "#/$defs/file_reference"}
+      }
+    }
+  },
+  "$defs": {
+    "token": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "recheck_id": {
+      "type": "string",
+      "$comment": "A ledger step id or an attack-path id (sha256 hex), or an unambiguous prefix of at least 8 characters.",
+      "pattern": "^[0-9a-f]{8,64}$"
+    },
+    "recheck_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain": {"type": "string", "pattern": "^[a-z0-9_][a-z0-9_.-]{0,252}$"},
+        "status": {"enum": ["open", "remediated", "not_reevaluated", "all"]}
+      }
+    },
+    "workspace_name": {
+      "type": "string",
+      "$comment": "A workspace NAME, never a path: no separator, no leading dot, no '..', no control character.",
+      "pattern": "^(?!.*\\.\\.)[^/\\\\\\u0000-\\u001f.][^/\\\\\\u0000-\\u001f]{0,127}$"
+    },
+    "label": {"type": "string", "pattern": "^[^\\u0000-\\u001f]{1,200}$"},
+    "domain": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}$"},
+    "host": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:%-]{0,252}$"},
+    "host_list": {
+      "type": "string",
+      "$comment": "Comma- or space-separated IPs, CIDRs or hostnames. A '/' only as a CIDR prefix length.",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:-]*(/[0-9]{1,3})?([, ]+[A-Za-z0-9_][A-Za-z0-9_.:-]*(/[0-9]{1,3})?)*$",
+      "maxLength": 4096
+    },
+    "interface": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,31}$"},
+    "username": {"type": "string", "pattern": "^[^\\u0000-\\u001f]{1,256}$"},
+    "reference": {
+      "type": "object",
+      "$comment": "env:NAME (process environment), file:<relpath> (relative to the run directory), node:<profile> (held by the scanner node), engagement:<principal> (engagement vault).",
+      "additionalProperties": false,
+      "required": ["ref"],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]{0,127}|file:(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*|node:[A-Za-z0-9][A-Za-z0-9._-]{0,63}|engagement:[^\\u0000-\\u001f]{1,256})$"
+        }
+      }
+    },
+    "file_reference": {
+      "type": "object",
+      "$comment": "A non-secret input file shipped beside the plan, relative to the run directory.",
+      "additionalProperties": false,
+      "required": ["ref"],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^file:(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+        }
+      }
+    },
+    "slug_list": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*(,[a-z][a-z0-9_-]*)*$", "maxLength": 512},
+    "frameworks": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {"enum": ["ens", "nis2", "iso27001", "dora", "pci_dss", "cis"]}
+    },
+    "string_list": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$"}
+    },
+    "check_selector_list": {
+      "type": "array",
+      "$comment": "Check ids or family selectors (adscan_core/scan_policy/policy.py CHECK_SELECTOR_PATTERN).",
+      "maxItems": 1024,
+      "items": {"type": "string", "pattern": "^(step|finding|probe|module|family):[a-z0-9_.-]+$", "maxLength": 128}
+    },
+    "pacing_level": {"enum": ["fragile", "polite", "normal", "fast"]},
+    "pacing_overrides": {
+      "type": "object",
+      "$comment": "One property per knob of adscan_core/scan_pacing/pacing_knobs.py PACING_KNOBS (locked by tests/unit/contracts/test_schemas_golden.py). Canonical form: flat dotted keys; the nested 'port_scan' group is accepted too, as the engine parser accepts it.",
+      "additionalProperties": false,
+      "properties": {
+        "port_scan": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_rate_pps": {"oneOf": [{"type": "integer", "minimum": 10, "maximum": 800}, {"const": "unlimited"}]},
+            "max_hostgroup": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1024}, {"const": "unlimited"}]},
+            "scan_delay_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+            "host_timeout_minutes": {"type": "integer", "minimum": 5, "maximum": 120}
+          }
+        },
+        "max_parallel_hosts": {"type": "integer", "minimum": 1, "maximum": 128},
+        "max_parallel_probes": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "max_in_flight_per_host": {"type": "integer", "minimum": 1, "maximum": 32},
+        "max_requests_per_second": {"oneOf": [{"type": "number", "minimum": 0.5, "maximum": 5000}, {"const": "unlimited"}]},
+        "per_host_delay_ms": {"type": "integer", "minimum": 0, "maximum": 60000},
+        "jitter_pct": {"type": "integer", "minimum": 0, "maximum": 100},
+        "timeout_multiplier": {"type": "number", "minimum": 0.5, "maximum": 4},
+        "max_retries": {"type": "integer", "minimum": 0, "maximum": 10},
+        "port_scan.max_rate_pps": {"oneOf": [{"type": "integer", "minimum": 10, "maximum": 800}, {"const": "unlimited"}]},
+        "port_scan.max_hostgroup": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1024}, {"const": "unlimited"}]},
+        "port_scan.scan_delay_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+        "port_scan.host_timeout_minutes": {"type": "integer", "minimum": 5, "maximum": 120},
+        "ldap_page_size": {"type": "integer", "minimum": 100, "maximum": 1000},
+        "share_bandwidth_mibps": {"oneOf": [{"type": "number", "minimum": 0.5, "maximum": 1000}, {"const": "unlimited"}]},
+        "strain_backoff": {"type": "boolean"}
+      }
+    },
+    "pacing_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "level": {"$ref": "#/$defs/pacing_level"},
+        "overrides": {"$ref": "#/$defs/pacing_overrides"}
+      }
+    },
+    "policy_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "maxLength": 128},
+        "name": {"type": "string", "maxLength": 256},
+        "revision": {"type": "integer", "minimum": 0},
+        "modified_for_this_scan": {"type": "boolean"}
+      }
+    },
+    "scan_config": {
+      "type": "object",
+      "$comment": "Mirrors adscan_internal/services/scan_config.py (locked by tests/unit/contracts/test_schemas_golden.py). Lists are arrays, already normalised.",
+      "additionalProperties": false,
+      "properties": {
+        "phases": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "disabled": {"$ref": "#/$defs/string_list"},
+            "steps": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"disabled": {"$ref": "#/$defs/string_list"}}
+              }
+            }
+          }
+        },
+        "trust_enumeration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "policy": {"enum": ["origin_only", "skip", "all", "selected", "interactive"]},
+            "domains": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/domain"}}
+          }
+        },
+        "attack_paths": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "policy": {"enum": ["none", "all", "selected", "interactive"]},
+            "selected": {"type": "array", "maxItems": 512, "items": {"$ref": "#/$defs/label"}}
+          }
+        },
+        "audit_extras": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"target_scope": {"enum": ["default", "domain_controllers", "all_hosts"]}}
+        },
+        "host_cap": {"type": "integer", "minimum": 0},
+        "cracking": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "effort": {"enum": ["fast", "balanced", "thorough"]},
+            "wordlist": {
+              "type": "string",
+              "$comment": "A wordlist NAME or a path relative to the wordlists directory; never absolute, never '..'.",
+              "pattern": "^(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+            }
+          }
+        },
+        "poisoning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean"}}
+        },
+        "pivoting": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean"}}
+        },
+        "writeshare_bait": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"enabled": {"type": "boolean"}}
+        },
+        "durable_changes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "keep": {"type": "boolean"},
+            "allow_ca_key_backup": {"type": "boolean"},
+            "auto_revert": {"type": "boolean"},
+            "machine_account_policy": {"enum": ["retain_one", "revert_each_run"]}
+          }
+        },
+        "cleanup_credential": {
+          "type": "object",
+          "$comment": "The client's cleanup-only account by REFERENCE: the principal and the ADSCAN_* environment variable holding its secret (adscan_internal/services/cleanup_credential_reference.py). Never the secret.",
+          "additionalProperties": false,
+          "required": ["username"],
+          "properties": {
+            "username": {"$ref": "#/$defs/username"},
+            "domain": {"type": "string", "maxLength": 255},
+            "secret_env": {"type": "string", "pattern": "^ADSCAN_[A-Z0-9_]{1,120}$"}
+          }
+        },
+        "checks": {
+          "type": "object",
+          "$comment": "The scan policy (adscan_core/scan_policy/policy.py parse_policy_definition).",
+          "additionalProperties": false,
+          "properties": {
+            "base": {"enum": ["lab_ctf", "audit", "production_sensitive", "full_validation", "detection_only", "safe_for_production"]},
+            "enabled": {"$ref": "#/$defs/check_selector_list"},
+            "disabled": {"$ref": "#/$defs/check_selector_list"},
+            "new_checks": {"enum": ["follow_base", "disabled"]},
+            "execution_mode": {"enum": ["unattended", "attended"]},
+            "environment": {"enum": ["lab", "real"]},
+            "password_attempts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reserve_margin": {"type": "integer", "minimum": 0, "maximum": 20},
+                "unknown_threshold": {"enum": ["conservative", "attempt_anyway"]},
+                "ignore_threshold": {"type": "boolean"}
+              }
+            },
+            "settings": {
+              "type": "object",
+              "$comment": "Behaviour settings (adscan_core/scan_policy/settings.py); only the keys the policy sets.",
+              "additionalProperties": false,
+              "properties": {
+                "objective": {"enum": ["domain_compromise", "full_assessment"]},
+                "scope_expansion": {"enum": ["automatic", "ask"]},
+                "default_reach": {"enum": ["wide", "bounded"]},
+                "operator_prompts": {"enum": ["answer_defaults", "ask"]},
+                "cracking_wordlist": {"enum": ["rockyou", "real_world"]},
+                "cracking_effort": {"enum": ["fast", "balanced", "thorough"]},
+                "online_hash_lookup": {"enum": ["on", "ask", "off"]},
+                "poisoning": {"enum": ["on", "off"]},
+                "writeshare_bait": {"enum": ["automatic", "ask"]}
+              }
+            },
+            "saved_at_registry_version": {"type": "integer", "minimum": 0},
+            "pacing": {"$ref": "#/$defs/pacing_request"},
+            "policy": {"$ref": "#/$defs/policy_identity"}
+          }
+        },
+        "pacing": {
+          "type": "object",
+          "$comment": "Scan speed (adscan_core/scan_pacing parse_pacing_block). 'ceiling' is written from a saved policy, 'profile' names the saved pace profile the pace started from.",
+          "additionalProperties": false,
+          "properties": {
+            "level": {"$ref": "#/$defs/pacing_level"},
+            "overrides": {"$ref": "#/$defs/pacing_overrides"},
+            "profile": {
+              "type": "object",
+              "$comment": "adscan_core/scan_pacing/pacing_model.py PaceProfileRef (disclosure only, never logic).",
+              "additionalProperties": false,
+              "required": ["name"],
+              "properties": {
+                "id": {"type": "string", "maxLength": 128},
+                "name": {"type": "string", "minLength": 1, "maxLength": 255},
+                "revision": {"type": "integer", "minimum": 0},
+                "adjusted": {"type": "boolean"},
+                "lowered": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key"],
+                    "properties": {
+                      "key": {"type": "string", "maxLength": 64},
+                      "requested": {"type": ["string", "number", "boolean", "null"]},
+                      "allowed": {"type": ["string", "number", "boolean", "null"]}
+                    }
+                  }
+                }
+              }
+            },
+            "ceiling": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["level"],
+              "properties": {
+                "level": {"$ref": "#/$defs/pacing_level"},
+                "overrides": {"$ref": "#/$defs/pacing_overrides"},
+                "policy": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {"type": "string", "maxLength": 128},
+                    "name": {"type": "string", "maxLength": 256},
+                    "revision": {"type": "integer", "minimum": 0}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

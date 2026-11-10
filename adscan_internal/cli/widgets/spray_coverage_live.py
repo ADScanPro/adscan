@@ -630,7 +630,7 @@ def render_pre2k_education_panel(domain: str, *, computer_count: int) -> Panel:
     _section(
         "Why it runs first, and why it is safe",
         "Computer accounts are NOT governed by the user account-lockout policy, "
-        "so this can never lock out a domain user. It is the cheapest, "
+        "so failed sign-ins against them do not count toward a domain user's lockout. It is the cheapest, "
         "lowest-risk foothold check available, so it leads the phase.",
     )
     _section(

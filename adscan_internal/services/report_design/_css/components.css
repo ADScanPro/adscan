@@ -305,3 +305,61 @@ table.adscan-table tr:last-child td { border-bottom: none; }
   white-space: nowrap;
 }
 
+
+/* ── Trend columns — one value per assessment, on a fixed 0 to 100 axis ─────
+   A column chart drawn by layout, never by coordinates. The renderer passes
+   each column its share of the axis as a unitless custom property
+   (style="--r:0.62") and CSS turns it into a height, so the geometry follows
+   the data and nothing is positioned by hand. Both series it draws (the AD
+   Exposure Score and a framework's conformant share) are percentages, so the
+   axis is fixed rather than scaled to the data: a fall from 62 to 51 reads as
+   the eleven points it is, not as a collapse.
+
+   The current assessment is the solid column; earlier ones are tinted. A
+   point the assessment did not record is an empty dashed slot labelled as
+   such, never a zero-height bar that would read as zero.
+
+   Scoped under .ds-doc: new grammar, so it cannot reach the paid template. */
+.ds-doc .ds-trend {
+  position: relative; display: flex; align-items: flex-end; gap: 3mm;
+  height: 36mm; padding: 0 1mm; margin-top: 4mm;
+  border-bottom: 1px solid var(--line-2);
+  break-inside: avoid; page-break-inside: avoid;
+}
+.ds-doc .ds-trend::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 50%;
+  border-top: 1px dashed var(--line);
+}
+.ds-doc .ds-trend-col {
+  position: relative; z-index: 1;
+  flex: 1 1 0; min-width: 0; max-width: 24mm; height: 100%;
+  display: flex; flex-direction: column; justify-content: flex-end; align-items: center;
+}
+.ds-doc .ds-trend-v {
+  font-family: var(--font-mono); font-size: 7pt; font-weight: 700;
+  color: var(--text-2); margin-bottom: 1.2mm; white-space: nowrap;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.ds-doc .ds-trend-bar {
+  width: 100%; min-height: 0.6mm;
+  height: calc(var(--r, 0) * (100% - 5mm));
+  background: var(--accent-soft, var(--bg-3));
+  border-radius: 1mm 1mm 0 0;
+}
+.ds-doc .ds-trend-col.is-current .ds-trend-bar { background: var(--accent); }
+.ds-doc .ds-trend-col.is-missing .ds-trend-v { color: var(--text-4); font-weight: 400; }
+.ds-doc .ds-trend-col.is-missing .ds-trend-bar {
+  height: 4mm; background: transparent;
+  border: 1px dashed var(--line-2); border-bottom: none;
+}
+.ds-doc .ds-trend-axis { display: flex; gap: 3mm; padding: 1.5mm 1mm 0; }
+.ds-doc .ds-trend-axis span {
+  flex: 1 1 0; min-width: 0; max-width: 24mm; text-align: center;
+  font-size: 6.5pt; color: var(--text-4); letter-spacing: 0.08em; text-transform: uppercase;
+}
+
+/* ── Change tag — the movement of a lower-is-better (or higher-is-better)
+   figure, coloured by what the movement means, not by its sign. ──────────── */
+.ds-doc .ds-delta { font-size: 7.5pt; font-weight: 700; white-space: nowrap; color: var(--text-3); }
+.ds-doc .ds-delta.good { color: var(--green); }
+.ds-doc .ds-delta.bad  { color: var(--critical); }

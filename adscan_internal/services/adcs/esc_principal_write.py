@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from adscan_internal import telemetry
-from adscan_internal.rich_output import print_error, print_info, print_success
+from adscan_internal.rich_output import (
+    print_error,
+    print_info,
+    print_success,
+)
 from adscan_internal.services.adcs.cert_auth import (
     CertAuthConfig,
     authenticate_with_cert_native,
@@ -18,9 +21,8 @@ from adscan_internal.services.adcs.cert_request import (
     request_certificate_native,
 )
 from adscan_internal.services.adcs.esc_cleanup import (
+    esc_revert_ldap_change,
     esc_rollback_scope,
-    mark_revert_failed,
-    mark_reverted,
     register_ldap_change,
 )
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
@@ -28,10 +30,18 @@ from adscan_internal.services.ldap_transport_service import (
     ADscanLDAPConfig,
     ADscanLDAPConnection,
 )
+from adscan_internal.services.cleanup_verification import (
+    VERIFY_ACCOUNT_DELETED,
+    VERIFY_ALTSECID,
+    VERIFY_ATTRIBUTE,
+    VERIFY_UPN,
+    verify_machine_account_deleted,
+)
 from adscan_internal.services.machine_account_provisioning_service import (
-    assess_machine_account_capacity,
-    record_machine_account_creation_result,
-    register_managed_machine_account,
+    POLICY_RETAIN_ONE,
+    POLICY_REVERT_EACH_RUN,
+    acquire_controlled_machine_account,
+    forget_machine_account,
 )
 from adscan_core.rich_output import print_exception
 
@@ -48,155 +58,38 @@ def _ldap_cfg(config: EscConfig) -> ADscanLDAPConfig:
     )
 
 
-@dataclass(frozen=True)
-class _DeleteCredential:
-    """One credential the ESC14 cleanup may authenticate its delete as.
+def _revert_ldap_change(
+    config: EscConfig,
+    *,
+    change_id: Optional[str],
+    purpose: str,
+    revert,
+    verify,
+    verification_method: str,
+    manual_instructions: str,
+    object_dn: str,
+    description: str,
+    elevated_ccache: Optional[str] = None,
+) -> bool:
+    """Undo one LDAP write of an ESC step through the shared revert precedence.
 
-    ``label`` is operator-facing (it names WHICH principal the attempt ran as, so
-    a cascade that falls through is readable in the log); ``config`` is the LDAP
-    transport config to open for that attempt.
+    Thin delegate to :func:`esc_cleanup.esc_revert_ldap_change` that binds this
+    module's LDAP transport (resolved at call time, so it stays patchable).
+    Synchronous: call through ``asyncio.to_thread``.
     """
-
-    label: str
-    config: ADscanLDAPConfig
-
-
-def _privileged_delete_candidate(config: EscConfig) -> Optional[_DeleteCredential]:
-    """A stored credential whose principal is VERIFIED privileged, or ``None``.
-
-    Resolved through the credential-store SSOT
-    :func:`pick_credential_for_local_admin`, which derives the privilege from the
-    canonical AD data ADscan already collected (the account's RID, the
-    identity-risk snapshot's Tier-0 reasons) rather than from a group-NAME match,
-    and returns only the Domain Admins / Enterprise Admins / RID-500 tiers with
-    ``target_host=None``. That is exactly the bar for deleting a computer object,
-    and resolving it costs ZERO authentications against the DC (it is a pure read
-    of the workspace graph and the in-memory store).
-
-    Never raises: an unreadable store or an uncollected graph degrades to ``None``
-    and the caller's cascade continues with its remaining candidates.
-    """
-    shell = getattr(config, "shell", None)
-    if shell is None:
-        return None
-    try:
-        from adscan_internal.services.credentials.privilege_role import (
-            CredentialKind,
-            pick_credential_for_local_admin,
-        )
-
-        picked = pick_credential_for_local_admin(shell, domain=config.domain)
-    except Exception as exc:  # noqa: BLE001 — best-effort candidate resolution
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return None
-    if not picked:
-        return None
-    username, secret, kind = picked
-    if not username or not secret:
-        return None
-    # A stored secret may still carry the invisible sensitivity markers used to
-    # keep it out of telemetry; they must never reach the wire.
-    from adscan_core.sensitive import strip_sensitive_markers
-
-    secret = strip_sensitive_markers(secret)
-    username = strip_sensitive_markers(username)
-    if not username or not secret:
-        return None
-
-    common = {
-        "domain": config.domain,
-        "dc_ip": config.dc_ip,
-        "username": username,
-        "use_ldaps": True,
-        "kerberos_target_hostname": config.dc_fqdn or None,
-    }
-    if kind is CredentialKind.CCACHE_PATH:
-        cfg = ADscanLDAPConfig(use_kerberos=True, ccache_path=secret, **common)
-    elif kind in (CredentialKind.AES256_KEY, CredentialKind.AES128_KEY):
-        # AES-only domains: the key IS the Kerberos secret (RC4 may be blocked).
-        cfg = ADscanLDAPConfig(use_kerberos=True, aes_key=secret, **common)
-    else:
-        # Password or NT hash — the transport detects the hash form itself and
-        # pass-the-hashes rather than treating it as a plaintext password.
-        cfg = ADscanLDAPConfig(use_kerberos=False, password=secret, **common)
-    return _DeleteCredential(label=f"privileged account {username}", config=cfg)
-
-
-def _delete_ldap_candidates(
-    config: EscConfig, elevated_ccache: Optional[str]
-) -> list[_DeleteCredential]:
-    """Ordered credentials to try when DELETING an ESC14 machine account.
-
-    The MAQ creator (``config.username``) usually lacks Delete rights on the
-    computer account it created, so authenticating the delete as the creator fails
-    with ``insufficientAccessRights`` and the account is orphaned. The attack also
-    produces a PKINIT ccache for the compromised target, but that target is NOT
-    necessarily privileged: ESC14 variant A routinely impersonates an ordinary
-    Tier-2 account, and a cleanup that assumes a Domain Admin there orphans the
-    machine account exactly as the creator would. So neither credential is assumed
-    to work: this returns every credential the SESSION actually holds that could
-    plausibly delete the object, strongest evidence first.
-
-    Order, and why:
-
-    1. A stored credential whose principal is VERIFIED privileged
-       (:func:`_privileged_delete_candidate`). Preferred first because its
-       privilege is evidence-backed, and resolving it costs no authentication.
-    2. The compromised target's PKINIT ccache. Kept in the cascade because when
-       the target IS privileged this is the cheapest correct option (the ticket is
-       already minted, so no new secret reaches the wire), and because when no
-       collection has graded the principals it is the only elevated material in
-       hand.
-    3. The machine-account creator. Last, because it is the one we know usually
-       lacks the right; it stays so a session with no other credential behaves
-       exactly as before.
-
-    Worst case this costs THREE binds, each with a credential ADscan already holds
-    and has already authenticated with in this session (the creator just created
-    the account; the privileged credential was captured or validated; the ccache
-    was just minted). None is a guess, so no attempt can increment ``badPwdCount``
-    or move an account toward lockout. This is a bounded cleanup, not a sweep: the
-    credential set is never iterated.
-    """
-    candidates: list[_DeleteCredential] = []
-    seen: set[tuple[str, str]] = set()
-
-    def _add(candidate: Optional[_DeleteCredential]) -> None:
-        if candidate is None:
-            return
-        key = (
-            str(candidate.config.username or "").lower(),
-            str(candidate.config.ccache_path or ""),
-        )
-        if key in seen:
-            return
-        seen.add(key)
-        candidates.append(candidate)
-
-    _add(_privileged_delete_candidate(config))
-    if elevated_ccache:
-        _add(
-            _DeleteCredential(
-                label=f"compromised target {config.target_account}",
-                config=ADscanLDAPConfig(
-                    domain=config.domain,
-                    dc_ip=config.dc_ip,
-                    username=config.target_account,
-                    use_ldaps=True,
-                    use_kerberos=True,
-                    ccache_path=elevated_ccache,
-                    kerberos_target_hostname=config.dc_fqdn or None,
-                ),
-            )
-        )
-    _add(
-        _DeleteCredential(
-            label=f"machine account creator {config.username}",
-            config=_ldap_cfg(config),
-        )
+    return esc_revert_ldap_change(
+        config,
+        change_id=change_id,
+        purpose=purpose,
+        revert=revert,
+        verify=verify,
+        verification_method=verification_method,
+        manual_instructions=manual_instructions,
+        object_dn=object_dn,
+        description=description,
+        elevated_ccache=elevated_ccache,
+        connect=lambda ldap_cfg: ADscanLDAPConnection(ldap_cfg),
     )
-    return candidates
 
 
 def _manual_machine_account_instructions(
@@ -224,61 +117,54 @@ async def _delete_machine_account_with_cascade(
     change_id: Optional[str],
     elevated_ccache: Optional[str] = None,
 ) -> bool:
-    """Delete an ESC14-created machine account, trying each held credential once.
+    """Delete an ESC14-created machine account through the shared revert precedence.
 
-    Returns True once the object is gone. When NO credential can delete it the
-    ledger entry stays ``manual_required`` (never "reverted") and carries the
-    exact object plus the native command a privileged administrator runs. That
-    disclosure is the legally-critical floor: an unreverted change that is
-    disclosed is correct, one quietly dropped is not.
+    The client cleanup account, a verified privileged credential, the
+    compromised target's ticket when held, then the creator (which usually
+    lacks Delete on the object it created). Each principal once, each attempt
+    recorded, and only a re-read that no longer finds the account confirms it.
+    Returns True once the object is gone. When nothing can delete it the entry
+    is ``manual_required`` with the exact object and the native command; that
+    disclosure is the legally-critical floor.
     """
-    last_error: Optional[str] = None
-    for candidate in _delete_ldap_candidates(config, elevated_ccache):
-
-        def _do_delete(delete_cfg: ADscanLDAPConfig = candidate.config) -> bool:
-            with ADscanLDAPConnection(delete_cfg) as conn:
-                return conn.delete(computer_dn)
-
-        try:
-            ok = await asyncio.to_thread(_do_delete)
-        except Exception as exc:  # noqa: BLE001 — try the next credential
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            last_error = str(exc)
-            print_info(
-                f"ESC14: delete as {candidate.label} failed ({exc}); "
-                "trying the next available credential..."
-            )
-            continue
-        if ok:
-            mark_reverted(config.shell, change_id)
-            print_success(
-                f"ESC14: computer {computer_name} deleted as {candidate.label}."
-            )
-            return True
-        last_error = "LDAP delete returned False"
-        print_info(
-            f"ESC14: delete as {candidate.label} did not remove the object; "
-            "trying the next available credential..."
-        )
-
-    mark_revert_failed(
-        config.shell,
-        change_id,
-        error=(
-            last_error
-            or "No available credential held Delete rights on the computer object."
+    confirmed = await asyncio.to_thread(
+        _revert_ldap_change,
+        config,
+        change_id=change_id,
+        purpose="computer_account_created",
+        revert=lambda conn: bool(conn.delete(computer_dn)),
+        verify=lambda conn: verify_machine_account_deleted(
+            conn, sam_account_name=computer_name
         ),
-        instructions=_manual_machine_account_instructions(
-            computer_name, computer_dn
-        ),
+        verification_method=VERIFY_ACCOUNT_DELETED,
+        manual_instructions=_manual_machine_account_instructions(computer_name, computer_dn),
+        object_dn=computer_dn,
+        description="Computer account delete",
+        elevated_ccache=elevated_ccache,
     )
+    if confirmed:
+        # The object is gone: drop it (and its password) from the credential
+        # store and the managed registry so no later step reuses it.
+        _forget_deleted_machine_account(config, computer_name)
+        print_success(f"ESC14: computer {computer_name} deleted.")
+        return True
     print_error(
         f"ESC14: could not delete computer {computer_name} with any credential "
         "this session holds. Manual cleanup required (disclosed in the "
         "environment-change ledger)."
     )
     return False
+
+
+def _forget_deleted_machine_account(config: EscConfig, computer_name: str) -> None:
+    """Remove a deleted machine account from every place a later step reads it."""
+    try:
+        forget_machine_account(
+            config.shell, domain=config.domain, sam_account_name=computer_name
+        )
+    except Exception as exc:  # noqa: BLE001 - bookkeeping never fails the revert
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _output_dir(config: EscConfig) -> Path:
@@ -360,31 +246,95 @@ def _add_shadow_creds(config: EscConfig):
     )
 
 
-def _remove_shadow_creds(config: EscConfig) -> None:
-    from adscan_internal.services.adcs.shadow_credentials import (
-        remove_shadow_credentials_native,
+def _remove_shadow_creds(
+    config: EscConfig, *, change_id: Optional[str], key_credential_value: str
+) -> bool:
+    """Remove ONLY the key credential ESC9 added, through the shared revert.
+
+    Same executor as the exit cleanup and the final retry pass (the shared
+    revert precedence, each attempt recorded, a confirming re-read). Sibling
+    values on ``msDS-KeyCredentialLink`` (Windows Hello for Business keys, for
+    instance) are never touched. Synchronous; returns True when confirmed.
+    """
+    from adscan_internal.services.acl_change_cleanup_service import (  # noqa: PLC0415
+        revert_acl_change_now,
     )
 
-    try:
-        remove_shadow_credentials_native(
-            dc_ip=config.dc_ip,
-            domain=config.auth_domain,
-            username=config.username,
-            password=config.effective_secret or "",
-            target_account=config.target_account,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-
-
-async def _add_computer(ldap_cfg: ADscanLDAPConfig):
-    """Deferred wrapper around add_computer_native to allow test patching."""
-    from adscan_internal.services.exploitation.delegation_native import (
-        add_computer_native,
+    return revert_acl_change_now(
+        config.shell,
+        action={
+            "kind": "shadow_credentials_added",
+            "domain": config.auth_domain or config.domain,
+            "target_domain": config.domain,
+            "target": config.target_account,
+            "exec_username": config.username,
+            "exec_password": config.effective_secret or "",
+            "added_key_credential_value": key_credential_value,
+            "_ledger_change_id": change_id,
+        },
     )
 
-    return await add_computer_native(ldap_config=ldap_cfg)
+
+def _read_attribute_values(
+    conn: ADscanLDAPConnection, account_dn: str, attribute: str
+) -> list[str]:
+    """Read every value of a multi-valued string attribute of ``account_dn``."""
+    conn.search(
+        search_base=account_dn,
+        search_filter="(objectClass=*)",
+        attributes=[attribute],
+        search_scope="BASE",
+    )
+    if not conn.entries:
+        return []
+    raw = conn.entries[0].entry_raw_attributes.get(attribute) or []
+    return [v.decode() if isinstance(v, bytes) else str(v) for v in raw]
+
+
+def _same_value(current: Optional[str], expected: Optional[str]) -> bool:
+    """Directory string equality (case-insensitive; absent equals empty)."""
+    return str(current or "").strip().lower() == str(expected or "").strip().lower()
+
+
+def _acquire_machine_account(
+    config: EscConfig, ldap_cfg: ADscanLDAPConfig, *, purpose: str, method: str
+):
+    """Get the step's computer account through the provisioning SSOT.
+
+    Synchronous (it drives its own event loop): call through
+    ``asyncio.to_thread``. ``acquire_controlled_machine_account`` re-reads the
+    actor's capacity, reuses the retained account under ``retain_one`` and
+    otherwise creates ``ADSCAN`` + 8 hex, recording the ledger entry and the
+    managed registry. Returns the lease, or ``None`` (reason already printed).
+    """
+    return acquire_controlled_machine_account(
+        config.shell,
+        domain=config.domain,
+        actor_ldap_config=ldap_cfg,
+        actor_username=str(config.username or ""),
+        purpose=purpose,
+        method=method,
+        step_scoped=True,
+        ledger_kind="computer_account_created",
+        respect_capacity=True,
+    )
+
+
+def _lease_is_step_scoped(lease) -> bool:
+    """True when the step created the account and must delete it at its end.
+
+    The retained account (reused, or created now under ``retain_one``) is kept
+    for later runs and disclosed as such; deleting it would defeat the policy.
+    """
+    return bool(getattr(lease, "created", False)) and (
+        getattr(lease, "policy", POLICY_REVERT_EACH_RUN) != POLICY_RETAIN_ONE
+    )
+
+
+_NO_MACHINE_ACCOUNT_ERROR = (
+    "No computer account available for the step (MachineAccountQuota exhausted, "
+    "or the domain controller refused the creation)."
+)
 
 
 async def run_esc9(config: EscConfig) -> EscResult:
@@ -394,7 +344,59 @@ async def run_esc9(config: EscConfig) -> EscResult:
 
     # Step 1: Add shadow credentials to get the target's NT hash
     shadow = await asyncio.to_thread(_add_shadow_creds, config)
+    added_key = getattr(shadow, "added_key_credential_value", None)
+    if not isinstance(added_key, str) or not added_key:
+        added_key = None
+
+    # Disclose the write WHENEVER the key credential landed, independent of
+    # success: a write followed by a PKINIT failure leaves it on the account.
+    sc_change_id = None
+    if added_key:
+        sc_change_id = register_ldap_change(
+            config.shell,
+            kind="shadow_credentials_added",
+            domain=config.domain,
+            target=config.target_account,
+            detail={
+                "target": config.target_account,
+                "target_object": config.target_account,
+                "target_user": config.target_account,
+                "target_domain": config.domain,
+                "exec_user": config.username,
+                "exec_username": config.username,
+                "executor_username": config.username,
+                "executor_auth_domain": config.auth_domain or config.domain,
+                "added_key_credential_value": added_key,
+            },
+            method="ADCSESC9 — shadow credentials",
+        )
+
+    shadow_revert_ran = False
+
+    async def _rm_shadow() -> None:
+        nonlocal shadow_revert_ran
+        if shadow_revert_ran or not added_key:
+            return
+        shadow_revert_ran = True
+        print_info(
+            f"ESC9: removing the shadow credential added to {config.target_account}..."
+        )
+        if await asyncio.to_thread(
+            _remove_shadow_creds,
+            config,
+            change_id=sc_change_id,
+            key_credential_value=added_key,
+        ):
+            print_success("ESC9: shadow credential removed.")
+        else:
+            print_error(
+                "ESC9: the shadow credential could not be removed with any credential "
+                "this session holds. Manual cleanup required (disclosed in the "
+                "environment-change ledger)."
+            )
+
     if not getattr(shadow, "success", False):
+        await _rm_shadow()
         inner = getattr(shadow, "error", None) or "operation failed"
         return EscResult(
             success=False,
@@ -402,46 +404,12 @@ async def run_esc9(config: EscConfig) -> EscResult:
             error=f"shadow credentials failed: {inner}",
         )
 
-    sc_change_id = register_ldap_change(
-        config.shell,
-        kind="shadow_credentials_added",
-        domain=config.domain,
-        target=config.target_account,
-        detail={"target": config.target_account, "exec_user": config.username},
-        method="ADCSESC9 — shadow credentials",
-    )
-
     nt_hash = getattr(shadow, "nt_hash", None)
 
     upn_restored = False
-    shadow_removed = False
+    upn_revert_ran = False
 
     async with esc_rollback_scope() as rb:
-
-        async def _rm_shadow() -> None:
-            nonlocal shadow_removed
-            if shadow_removed:
-                return
-            print_info(
-                f"ESC9: removing shadow credentials from {config.target_account}..."
-            )
-            try:
-                await asyncio.to_thread(_remove_shadow_creds, config)
-                shadow_removed = True
-                mark_reverted(config.shell, sc_change_id)
-                print_success("ESC9: shadow credentials removed.")
-            except Exception as exc:
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                mark_revert_failed(
-                    config.shell,
-                    sc_change_id,
-                    error=str(exc),
-                    instructions=(
-                        f"Manually clear msDS-KeyCredentialLink on {config.target_account_dn}"
-                    ),
-                )
-                print_error(f"ESC9: failed to remove shadow creds: {exc}")
 
         rb.add(_rm_shadow)
 
@@ -468,40 +436,44 @@ async def run_esc9(config: EscConfig) -> EscResult:
         )
 
         async def _restore_upn() -> None:
-            nonlocal upn_restored
-            if upn_restored:
+            nonlocal upn_restored, upn_revert_ran
+            if upn_revert_ran:
                 return
+            upn_revert_ran = True
             _upn_display = repr(original_upn) if original_upn else "(none)"
             print_info(
                 f"ESC9: restoring UPN of {config.target_account} -> {_upn_display}..."
             )
+            account_dn = config.target_account_dn
 
-            def _do_restore() -> bool:
-                with ADscanLDAPConnection(ldap_cfg) as c2:
-                    if original_upn:
-                        return _set_upn(c2, config.target_account_dn, original_upn)
-                    # No original UPN — delete the attribute
-                    return bool(
-                        c2.modify(
-                            config.target_account_dn,
-                            {"userPrincipalName": [("delete", [])]},
-                        )
-                    )
+            def _revert(conn: ADscanLDAPConnection) -> bool:
+                if original_upn:
+                    return _set_upn(conn, account_dn, original_upn)
+                # No original UPN: delete the attribute.
+                return bool(
+                    conn.modify(account_dn, {"userPrincipalName": [("delete", [])]})
+                )
 
-            ok = await asyncio.to_thread(_do_restore)
+            ok = await asyncio.to_thread(
+                _revert_ldap_change,
+                config,
+                change_id=upn_change_id,
+                purpose="upn_changed",
+                revert=_revert,
+                verify=lambda conn: _same_value(_read_upn(conn, account_dn), original_upn),
+                verification_method=VERIFY_UPN,
+                manual_instructions=(
+                    f"Manually set userPrincipalName={original_upn} on {account_dn}"
+                    if original_upn
+                    else f"Manually clear userPrincipalName on {account_dn}"
+                ),
+                object_dn=account_dn,
+                description="UPN restore",
+            )
             if ok:
                 upn_restored = True
-                mark_reverted(config.shell, upn_change_id)
                 print_success("ESC9: UPN restored.")
             else:
-                mark_revert_failed(
-                    config.shell,
-                    upn_change_id,
-                    error="LDAP modify failed",
-                    instructions=(
-                        f"Manually set userPrincipalName={original_upn} on {config.target_account_dn}"
-                    ),
-                )
                 print_error("ESC9: UPN restore failed (manual cleanup required).")
 
         rb.add(_restore_upn)
@@ -687,83 +659,37 @@ async def _run_esc14_write_access(config: EscConfig) -> EscResult:
     out = _output_dir(config)
     ldap_cfg = _ldap_cfg(config)
 
-    print_info("ESC14: creating machine account...")
-    # assess_machine_account_capacity opens a SYNC ADscanLDAPConnection, which drives
-    # its own new_event_loop().run_until_complete(). This executor already runs inside
-    # an asyncio loop (run_esc_sync -> run_async_sync -> asyncio.run), so calling it
-    # inline raises a nested-loop RuntimeError. Offload it to a worker thread with no
-    # running loop of its own (same pattern as the delete/clear/write below).
-    capacity = await asyncio.to_thread(
-        lambda: assess_machine_account_capacity(
-            ldap_config=ldap_cfg,
-            actor_username=config.username,
-            shell=config.shell,
-        )
-    )
-    if capacity.can_create is False:
-        return EscResult(
-            success=False,
-            esc=14,
-            error=capacity.blocked_reason
-            or "MachineAccountQuota does not allow creating a machine account",
-        )
-    computer_result = await _add_computer(ldap_cfg)
-    if not computer_result.success:
-        record_machine_account_creation_result(
-            config.shell,
-            domain=config.domain,
-            actor_username=config.username,
-            success=False,
-            quota_exceeded=bool(getattr(computer_result, "quota_exceeded", False)),
-            reason=computer_result.error or "MachineAccountQuota exceeded for actor.",
-        )
-        return EscResult(
-            success=False,
-            esc=14,
-            error=computer_result.error or "addcomputer failed",
-        )
-
-    computer_name: str = computer_result.computer_name or ""
-    computer_password: str = computer_result.password or ""
-    computer_dn: str = computer_result.dn or ""
-    record_machine_account_creation_result(
-        config.shell,
-        domain=config.domain,
-        actor_username=config.username,
-        success=True,
-    )
-    register_managed_machine_account(
-        config.shell,
-        domain=config.domain,
-        sam_account_name=computer_name,
-        password=computer_password,
-        dn=computer_dn,
-        created_by=config.username,
-        source="adcs_esc14",
-    )
-
-    comp_change_id = register_ldap_change(
-        config.shell,
-        kind="computer_account_created",
-        domain=config.domain,
-        target=computer_name,
-        detail={"computer_name": computer_name, "dn": computer_dn},
+    print_info("ESC14: obtaining a computer account...")
+    lease = await asyncio.to_thread(
+        _acquire_machine_account,
+        config,
+        ldap_cfg,
+        purpose="adcs_esc14",
         method="ADCSESC14 — computer account creation",
     )
+    if lease is None:
+        return EscResult(success=False, esc=14, error=_NO_MACHINE_ACCOUNT_ERROR)
+
+    computer_name: str = lease.sam_account_name
+    computer_password: str = lease.password
+    computer_dn: str = lease.dn or ""
+    comp_change_id = lease.ledger_change_id
+    delete_computer_at_end = _lease_is_step_scoped(lease)
 
     computer_deleted = False
     altsec_cleared = False
+    altsec_revert_ran = False
     # Set after PKINIT succeeds: the impersonated target's ccache. It is ONE of the
     # credentials the delete cascade may authenticate as, not a privileged one by
     # assumption (variant A routinely impersonates an ordinary Tier-2 account) —
-    # see :func:`_delete_ldap_candidates`.
+    # see :func:`_delete_machine_account_with_cascade`.
     elevated_delete_ccache: Optional[str] = None
 
     async with esc_rollback_scope() as rb:
 
         async def _delete_computer() -> None:
             nonlocal computer_deleted
-            if computer_deleted:
+            if computer_deleted or not delete_computer_at_end:
                 return
             print_info(f"ESC14: deleting computer account {computer_name}...")
             if await _delete_machine_account_with_cascade(
@@ -832,35 +758,47 @@ async def _run_esc14_write_access(config: EscConfig) -> EscResult:
         )
 
         async def _clear_altsec() -> None:
-            nonlocal altsec_cleared
-            if altsec_cleared:
+            nonlocal altsec_cleared, altsec_revert_ran
+            if altsec_revert_ran:
                 return
+            altsec_revert_ran = True
             print_info(
                 f"ESC14: clearing altSecurityIdentities on {config.target_account}..."
             )
+            account_dn = config.target_account_dn
 
-            def _do_clear() -> bool:
-                with ADscanLDAPConnection(ldap_cfg) as conn:
-                    return conn.modify(
-                        config.target_account_dn,
+            def _revert(conn: ADscanLDAPConnection) -> bool:
+                return bool(
+                    conn.modify(
+                        account_dn,
                         {"altSecurityIdentities": [("delete", [binding_value])]},
                     )
+                )
 
-            ok = await asyncio.to_thread(_do_clear)
+            def _verify(conn: ADscanLDAPConnection) -> bool:
+                values = _read_attribute_values(conn, account_dn, "altSecurityIdentities")
+                return not any(_same_value(v, binding_value) for v in values)
+
+            ok = await asyncio.to_thread(
+                _revert_ldap_change,
+                config,
+                change_id=altsec_change_id,
+                purpose="altsecurityidentities_written",
+                revert=_revert,
+                verify=_verify,
+                verification_method=VERIFY_ALTSECID,
+                manual_instructions=(
+                    f"Manually remove {binding_value} from altSecurityIdentities "
+                    f"on {account_dn}"
+                ),
+                object_dn=account_dn,
+                description="altSecurityIdentities clear",
+                elevated_ccache=elevated_delete_ccache,
+            )
             if ok:
                 altsec_cleared = True
-                mark_reverted(config.shell, altsec_change_id)
                 print_success("ESC14: altSecurityIdentities cleared.")
             else:
-                mark_revert_failed(
-                    config.shell,
-                    altsec_change_id,
-                    error="LDAP modify failed",
-                    instructions=(
-                        f"Manually remove {binding_value} from altSecurityIdentities "
-                        f"on {config.target_account_dn}"
-                    ),
-                )
                 print_error("ESC14: failed to clear altSecurityIdentities.")
 
         rb.add(_clear_altsec)
@@ -946,66 +884,21 @@ async def run_esc14_weak_mapping(config: EscConfig) -> EscResult:
     out = _output_dir(config)
     ldap_cfg = _ldap_cfg(config)
 
-    print_info(
-        f"ESC14 variant {variant}: creating controlled victim machine account..."
-    )
-    # Offload the sync capacity probe off the running loop (see the variant-A note):
-    # it opens a sync ADscanLDAPConnection that drives its own event loop.
-    capacity = await asyncio.to_thread(
-        lambda: assess_machine_account_capacity(
-            ldap_config=ldap_cfg,
-            actor_username=config.username,
-            shell=config.shell,
-        )
-    )
-    if capacity.can_create is False:
-        return EscResult(
-            success=False,
-            esc=14,
-            error=capacity.blocked_reason
-            or "MachineAccountQuota does not allow creating a victim machine account",
-        )
-    computer_result = await _add_computer(ldap_cfg)
-    if not computer_result.success:
-        record_machine_account_creation_result(
-            config.shell,
-            domain=config.domain,
-            actor_username=config.username,
-            success=False,
-            quota_exceeded=bool(getattr(computer_result, "quota_exceeded", False)),
-            reason=computer_result.error or "MachineAccountQuota exceeded for actor.",
-        )
-        return EscResult(
-            success=False, esc=14, error=computer_result.error or "addcomputer failed"
-        )
-
-    victim_name: str = computer_result.computer_name or ""
-    victim_password: str = computer_result.password or ""
-    victim_dn: str = computer_result.dn or ""
-    record_machine_account_creation_result(
-        config.shell,
-        domain=config.domain,
-        actor_username=config.username,
-        success=True,
-    )
-    register_managed_machine_account(
-        config.shell,
-        domain=config.domain,
-        sam_account_name=victim_name,
-        password=victim_password,
-        dn=victim_dn,
-        created_by=config.username,
-        source="adcs_esc14",
-    )
-
-    comp_change_id = register_ldap_change(
-        config.shell,
-        kind="computer_account_created",
-        domain=config.domain,
-        target=victim_name,
-        detail={"computer_name": victim_name, "dn": victim_dn},
+    print_info(f"ESC14 variant {variant}: obtaining a controlled victim computer account...")
+    lease = await asyncio.to_thread(
+        _acquire_machine_account,
+        config,
+        ldap_cfg,
+        purpose="adcs_esc14_victim",
         method=f"ADCSESC14 variant {variant} — victim machine account creation",
     )
+    if lease is None:
+        return EscResult(success=False, esc=14, error=_NO_MACHINE_ACCOUNT_ERROR)
+
+    victim_name: str = lease.sam_account_name
+    victim_password: str = lease.password
+    victim_dn: str = lease.dn or ""
+    comp_change_id = lease.ledger_change_id
 
     try:
         return await _run_esc14_weak_mapping_scoped(
@@ -1019,6 +912,7 @@ async def run_esc14_weak_mapping(config: EscConfig) -> EscResult:
             victim_password=victim_password,
             victim_dn=victim_dn,
             comp_change_id=comp_change_id,
+            delete_victim_at_end=_lease_is_step_scoped(lease),
         )
     except Exception as exc:  # noqa: BLE001 — rollbacks already ran in the scope
         telemetry.capture_exception(exc)
@@ -1043,6 +937,7 @@ async def _run_esc14_weak_mapping_scoped(
     victim_password: str,
     victim_dn: str,
     comp_change_id: Optional[str],
+    delete_victim_at_end: bool = True,
 ) -> EscResult:
     """The B/C/D rollback-scoped body (see :func:`run_esc14_weak_mapping`).
 
@@ -1053,16 +948,17 @@ async def _run_esc14_weak_mapping_scoped(
     """
     computer_deleted = False
     attribute_restored = False
+    attribute_revert_ran = False
     # Set after PKINIT succeeds: the impersonated target's ccache, one of the
     # credentials the delete cascade may authenticate as (see
-    # :func:`_delete_ldap_candidates`).
+    # :func:`_delete_machine_account_with_cascade`).
     elevated_delete_ccache: Optional[str] = None
 
     async with esc_rollback_scope() as rb:
 
         async def _delete_victim() -> None:
             nonlocal computer_deleted
-            if computer_deleted:
+            if computer_deleted or not delete_victim_at_end:
                 return
             print_info(f"ESC14: deleting victim machine account {victim_name}...")
             if await _delete_machine_account_with_cascade(
@@ -1100,35 +996,39 @@ async def _run_esc14_weak_mapping_scoped(
         )
 
         async def _restore_attr() -> None:
-            nonlocal attribute_restored
-            if attribute_restored:
+            nonlocal attribute_restored, attribute_revert_ran
+            if attribute_revert_ran:
                 return
+            attribute_revert_ran = True
             print_info(
                 f"ESC14: restoring {attribute} on victim {victim_name} to its "
                 "original value..."
             )
 
-            def _do_restore() -> bool:
-                with ADscanLDAPConnection(ldap_cfg) as conn:
-                    return _restore_attribute(
-                        conn, victim_dn, attribute, original_value
-                    )
-
-            ok = await asyncio.to_thread(_do_restore)
+            ok = await asyncio.to_thread(
+                _revert_ldap_change,
+                config,
+                change_id=attr_change_id,
+                purpose="victim_attribute_written",
+                revert=lambda conn: _restore_attribute(
+                    conn, victim_dn, attribute, original_value
+                ),
+                verify=lambda conn: _same_value(
+                    _read_attribute(conn, victim_dn, attribute), original_value
+                ),
+                verification_method=VERIFY_ATTRIBUTE,
+                manual_instructions=(
+                    f"Manually restore {attribute} on {victim_dn} to "
+                    f"{original_value!r} (or delete it)"
+                ),
+                object_dn=victim_dn,
+                description=f"Victim {attribute} restore",
+                elevated_ccache=elevated_delete_ccache,
+            )
             if ok:
                 attribute_restored = True
-                mark_reverted(config.shell, attr_change_id)
                 print_success(f"ESC14: victim {attribute} restored.")
             else:
-                mark_revert_failed(
-                    config.shell,
-                    attr_change_id,
-                    error="LDAP modify failed",
-                    instructions=(
-                        f"Manually restore {attribute} on {victim_dn} to "
-                        f"{original_value!r} (or delete it)"
-                    ),
-                )
                 print_error(f"ESC14: failed to restore victim {attribute}.")
 
         rb.add(_restore_attr)

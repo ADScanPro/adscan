@@ -51,7 +51,7 @@ requires-dist = [
 
 [[package]]
 name = "adscan"
-version = "13.2.0"
+version = "14.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },

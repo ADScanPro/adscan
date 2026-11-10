@@ -168,10 +168,105 @@ def resolve_collection_selection(
     if scan_config is None:
         scan_config = getattr(shell, "scan_config", None)
 
-    if not _scan_config_constrains_collection(scan_config):
-        return prompt_collection_selection(shell, target_domain)
+    # Scan policy (spec 2026-11-04 § 7.2 S5): this selector reads
+    # ``phases.steps`` directly instead of going through ``subphase_is_enabled``,
+    # so the policy verdict is applied here too. A policy that excludes a
+    # collector resolves the selection without prompting; whatever path builds
+    # the selection, the policy ANDs in last so an excluded collector never runs.
+    if _scan_policy_constrains_collection(shell):
+        return _apply_scan_policy_to_selection(
+            shell, _selection_from_config(shell, target_domain, scan_config)
+        )
 
-    disabled = set(scan_config.phases.steps.get(COLLECTION_PHASE_ID, ()))
+    if not _scan_config_constrains_collection(scan_config):
+        return _apply_scan_policy_to_selection(
+            shell, prompt_collection_selection(shell, target_domain)
+        )
+    return _apply_scan_policy_to_selection(
+        shell, _selection_from_config(shell, target_domain, scan_config)
+    )
+
+
+def _scan_policy_collector_allowed(shell: Any, subphase_id: str) -> bool:
+    """Policy verdict for one optional collector (True without a policy)."""
+    from adscan_core.scan_policy.gate import active_policy, subphase_allowed
+
+    if active_policy(shell) is None:
+        return True
+    return subphase_allowed(shell, COLLECTION_PHASE_ID, subphase_id)
+
+
+def _collector_check_ids(shell: Any, subphase_id: str) -> list[str]:
+    """The registry check bound to one optional collector (empty when unbound)."""
+    from adscan_core.scan_policy.registry import CheckRegistry, load_registry
+
+    reg = getattr(shell, "scan_policy_registry", None)
+    if not isinstance(reg, CheckRegistry):
+        reg = load_registry()
+    check = reg.check_for_subphase(COLLECTION_PHASE_ID, subphase_id)
+    return [check.check_id] if check is not None else []
+
+
+def _scan_policy_constrains_collection(shell: Any) -> bool:
+    """True when an active scan policy excludes at least one optional collector."""
+    return any(
+        not _scan_policy_collector_allowed(shell, sub_id)
+        for sub_id in sorted(OPTIONAL_COLLECTOR_IDS)
+    )
+
+
+def _apply_scan_policy_to_selection(
+    shell: Any, selection: CollectionSelection
+) -> CollectionSelection:
+    """AND the scan-policy verdict into a resolved selection (no-op without one)."""
+    collect_samr = selection.collect_samr and _scan_policy_collector_allowed(
+        shell, SAMR_SUBPHASE_ID
+    )
+    collect_shares = selection.collect_shares and _scan_policy_collector_allowed(
+        shell, SHARES_SUBPHASE_ID
+    )
+    collect_mssql = selection.collect_mssql and _scan_policy_collector_allowed(
+        shell, MSSQL_SUBPHASE_ID
+    )
+    if (collect_samr, collect_shares, collect_mssql) == (
+        selection.collect_samr,
+        selection.collect_shares,
+        selection.collect_mssql,
+    ):
+        return selection
+    # Explain each collector the policy removed (the selection would otherwise
+    # have run it, or offered it in the collection prompt).
+    from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+        notify_policy_skip,
+    )
+
+    for wanted, kept, sub_id in (
+        (selection.collect_samr, collect_samr, SAMR_SUBPHASE_ID),
+        (selection.collect_shares, collect_shares, SHARES_SUBPHASE_ID),
+        (selection.collect_mssql, collect_mssql, MSSQL_SUBPHASE_ID),
+    ):
+        if wanted and not kept:
+            notify_policy_skip(shell, _collector_check_ids(shell, sub_id))
+    print_info_debug(
+        "[collection-selector] scan policy applied "
+        f"samr={collect_samr} shares={collect_shares} mssql={collect_mssql}"
+    )
+    return CollectionSelection(
+        collect_samr=collect_samr,
+        collect_shares=collect_shares,
+        collect_mssql=collect_mssql,
+    )
+
+
+def _selection_from_config(
+    shell: Any, target_domain: str, scan_config: Any
+) -> CollectionSelection:
+    """Build the selection from ``phases.steps`` without prompting."""
+    steps = getattr(getattr(scan_config, "phases", None), "steps", None) or {}
+    try:
+        disabled = set(steps.get(COLLECTION_PHASE_ID, ()))
+    except Exception:  # noqa: BLE001 - a malformed config disables nothing here
+        disabled = set()
 
     # The LDAP base is mandatory — never honor a request to disable it.
     if LDAP_SUBPHASE_ID in disabled:

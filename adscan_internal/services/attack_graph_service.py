@@ -31,6 +31,15 @@ from adscan_internal.rich_output import (
     print_attack_paths_summary_debug,
 )
 from adscan_core.rich_output import strip_sensitive_markers
+from adscan_core.reporting.attack_path_execution_events import (
+    NOT_EXECUTED_REASON_KEY,
+    not_needed_reason,
+)
+from adscan_core.scan_policy.annotate import is_policy_exclusion_note
+from adscan_core.attack_graph_edge_identity import (
+    SHARE_ACCESS_RELATION_KEYS,
+    share_access_name_from_notes,
+)
 from adscan_internal.workspaces import (
     domain_subpath,
     read_json_file,
@@ -55,6 +64,10 @@ from adscan_core.reporting.attack_path_memory_gate import (
     _read_max_dfs_states,
 )
 from adscan_internal.services.attack_graph_findings import sync_attack_graph_findings
+from adscan_internal.services.graph_secret_store import redact_graph_for_persist
+from adscan_internal.services.attack_graph_findings import (
+    stamp_adcs_edge_display_contract,
+)
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
     is_dependency_only_tier_zero_group,
@@ -106,6 +119,7 @@ from adscan_internal.services.compromise_class import (
     PrivilegeTier,
     apply_path_based_classification,
     is_structural_hierarchy_source,
+    node_stamped_privilege_tier,
     privilege_tier_for_node,
     privilege_tier_for_principal,
 )
@@ -2563,6 +2577,188 @@ def _scope_owns_domain_coverage(scope: Any) -> bool:
     return normalized not in _COVERAGE_NON_OWNING_SCOPES
 
 
+#: Set while a NON-canonical domain-scope computation runs. The per-domain
+#: ``attack_path_coverage`` block describes ONE computation, the canonical domain
+#: listing the deliverable and the web render; a capped (``max_paths``),
+#: retargeted, shallower or filter-scoped domain computation answers a different
+#: question, and letting it write was "last writer wins" on the block. Measured
+#: case: the end-of-scan recap's headline lookup (``max_paths=1``) returned 0
+#: routes and recorded "complete" over the domain block seconds after the
+#: canonical listing had recorded 30. A ContextVar so every nested writer
+#: (complete, sampled, memory-abort recovery) inherits the decision without
+#: threading a flag through each one.
+_DOMAIN_COVERAGE_WRITE_SUPPRESSED: ContextVar[bool] = ContextVar(
+    "adscan_domain_coverage_write_suppressed", default=False
+)
+
+
+@contextmanager
+def _suppress_domain_coverage_write(active: bool) -> Iterator[None]:
+    """Suppress per-domain coverage writes for the duration, when ``active``.
+
+    A no-op when ``active`` is false, so a canonical computation nested inside a
+    non-canonical one never re-enables writes.
+    """
+    if not active:
+        yield
+        return
+    token = _DOMAIN_COVERAGE_WRITE_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _DOMAIN_COVERAGE_WRITE_SUPPRESSED.reset(token)
+
+
+def _is_canonical_domain_listing(
+    *,
+    max_depth: int,
+    max_paths: int | None,
+    target: str,
+    target_mode: str,
+    keep_longest: bool,
+    allow_owned_terminal_target: bool,
+    summary_filters: "AttackPathSummaryFilters | None" = None,
+    enumeration_cap: int | None = None,
+) -> bool:
+    """Return whether a domain-scope computation IS the canonical domain listing.
+
+    The canonical listing is the one the report, the scan-end snapshot and the
+    web all render (:func:`report_attack_paths.compute_report_attack_paths`):
+    ``target="highvalue"``, ``target_mode="object"``, ``keep_longest=True``, no
+    route cap, no owned-terminal widening, no post-compute filter, at the
+    canonical effective depth or deeper. Only that computation may write the
+    per-domain coverage block. Fails closed (``False``) on unreadable input, so
+    an odd caller can never relabel the block.
+    """
+    try:
+        from adscan_internal.services.report_attack_paths import (  # noqa: PLC0415
+            REPORT_ATTACK_PATH_MAX_DEPTH,
+        )
+
+        # A listing cap returns only the top N of the canonical set, so its result
+        # is not the set the block describes; an enumeration bound may have stopped
+        # discovery early. Neither may write.
+        if max_paths is not None or enumeration_cap is not None:
+            return False
+        if str(target or "").strip().lower() != "highvalue":
+            return False
+        if str(target_mode or "").strip().lower() != "object":
+            return False
+        if not keep_longest or allow_owned_terminal_target:
+            return False
+        if isinstance(summary_filters, AttackPathSummaryFilters) and (
+            summary_filters.target_labels or summary_filters.terminal_relations
+        ):
+            return False
+        canonical_depth = _effective_max_depth(
+            REPORT_ATTACK_PATH_MAX_DEPTH, scope="domain", target="highvalue"
+        )
+        effective_depth = _effective_max_depth(
+            int(max_depth), scope="domain", target="highvalue"
+        )
+        return effective_depth >= canonical_depth
+    except Exception:  # noqa: BLE001 — fail closed: no ownership on doubt.
+        return False
+
+
+def _apply_listing_cap(
+    records: list[dict[str, Any]], max_paths: int | None
+) -> list[dict[str, Any]]:
+    """Return the top ``max_paths`` routes of the FINAL, ordered listing.
+
+    SSOT for what a ``max_paths`` cap means on every public attack-path entry
+    point: the first N routes of the listing AFTER every post-processing rule
+    (minimize, collapse, filters, the origin fold) has run, in the listing's own
+    order. It is applied LAST and never reaches the DFS. Before this the value was
+    forwarded into discovery as a raw-candidate bound, so the one capped candidate
+    was routinely discarded by post-processing: the end-of-scan recap asked for
+    ``max_paths=1`` and got 0 routes on a domain whose listing had 30.
+
+    A resource bound on discovery is a different thing with its own parameter,
+    ``enumeration_cap``, which is declared when it truncates
+    (:func:`_note_enumeration_cap_reached`).
+    """
+    if max_paths is None or not isinstance(records, list):
+        return records
+    try:
+        cap = int(max_paths)
+    except (TypeError, ValueError):
+        return records
+    if cap <= 0:
+        return records
+    return records[:cap]
+
+
+def _note_enumeration_cap_reached(
+    truncated: bool, enumeration_cap: int | None, *, domain: str, scope: str
+) -> None:
+    """Declare on the terminal that discovery stopped at the enumeration bound.
+
+    ``enumeration_cap`` (the operator's ``ADSCAN_ATTACK_PATHS_COMPUTE_MAX``
+    memory workaround) stops the DFS after N raw candidate routes, so the listing
+    built from them is a bounded sample, never the complete set. A bounded
+    computation is a data gap: say so instead of letting the listing read as
+    exhaustive. Best-effort; never raises.
+    """
+    try:
+        if not truncated or enumeration_cap is None:
+            return
+        print_warning(
+            f"Attack-path discovery for {mark_sensitive(domain, 'domain')} ({scope} scope) "
+            f"stopped at the configured limit of {int(enumeration_cap)} candidate routes "
+            "(ADSCAN_ATTACK_PATHS_COMPUTE_MAX). Routes beyond that limit were not "
+            "evaluated, so this listing is incomplete."
+        )
+    except Exception:  # noqa: BLE001 - a declaration never breaks the compute
+        return
+
+
+def _carry_known_complete_route_counts(
+    shell: object, domain: str, block: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep the route counts of a COMPLETE record when a later seam has none.
+
+    ``get_attack_path_summaries`` records COMPLETE again right after the domain
+    compute it wraps has recorded COMPLETE with the real counts. The outer seam
+    sees only the filtered, origin-folded listing, so it has no count of its own,
+    and letting it overwrite would blank the counts the compute just measured:
+    the exact "complete over zero examined routes" block this repairs. So a
+    count-less COMPLETE record reuses the counts of a COMPLETE block already
+    persisted. Only COMPLETE onto COMPLETE: over a sampled or bounded block the
+    record still clears the latch and its counts stay unknown (``None``), never
+    a figure borrowed from a different kind of run. Best-effort: any failure
+    returns the block unchanged.
+    """
+    try:
+        from adscan_core.reporting.attack_path_memory_gate import (
+            COVERAGE_MODE_COMPLETE,
+            build_attack_path_coverage,
+        )
+        from adscan_core.reporting.technical_report import read_attack_path_coverage
+
+        if block.get("mode") != COVERAGE_MODE_COMPLETE:
+            return block
+        if block.get("reported_routes") is not None:
+            return block
+        prior = read_attack_path_coverage(shell, domain)
+        if not isinstance(prior, dict) or prior.get("mode") != COVERAGE_MODE_COMPLETE:
+            return block
+        prior_reported = prior.get("reported_routes")
+        if not isinstance(prior_reported, int):
+            return block
+        prior_examined = prior.get("examined_routes")
+        return build_attack_path_coverage(
+            examined_routes=(
+                prior_examined if isinstance(prior_examined, int) else None
+            ),
+            reported_routes=prior_reported,
+        )
+    except Exception as exc:  # noqa: BLE001 — carrying counts is best-effort.
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return block
+
+
 def _record_attack_path_coverage_for_compute(
     shell: object,
     domain: str,
@@ -2607,6 +2803,12 @@ def _record_attack_path_coverage_for_compute(
     """
     if not _scope_owns_domain_coverage(scope):
         return None
+    if _DOMAIN_COVERAGE_WRITE_SUPPRESSED.get():
+        print_info_debug(
+            "[attack_paths] coverage write skipped: non-canonical domain "
+            f"computation for {mark_sensitive(domain, 'domain')}"
+        )
+        return None
     try:
         from adscan_core.reporting.attack_path_memory_gate import (
             attack_path_coverage_view,
@@ -2615,7 +2817,7 @@ def _record_attack_path_coverage_for_compute(
             record_attack_path_coverage,
         )
 
-        block = coverage.to_block()
+        block = _carry_known_complete_route_counts(shell, domain, coverage.to_block())
         record_attack_path_coverage(shell, domain, coverage=block)
         if emit:
             _emit_attack_path_coverage_status_line(
@@ -2826,7 +3028,12 @@ def _handle_attack_path_sampled_coverage(
 
 
 def _handle_attack_path_complete_coverage(
-    shell: object, domain: str, *, scope: str | None = None
+    shell: object,
+    domain: str,
+    *,
+    scope: str | None = None,
+    examined_routes: int | None = None,
+    reported_routes: int | None = None,
 ) -> None:
     """Record the COMPLETE coverage declaration after a full-DFS run.
 
@@ -2837,13 +3044,24 @@ def _handle_attack_path_complete_coverage(
     never cleared — so every later render of that workspace inherited "sampled"
     coverage, including renders whose computation walked the whole graph. A
     completed computation now states so and overwrites the stale declaration.
-    Best-effort; never raises into the caller.
+
+    ``examined_routes`` / ``reported_routes`` are the size of the computation
+    (candidate routes walked, routes produced). The domain compute passes both;
+    a seam that does not know them passes nothing and the recorder keeps the
+    counts the compute already recorded (see
+    :func:`_carry_known_complete_route_counts`). Best-effort; never raises.
     """
     try:
         from adscan_core.reporting.attack_path_coverage import AttackPathCoverage
 
         _record_attack_path_coverage_for_compute(
-            shell, domain, AttackPathCoverage.complete(), scope=scope
+            shell,
+            domain,
+            AttackPathCoverage.complete(
+                examined_routes=examined_routes,
+                reported_routes=reported_routes,
+            ),
+            scope=scope,
         )
     except Exception as record_exc:  # noqa: BLE001
         telemetry.capture_exception(record_exc)
@@ -4530,6 +4748,57 @@ def _build_label_kind_and_sid_maps(
     return label_kind_map, label_sid_map
 
 
+#: Most privileged first, so two verdicts for one account resolve to the higher.
+_TIER_SEVERITY_ORDER: tuple[PrivilegeTier, ...] = (
+    PrivilegeTier.TIER0_DIRECT,
+    PrivilegeTier.TIER0_ESCALATION_CAPABLE,
+    PrivilegeTier.TIER1,
+    PrivilegeTier.TIER2,
+)
+
+
+def _more_privileged_tier(first: PrivilegeTier, second: PrivilegeTier) -> PrivilegeTier:
+    """Return whichever of two tiers grants more."""
+    try:
+        return min(first, second, key=_TIER_SEVERITY_ORDER.index)
+    except ValueError:
+        return first
+
+
+def stamped_account_tiers(graph: Mapping[str, Any] | None) -> dict[str, PrivilegeTier]:
+    """Return ``{samaccountname: stamped PrivilegeTier}`` for the graph's user nodes.
+
+    The stamped tier (``node_stamped_privilege_tier``) is the membership- AND
+    ACL-aware grade the graph carries: an account that is local administrator of
+    a server is Tier 1 there even though no group makes it so. The account
+    grader below reads it so an account's tier in a KPI, a finding and a graph
+    badge is one value. Nodes without a stamp are left out (the grader then
+    falls back to the membership resolver).
+    """
+    out: dict[str, PrivilegeTier] = {}
+    if not isinstance(graph, Mapping):
+        return out
+    nodes = graph.get("nodes")
+    if isinstance(nodes, Mapping):
+        iterable = nodes.values()
+    elif isinstance(nodes, list):
+        iterable = nodes
+    else:
+        return out
+    for node in iterable:
+        if not isinstance(node, Mapping) or str(node.get("kind") or "") != "User":
+            continue
+        stamped = node_stamped_privilege_tier(node)
+        if stamped is None:
+            continue
+        props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+        raw_name = props.get("samaccountname") or node.get("label") or node.get("name")
+        key = normalize_samaccountname(str(raw_name or ""))
+        if key:
+            out[key] = stamped
+    return out
+
+
 def _classify_accounts_by_privilege_tier(
     shell: object,
     domain: str,
@@ -4537,6 +4806,7 @@ def _classify_accounts_by_privilege_tier(
     *,
     label_sid_map: Mapping[str, str],
     membership_closure: Mapping[str, tuple[str, ...]],
+    stamped_tiers: Mapping[str, PrivilegeTier] | None = None,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """Grade a set of accounts by the Privilege Tier each one IS GRANTED.
 
@@ -4551,7 +4821,12 @@ def _classify_accounts_by_privilege_tier(
     Grading is the engine SSOT ``privilege_tier_for_principal`` over each
     account's TRANSITIVE group closure, with its own RID read from the SID, and
     the identity-risk Tier-0 flag as a floor for an account the snapshot did not
-    cover.
+    cover. When the graph STAMPED a tier on the account (``stamped_tiers``), the
+    more privileged of the stamp and the membership verdict wins: the stamp also
+    sees the rights an account holds on hosts (local administrator makes it
+    Tier 1), which a group closure cannot, and a finding badges the account with
+    that stamp. Counting it as an ordinary account in a KPI while the finding
+    beside it says Tier 1 is the disagreement this removes.
     """
     normalized_users = sorted(
         {
@@ -4574,6 +4849,9 @@ def _classify_accounts_by_privilege_tier(
         groups = membership_closure.get(canonical, ()) if canonical else ()
         sid = label_sid_map.get(canonical or "", "") if canonical else ""
         tier = privilege_tier_for_principal(list(groups), sid=sid or None)
+        stamped = (stamped_tiers or {}).get(normalize_samaccountname(str(samaccountname)))
+        if stamped is not None:
+            tier = _more_privileged_tier(tier, stamped)
         if not tier.is_tier0:
             risk = risk_flags.get(normalize_samaccountname(str(samaccountname)))
             if bool(getattr(risk, "is_tier0", False)):
@@ -4609,6 +4887,7 @@ def classify_accounts_by_privilege_tier(
         users,
         label_sid_map=label_sid_map,
         membership_closure=membership_closure,
+        stamped_tiers=stamped_account_tiers(graph),
     )
 
 
@@ -4702,6 +4981,8 @@ def _apply_affected_user_metadata(
         else {}
     )
 
+    _stamped_tiers = stamped_account_tiers(base_graph)
+
     def _tier_classification_for_affected(
         users: list[str],
     ) -> tuple[dict[str, int], dict[str, str]]:
@@ -4719,6 +5000,7 @@ def _apply_affected_user_metadata(
             users,
             label_sid_map=label_sid_map,
             membership_closure=_membership_closure,
+            stamped_tiers=_stamped_tiers,
         )
 
     fallback_domain_users_source = ""
@@ -5938,28 +6220,29 @@ def _annotate_writelogonscript_prerequisite_status(
     return changed
 
 
-def _infer_kind_from_label(label: str) -> str:
-    """Infer a principal kind from a normalized BloodHound-style label."""
-    label_clean = str(label or "").strip()
-    if not label_clean:
-        return "Unknown"
-    left = label_clean.split("@", 1)[0].strip()
-    if left.endswith("$"):
-        return "Computer"
-    if " " in left:
-        return "Group"
-    return "User"
-
-
 def _build_synthetic_principal_node_from_sid(
     *,
     domain: str,
     sid: str,
     label: str | None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
-    """Build a synthetic principal node when BH-backed resolution is unavailable."""
+    """Build a synthetic principal node when BH-backed resolution is unavailable.
+
+    The kind comes from evidence, never from the label's shape: ``kind`` when the
+    caller holds it (it resolved a group by RID, or read an objectClass), else
+    what the SID itself proves (well-known SIDs, fixed domain RIDs), else
+    ``Unknown``. Guessing from the name wrote a group named without a space
+    (``ServerAdmins``) into the graph as a User, and every resolver downstream
+    trusts the graph node kind first.
+    """
+    from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+        graph_kind_label,
+        principal_kind_from_sid,
+    )
+
     resolved_label = str(label or sid or "").strip()
-    kind = _infer_kind_from_label(resolved_label)
+    kind = graph_kind_label(kind or principal_kind_from_sid(sid))
     return {
         "name": resolved_label,
         "kind": [kind],
@@ -6752,6 +7035,58 @@ def _inventory_adcs_path(domain_dir: str, filename: str) -> str:
     return os.path.join(domain_dir, "inventory", filename)
 
 
+def load_adcs_attack_step_records(domain_dir: str) -> "list | None":
+    """Return the raw AD CS escalation rows of a domain, or ``None`` when absent.
+
+    The rows are the unsuppressed per-(principal x object) view (the judged graph
+    prunes Tier 0 sources and re-projects ESC4, so execution cannot read it).
+    Source of truth is the run's observation record (``observations.json``, the
+    ``adcs.escN`` families' ``instances``) whenever it still describes the
+    inventory on disk, i.e. both carry the same run id; otherwise the inventory
+    file itself (a later session re-collected, or no recorded run wrote it).
+    ``None`` means "no inventory yet", never "no escalation".
+    """
+    steps_path = _inventory_adcs_path(domain_dir, "adcs_attack_steps.json")
+    if not os.path.isfile(steps_path):
+        return None
+    try:
+        data = read_json_file(steps_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    observed = _adcs_rows_from_observation_record(domain_dir, data)
+    if observed is not None:
+        return observed
+    records = data.get("records")
+    return records if isinstance(records, list) else None
+
+
+def _adcs_rows_from_observation_record(domain_dir: str, inventory: dict) -> "list | None":
+    """The AD CS rows of the run that wrote ``inventory``, or ``None`` if unbound."""
+    from adscan_core.engagement.coverage_io import ARTIFACT_RUN_ID_KEY
+    from adscan_core.engagement.observations import load_observation_record
+
+    stamped = str(inventory.get(ARTIFACT_RUN_ID_KEY) or "")
+    if not stamped:
+        return None
+    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(domain_dir)))
+    record = load_observation_record(workspace_dir)
+    if record.run_id != stamped:
+        return None
+    domain_id = os.path.basename(os.path.abspath(domain_dir)).strip().lower()
+    rows: list = []
+    families = 0
+    for (check_id, obs_domain), obs in sorted(record.observations.items()):
+        if obs_domain != domain_id or not check_id.startswith("adcs.esc"):
+            continue
+        families += 1
+        rows.extend(dict(row) for row in obs.instances)
+    return rows if families else None
+
+
 def resolve_adcs_vulns_from_inventory(
     domain_dir: str,
     *,
@@ -6774,19 +7109,8 @@ def resolve_adcs_vulns_from_inventory(
     """
     from adscan_internal.services.adcs.types import ADCSVulnerability
 
-    steps_path = _inventory_adcs_path(domain_dir, "adcs_attack_steps.json")
-    if not os.path.isfile(steps_path):
-        return None
-
-    try:
-        data = read_json_file(steps_path)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return None
-
-    records = data.get("records")
-    if not isinstance(records, list):
+    records = load_adcs_attack_step_records(domain_dir)
+    if records is None:
         return None
 
     sam_lower = str(username or "").strip().lower()
@@ -6843,19 +7167,8 @@ def resolve_esc4_templates_from_inventory(
     Returns ``None`` when the inventory file does not exist so the caller can
     fall back to native inventory if available.
     """
-    steps_path = _inventory_adcs_path(domain_dir, "adcs_attack_steps.json")
-    if not os.path.isfile(steps_path):
-        return None
-
-    try:
-        data = read_json_file(steps_path)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return None
-
-    records = data.get("records")
-    if not isinstance(records, list):
+    records = load_adcs_attack_step_records(domain_dir)
+    if records is None:
         return None
 
     sam_lower = str(username or "").strip().lower()
@@ -7110,6 +7423,16 @@ def _edge_has_tier0_source(
         and to_id
         and str(from_id).strip() == str(to_id).strip()
         and grants_host_system_session(relation_lc)
+    ):
+        return False
+    # The same holds for every engine-synthesized follow-up self-loop
+    # (ScheduledTask / DumpLSASS on a HasSession user, DumpLSA on a host,
+    # XpCmdshell on a SQL host). It is the step that TAKES control of a Tier-0
+    # node, not an edge leaving one the path already controls, and it is written
+    # only to record that step's outcome. Refusing it lost the outcome: a
+    # ScheduledTask run as a Tier-0 session user read as never attempted.
+    if attack_graph_core.is_implicit_followup_self_loop(
+        str(from_id or ""), str(to_id or ""), relation_lc
     ):
         return False
     is_cross_forest_lateral = relation_lc in _CROSS_FOREST_LATERAL_RELATIONS
@@ -7629,6 +7952,7 @@ def _resolve_attack_step_group_node(
             domain=domain_clean,
             sid=well_known_sid,
             label=label_from_sid or canonical_label,
+            kind="group",  # this resolver looks up a GROUP by its well-known SID
         )
         _mark_synthetic_node_record(
             node, domain=domain_clean, source=f"{source}_well_known_sid_fallback"
@@ -7664,6 +7988,7 @@ def _resolve_attack_step_group_node(
                 domain=domain_clean,
                 sid=target_sid,
                 label=label_from_sid or canonical_label,
+                kind="group",  # this resolver looks up a GROUP by its domain RID
             )
             _mark_synthetic_node_record(
                 node, domain=domain_clean, source=f"{source}_domain_rid_fallback"
@@ -8626,11 +8951,33 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
     return data
 
 
+def _domain_data_for(shell: object, domain: str) -> dict[str, Any] | None:
+    """Return ``domains_data[<domain>]`` for *shell*, or ``None``.
+
+    Read-only accessor for load-time enrichments that want the domain's recorded
+    facts (today: pinning a DC-targeted privileged-group escalation to the
+    recorded primary controller). Never raises — a shell without domains_data is
+    a legitimate caller and the enrichment degrades.
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return None
+    entry = domains_data.get(domain)
+    return entry if isinstance(entry, dict) else None
+
+
 def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]:
     """Load or initialize the attack graph for a domain."""
     path = _graph_path(shell, domain)
     if os.path.exists(path):
         data = read_json_file(path)
+        # Migration on read: a graph written before secret references existed
+        # carries recovered values inline. Retain them in the secret sidecar and
+        # drop them from the in-memory graph, so no consumer sees them and the
+        # next save cannot write them back. The file itself is rewritten only by
+        # ``save_attack_graph``, which runs the same redaction.
+        if isinstance(data, dict):
+            redact_graph_for_persist(shell, domain, data)
         schema_version = str(data.get("schema_version") or "")
         # Phase 2 (schema 1.2) added a top-level `kind` field to every
         # edge. Schema 1.1 graphs upgrade transparently: backfill the
@@ -8732,7 +9079,9 @@ def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]
             # materialises the member's path to domain compromise. Runs AFTER
             # the label/domain normalization passes, because the edge target is
             # resolved from the domain NODE.
-            attack_graph_core._backfill_privileged_group_escalations(data)
+            attack_graph_core._backfill_privileged_group_escalations(
+                data, _domain_data_for(shell, domain)
+            )
             return data
         if schema_version in {"1.0"}:
             migrated = _migrate_attack_graph(data)
@@ -8756,7 +9105,9 @@ def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]
                 save_attack_graph(shell, domain, migrated)
                 _enrich_foreign_dc_nodes(shell, domain, migrated)
                 attack_graph_core._backfill_privilege_tier(migrated)
-                attack_graph_core._backfill_privileged_group_escalations(migrated)
+                attack_graph_core._backfill_privileged_group_escalations(
+                    migrated, _domain_data_for(shell, domain)
+                )
                 return migrated
     return {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
@@ -8926,6 +9277,7 @@ def _policy_blocked_edge_notes(
     """
     from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
         classify_destructive,
+        safety_abstention_notes,
     )
 
     nodes = graph.get("nodes")
@@ -8937,17 +9289,23 @@ def _policy_blocked_edge_notes(
         if isinstance(target_node, dict)
         else ""
     )
-    verdict = classify_destructive(relation, target_kind)
+    node_for_policy = target_node if isinstance(target_node, dict) else None
+    verdict = classify_destructive(relation, target_kind, target=node_for_policy)
     if verdict.hard_blocked:
-        return {
-            "blocked_kind": "dangerous_destructive",
-            # Both keys carry the SAME authored, client-facing sentence — never
-            # ``support.reason``, which is the catalog's engineering-register
-            # note and must not reach a deliverable.
-            "reason": verdict.client_safe_reason,
-            "client_safe_reason": verdict.client_safe_reason,
-            "exec_support": "policy_blocked",
-        }
+        # Both keys carry the SAME authored, client-facing sentence — never
+        # ``support.reason``, which is the catalog's engineering-register note
+        # and must not reach a deliverable. ``safety_abstention_notes`` also
+        # records the protected-account class of a refused password reset, so
+        # the report describes the disruption to THAT account.
+        notes = dict(
+            safety_abstention_notes(relation, target_kind, target=node_for_policy)
+            or {}
+        )
+        notes.setdefault("blocked_kind", "dangerous_destructive")
+        notes.setdefault("reason", verdict.client_safe_reason)
+        notes.setdefault("client_safe_reason", verdict.client_safe_reason)
+        notes["exec_support"] = "policy_blocked"
+        return notes
     # Opt-in-only (not hard-blocked). ``support.reason`` is the catalog's
     # engineering-register note, so the authored client-facing sentence from the
     # classifier is stamped alongside it — the deliverable renders
@@ -8992,16 +9350,26 @@ def _classify_edge_execution_support(
             compromise_semantics=base_support.compromise_semantics,
             compromise_effort=base_support.compromise_effort,
         )
-    # Safety hard-block: ForceChangePassword against ANY computer/machine account
-    # resets that host's password and is disruptive (not just Tier Zero DCs/RODCs).
-    # Routed through the destructive-action SSOT so the graph classification, the
-    # display, and the executor stay aligned.
+    # Safety hard-block: a password reset (ForceChangePassword, or
+    # AllExtendedRights on a user) against an account a running system depends
+    # on: ANY computer account (not just Tier Zero DCs/RODCs), krbtgt and the
+    # per-RODC krbtgt accounts, a managed service account, an Entra ID sync
+    # account. Routed through the destructive-action SSOT with the target NODE,
+    # so the classifier reads its SID / object class / account type, and the
+    # graph classification, the display and the executor stay aligned.
     from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
         classify_destructive,
     )
 
-    if normalize_execution_relation(relation) == "forcechangepassword":
-        destructive_verdict = classify_destructive(relation, target_kind)
+    if normalize_execution_relation(relation) in {
+        "forcechangepassword",
+        "allextendedrights",
+    }:
+        destructive_verdict = classify_destructive(
+            relation,
+            target_kind,
+            target=target_node if isinstance(target_node, dict) else None,
+        )
         if destructive_verdict.hard_blocked:
             return RelationSupport(
                 kind="policy_blocked",
@@ -9144,34 +9512,135 @@ def classify_graph_edges(graph: dict[str, Any]) -> int:
     return changed
 
 
-def _refresh_edge_verify_commands(graph: dict[str, Any]) -> int:
-    """Re-render the ``knowledge`` verify commands on technique edges.
+def _verification_env_from_graph(graph: dict[str, Any]) -> dict[str, str]:
+    """The graph-level coordinates a verify/exploit command is filled with.
+
+    Stamped once by :func:`save_attack_graph` (``dc_ip`` via ``resolve_dc_ip``,
+    ``dc_fqdn`` via ``resolve_dc_fqdn``, the NetBIOS name and the account the
+    scan authenticated as). None of them is a secret.
+    """
+    env: dict[str, str] = {}
+    for graph_key, details_key in (
+        ("dc_ip", "dc_ip"),
+        ("domain", "domain"),
+        ("dc_fqdn", "dc_fqdn"),
+        ("netbios", "netbios_domain"),
+        ("scan_principal", "scan_principal"),
+        ("ca_name", "ca_name"),
+        ("ca_host", "ca_host"),
+    ):
+        value = str(graph.get(graph_key) or "").strip()
+        if value:
+            env[details_key] = value
+    return env
+
+
+def _edge_verification_step(
+    graph: dict[str, Any],
+    edge: dict[str, Any],
+    env: dict[str, str],
+    nodes_by_id: dict[str, Any] | None = None,
+    member_resolver: Any = None,
+) -> dict[str, Any]:
+    """Build the synthetic step a technique edge's verify block renders against.
+
+    Carries the edge's own notes (template, CA, SPNs, impersonation hint), the
+    graph coordinates, and the REAL identifiers of both endpoint nodes
+    (sAMAccountName / DN / DNS hostname / object class) so a command names the
+    object the client can resolve, never the display label.
+    """
+    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+    details: dict[str, Any] = {
+        **notes,
+        "from": str(notes.get("source_label") or edge.get("from") or ""),
+        "to": str(notes.get("target_label") or edge.get("to") or ""),
+        **env,
+    }
+    if nodes_by_id is not None:
+        attack_graph_core._stamp_step_identity(
+            details,
+            nodes_by_id.get(str(edge.get("from") or "")),
+            nodes_by_id.get(str(edge.get("to") or "")),
+        )
+    if member_resolver is not None:
+        # A GROUP source acts through a known member (membership SSOT, a
+        # controlled one first), the same rule the report's step render uses.
+        from adscan_internal.services.affected_assets_struct import (  # noqa: PLC0415
+            stamp_step_source_member,
+        )
+
+        stamp_step_source_member(details, member_resolver)
+    return {"relation": str(edge.get("relation") or "").strip(), "details": details}
+
+
+def _bake_engine_followup_knowledge(graph: dict[str, Any]) -> int:
+    """Bake technique knowledge onto stored engine follow-ups that lack it.
+
+    An edge created through :func:`upsert_edge` gets its ``knowledge`` block
+    there; an engine follow-up is appended by the writer instead, so the web edge
+    detail would otherwise open it with no technique prose. Same baking, same
+    inputs, once per edge. Best-effort.
+    """
+    edges = graph.get("edges")
+    if not isinstance(edges, list):
+        return 0
+    baked = 0
+    for edge in edges:
+        if not isinstance(edge, dict) or "knowledge" in edge:
+            continue
+        if not attack_graph_core.edge_is_engine_followup(edge):
+            continue
+        try:
+            knowledge = _personalize_edge_knowledge(
+                _normalize_relation(str(edge.get("relation") or "")),
+                edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
+                dc_ip=str(graph.get("dc_ip") or "").strip(),
+                domain=str(graph.get("domain") or "").strip(),
+            )
+        except Exception:  # noqa: BLE001 - never break the write over an enrichment
+            continue
+        if knowledge:
+            edge["knowledge"] = knowledge
+            baked += 1
+    return baked
+
+
+def _refresh_edge_verify_commands(
+    graph: dict[str, Any], member_resolver: Any = None
+) -> int:
+    """Re-render the ``knowledge`` verification block on technique edges.
 
     An edge's ``knowledge`` block is baked in :func:`upsert_edge`, which runs
-    during collection — before ``save_attack_graph`` stamps ``graph["dc_ip"]``
-    (and, for some writers, ``graph["domain"]``) — so its ``verify_windows`` /
-    ``verify_linux`` still carry the literal ``<dc_ip>`` / ``<domain>`` tokens.
-    Once the writer knows the coordinates it re-renders them against each edge's
-    own source/target so the web CTEM shows a copy-paste command with the real
-    DC IP and domain, matching what the report re-renders at PDF-build time.
+    during collection, before ``save_attack_graph`` stamps the graph's
+    coordinates (``dc_ip``, ``dc_fqdn``, ``netbios``, the scan's principal), so
+    its commands still carry ``<dc_ip>`` / ``<domain>`` fill-ins. Once the writer
+    knows them it re-renders the structured ``verification`` block (and the two
+    legacy strings derived from it) against each edge's own endpoints, with the
+    endpoint nodes' real identifiers, so the web CTEM shows the same filled
+    command the report re-renders at PDF-build time.
 
-    Only technique edges (those carrying a ``knowledge`` block with a verify
-    command) are touched; ``<user>`` / ``<pass>`` are never substituted. Idempotent
-    and best-effort — a no-op when the graph has no coordinates or no such edges.
+    Only technique edges (those carrying a ``knowledge`` block with a verify or
+    exploit command) are touched. A secret is never filled: no coordinate is a
+    credential and ``<password>`` tokens stay as authored. Idempotent and
+    best-effort: a no-op when the graph has no coordinates or no such edges.
     """
-    dc_ip = str(graph.get("dc_ip") or "").strip()
-    domain = str(graph.get("domain") or "").strip()
-    if not dc_ip and not domain:
+    env = _verification_env_from_graph(graph)
+    if not (env.get("dc_ip") or env.get("domain")):
         return 0
     edges = graph.get("edges")
     if not isinstance(edges, list):
         return 0
     try:
+        from adscan_core.reporting.verification_model import (  # noqa: PLC0415
+            legacy_text_from_items,
+        )
         from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
-            render_step_verify,
+            render_step_verification,
         )
     except Exception:  # noqa: BLE001 — never break the write over an enrichment
         return 0
+    nodes = graph.get("nodes")
+    nodes_by_id: dict[str, Any] = nodes if isinstance(nodes, dict) else {}
     refreshed = 0
     for edge in edges:
         if not isinstance(edge, dict):
@@ -9179,35 +9648,32 @@ def _refresh_edge_verify_commands(graph: dict[str, Any]) -> int:
         knowledge = edge.get("knowledge")
         if not isinstance(knowledge, dict):
             continue
-        if not (knowledge.get("verify_windows") or knowledge.get("verify_linux")):
+        if not (
+            knowledge.get("verify_windows")
+            or knowledge.get("verify_linux")
+            or knowledge.get("verification")
+        ):
             continue
-        relation = str(edge.get("relation") or "").strip()
-        if not relation:
+        if not str(edge.get("relation") or "").strip():
             continue
-        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-        verify_step = {
-            "relation": relation,
-            "details": {
-                "from": str(notes.get("source_label") or edge.get("from") or ""),
-                "to": str(notes.get("target_label") or edge.get("to") or ""),
-                **({"dc_ip": dc_ip} if dc_ip else {}),
-                **({"domain": domain} if domain else {}),
-            },
-        }
         try:
-            rendered = render_step_verify(verify_step)
+            rendered = render_step_verification(
+                _edge_verification_step(graph, edge, env, nodes_by_id, member_resolver)
+            )
         except Exception:  # noqa: BLE001
             continue
-        changed = False
-        if rendered.get("windows") and knowledge.get("verify_windows"):
-            if knowledge["verify_windows"] != rendered["windows"]:
-                knowledge["verify_windows"] = rendered["windows"]
-                changed = True
-        if rendered.get("linux") and knowledge.get("verify_linux"):
-            if knowledge["verify_linux"] != rendered["linux"]:
-                knowledge["verify_linux"] = rendered["linux"]
-                changed = True
+        updates: dict[str, Any] = {}
+        if rendered["verify"] or rendered["exploit"]:
+            updates["verification"] = rendered
+        windows = legacy_text_from_items(rendered["verify"], "windows")
+        linux = legacy_text_from_items(rendered["verify"], "linux")
+        if windows:
+            updates["verify_windows"] = windows
+        if linux:
+            updates["verify_linux"] = linux
+        changed = any(knowledge.get(key) != value for key, value in updates.items())
         if changed:
+            knowledge.update(updates)
             refreshed += 1
     return refreshed
 
@@ -9222,9 +9688,22 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
     all of it by persisting through this function instead of serializing the file
     itself. Locked by ``tests/unit/services/test_attack_graph_write_seam.py``.
     """
+    from adscan_core.workspace_freeze import write_blocked  # noqa: PLC0415
+
+    if write_blocked(_graph_path(shell, domain)):
+        # A frozen workspace (a recheck) keeps the scan's graph byte-identical.
+        return
     graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
     graph["domain"] = domain
     graph["generated_at"] = _utc_now_iso()
+    # Bind the graph to the recorded run writing it (or clear a stale binding),
+    # so the run's coverage.json is only trusted for a graph that run wrote.
+    from adscan_core.engagement.coverage_io import stamp_artifact_run_id  # noqa: PLC0415
+    from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
+        active_run_id,
+    )
+
+    stamp_artifact_run_id(graph, active_run_id(shell))
     # Stamp the DC/KDC IP onto the graph so downstream renderers (report,
     # attack-path snapshot, edge-knowledge bake) can substitute a real IP into
     # the independent-verification commands instead of a literal <dc_ip> token.
@@ -9250,6 +9729,29 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
             netbios = str(domain_entry.get("netbios") or "").strip()
             if netbios:
                 graph["netbios"] = netbios
+            # The DC's DNS name (the Kerberos SPN host a ``-k`` verify or exploit
+            # command needs) through the ``resolve_dc_fqdn`` SSOT, and the
+            # account the scan authenticated as (the principal a read-only verify
+            # query runs as). Neither is a secret; the password never is stamped.
+            from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+
+            dc_fqdn = resolve_dc_fqdn(domain_entry, target_domain=domain)
+            if dc_fqdn:
+                graph["dc_fqdn"] = dc_fqdn
+            scan_principal = str(domain_entry.get("username") or "").strip()
+            if scan_principal:
+                graph["scan_principal"] = scan_principal
+            # The domain's certificate authority the scan enumerated (name and
+            # host), so an AD CS command names it instead of a ``<ca_host>``
+            # fill-in. Recorded by the ADCS discovery; not a secret.
+            ca_name = str(domain_entry.get("ca") or "").strip()
+            ca_host = str(
+                domain_entry.get("adcs_fqdn") or domain_entry.get("adcs") or ""
+            ).strip()
+            if ca_name and isinstance(domain_entry.get("ca"), str):
+                graph["ca_name"] = ca_name
+            if ca_host and "." in ca_host:
+                graph["ca_host"] = ca_host.lower()
     except Exception:  # noqa: BLE001 — never break the graph write over an enrichment
         pass
     # Edges are baked during collection, BEFORE the dc_ip/domain stamps above
@@ -9257,10 +9759,41 @@ def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None
     # literal <dc_ip>/<domain> tokens. Refresh them here — at the ONE writer,
     # after the coordinates are known — so the web CTEM edge panel gets the real
     # DC IP + domain in its copy-paste verify commands (parity with the report).
-    _refresh_edge_verify_commands(graph)
+    _member_resolver = None
+    _ws_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+    if _ws_dir:
+        from adscan_internal.services.affected_assets_struct import (  # noqa: PLC0415
+            safe_member_example_resolver,
+        )
+
+        _member_resolver = safe_member_example_resolver(_ws_dir, domain)
+    # The follow-up steps the engine adds after an access are stored as ordinary
+    # edges, with their provenance, so their outcome always has an edge to land
+    # on and every reader sees one representation. Idempotent. Runs before the
+    # verify-command refresh so a new follow-up's technique knowledge is filled
+    # with the graph's coordinates like any other edge's.
+    _followups_added, _followups_removed = (
+        attack_graph_core.materialize_engine_followup_edges(graph)
+    )
+    if _followups_added or _followups_removed:
+        print_info_debug(
+            "[attack_graph] engine follow-ups reconciled: "
+            f"added={_followups_added} removed={_followups_removed}"
+        )
+    _bake_engine_followup_knowledge(graph)
+    _refresh_edge_verify_commands(graph, _member_resolver)
     classify_graph_edges(graph)
     _prune_tier0_source_attack_edges(graph)
     _flush_tier0_source_attack_edge_skip_summary(graph)
+    # After the prune and before the write: every surviving AD CS edge carries
+    # endpoint labels and the report's own finding verdict, so the web AD CS
+    # view reads the engine's decision instead of re-deriving it.
+    stamp_adcs_edge_display_contract(graph, getattr(shell, "domains_data", None))
+    # A recovered secret never reaches the ``finding``-class graph file: each
+    # secret-bearing note field becomes a credential-store reference plus a keyed
+    # fingerprint, and the value is retained in the secret-class sidecar first.
+    # Runs on the in-memory graph too, so the load memo cannot serve the value.
+    redact_graph_for_persist(shell, domain, graph)
     path = _graph_path(shell, domain)
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -9745,11 +10278,30 @@ def upsert_nodes(
             or merged.get("target_terminal_class")
             or ""
         ).strip()
+        # A node's kind is directory evidence. An Unknown / Entry kind never
+        # overwrites a principal kind, and a SYNTHETIC record (a fallback built
+        # without a directory read) never overwrites the kind of a node that was
+        # read from the directory: a synthetic "User" upsert for WINTERFELL$
+        # turned a domain controller's Computer node into a User in a lab graph.
+        incoming_kind = _node_kind(node)
+        existing_kind = _node_kind(merged) if merged else "Unknown"
+        if (
+            existing_kind in {"User", "Group", "Computer", "Domain"}
+            and incoming_kind != existing_kind
+            and (
+                incoming_kind in {"", "Unknown", "Entry"}
+                or (
+                    bool(incoming_properties.get("synthetic"))
+                    and not bool(existing_properties.get("synthetic"))
+                )
+            )
+        ):
+            incoming_kind = existing_kind
         merged.update(
             {
                 "id": nid,
                 "label": _node_display_name(node),
-                "kind": _node_kind(node),
+                "kind": incoming_kind,
                 "objectId": (
                     node.get("objectId")
                     or node.get("objectid")
@@ -9778,19 +10330,14 @@ def upsert_nodes(
     return computed
 
 
-_SHARE_ACCESS_RELATION_KEYS = {"readshare", "writeshare", "fullcontrolshare"}
+# Edge identity beyond (from, relation, to) is the shared SSOT the web
+# persistence keys on too (``adscan_core.attack_graph_edge_identity``).
+_SHARE_ACCESS_RELATION_KEYS = SHARE_ACCESS_RELATION_KEYS
 
 
 def _share_access_identity_from_notes(notes: dict[str, Any] | None) -> str:
     """Return the canonical share identity for SMB share-access edges."""
-    if not isinstance(notes, dict):
-        return ""
-    share_name = str(notes.get("share_name") or notes.get("share") or "").strip()
-    if not share_name:
-        collector_method = str(notes.get("collector_method") or "").strip()
-        if collector_method.lower().startswith("share_acl:"):
-            share_name = collector_method.split(":", 1)[1].strip()
-    return share_name.casefold()
+    return share_access_name_from_notes(notes).casefold()
 
 
 def _edge_share_identity(relation: str, notes: dict[str, Any] | None) -> str:
@@ -10066,27 +10613,37 @@ def _personalize_edge_knowledge(
     # the report. Only when the graph supplied at least one coordinate and the
     # base actually carries a verify block. Best-effort: any failure keeps the
     # generic (literal-token) verify already on the base.
-    verify_override: dict[str, str] = {}
-    if (dc_ip or domain) and (base.get("verify_windows") or base.get("verify_linux")):
+    verify_override: dict[str, Any] = {}
+    if (dc_ip or domain) and (
+        base.get("verify_windows") or base.get("verify_linux") or base.get("verification")
+    ):
         try:
+            from adscan_core.reporting.verification_model import (  # noqa: PLC0415
+                legacy_text_from_items,
+            )
             from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
-                render_step_verify,
+                render_step_verification,
             )
 
             verify_step = {
                 "relation": relation_norm,
                 "details": {
+                    **edge_notes,
                     "from": str(edge_notes.get("source_label") or ""),
                     "to": str(edge_notes.get("target_label") or ""),
                     **({"dc_ip": dc_ip} if dc_ip else {}),
                     **({"domain": domain} if domain else {}),
                 },
             }
-            rendered = render_step_verify(verify_step)
-            if rendered.get("windows") and base.get("verify_windows"):
-                verify_override["verify_windows"] = rendered["windows"]
-            if rendered.get("linux") and base.get("verify_linux"):
-                verify_override["verify_linux"] = rendered["linux"]
+            rendered = render_step_verification(verify_step)
+            if rendered["verify"] or rendered["exploit"]:
+                verify_override["verification"] = rendered
+            windows = legacy_text_from_items(rendered["verify"], "windows")
+            linux = legacy_text_from_items(rendered["verify"], "linux")
+            if windows and base.get("verify_windows"):
+                verify_override["verify_windows"] = windows
+            if linux and base.get("verify_linux"):
+                verify_override["verify_linux"] = linux
         except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
             telemetry.capture_exception(exc)
 
@@ -10141,6 +10698,11 @@ def _personalize_edge_knowledge(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return _with_verify(base)
+
+
+#: Statuses a "not needed" write may put back to ``discovered``: the ones a
+#: step start or a failed try leaves, never a proof or a safety block.
+_NOT_NEEDED_RESETTABLE_STATUSES = frozenset({"attempted", "failed", "error"})
 
 
 def upsert_edge(
@@ -10251,10 +10813,31 @@ def upsert_edge(
             status_changed = _status_rank(desired_status) > _status_rank(current)
             if status_changed:
                 edge["status"] = desired_status
+            # A step deliberately not run is put back to ``discovered`` even
+            # though the step start wrote ``attempted``: the rank rule would
+            # otherwise keep it reading as a step that ran and failed. Two
+            # reasons qualify: its result was already held (the "not needed"
+            # vocabulary), or the scan policy excluded the technique its branch
+            # would have performed (reached through another relation). Only the
+            # attempted family is reset, never a proven or blocked status.
+            incoming_not_needed = bool(not_needed_reason(notes))
+            incoming_not_run = incoming_not_needed or is_policy_exclusion_note(notes)
+            if (
+                incoming_not_run
+                and desired_status in {"", "discovered"}
+                and current.strip().lower() in _NOT_NEEDED_RESETTABLE_STATUSES
+            ):
+                edge["status"] = "discovered"
             edge.setdefault("edge_type", edge_type)
             existing_notes = edge.get("notes")
             if not isinstance(existing_notes, dict):
                 existing_notes = {}
+            if not incoming_not_needed and desired_status not in {"", "discovered"}:
+                # The step ran since: a "not needed" note from an earlier run
+                # no longer describes it.
+                if not_needed_reason(existing_notes):
+                    existing_notes = dict(existing_notes)
+                    existing_notes.pop(NOT_EXECUTED_REASON_KEY, None)
             merged_notes = _merge_attack_step_notes(
                 existing=existing_notes,
                 incoming=notes or {},
@@ -10726,14 +11309,28 @@ def record_credential_source_steps(
             str(step.entry_kind or notes.get("entry_kind") or "").strip().lower()
         )
 
-        use_computer_entry = False
-        if entry_kind == "computer":
-            use_computer_entry = True
-        elif entry_label:
-            from adscan_internal.principal_utils import is_machine_account
+        use_computer_entry = entry_kind == "computer"
+        if not entry_kind and entry_label:
+            # No declared kind: a computer entry needs evidence that the label
+            # IS a computer, from the principal-kind SSOT (the graph in hand, the
+            # SID, the membership snapshot), never a trailing ``$`` on the name.
+            # Anything else keeps the generic entry path, which resolves the
+            # kind from directory evidence too.
+            from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+                resolve_principal_kind,
+            )
 
-            label_for_check = entry_label.split("@", 1)[0].strip()
-            use_computer_entry = is_machine_account(label_for_check)
+            use_computer_entry = (
+                resolve_principal_kind(
+                    shell,
+                    domain,
+                    entry_label,
+                    get_node=lambda _s, _d, *, label, _g=graph: _graph_node_by_label(
+                        _g, label
+                    ),
+                )
+                == "computer"
+            )
 
         if use_computer_entry:
             entry_id = ensure_computer_node_for_domain(
@@ -11089,9 +11686,13 @@ def _write_edge_status_in_graph(
     from_label: str,
     to_label: str,
     notes: dict[str, Any] | None,
-) -> None:
-    """Upsert the edge status into ``graph`` and persist ``domain``'s graph."""
-    upsert_edge(
+) -> bool:
+    """Upsert the edge status into ``graph`` and persist ``domain``'s graph.
+
+    Returns False when the upsert refused the edge (a Tier-0-source edge the
+    graph does not keep), so a caller never reports a status it did not record.
+    """
+    written = upsert_edge(
         graph,
         from_id=from_id,
         to_id=to_id,
@@ -11100,12 +11701,21 @@ def _write_edge_status_in_graph(
         status=status,
         notes=notes,
     )
+    if not written:
+        print_info_debug(
+            "attack-graph: Edge status update skipped: "
+            f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
+            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            "reason=upsert_refused_tier0_source"
+        )
+        return False
     save_attack_graph(shell, domain, graph)
     print_info_debug(
         "[attack-graph] Edge status updated: "
         f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
         f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')}"
     )
+    return True
 
 
 def _is_cross_domain_relation(relation: str) -> bool:
@@ -11151,7 +11761,7 @@ def _route_cross_domain_status_to_owning_graph(
         )
         if not from_id or not to_id:
             continue
-        _write_edge_status_in_graph(
+        if not _write_edge_status_in_graph(
             shell,
             other_domain,
             other_graph,
@@ -11162,7 +11772,8 @@ def _route_cross_domain_status_to_owning_graph(
             from_label=from_label,
             to_label=to_label,
             notes=notes,
-        )
+        ):
+            return False
         print_info_debug(
             "[attack-graph] Cross-domain edge status routed to owning graph: "
             f"path_domain={mark_sensitive(path_domain, 'domain')} "
@@ -11171,6 +11782,77 @@ def _route_cross_domain_status_to_owning_graph(
         )
         return True
     return False
+
+
+def _trust_partner_domain_sid(
+    shell: object, domain: str, partner_fqdn: str
+) -> tuple[bool, str | None]:
+    """Whether ``partner_fqdn`` is a domain the workspace knows, and its SID.
+
+    Known means the path domain records a trust to it, or the workspace holds
+    it as a domain. The SID (the trust's ``partner_sid``, else the domain's own
+    ``domain_sid``) keys the node the way the collector would, so a later
+    collection of that domain merges onto it instead of duplicating it.
+    """
+    domains_data = getattr(shell, "domains_data", None)
+    if not isinstance(domains_data, dict):
+        return False, None
+    wanted = partner_fqdn.strip().rstrip(".").lower()
+    known = False
+    sid: str | None = None
+    origin = domains_data.get(domain)
+    if isinstance(origin, dict):
+        for trust in origin.get("trusts") or ():
+            if not isinstance(trust, dict):
+                continue
+            if str(trust.get("target_domain") or "").strip().rstrip(".").lower() == wanted:
+                known = True
+                sid = str(trust.get("partner_sid") or "").strip() or None
+                break
+    for key, entry in domains_data.items():
+        if str(key or "").strip().rstrip(".").lower() != wanted:
+            continue
+        known = True
+        if sid is None and isinstance(entry, dict):
+            sid = str(entry.get("domain_sid") or "").strip() or None
+        break
+    return known, sid
+
+
+def _materialize_trust_partner_domain_endpoint(
+    shell: object,
+    domain: str,
+    graph: dict[str, Any],
+    *,
+    from_id: str,
+    to_label: str,
+) -> bool:
+    """Add the trust partner's Domain node so a cross-domain step can be recorded.
+
+    A cross-domain escalation (RaiseChild, CrossOrgTgtDelegation) whose target
+    domain was never collected (it sits outside the engagement scope, say) has
+    no Domain node in any persisted graph, so its outcome, a refusal included,
+    had nothing to land on and every surface showed the route as unmapped. The
+    node added here is the one :func:`attack_graph_core._ensure_trusted_domain_node`
+    synthesizes for a trust partner in memory, with the same provenance
+    (``synthesized_from = trusted_domain_inventory``). Only for a domain the
+    workspace knows through a trust or as a domain, and only when the source
+    endpoint already resolves. Returns True when it added the node.
+    """
+    partner = str(to_label or "").strip().rstrip(".")
+    if not from_id or not partner or "." not in partner:
+        return False
+    if any(sep in partner for sep in ("@", "\\", "/")):
+        return False
+    known, sid = _trust_partner_domain_sid(shell, domain, partner)
+    if not known:
+        return False
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict):
+        return False
+    return attack_graph_core._ensure_trusted_domain_node(  # noqa: SLF001
+        nodes_map, partner, sid
+    )
 
 
 def update_edge_status_by_labels(
@@ -11188,7 +11870,24 @@ def update_edge_status_by_labels(
     This is used by interactive CLI flows where we only have display labels.
     Note: attack-path counts are derived from the curated client path set at scan
     completion (``services.attack_path_counts``) rather than tracked at runtime.
+
+    Every step outcome of an attack-path run is persisted through here, so this
+    is also where the active run (if any) observes it. The observation happens
+    before node resolution, so a status the graph cannot place still reaches
+    the operator's run view.
     """
+    from adscan_internal.services.attack_path_execution_run import (  # noqa: PLC0415
+        notify_edge_status,
+    )
+
+    notify_edge_status(
+        shell,
+        relation=relation,
+        from_label=from_label,
+        to_label=to_label,
+        status=status,
+        notes=notes,
+    )
     graph = load_attack_graph(shell, domain)
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
@@ -11221,18 +11920,55 @@ def update_edge_status_by_labels(
         # is cross-domain, route the write to the graph that actually holds the
         # edge, rather than dropping the status. Generalized via the SSOT relation
         # set — no per-technique special-casing.
-        if _is_cross_domain_relation(
-            relation
-        ) and _route_cross_domain_status_to_owning_graph(
-            shell,
-            domain,
-            from_label=from_label,
-            relation=relation,
-            to_label=to_label,
-            status=status,
-            notes=notes,
-        ):
-            return True
+        if _is_cross_domain_relation(relation):
+            if _route_cross_domain_status_to_owning_graph(
+                shell,
+                domain,
+                from_label=from_label,
+                relation=relation,
+                to_label=to_label,
+                status=status,
+                notes=notes,
+            ):
+                return True
+            # No persisted graph holds the target domain (it was never
+            # collected): materialize the trust partner's Domain node in the
+            # path domain's graph so the outcome, a scope refusal included, is
+            # recorded on an edge every surface reads.
+            if _materialize_trust_partner_domain_endpoint(
+                shell, domain, graph, from_id=from_id, to_label=to_label
+            ):
+                from_id, to_id = _resolve_edge_endpoints_in_graph(
+                    graph, from_label=from_label, relation=relation, to_label=to_label
+                )
+                if from_id and to_id:
+                    print_info_debug(
+                        "[attack-graph] Trust partner Domain node materialized for a "
+                        f"step outcome: domain={mark_sensitive(domain, 'domain')} "
+                        f"relation={relation} to={mark_sensitive(to_label, 'node')}"
+                    )
+                    return _write_edge_status_in_graph(
+                        shell,
+                        domain,
+                        graph,
+                        from_id=from_id,
+                        to_id=to_id,
+                        relation=relation,
+                        status=status,
+                        from_label=from_label,
+                        to_label=to_label,
+                        notes={
+                            **(notes or {}),
+                            "synthesized_from": "step_outcome",
+                            attack_graph_core.ENGINE_FOLLOWUP_ORIGIN_KEY: (
+                                attack_graph_core.ENGINE_FOLLOWUP_ORIGIN
+                            ),
+                            attack_graph_core.ENGINE_FOLLOWUP_PARENT_KEY: (
+                                f"trust:{str(domain).strip().lower()}->"
+                                f"{str(to_label).strip().rstrip('.').lower()}"
+                            ),
+                        },
+                    )
 
         # Only the sampled node LABELS are marked: the counts and the kind
         # census carry no identity and must stay readable in a recording — they
@@ -11266,7 +12002,7 @@ def update_edge_status_by_labels(
             )
         return False
 
-    _write_edge_status_in_graph(
+    return _write_edge_status_in_graph(
         shell,
         domain,
         graph,
@@ -11278,7 +12014,6 @@ def update_edge_status_by_labels(
         to_label=to_label,
         notes=notes,
     )
-    return True
 
 
 #: Note key recording the principal ADscan authenticated as when it performed a
@@ -11582,15 +12317,21 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
     _graph_dc_ip = str(graph.get("dc_ip") or "").strip()
     _graph_domain = str(graph.get("domain") or "").strip()
     _graph_netbios = str(graph.get("netbios") or "").strip()
+    _graph_dc_fqdn = str(graph.get("dc_fqdn") or "").strip()
+    _graph_scan_principal = str(graph.get("scan_principal") or "").strip()
 
     def _stamp_env(details: dict[str, Any]) -> dict[str, Any]:
-        """Attach dc_ip/domain/netbios_domain to a step's details when known."""
+        """Attach the environment coordinates to a step's details when known."""
         if _graph_dc_ip:
             details.setdefault("dc_ip", _graph_dc_ip)
         if _graph_domain:
             details.setdefault("domain", _graph_domain)
         if _graph_netbios:
             details.setdefault("netbios_domain", _graph_netbios)
+        if _graph_dc_fqdn:
+            details.setdefault("dc_fqdn", _graph_dc_fqdn)
+        if _graph_scan_principal:
+            details.setdefault("scan_principal", _graph_scan_principal)
         return details
 
     def label(node_id: str) -> str:
@@ -11746,7 +12487,14 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             safety_abstention_notes,
         )
 
-        safety_notes = safety_abstention_notes(relation_key)
+        _target_node_for_safety = nodes_map.get(step.to_id)
+        safety_notes = safety_abstention_notes(
+            relation_key,
+            _target_identity.get("kind") or None,
+            target=_target_node_for_safety
+            if isinstance(_target_node_for_safety, dict)
+            else None,
+        )
         steps_for_ui.append(
             {
                 "step": idx,
@@ -11968,17 +12716,47 @@ def _resolve_bloodhound_principal_node(
 
     if hasattr(service, "get_principal_node"):
         try:
-            node_props = service.get_principal_node(  # type: ignore[attr-defined]
-                domain,
-                label_clean,
-                principal_type=kind_hint or None,
-                object_id=object_id,
-                lookup_name=lookup_name_clean,
-            )
+            matched_kind = ""
+            if hasattr(service, "get_principal_node_with_kind"):
+                matched = service.get_principal_node_with_kind(  # type: ignore[attr-defined]
+                    domain,
+                    label_clean,
+                    principal_type=kind_hint or None,
+                    object_id=object_id,
+                    lookup_name=lookup_name_clean,
+                )
+                matched_kind, node_props = matched if matched else ("", None)
+            else:
+                node_props = service.get_principal_node(  # type: ignore[attr-defined]
+                    domain,
+                    label_clean,
+                    principal_type=kind_hint or None,
+                    object_id=object_id,
+                    lookup_name=lookup_name_clean,
+                )
             if isinstance(node_props, dict):
-                kind_map = {"user": "User", "group": "Group", "computer": "Computer"}
-                node_kind = kind_map.get(
-                    kind_hint, "Group" if " " in label_clean else "User"
+                from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+                    graph_kind_label,
+                    principal_kind_from_properties,
+                    principal_kind_from_sid,
+                )
+
+                # Evidence only, in order: the kind the caller asked for, the
+                # collection the record was found in, the record's own
+                # sAMAccountType / objectClass, its SID. Otherwise Unknown, never
+                # a kind guessed from the label.
+                node_kind = graph_kind_label(
+                    (kind_hint if kind_hint in {"user", "group", "computer"} else "")
+                    or str(matched_kind or "").lower()
+                    or principal_kind_from_properties(node_props)
+                    or principal_kind_from_sid(
+                        str(
+                            node_props.get("objectid")
+                            or node_props.get("objectId")
+                            or object_id
+                            or ""
+                        )
+                    )
                 )
                 canonical_name = (
                     str(node_props.get("name") or label_clean).strip() or label_clean
@@ -13653,6 +14431,27 @@ def ensure_user_node_for_domain(
         or str(domain or "").strip().lower()
     )
 
+    # A caller can hand a machine account here (a recovered ``DC01$`` hash).
+    # When the directory records it as a computer, write the computer node: a
+    # User node for ``WINTERFELL$`` was found in a lab graph, grading the domain
+    # controller as an account.
+    from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+        resolve_principal_kind,
+    )
+
+    if (
+        resolve_principal_kind(
+            shell,
+            lookup_domain,
+            raw_username,
+            get_node=lambda _s, _d, *, label, _g=graph: _graph_node_by_label(_g, label),
+        )
+        == "computer"
+    ):
+        return ensure_computer_node_for_domain(
+            shell, domain, graph, principal=raw_username
+        )
+
     try:
         if hasattr(shell, "_get_graph_service"):
             service = shell._get_graph_service()  # type: ignore[attr-defined]
@@ -13889,11 +14688,32 @@ def ensure_principal_node_for_domain(
     """
     from adscan_internal.principal_utils import is_machine_account
 
+    from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+        resolve_principal_kind,
+    )
+
     kind_hint = (principal_kind or "").strip().lower()
     if kind_hint not in {"user", "computer"}:
         kind_hint = ""
+    # What the directory records wins over the caller's hint (a roasting caller
+    # hints "user" for every target, and a machine account must not become a
+    # User node because of it).
+    resolved = resolve_principal_kind(
+        shell,
+        domain,
+        principal,
+        get_node=lambda _s, _d, *, label, _g=graph: _graph_node_by_label(_g, label),
+    )
+    if resolved in {"user", "computer"}:
+        kind_hint = resolved
 
-    if kind_hint == "computer" or is_machine_account(principal):
+    # Directory evidence first. Only when nothing records the account does the
+    # sAMAccountName convention (a machine account ends in ``$``) separate a
+    # computer from a user: every caller passes a principal that HOLDS a
+    # credential (a sprayed, roasted or recovered secret), so it is an account,
+    # never a group, and the question left is only which kind of account. A
+    # machine account ADscan created moments ago is the case this covers.
+    if kind_hint == "computer" or (not kind_hint and is_machine_account(principal)):
         return ensure_computer_node_for_domain(
             shell, domain, graph, principal=principal
         )
@@ -14354,6 +15174,14 @@ def has_attack_paths_for_user(shell: object, domain: str, username: str) -> bool
             target="highvalue",
         )
     )
+
+
+def _graph_node_by_label(graph: dict[str, Any], label: str) -> dict[str, Any] | None:
+    """Return the node of an in-hand graph that ``label`` names, or ``None``."""
+    node_id = _find_node_id_by_label(graph, label)
+    nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    node = nodes_map.get(node_id) if node_id and isinstance(nodes_map, dict) else None
+    return node if isinstance(node, dict) else None
 
 
 def _find_node_id_by_label(graph: dict[str, Any], label: str) -> str | None:
@@ -16459,6 +17287,43 @@ def compute_display_paths_for_user(
     username: str,
     max_depth: int,
     max_paths: int | None = None,
+    enumeration_cap: int | None = None,
+    target: str = "highvalue",
+    target_mode: str = "object",
+    no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
+    display_friendly: bool | None = None,
+    force_perterminal: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute the user-scope listing; ``max_paths`` keeps its top N routes.
+
+    ``max_paths`` is applied to the FINAL listing (:func:`_apply_listing_cap`);
+    ``enumeration_cap`` is the separate, declared resource bound on discovery.
+    See :func:`_compute_display_paths_for_user_impl` for the computation.
+    """
+    records = _compute_display_paths_for_user_impl(
+        shell,
+        domain,
+        username=username,
+        max_depth=max_depth,
+        enumeration_cap=enumeration_cap,
+        target=target,
+        target_mode=target_mode,
+        no_cache=no_cache,
+        allow_owned_terminal_target=allow_owned_terminal_target,
+        display_friendly=display_friendly,
+        force_perterminal=force_perterminal,
+    )
+    return _apply_listing_cap(records, max_paths)
+
+
+def _compute_display_paths_for_user_impl(
+    shell: object,
+    domain: str,
+    *,
+    username: str,
+    max_depth: int,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     no_cache: bool = False,
@@ -16503,7 +17368,7 @@ def compute_display_paths_for_user(
         params=(
             user_norm,
             int(effective_depth),
-            max_paths,
+            enumeration_cap,
             target,
             str(target_mode or "object").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
@@ -16541,7 +17406,7 @@ def compute_display_paths_for_user(
                 domain,
                 username=username,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 no_cache=no_cache,
@@ -16618,32 +17483,36 @@ def compute_display_paths_for_user(
         )
     try:
         _dfs_t0 = time.monotonic()
-        records = _sort_display_paths(
-            attack_paths_core.compute_display_paths_for_start_node(
-                runtime_graph,
-                domain=domain,
-                snapshot=snapshot,
-                start_node_id=start_node_id,
-                max_depth=effective_depth,
-                max_paths=max_paths,
-                target=target,
-                target_mode=target_mode,
-                expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
-                filter_shortest_paths=False,
-                materialized_artifacts=(
-                    {
-                        "node_id_by_label": materialized_artifacts.node_id_by_label,
-                        "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
-                    }
-                    if materialized_artifacts is not None
-                    else None
-                ),
-                force_perterminal=force_perterminal,
+        with attack_paths_core.track_enumeration_truncation() as _enumeration:
+            records = _sort_display_paths(
+                attack_paths_core.compute_display_paths_for_start_node(
+                    runtime_graph,
+                    domain=domain,
+                    snapshot=snapshot,
+                    start_node_id=start_node_id,
+                    max_depth=effective_depth,
+                    enumeration_cap=enumeration_cap,
+                    target=target,
+                    target_mode=target_mode,
+                    expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+                    filter_shortest_paths=False,
+                    materialized_artifacts=(
+                        {
+                            "node_id_by_label": materialized_artifacts.node_id_by_label,
+                            "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
+                        }
+                        if materialized_artifacts is not None
+                        else None
+                    ),
+                    force_perterminal=force_perterminal,
+                )
             )
-        )
         _dfs_elapsed = time.monotonic() - _dfs_t0
         print_info_debug(
             f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=user)"
+        )
+        _note_enumeration_cap_reached(
+            _enumeration.truncated, enumeration_cap, domain=domain, scope="user"
         )
         records = _filter_zero_length_display_paths(records, domain=domain, scope="user")
         # Populate owned_labels so the owned-terminal filter can drop paths whose
@@ -16687,7 +17556,7 @@ def compute_display_paths_for_user(
                 domain,
                 username=str(username or "").strip(),
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 # Freshness: never serve/store a cached DFS result for the bounded
@@ -16739,6 +17608,61 @@ def compute_display_paths_for_domain(
     *,
     max_depth: int,
     max_paths: int | None = None,
+    enumeration_cap: int | None = None,
+    target: str = "highvalue",
+    target_mode: str = "object",
+    no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
+    display_friendly: bool | None = None,
+    keep_longest: bool = True,
+    force_perterminal: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute maximal attack paths for a domain with optional high-value promotion.
+
+    Thin wrapper that decides coverage OWNERSHIP before delegating to
+    :func:`_compute_display_paths_for_domain_impl`: the per-domain coverage block
+    describes the canonical domain listing only, so a capped, retargeted or
+    shallower domain computation runs with coverage writes suppressed (see
+    :func:`_is_canonical_domain_listing`). The route computation itself is
+    unchanged.
+
+    ``max_paths`` keeps the top N routes of the FINAL listing
+    (:func:`_apply_listing_cap`), so the full listing is computed (and cached
+    under the same key as the uncapped call) and only the result is cut.
+    ``enumeration_cap`` is the separate, declared resource bound on discovery.
+    """
+    canonical = _is_canonical_domain_listing(
+        max_depth=max_depth,
+        max_paths=max_paths,
+        enumeration_cap=enumeration_cap,
+        target=target,
+        target_mode=target_mode,
+        keep_longest=keep_longest,
+        allow_owned_terminal_target=allow_owned_terminal_target,
+    )
+    with _suppress_domain_coverage_write(not canonical):
+        records = _compute_display_paths_for_domain_impl(
+            shell,
+            domain,
+            max_depth=max_depth,
+            enumeration_cap=enumeration_cap,
+            target=target,
+            target_mode=target_mode,
+            no_cache=no_cache,
+            allow_owned_terminal_target=allow_owned_terminal_target,
+            display_friendly=display_friendly,
+            keep_longest=keep_longest,
+            force_perterminal=force_perterminal,
+        )
+    return _apply_listing_cap(records, max_paths)
+
+
+def _compute_display_paths_for_domain_impl(
+    shell: object,
+    domain: str,
+    *,
+    max_depth: int,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     no_cache: bool = False,
@@ -16777,7 +17701,7 @@ def compute_display_paths_for_domain(
         scope="domain",
         params=(
             int(effective_depth),
-            max_paths,
+            enumeration_cap,
             target,
             str(target_mode or "object").strip().lower(),
             bool(ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS),
@@ -16834,7 +17758,7 @@ def compute_display_paths_for_domain(
                 shell,
                 domain,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 no_cache=no_cache,
@@ -16914,30 +17838,38 @@ def compute_display_paths_for_domain(
             )
     try:
         _dfs_t0 = time.monotonic()
-        records = _sort_display_paths(
-            attack_paths_core.compute_display_paths_for_domain(
-                runtime_graph,
-                domain=domain,
-                snapshot=snapshot,
-                max_depth=effective_depth,
-                max_paths=max_paths,
-                target=target,
-                target_mode=target_mode,
-                expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
-                start_node_ids=start_node_ids,
-                materialized_artifacts=(
-                    {
-                        "node_id_by_label": materialized_artifacts.node_id_by_label,
-                        "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
-                    }
-                    if materialized_artifacts is not None
-                    else None
-                ),
-                keep_longest=keep_longest,
-                force_perterminal=force_perterminal,
+        with attack_paths_core.track_enumeration_truncation() as _enumeration:
+            records = _sort_display_paths(
+                attack_paths_core.compute_display_paths_for_domain(
+                    runtime_graph,
+                    domain=domain,
+                    snapshot=snapshot,
+                    max_depth=effective_depth,
+                    enumeration_cap=enumeration_cap,
+                    target=target,
+                    target_mode=target_mode,
+                    expand_terminal_memberships=ATTACK_PATH_EXPAND_TERMINAL_MEMBERSHIPS,
+                    start_node_ids=start_node_ids,
+                    materialized_artifacts=(
+                        {
+                            "node_id_by_label": materialized_artifacts.node_id_by_label,
+                            "recursive_groups_by_principal": materialized_artifacts.recursive_groups_by_principal,
+                        }
+                        if materialized_artifacts is not None
+                        else None
+                    ),
+                    keep_longest=keep_longest,
+                    force_perterminal=force_perterminal,
+                )
             )
-        )
         _dfs_elapsed = time.monotonic() - _dfs_t0
+        # The size of the candidate set the DFS walked, before post-processing
+        # collapses it: the COMPLETE coverage block states it, the same way a
+        # BOUNDED block states how far discovery got before it stopped.
+        _examined_route_count = len(records)
+        _note_enumeration_cap_reached(
+            _enumeration.truncated, enumeration_cap, domain=domain, scope="domain"
+        )
         print_info_debug(
             f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=domain)"
         )
@@ -16979,7 +17911,7 @@ def compute_display_paths_for_domain(
                 shell,
                 domain,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 # Freshness: never serve a cached DFS result for the bounded re-run.
@@ -17007,7 +17939,13 @@ def compute_display_paths_for_domain(
     # re-entered, or the abort recovery did), and its own seam records the sampled
     # declaration.
     if not force_perterminal:
-        _handle_attack_path_complete_coverage(shell, domain, scope="domain")
+        _handle_attack_path_complete_coverage(
+            shell,
+            domain,
+            scope="domain",
+            examined_routes=_examined_route_count,
+            reported_routes=len(records),
+        )
     print_info_debug(
         f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
         f" | total={_total_elapsed:.3f}s ({len(records)} paths, scope=domain)"
@@ -17481,6 +18419,7 @@ def compute_display_paths_for_owned_users(
     *,
     max_depth: int,
     max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     no_cache: bool = False,
@@ -17515,6 +18454,7 @@ def compute_display_paths_for_owned_users(
         principals=owned,
         max_depth=max_depth,
         max_paths=max_paths,
+        enumeration_cap=enumeration_cap,
         target=target,
         target_mode=target_mode,
         no_cache=no_cache,
@@ -17603,7 +18543,7 @@ def _compute_rustworkx_display_paths(
     username: str | None = None,
     principals: list[str] | None = None,
     max_depth: int,
-    max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     membership_sample_max: int = 3,
@@ -17648,7 +18588,7 @@ def _compute_rustworkx_display_paths(
                 shell,
                 domain,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 no_cache=True,
@@ -17662,7 +18602,7 @@ def _compute_rustworkx_display_paths(
                 domain,
                 username=str(username or "").strip(),
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 no_cache=True,
@@ -17672,7 +18612,7 @@ def _compute_rustworkx_display_paths(
                 shell,
                 domain,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 no_cache=True,
@@ -17688,7 +18628,7 @@ def _compute_rustworkx_display_paths(
                 domain,
                 principals=normalized,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 membership_sample_max=membership_sample_max,
@@ -17820,6 +18760,7 @@ def get_attack_path_summaries(
     principals: list[str] | None = None,
     max_depth: int,
     max_paths: int | None = None,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     target_mode: str = "object",
     summary_filters: AttackPathSummaryFilters | None = None,
@@ -17846,6 +18787,13 @@ def get_attack_path_summaries(
     listing returns the most direct route to domain compromise; when True it
     returns the holistic longest kill chain. It is part of the domain-scope cache
     key, so alternating modes in one process does not return stale results.
+
+    ``max_paths`` returns the top N routes of the FINAL listing, after every
+    post-processing rule, the summary filters and the origin fold, in the
+    listing's own order (:func:`_apply_listing_cap`): ``max_paths=1`` is exactly
+    the first route of the uncapped listing. It never bounds discovery. A caller
+    that needs a memory bound on discovery passes ``enumeration_cap`` instead,
+    which is declared on the terminal when it truncates.
     """
     scope_norm = str(scope or "domain").strip().lower()
 
@@ -17880,6 +18828,25 @@ def get_attack_path_summaries(
     attack_graph_core._ATTACK_PATH_WORKERS = _dev_workers  # noqa: SLF001
     attack_paths_core._PRINCIPAL_WORKERS = _dev_workers  # noqa: SLF001
 
+    # Coverage ownership for THIS call: a domain-scope summaries request that is
+    # not the canonical listing (a route cap such as the recap's ``max_paths=1``,
+    # a post-compute filter, another target/mode, a shallower depth) must not
+    # write the per-domain coverage block, from here or from any nested writer.
+    _coverage_suppress_token = (
+        _DOMAIN_COVERAGE_WRITE_SUPPRESSED.set(True)
+        if scope_norm == "domain"
+        and not _is_canonical_domain_listing(
+            max_depth=max_depth,
+            max_paths=max_paths,
+            enumeration_cap=enumeration_cap,
+            target=target,
+            target_mode=target_mode,
+            keep_longest=keep_longest,
+            allow_owned_terminal_target=False,
+            summary_filters=summary_filters,
+        )
+        else None
+    )
     try:
         with _attack_path_debug_summary_tables(render_debug_tables):
             result = _compute_attack_path_summaries_inner(
@@ -17890,7 +18857,7 @@ def get_attack_path_summaries(
                 username=username,
                 principals=principals,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 summary_filters=summary_filters,
@@ -17918,7 +18885,7 @@ def get_attack_path_summaries(
             )
         else:
             _handle_attack_path_complete_coverage(shell, domain, scope=scope_norm)
-        return result
+        return _apply_listing_cap(result, max_paths)
     except _AttackPathMemoryBudgetExceeded as exc:
         # The memory gate stopped discovery cleanly before it could be SIGKILLed.
         # Abort backstop (hybrid switch): the DFS blew the budget even though the
@@ -17939,7 +18906,7 @@ def get_attack_path_summaries(
                     username=username,
                     principals=principals,
                     max_depth=max_depth,
-                    max_paths=max_paths,
+                    enumeration_cap=enumeration_cap,
                     target=target,
                     target_mode=target_mode,
                     summary_filters=summary_filters,
@@ -17950,16 +18917,21 @@ def get_attack_path_summaries(
                     force_perterminal=True,
                 )
 
-        return _recover_from_memory_abort(
-            shell,
-            domain,
-            exc,
-            recompute_bounded=_recompute_bounded_summaries,
-            scope=scope_norm,
+        return _apply_listing_cap(
+            _recover_from_memory_abort(
+                shell,
+                domain,
+                exc,
+                recompute_bounded=_recompute_bounded_summaries,
+                scope=scope_norm,
+            ),
+            max_paths,
         )
     finally:
         attack_graph_core._ATTACK_PATH_WORKERS = _prev_graph_workers  # noqa: SLF001
         attack_paths_core._PRINCIPAL_WORKERS = _prev_principal_workers  # noqa: SLF001
+        if _coverage_suppress_token is not None:
+            _DOMAIN_COVERAGE_WRITE_SUPPRESSED.reset(_coverage_suppress_token)
 
 
 def get_owned_attack_path_summaries_to_target(
@@ -17998,7 +18970,8 @@ def get_owned_attack_path_summaries_to_target(
         target_label: Concrete summary target label to retain.
         terminal_relations: Optional final-step relation keys to retain.
         max_depth: Max graph depth for the underlying computation.
-        max_paths: Optional path cap.
+        max_paths: Optional cap on the FINAL listing: the top N routes after
+            the target/relation filter, never a bound on discovery.
         target_mode: Existing attack-path target mode.
         membership_sample_max: Existing sample setting forwarded to summaries.
         no_cache: When True, bypass cached summary results.
@@ -18210,7 +19183,8 @@ def resolve_target_labels(
             except Exception:  # noqa: BLE001 — best-effort fallback tier
                 user_members, computer_members = {}, {}
             group_labels = set(user_members) | set(computer_members)
-            for group_label in group_labels:
+            # Sorted: a case-insensitive first-match must not pick in set order.
+            for group_label in sorted(group_labels):
                 if group_label.upper() == canonical.upper():
                     matched.add(group_label)
                     break
@@ -18376,7 +19350,7 @@ def _compute_attack_path_summaries_inner(
     username: str | None,
     principals: list[str] | None,
     max_depth: int,
-    max_paths: int | None,
+    enumeration_cap: int | None,
     target: str,
     target_mode: str,
     summary_filters: AttackPathSummaryFilters | None,
@@ -18490,7 +19464,7 @@ def _compute_attack_path_summaries_inner(
                 username=username,
                 principals=list(principals or []),
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 target_mode=target_mode,
                 membership_sample_max=membership_sample_max,
@@ -18506,7 +19480,7 @@ def _compute_attack_path_summaries_inner(
             shell,
             domain,
             max_depth=max_depth,
-            max_paths=max_paths,
+            enumeration_cap=enumeration_cap,
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
@@ -18523,7 +19497,7 @@ def _compute_attack_path_summaries_inner(
             domain,
             username=str(username or "").strip(),
             max_depth=max_depth,
-            max_paths=max_paths,
+            enumeration_cap=enumeration_cap,
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
@@ -18536,7 +19510,7 @@ def _compute_attack_path_summaries_inner(
             shell,
             domain,
             max_depth=max_depth,
-            max_paths=max_paths,
+            enumeration_cap=enumeration_cap,
             target=target,
             target_mode=target_mode,
             no_cache=no_cache,
@@ -18557,7 +19531,7 @@ def _compute_attack_path_summaries_inner(
             domain,
             principals=normalized_principals,
             max_depth=max_depth,
-            max_paths=max_paths,
+            enumeration_cap=enumeration_cap,
             target=target,
             membership_sample_max=membership_sample_max,
             target_mode=target_mode,
@@ -18671,6 +19645,45 @@ def compute_display_paths_for_principals(
     principals: list[str],
     max_depth: int,
     max_paths: int | None = None,
+    enumeration_cap: int | None = None,
+    target: str = "highvalue",
+    membership_sample_max: int = 3,
+    target_mode: str = "object",
+    no_cache: bool = False,
+    allow_owned_terminal_target: bool = False,
+    display_friendly: bool | None = None,
+    force_perterminal: bool = False,
+) -> list[dict[str, Any]]:
+    """Compute the principals-scope listing; ``max_paths`` keeps its top N routes.
+
+    ``max_paths`` is applied to the FINAL listing (:func:`_apply_listing_cap`);
+    ``enumeration_cap`` is the separate, declared resource bound on discovery.
+    See :func:`_compute_display_paths_for_principals_impl` for the computation.
+    """
+    records = _compute_display_paths_for_principals_impl(
+        shell,
+        domain,
+        principals=principals,
+        max_depth=max_depth,
+        enumeration_cap=enumeration_cap,
+        target=target,
+        membership_sample_max=membership_sample_max,
+        target_mode=target_mode,
+        no_cache=no_cache,
+        allow_owned_terminal_target=allow_owned_terminal_target,
+        display_friendly=display_friendly,
+        force_perterminal=force_perterminal,
+    )
+    return _apply_listing_cap(records, max_paths)
+
+
+def _compute_display_paths_for_principals_impl(
+    shell: object,
+    domain: str,
+    *,
+    principals: list[str],
+    max_depth: int,
+    enumeration_cap: int | None = None,
     target: str = "highvalue",
     membership_sample_max: int = 3,
     target_mode: str = "object",
@@ -18720,7 +19733,7 @@ def compute_display_paths_for_principals(
         params=(
             principals_key,
             int(effective_depth),
-            max_paths,
+            enumeration_cap,
             target,
             int(membership_sample_max),
             str(target_mode or "object").strip().lower(),
@@ -18789,7 +19802,7 @@ def compute_display_paths_for_principals(
                 domain,
                 principals=principals,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 membership_sample_max=membership_sample_max,
                 target_mode=target_mode,
@@ -18887,24 +19900,28 @@ def compute_display_paths_for_principals(
     )
     try:
         _dfs_t0 = time.monotonic()
-        records = _sort_display_paths(
-            attack_paths_core.compute_display_paths_for_principals(
-                runtime_graph,
-                domain=domain,
-                snapshot=snapshot,
-                principals=unique_principals,
-                max_depth=effective_depth,
-                max_paths=max_paths,
-                target=target,
-                membership_sample_max=membership_sample_max,
-                target_mode=target_mode,
-                filter_shortest_paths=False,
-                force_perterminal=force_perterminal,
+        with attack_paths_core.track_enumeration_truncation() as _enumeration:
+            records = _sort_display_paths(
+                attack_paths_core.compute_display_paths_for_principals(
+                    runtime_graph,
+                    domain=domain,
+                    snapshot=snapshot,
+                    principals=unique_principals,
+                    max_depth=effective_depth,
+                    enumeration_cap=enumeration_cap,
+                    target=target,
+                    membership_sample_max=membership_sample_max,
+                    target_mode=target_mode,
+                    filter_shortest_paths=False,
+                    force_perterminal=force_perterminal,
+                )
             )
-        )
         _dfs_elapsed = time.monotonic() - _dfs_t0
         print_info_debug(
             f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s ({len(records)} raw paths, scope=principals)"
+        )
+        _note_enumeration_cap_reached(
+            _enumeration.truncated, enumeration_cap, domain=domain, scope="principals"
         )
         records = _filter_zero_length_display_paths(
             records, domain=domain, scope="principals"
@@ -18939,7 +19956,7 @@ def compute_display_paths_for_principals(
                 domain,
                 principals=principals,
                 max_depth=max_depth,
-                max_paths=max_paths,
+                enumeration_cap=enumeration_cap,
                 target=target,
                 membership_sample_max=membership_sample_max,
                 target_mode=target_mode,

@@ -78,6 +78,16 @@ class HostHelperResponse:
     message: str | None = None
 
 
+def _looks_like_ntlm_hash(value: str) -> bool:
+    """Return True when value resembles an NTLM hash or LM:NT pair."""
+    candidate = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", candidate):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{32}:[0-9a-fA-F]{32}", candidate):
+        return True
+    return False
+
+
 def _get_shared_token() -> str:
     token = os.getenv("CONTAINER_SHARED_TOKEN", "").strip()
     if not token:
@@ -298,6 +308,46 @@ def _translate_container_workspace_path(value: Path) -> Path:
 
     host_root = (_invoker_adscan_root_dir() / "workspaces").resolve(strict=False)
     return (host_root / rel).resolve(strict=False)
+
+
+def _invoker_deliverables_dir() -> Path:
+    """The invoker's deliverables folder, resolved by the shared SSOT.
+
+    Same function the launcher used to mount it. Under ``sudo`` the default
+    resolves against ``SUDO_USER``'s home, and an ``ADSCAN_DELIVERABLES_DIR``
+    override reaches the helper through ``--preserve-env``.
+    """
+    from adscan_core.deliverable_destination import (  # noqa: PLC0415
+        host_deliverables_dir,
+    )
+
+    return host_deliverables_dir()
+
+
+def _resolve_openable_host_path(candidate: Path) -> Path:
+    """Map a container path to the host file ``open_file`` may open.
+
+    Security: only files under the invoker's workspaces tree or the invoker's
+    deliverables folder (mounted read-write at ``DELIVERABLES_CONTAINER_DIR``)
+    are openable, which prevents arbitrary host file exposure from the
+    container. The opener runs as the invoking user, never as root.
+
+    Raises:
+        HostHelperError: When the path is outside both roots.
+    """
+    from adscan_core.container_io import DELIVERABLES_CONTAINER_DIR  # noqa: PLC0415
+
+    try:
+        relative = candidate.relative_to(DELIVERABLES_CONTAINER_DIR)
+    except ValueError:
+        relative = None
+    if relative is not None:
+        deliverables_root = _invoker_deliverables_dir().resolve(strict=False)
+        return _safe_resolve_within(deliverables_root, deliverables_root / relative)
+
+    host_path = _translate_container_workspace_path(candidate)
+    workspaces_root = (_invoker_adscan_root_dir() / "workspaces").resolve(strict=False)
+    return _safe_resolve_within(workspaces_root, host_path)
 
 
 def _copy_file(src: Path, dst: Path) -> None:
@@ -521,6 +571,157 @@ def _run_cmd(
     )
 
 
+# Host time-sync state as it was before ADscan first turned it off, so the exit
+# path restores THAT instead of forcing it on. Kept on tmpfs (/run): it survives
+# a helper restart within a session and is gone after a reboot. Values:
+# "yes" / "no" (from ``timedatectl show -p NTP --value``) or "unknown".
+_NTP_PRIOR_STATE_FILE = Path("/run/adscan-host-helper/ntp-prior-state")
+
+
+def _read_host_ntp_state() -> str:
+    """Return "yes"/"no" for host NTP, or "unknown" when it cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["timedatectl", "show", "-p", "NTP", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — best-effort probe
+        return "unknown"
+    value = (proc.stdout or "").strip().lower()
+    return value if proc.returncode == 0 and value in {"yes", "no"} else "unknown"
+
+
+def _record_host_ntp_prior_state() -> None:
+    """Remember the pre-ADscan NTP state once (first disable of the session)."""
+    try:
+        if _NTP_PRIOR_STATE_FILE.exists():
+            return
+        _NTP_PRIOR_STATE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _NTP_PRIOR_STATE_FILE.write_text(_read_host_ntp_state(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _restore_host_ntp_prior_state() -> HostHelperResponse:
+    """Put host NTP back the way ADscan found it.
+
+    Nothing recorded means ADscan never turned it off: leave it alone. A host
+    whose time sync was already off before ADscan (the delivered appliance, an
+    administrator's deliberate choice) stays off. Only "yes", or a state that
+    could not be read, re-enables it, which is the previous behaviour.
+    """
+    try:
+        prior = _NTP_PRIOR_STATE_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return HostHelperResponse(
+            True, 0, None, None, "host time sync was not changed; nothing to restore"
+        )
+    except OSError:
+        prior = "unknown"
+    try:
+        _NTP_PRIOR_STATE_FILE.unlink()
+    except OSError:
+        pass
+    if prior == "no":
+        return HostHelperResponse(
+            True, 0, None, None, "host time sync was off before ADscan; left off"
+        )
+    if not shutil_which("timedatectl"):
+        return HostHelperResponse(False, 127, None, None, "timedatectl not found")
+    return _run_cmd(["timedatectl", "set-ntp", "true"], timeout=30)
+
+
+# Wall-clock restore after a scan stepped the host clock to a DC (decision D5,
+# ``adscan_core/wall_clock.py``). Shared by every helper process on the host;
+# tmpfs, so a reboot (which resets the clock from the RTC) clears it.
+_CLOCK_BASELINE_FILE = Path("/run/adscan-host-helper/clock-baseline.json")
+
+
+def _host_license_dir() -> Path:
+    """The invoking user's licence directory (where the engine reads the licence)."""
+    explicit = os.getenv("ADSCAN_STATE_DIR", "").strip()
+    base = Path(explicit) if explicit else _invoker_adscan_root_dir() / "state"
+    return base / "license"
+
+
+def _set_clock_stepped_marker(present: bool) -> None:
+    """Tell the licence check the clock is (no longer) DC-aligned. Best-effort."""
+    try:
+        from adscan_core import enterprise_license
+
+        directory = _host_license_dir()
+        if not present:
+            enterprise_license.clear_clock_stepped(directory)
+            return
+        if not directory.is_dir():
+            return
+        enterprise_license.mark_clock_stepped(directory, by="host-helper")
+        try:
+            uid, gid = _invoker_uid_gid()
+            if uid > 0:
+                os.chown(directory / enterprise_license.CLOCK_STEPPED_FILENAME, uid, gid)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001 — the marker must never break a step
+        return
+
+
+def _run_clock_step_cmd(argv: list[str], *, timeout: int) -> HostHelperResponse:
+    """Run a command that steps the host clock, keeping the restore baseline.
+
+    The first step of any session on the host records the wall clock and the
+    elapsed clock BEFORE the step; the restore later sets "that wall clock +
+    elapsed", never the DC's time.
+    """
+    try:
+        from adscan_core import wall_clock
+
+        wall_clock.register_step_holder(os.getpid(), path=_CLOCK_BASELINE_FILE)
+    except Exception:  # noqa: BLE001 — a missing baseline must not block the step
+        wall_clock = None  # type: ignore[assignment]
+    resp = _run_cmd(argv, timeout=timeout)
+    if resp.ok and wall_clock is not None:
+        wall_clock.mark_stepped(path=_CLOCK_BASELINE_FILE)
+        _set_clock_stepped_marker(True)
+    return resp
+
+
+def _restore_wall_clock(holder: int | None) -> HostHelperResponse:
+    """Release ``holder``; restore the wall clock when it was the last one.
+
+    ``holder=None`` (a helper starting) only sweeps holders that died, which
+    restores a clock a crashed session left stepped.
+    """
+    try:
+        from adscan_core import wall_clock
+    except Exception:  # noqa: BLE001
+        return HostHelperResponse(False, None, None, None, "wall clock restore unavailable")
+    outcome = wall_clock.release_step_holder(holder, path=_CLOCK_BASELINE_FILE)
+    if outcome.last_holder:
+        _set_clock_stepped_marker(False)
+    if outcome.restore_to is None:
+        message = (
+            "another session still holds the clock"
+            if not outcome.last_holder
+            else "host clock was not stepped; nothing to restore"
+        )
+        return HostHelperResponse(True, 0, None, None, message)
+    if not shutil_which("date"):
+        return HostHelperResponse(False, 127, None, None, "date binary not found")
+    resp = _run_cmd(
+        ["date", "-u", "-s", wall_clock.format_for_date_command(outcome.restore_to)],
+        timeout=10,
+    )
+    return HostHelperResponse(
+        resp.ok, resp.returncode, resp.stdout, resp.stderr, "host clock restored"
+        if resp.ok
+        else (resp.message or "host clock restore failed"),
+    )
+
+
 def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
     op = str(req.get("op") or "").strip()
     if not op:
@@ -538,9 +739,17 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         # Best-effort: timedatectl may not exist; report clearly.
         if not shutil_which("timedatectl"):
             return HostHelperResponse(False, 127, None, None, "timedatectl not found")
+        if not value:
+            _record_host_ntp_prior_state()
         return _run_cmd(
             ["timedatectl", "set-ntp", "true" if value else "false"], timeout=30
         )
+
+    if op == "timedatectl_restore_ntp":
+        return _restore_host_ntp_prior_state()
+
+    if op == "restore_system_time":
+        return _restore_wall_clock(os.getpid())
 
     if op == "ntpdate":
         host = req.get("host")
@@ -554,9 +763,9 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
                 False, 127, None, None, "ntpdate/ntpdig not found"
             )
         if shutil_which("ntpdate"):
-            return _run_cmd(["ntpdate", ip], timeout=60)
+            return _run_clock_step_cmd(["ntpdate", ip], timeout=60)
         # ntpdig fallback (ntpsec)
-        return _run_cmd(["ntpdig", "-gq", ip], timeout=60)
+        return _run_clock_step_cmd(["ntpdig", "-gq", ip], timeout=60)
 
     if op == "net_time_set":
         host = req.get("host")
@@ -568,7 +777,7 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         if not shutil_which("net"):
             return HostHelperResponse(False, 127, None, None, "net not found")
         # `net time set -S <server>` sets local system time based on SMB/RPC.
-        return _run_cmd(["net", "time", "set", "-S", ip], timeout=120)
+        return _run_clock_step_cmd(["net", "time", "set", "-S", ip], timeout=120)
 
     if op == "ntp_query":
         host = req.get("host")
@@ -634,7 +843,7 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
         # use ``date -u -s`` as the canonical path because it works on both
         # systemd and non-systemd hosts.
         if shutil_which("date"):
-            return _run_cmd(["date", "-u", "-s", datetime_iso], timeout=10)
+            return _run_clock_step_cmd(["date", "-u", "-s", datetime_iso], timeout=10)
         return HostHelperResponse(False, 127, None, None, "date binary not found")
 
 
@@ -710,10 +919,16 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
             rdp_bin,
             f"/d:{domain}",
             f"/u:{username}",
-            f"/p:{password}",
             f"/v:{validated_host}",
             "/cert:ignore",
         ]
+        # An NT hash is passed as a hash. Sent as /p: it is tried as a literal
+        # password and the domain controller counts a failed sign-in against
+        # the account (badPwdCount), one step toward locking it out.
+        if _looks_like_ntlm_hash(password):
+            argv.append(f"/pth:{password}")
+        else:
+            argv.append(f"/p:{password}")
         return _run_detached_as_invoker(argv, env=_build_invoker_env())
 
     if op == "open_file":
@@ -723,14 +938,7 @@ def _handle_request(req: dict[str, Any]) -> HostHelperResponse:
                 False, None, None, None, "Invalid path for open_file"
             )
         try:
-            candidate = Path(path_raw)
-            host_path = _translate_container_workspace_path(candidate)
-            # Security: only files under the invoker's workspaces tree are
-            # openable. Prevents arbitrary host file exposure from the container.
-            workspaces_root = (_invoker_adscan_root_dir() / "workspaces").resolve(
-                strict=False
-            )
-            host_path = _safe_resolve_within(workspaces_root, host_path)
+            host_path = _resolve_openable_host_path(Path(path_raw))
         except HostHelperError as exc:
             return HostHelperResponse(False, None, None, None, str(exc))
         if not host_path.is_file():
@@ -1252,6 +1460,11 @@ def run_host_helper_server(socket_path: str) -> int:
         os.chmod(str(sock_path), 0o660)
         server.listen(5)
         server.settimeout(0.5)
+        # A previous session that crashed may have left the clock stepped.
+        try:
+            _restore_wall_clock(None)
+        except Exception:  # noqa: BLE001
+            pass
 
         while not should_stop:
             try:
@@ -1297,6 +1510,12 @@ def run_host_helper_server(socket_path: str) -> int:
                     except Exception:
                         pass
     finally:
+        # Every exit of a session (engine done, crashed or killed) passes here:
+        # put the wall clock back unless another session still holds it.
+        try:
+            _restore_wall_clock(os.getpid())
+        except Exception:  # noqa: BLE001
+            pass
         try:
             server.close()
         except Exception:

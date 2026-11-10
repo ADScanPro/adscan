@@ -42,13 +42,18 @@ name different objects for the same finding.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 import ipaddress
 import json
 from pathlib import Path
 from typing import Any
 
+from adscan_core.graph_secret_refs import note_has_recovered_secret
+from adscan_core.reporting.affected_asset_roles import broad_scope_note
+from adscan_core.reporting.affected_assets_contract import (
+    AFFECTED_ASSETS_DISPLAY_ONLY_KEY,
+)
 from adscan_core.reporting.tier_basis import describe_tier_basis
 
 from adscan_internal.services.affected_asset_rules import (
@@ -220,6 +225,39 @@ class AffectedAssetEntity:
     # attempted) — derived from the account's attack-graph edge STEP status.
     # ``None`` for every non-roasting asset.
     crack_status: str | None = None
+    # For a DIRECTORY-ATTRIBUTE SECRET finding whose rows do NOT all share one
+    # state: whether the leaked value AUTHENTICATED as this object
+    # (:data:`SECRET_STATUS_AUTHENTICATED`) or did not
+    # (:data:`SECRET_STATUS_UNPROVEN`), read from the per-record ``verified``
+    # flag both producers write. ``None`` when every row shares one state,
+    # where the finding's own key and severity already carry the distinction
+    # and a per-row badge would be noise.
+    secret_status: str | None = None
+    # For a BROAD built-in identity (``Authenticated Users``, ``Domain Users``,
+    # ``Everyone``, ``Anonymous Logon``): one plain client sentence saying how
+    # many accounts it covers (``Any account that can sign in to the domain``),
+    # so the identity renders as ONE object with its reach explained instead of
+    # a list of its members. From ``adscan_core.reporting.affected_asset_roles``.
+    # ``None`` for every other object.
+    scope_note: str | None = None
+    # For a GROUP that can exploit an attack step: one known member, from the
+    # membership SSOT (transitive, primary group included), preferring an
+    # account the assessment controls, so a command that must run as "someone
+    # in that group" names a real account. ``member_controlled`` says whether
+    # the assessment holds that account's credential. ``None`` when no member
+    # is known (the command then keeps an explicit fill-in) and for a broad
+    # built-in identity (the scan's own account already qualifies).
+    member_example: str | None = None
+    member_controlled: bool | None = None
+    # The object's distinguished name and its first service principal name,
+    # from the graph node, so a command names the real object (``Get-Acl
+    # "AD:<dn>"``, ``klist get <spn>``). ``None`` when the node carries none.
+    dn: str | None = None
+    spn: str | None = None
+    # For a USER or COMPUTER that can exploit an attack step: whether the
+    # assessment holds its credential (it is then the account a reproduced
+    # command runs as first). ``None`` when not stamped.
+    controlled: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the JSON contract (omitting empty optional fields)."""
@@ -257,6 +295,19 @@ class AffectedAssetEntity:
             payload["metric"] = self.metric
         if self.crack_status:
             payload["crack_status"] = self.crack_status
+        if self.secret_status:
+            payload["secret_status"] = self.secret_status
+        if self.scope_note:
+            payload["scope_note"] = self.scope_note
+        if self.member_example:
+            payload["member_example"] = self.member_example
+            payload["member_controlled"] = bool(self.member_controlled)
+        if self.controlled:
+            payload["controlled"] = True
+        if self.dn:
+            payload["dn"] = self.dn
+        if self.spn:
+            payload["spn"] = self.spn
         return payload
 
 
@@ -314,6 +365,11 @@ class _ResolvedNode:
     pwdlastset: int | None = None
     lastlogon: int | None = None
     os: str = ""
+    # The object's distinguished name and (for an account) its SPNs, read off
+    # the node so a command can name the real object (its DN, its OU, the SPN
+    # a ticket request targets) instead of a fill-in.
+    dn: str = ""
+    spns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -349,6 +405,15 @@ class AssetIndex:
     domain: str = ""
     dc_nodes: list[_ResolvedNode] = field(default_factory=list)
     _templates_by_token: dict[str, _ResolvedTemplate] = field(default_factory=dict)
+    #: Lower-cased DNS names of the domain objects the graph holds. A finding
+    #: that names a DOMAIN (the forest root a child escalates into) resolves to
+    #: a domain entity from this directory data, never to an account by default.
+    domain_names: set[str] = field(default_factory=set)
+
+    def is_domain_name(self, value: Any) -> bool:
+        """True when ``value`` names a domain object of this graph."""
+        text = str(value or "").strip().rstrip(".").lower()
+        return bool(text) and (text in self.domain_names or text == self.domain.lower())
 
     def _register_template(self, template: _ResolvedTemplate) -> None:
         """Index a certificate template under every spelling that names it."""
@@ -465,6 +530,21 @@ def _is_dc_node(node: Mapping[str, Any], props: Mapping[str, Any]) -> bool:
     return False
 
 
+def _node_dn(props: Mapping[str, Any]) -> str:
+    """The node's distinguished name, or ``""``."""
+    return str(
+        props.get("distinguishedname") or props.get("distinguished_name") or ""
+    ).strip()
+
+
+def _node_spns(props: Mapping[str, Any]) -> tuple[str, ...]:
+    """The node's service principal names, in collector order."""
+    raw = props.get("serviceprincipalnames")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(str(spn).strip() for spn in raw if str(spn or "").strip())
+
+
 def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
     """Build an :class:`AssetIndex` from a parsed ``attack_graph.json`` graph.
 
@@ -513,6 +593,12 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
                 )
             )
             continue
+        if kind == "domain":
+            for raw in (node.get("label"), _node_props(node).get("name")):
+                text = str(raw or "").strip().rstrip(".").lower()
+                if text and "@" not in text:
+                    index.domain_names.add(text)
+            continue
         if kind not in ("computer", "user", "group"):
             continue
         props = _node_props(node)
@@ -545,6 +631,8 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
                 tier_basis=tier_basis,
                 pwdlastset=pwdlastset,
                 lastlogon=lastlogon,
+                dn=_node_dn(props),
+                spns=_node_spns(props),
                 # The operating-system string lives under ``os`` on the graph node
                 # (the collector stamps ``operatingSystem`` there); accept the raw
                 # ``operatingsystem`` alias too for an older graph.
@@ -565,6 +653,8 @@ def build_asset_index_from_graph(graph: Mapping[str, Any]) -> AssetIndex:
                 tier_basis=tier_basis,
                 pwdlastset=pwdlastset,
                 lastlogon=lastlogon,
+                dn=_node_dn(props),
+                spns=_node_spns(props),
             )
             index._register(resolved)
     return index
@@ -864,6 +954,13 @@ def _entity_for_principal(
         )
 
     node = index.lookup(text, sid_hint) if index is not None else None
+    if node is None and index is not None and index.is_domain_name(text):
+        # The directory says this is a domain object (a forest root, a trusted
+        # domain), so it is filed as a domain, not as an account named after it.
+        entity = _domain_entity(text.lower(), role_label=role_label, pairing_id=pairing_id)
+        return _qualified_entity(
+            replace(entity, role=role, pair_relation=pair_relation), qualifier
+        )
     tier, tier_label = _tier_fields(node.tier if node else "")
     tier_confidence, tier_basis = _tier_basis_fields(node)
     # The per-asset measured value for a staleness/age/obsolete-OS finding, read
@@ -910,6 +1007,8 @@ def _entity_for_principal(
                 pairing_id=pairing_id,
                 pair_relation=pair_relation,
                 metric=metric,
+                dn=(node.dn if node else "") or None,
+                spn=(node.spns[0] if node and node.spns else None),
             ),
             qualifier,
         )
@@ -921,7 +1020,15 @@ def _entity_for_principal(
     sam = (node.samaccountname if node else "") or _strip_realm(text)
     sid = (node.sid if node else "") or sid_hint
     upn = node.upn if node else ""
-    is_group = node is not None and node.kind == TYPE_GROUP
+    # A broad built-in identity (Authenticated Users, Domain Users, Everyone,
+    # Anonymous Logon) is ONE object that stands for every account it covers.
+    # The graph often carries it as a synthetic ``@WELLKNOWN`` label with no
+    # node, so it is recognised from its SID or exact built-in name and typed
+    # as a group, never filed under the client's accounts.
+    scope_note = broad_scope_note(sid=sid, label=text) or None
+    is_group = (node is not None and node.kind == TYPE_GROUP) or (
+        scope_note is not None and (node is None or node.kind != TYPE_USER)
+    )
     # The DISPLAY is client-facing (web CTEM + the flat report), so name the
     # principal the way the prose humanizer SSOT does — an all-caps user sam
     # de-shouts (``SVC_TGS`` -> ``svc_tgs``), a well-known identity renders
@@ -952,6 +1059,9 @@ def _entity_for_principal(
             pairing_id=pairing_id,
             pair_relation=pair_relation,
             metric=metric,
+            scope_note=scope_note,
+            dn=(node.dn if node else "") or None,
+            spn=(node.spns[0] if node and node.spns else None),
         ),
         qualifier,
     )
@@ -1091,6 +1201,108 @@ def _edge_pairs(
         if srcs or tgts:
             pairs.append((srcs, tgts, str(edge.get("relation") or "")))
     return pairs
+
+
+#: Edge-source labels that name the SCANNER, not a client principal. A CVE or
+#: posture edge whose source is the assessment itself has nobody to list under
+#: "who can exploit it".
+_SCANNER_SOURCE_TOKENS: frozenset[str] = frozenset({"adscan"})
+
+
+def _edge_source_entities(
+    view: Mapping[str, Any],
+    *,
+    aliases: set[str],
+    rule: Any,
+    index: AssetIndex | None,
+    domain_hint: str,
+    role_label: str | None,
+) -> list[AffectedAssetEntity]:
+    """Return the SOURCE principals of a finding's attack-graph edges.
+
+    Only for a rule that declares client principals as its source
+    (``SourceMode.PRINCIPALS``); a scanner-sourced edge contributes nothing.
+    """
+    from adscan_internal.services.affected_asset_rules import (  # noqa: PLC0415
+        SourceMode,
+    )
+
+    if getattr(rule, "source", None) is not SourceMode.PRINCIPALS:
+        return []
+    sources, _targets = _edge_principals(view, aliases)
+    out: list[AffectedAssetEntity] = []
+    for name in sources:
+        if _norm_key(_strip_realm(name)) in _SCANNER_SOURCE_TOKENS:
+            continue
+        entity = _entity_for_principal(
+            name,
+            role=ROLE_SOURCE,
+            index=index,
+            domain_hint=domain_hint,
+            role_label=role_label or "",
+        )
+        if entity is not None:
+            out.append(entity)
+    return out
+
+
+#: ``vulnerable_resources`` kinds that name a principal rather than an ADCS object.
+_ADCS_PRINCIPAL_RESOURCE_KINDS: frozenset[str] = frozenset({"user", "computer", "group"})
+
+
+def _adcs_edge_target_split(
+    view: Mapping[str, Any],
+    aliases: set[str],
+    index: AssetIndex | None,
+) -> tuple[list[str], list[str]]:
+    """Split ADCS edge targets into ``(principals, objects)``.
+
+    A target is a PRINCIPAL when the edge's own ``vulnerable_resources`` lists it
+    with a principal ``kind`` (``User`` / ``Computer`` / ``Group``, the puppet of
+    ESC9/ESC10/ESC14), or when the directory resolves it to a principal and not
+    to a certificate template. Everything else is the abused OBJECT (a template
+    or a CA). Direct domain breakers are dropped on the shared rule of
+    :func:`_edge_principals`.
+    """
+    edges = view.get("attack_graph_edges")
+    if not isinstance(edges, list):
+        return [], []
+    principals: list[str] = []
+    objects: list[str] = []
+    seen: set[str] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = _norm_key(edge.get("relation")).replace(" ", "")
+        if aliases and relation and relation not in aliases:
+            continue
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        principal_names: set[str] = set()
+        resources = notes.get("vulnerable_resources") if notes else None
+        if isinstance(resources, list):
+            for entry in resources:
+                if not isinstance(entry, dict):
+                    continue
+                kind = str(entry.get("kind") or "").strip().lower()
+                if kind in _ADCS_PRINCIPAL_RESOURCE_KINDS:
+                    principal_names.add(_norm_key(_strip_realm(str(entry.get("name") or ""))))
+        for value in _extract_strings(edge.get("target")) + _extract_strings(
+            edge.get("to")
+        ):
+            if _is_direct_domain_breaker_asset(value):
+                continue
+            token = _norm_key(_strip_realm(value))
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            is_principal = token in principal_names
+            if not is_principal and index is not None:
+                is_principal = (
+                    index.lookup(value) is not None
+                    and index.lookup_template(value) is None
+                )
+            (principals if is_principal else objects).append(value)
+    return principals, objects
 
 
 def _prefer_precise_share_entities(
@@ -1276,6 +1488,149 @@ def _roasting_affected_entities(
 
 
 # --------------------------------------------------------------------------- #
+# Directory-attribute secret: did the leaked value authenticate as this object? #
+# --------------------------------------------------------------------------- #
+
+#: The leaked value AUTHENTICATED as this object.
+SECRET_STATUS_AUTHENTICATED = "authenticated"
+#: The leaked value did NOT authenticate as this object. Honest and
+#: deliberately not "stale": the run proved a refusal, not a reason for it.
+SECRET_STATUS_UNPROVEN = "unproven"
+
+#: The description-secret alias family: one weakness, three producers. Every
+#: one of them writes a per-record ``verified`` boolean, which is the flag this
+#: rendering reads.
+_ATTRIBUTE_SECRET_FINDING_KEYS: frozenset[str] = frozenset(
+    {
+        "credential_in_ldap_attribute",
+        "ldap_user_description_password_leak",
+        "user_description_credential_leak",
+    }
+)
+
+#: Record containers those producers write their per-account rows under.
+_ATTRIBUTE_SECRET_CONTAINERS: tuple[str, ...] = ("findings", "samples")
+
+#: Proven first: an account the value opens is what the client acts on.
+_SECRET_STATUS_SORT_RANK: dict[str, int] = {
+    SECRET_STATUS_AUTHENTICATED: 0,
+    SECRET_STATUS_UNPROVEN: 1,
+}
+
+
+def _attribute_secret_status_by_principal(view: Mapping[str, Any]) -> dict[str, str]:
+    """Map each named principal to whether the leaked value opened it.
+
+    Returns ``{}`` unless the finding carries BOTH states, which is the case
+    the per-row flag exists for. While every row shares one state the finding's
+    own key and severity carry the distinction and nothing is misrepresented;
+    the moment a promoted proof and an unproven observation sit in one record
+    (which the cross-attribution promotion makes happen by construction) a
+    single high finding would otherwise list proven and unproven accounts
+    indistinguishably.
+    """
+    status: dict[str, str] = {}
+    for container in _ATTRIBUTE_SECRET_CONTAINERS:
+        rows = view.get(container)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            name = ""
+            for key in ("samaccountname", "username", "name"):
+                value = row.get(key)
+                if _is_non_empty_string(value):
+                    name = _norm_key(_strip_realm(str(value)))
+                    break
+            if not name:
+                continue
+            verified = row.get("verified")
+            if not isinstance(verified, bool):
+                # A row that never recorded the flag says nothing either way,
+                # and inventing a state for it would be the whole defect.
+                continue
+            token = (
+                SECRET_STATUS_AUTHENTICATED if verified else SECRET_STATUS_UNPROVEN
+            )
+            current = status.get(name)
+            if current is None or _SECRET_STATUS_SORT_RANK.get(
+                token, 9
+            ) < _SECRET_STATUS_SORT_RANK.get(current, 9):
+                status[name] = token
+    if len(set(status.values())) < 2:
+        return {}
+    return status
+
+
+#: The row-level ``verification`` value a producer writes when the scan policy
+#: forbade the sign-in that would test the harvested value
+#: (``scan_policy_enforcement.HARVESTED_SECRET_NOT_VERIFIED_BY_POLICY``; a unit
+#: test locks the two together).
+_VERIFICATION_NOT_TRIED_BY_POLICY = "not_verified_scan_policy"
+#: What the affected account says when its value was never tried. Rendered as
+#: the entity's ``scope_note`` on every surface (both reports and the web).
+POLICY_UNTRIED_SECRET_NOTE = (
+    "value never tried, because the scan policy excludes signing in with harvested values"
+)
+
+
+def _policy_untried_principals(view: Mapping[str, Any]) -> set[str]:
+    """Principals whose leaked value the scan policy kept ADscan from trying."""
+    names: set[str] = set()
+    for container in _ATTRIBUTE_SECRET_CONTAINERS:
+        rows = view.get(container)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("verification") or "") != _VERIFICATION_NOT_TRIED_BY_POLICY:
+                continue
+            for key in ("samaccountname", "username", "name"):
+                value = row.get(key)
+                if _is_non_empty_string(value):
+                    names.add(_norm_key(_strip_realm(str(value))))
+                    break
+    return names
+
+
+def _stamp_attribute_secret_status(
+    entities: list[AffectedAssetEntity], view: Mapping[str, Any]
+) -> list[AffectedAssetEntity]:
+    """Stamp the per-row authentication state, proven rows first.
+
+    A row whose value the scan policy kept from being tried says so on the
+    account (:data:`POLICY_UNTRIED_SECRET_NOTE`), so the finding never reads as
+    if the value had been tested.
+    """
+    untried = _policy_untried_principals(view)
+    if untried:
+        entities = [
+            replace(entity, scope_note=entity.scope_note or POLICY_UNTRIED_SECRET_NOTE)
+            if (
+                _norm_key(_strip_realm(entity.identifier)) in untried
+                or _norm_key(_strip_realm(entity.display)) in untried
+            )
+            else entity
+            for entity in entities
+        ]
+    status = _attribute_secret_status_by_principal(view)
+    if not status:
+        return entities
+    stamped: list[AffectedAssetEntity] = []
+    for entity in entities:
+        token = status.get(_norm_key(_strip_realm(entity.identifier))) or status.get(
+            _norm_key(_strip_realm(entity.display))
+        )
+        stamped.append(replace(entity, secret_status=token) if token else entity)
+    stamped.sort(
+        key=lambda item: _SECRET_STATUS_SORT_RANK.get(item.secret_status or "", 9)
+    )
+    return stamped
+
+
+# --------------------------------------------------------------------------- #
 # Public composition                                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1320,6 +1675,10 @@ def build_affected_asset_entities(
     # breaker the generic target overlay would drop) and stamp a per-account
     # ``crack_status`` from each account's edge STEP status. CRACKED first.
     if finding_key in ROASTING_FINDING_KEYS:
+        # Who can request the ticket (Authenticated Users for Kerberoasting,
+        # Anonymous Logon for an AS-REP or Timeroast reachable without a
+        # credential) is the edge SOURCE: one object, its reach in
+        # ``scope_note``. It follows the roastable accounts so they lead.
         return _dedupe(
             _roasting_affected_entities(
                 view,
@@ -1328,6 +1687,14 @@ def build_affected_asset_entities(
                 domain_hint=domain_hint,
                 target_label=target_label,
                 rule=rule,
+            )
+            + _edge_source_entities(
+                view,
+                aliases=aliases,
+                rule=rule,
+                index=index,
+                domain_hint=domain_hint,
+                role_label=source_label,
             )
         )
 
@@ -1515,6 +1882,52 @@ def build_affected_asset_entities(
             if entity is not None:
                 entities.append(entity)
 
+    # ---- ADCS: the principal an ESC exposes ---------------------------------
+    # An ADCS edge TARGET is either the abused OBJECT (a template, a CA) or the
+    # PRINCIPAL the escalation lands on: the ESC14 account whose weak
+    # ``altSecurityIdentities`` mapping is written, the ESC9/ESC10 account
+    # whose identity is borrowed. The principal is what the finding exposes, so
+    # it is a TARGET entity, never a template. The edge's own
+    # ``vulnerable_resources[].kind`` and the directory decide which is which.
+    adcs_principal_targets: set[str] = set()
+    if is_adcs:
+        principal_targets, _object_targets = _adcs_edge_target_split(
+            view, aliases, index
+        )
+        for name in principal_targets:
+            entity = _entity_for_principal(
+                name,
+                role=ROLE_TARGET,
+                index=index,
+                domain_hint=domain_hint,
+                role_label=target_label,
+            )
+            if entity is not None:
+                entities.append(entity)
+                adcs_principal_targets.add(_norm_key(_strip_realm(name)))
+
+    # ---- Who can exploit it, for an object-centric attack step ---------------
+    # A TARGET_ONLY finding backed by attack-graph edges (the CA-flag ESCs,
+    # unconstrained delegation) still has someone who can carry the step out:
+    # the edge SOURCE. It is surfaced as the ONE principal the edge names; a
+    # broad built-in source (Authenticated Users) stays one object with its
+    # reach in ``scope_note``, never a list of members.
+    if (
+        rep is Representation.TARGET_ONLY
+        and rule.scope is Scope.PER_PRINCIPAL
+        and not any(entity.role == ROLE_SOURCE for entity in entities)
+    ):
+        entities.extend(
+            _edge_source_entities(
+                view,
+                aliases=aliases,
+                rule=rule,
+                index=index,
+                domain_hint=domain_hint,
+                role_label=source_label,
+            )
+        )
+
     # ---- Typed extras (ADCS templates + CA, shares, artifacts) --------------
     if Extra.TEMPLATES in rule.extras:
         template_names = list(_adcs_template_names(view))
@@ -1522,12 +1935,17 @@ def build_affected_asset_entities(
             # The ADCS edge TARGET is the abused template object (e.g.
             # ``ESC13@ESSOS.LOCAL``); when the details carry no explicit template
             # field, recover it from the edge target so the template still
-            # surfaces. CA targets are handled by the CA extra below.
-            _, edge_targets = _edge_principals(view, aliases)
+            # surfaces. CA targets are handled by the CA extra below, and a
+            # PRINCIPAL target (the ESC14 mapped account) is never a template.
+            _, object_targets = _adcs_edge_target_split(view, aliases, index)
             ca_lower = {ca.strip().lower() for ca in extract_adcs_ca_names(view)}
-            for target in edge_targets:
+            for target in object_targets:
                 name = _strip_realm(target).strip()
-                if name and name.lower() not in ca_lower:
+                if (
+                    name
+                    and name.lower() not in ca_lower
+                    and _norm_key(name) not in adcs_principal_targets
+                ):
                     template_names.append(name)
         template_label = rule.role_label_for("template") or None
         for template in template_names:
@@ -1582,7 +2000,7 @@ def build_affected_asset_entities(
                 )
     if Extra.PASSWORD_REDACTED in rule.extras:
         for key in ("password", "secret", "plaintext", "cleartext"):
-            if _is_non_empty_string(view.get(key)):
+            if _is_non_empty_string(view.get(key)) or note_has_recovered_secret(view, key):
                 entities.append(
                     AffectedAssetEntity(
                         type=TYPE_CREDENTIAL,
@@ -1634,7 +2052,71 @@ def build_affected_asset_entities(
                 )
             )
 
+    if finding_key in _ATTRIBUTE_SECRET_FINDING_KEYS:
+        return _stamp_attribute_secret_status(_dedupe(entities), view)
     return _dedupe(entities)
+
+
+def build_display_only_exposures(
+    finding_key: str,
+    details: Any,
+    *,
+    domain_name: str | None = None,
+    index: AssetIndex | None = None,
+    relation_aliases: set[str] | None = None,
+) -> list[AffectedAssetEntity]:
+    """Return the escalation landing points an attack step exposes, DISPLAY ONLY.
+
+    The affected-asset entities drop an edge target that is a direct domain
+    breaker (Domain Admins, Enterprise Admins, a domain controller): it is where
+    the escalation lands, not the object the finding is about, and the severity
+    overlay, the counts and the command resolvers must not see it. A reader still
+    needs it under "What it exposes" (ESC1 exposes Domain Admins), so it is
+    returned here and stamped under ``AFFECTED_ASSETS_DISPLAY_ONLY_KEY``, a key
+    nothing that scores reads.
+
+    Only for a finding whose rule declares client principals as its source (an
+    attack step), and never for roasting (whose entities already keep a breaker
+    account, as the roasted subject). Pure; no I/O.
+    """
+    from adscan_internal.services.affected_asset_rules import (  # noqa: PLC0415
+        SourceMode,
+    )
+
+    if finding_key in ROASTING_FINDING_KEYS:
+        return []
+    rule = rule_for(finding_key)
+    if rule.source is not SourceMode.PRINCIPALS:
+        return []
+    view = _details_view(details)
+    edges = view.get("attack_graph_edges")
+    if not isinstance(edges, list):
+        return []
+    aliases = relation_aliases or set()
+    domain_hint = str(domain_name or (index.domain if index is not None else "") or "")
+    out: list[AffectedAssetEntity] = []
+    seen: set[str] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        relation = _norm_key(edge.get("relation")).replace(" ", "")
+        if aliases and relation and relation not in aliases:
+            continue
+        for value in _extract_strings(edge.get("target")) + _extract_strings(
+            edge.get("to")
+        ):
+            if not _is_direct_domain_breaker_asset(value):
+                continue
+            token = _norm_key(_strip_realm(value))
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            entity = _entity_for_principal(
+                value, role=ROLE_TARGET, index=index, domain_hint=domain_hint
+            )
+            if entity is not None:
+                out.append(entity)
+    return out
 
 
 def _read_set_records(details: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -1739,6 +2221,7 @@ def serialize_affected_asset_entities(
     index: AssetIndex | None = None,
     relation_aliases: set[str] | None = None,
     flat_assets: Iterable[str] | None = None,
+    member_example_for: "GroupMemberExampleResolver | None" = None,
 ) -> list[dict[str, Any]]:
     """Return the JSON-serializable structured entities for a finding.
 
@@ -1765,7 +2248,164 @@ def serialize_affected_asset_entities(
             [*entities, *_typed_entities_from_flat_strings(flat_assets, index)]
         )
     entities = _prefer_precise_share_entities(entities)
+    if member_example_for is not None:
+        entities = [
+            _with_member_example(entity, member_example_for) for entity in entities
+        ]
     return [entity.to_dict() for entity in entities]
+
+
+@dataclass(frozen=True)
+class GroupMemberExampleResolver:
+    """What the workspace proves about who can act as a source principal.
+
+    ``member_for(identifier, sid)`` names one known member of a group (a
+    controlled one first) as ``(sAMAccountName, controlled)``; ``controlled``
+    holds the lower-cased accounts whose credential the workspace holds.
+    """
+
+    member_for: Callable[[str, str], "tuple[str, bool] | None"]
+    controlled: frozenset[str] = frozenset()
+
+
+def _with_member_example(
+    entity: AffectedAssetEntity, resolver: GroupMemberExampleResolver
+) -> AffectedAssetEntity:
+    """Stamp who can act for a SOURCE entity: a group's member, a user's control."""
+    if entity.role != ROLE_SOURCE or entity.scope_note:
+        return entity
+    if entity.type in (TYPE_USER, TYPE_COMPUTER):
+        name = _strip_realm(entity.identifier).strip().lower()
+        short = name.split(".", 1)[0]
+        if name in resolver.controlled or f"{short}$" in resolver.controlled:
+            return replace(entity, controlled=True)
+        return entity
+    if entity.type != TYPE_GROUP:
+        return entity
+    try:
+        found = resolver.member_for(entity.identifier, entity.sid or "")
+    except Exception:  # noqa: BLE001 - enrichment never breaks the stamp
+        found = None
+    if not found:
+        return entity
+    member, controlled = found
+    return replace(entity, member_example=member, member_controlled=controlled)
+
+
+def build_group_member_example_resolver(
+    workspace_dir: str | Path, domain_name: str
+) -> GroupMemberExampleResolver | None:
+    """Return a resolver naming one known member of a group, or ``None``.
+
+    Members come from the membership SSOT (``load_membership_snapshot`` +
+    ``group_member_index.build_group_member_index``: transitive, primary group
+    included). An account whose credential the workspace holds is preferred, so
+    a command a client reproduces runs as an account the assessment proved it
+    controls; otherwise the first member in a stable order. ``None`` when the
+    workspace carries no snapshot.
+    """
+    from adscan_internal.services.group_member_index import (  # noqa: PLC0415
+        build_group_member_index,
+    )
+
+    # Read the snapshot file directly, at the same path the attack graph is read
+    # from above. This module is bundled into the appliance backend image, and
+    # ``membership_snapshot`` pulls the scan engine in (its cache, the attack-graph
+    # service, the CLI output layer), which that image must never carry.
+    snapshot_path = Path(workspace_dir) / "domains" / str(domain_name) / "memberships.json"
+    try:
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    user_members, computer_members, has_principals = build_group_member_index(
+        snapshot, domain_name
+    )
+    if not has_principals:
+        return None
+    sid_to_label = snapshot.get("sid_to_label")
+    sid_to_label = sid_to_label if isinstance(sid_to_label, dict) else {}
+    controlled = _controlled_account_names(workspace_dir, domain_name)
+    realm = str(domain_name or "").strip().upper()
+
+    def _resolve(identifier: str, sid: str) -> tuple[str, bool] | None:
+        keys = []
+        label = sid_to_label.get(str(sid or "").strip().upper()) or sid_to_label.get(
+            str(sid or "").strip()
+        )
+        if label:
+            keys.append(str(label).upper())
+        name = _strip_realm(str(identifier or "")).strip().upper()
+        if name:
+            keys.append(f"{name}@{realm}")
+        for key in keys:
+            # User members first; a group whose members are machines (Domain
+            # Controllers) acts through a computer account.
+            members = user_members.get(key) or computer_members.get(key)
+            if not members:
+                continue
+            names = sorted({_strip_realm(str(m)).strip().lower() for m in members if m})
+            names = [n for n in names if n]
+            if not names:
+                continue
+            owned = [n for n in names if n in controlled]
+            return (owned[0], True) if owned else (names[0], False)
+        return None
+
+    return GroupMemberExampleResolver(member_for=_resolve, controlled=frozenset(controlled))
+
+
+def stamp_step_source_member(
+    details: dict[str, Any], resolver: GroupMemberExampleResolver | None
+) -> dict[str, Any]:
+    """Record a known member of an attack-path step's GROUP source on the step.
+
+    The attack-path twin of :func:`_with_member_example`. A step whose source is
+    a group (``source_kind`` stamped by ``attack_graph_core._stamp_step_identity``)
+    gets ``source_member_example`` / ``source_member_controlled``, so the step's
+    by-hand command runs as a real member instead of a fill-in. A broad built-in
+    group gets nothing (the scan's own account already qualifies), nor does a
+    step that already names its executor (``details["user"]``). Returns the same
+    dict; never raises.
+    """
+    if resolver is None or not isinstance(details, dict):
+        return details
+    if str(details.get("source_kind") or "").strip().lower() != "group":
+        return details
+    if str(details.get("user") or "").strip() or details.get("source_member_example"):
+        return details
+    sam = str(details.get("source_samaccountname") or "").strip()
+    sid = str(details.get("source_sid") or "").strip()
+    if broad_scope_note(sid=sid, label=sam or str(details.get("from") or "")):
+        return details
+    try:
+        found = resolver.member_for(sam or _strip_realm(str(details.get("from") or "")), sid)
+    except Exception:  # noqa: BLE001 - enrichment never breaks a render
+        found = None
+    if found:
+        details["source_member_example"] = found[0]
+        details["source_member_controlled"] = bool(found[1])
+    return details
+
+
+def _controlled_account_names(workspace_dir: str | Path, domain_name: str) -> set[str]:
+    """Lower-cased accounts whose credential the workspace holds for ``domain_name``.
+
+    Reads only the KEYS of ``domains_data[domain]["credentials"]`` from the
+    workspace's persisted variables; no secret is read into this module.
+    """
+    path = Path(workspace_dir) / "variables.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    domains = data.get("domains_data") if isinstance(data, dict) else None
+    entry = domains.get(domain_name) if isinstance(domains, dict) else None
+    creds = entry.get("credentials") if isinstance(entry, dict) else None
+    if not isinstance(creds, dict):
+        return set()
+    return {_strip_realm(str(name)).strip().lower() for name in creds if name}
 
 
 # --------------------------------------------------------------------------- #
@@ -1854,8 +2494,16 @@ def stamp_structured_affected_assets(
     domain_name: str,
     index: AssetIndex | None,
     attack_paths: list[dict[str, Any]] | None = None,
+    member_example_for: GroupMemberExampleResolver | None = None,
+    workspace_dir: str | Path | None = None,
 ) -> bool:
     """Stamp every finding's ``details[SERIALIZED_KEY]`` with structured entities.
+
+    ``workspace_dir`` (or an explicit ``member_example_for``) lets the stamp
+    record who can act for each source principal: a known member of a group,
+    whether the assessment controls a user. Every caller that has the
+    workspace passes it, so the on-disk artifact, the report's in-memory copy
+    and the web's live view stamp the same thing.
 
     The single serialization seam between the engine and the platform. Iterates
     the on-disk technical-report findings, computes the typed, correlation-ready
@@ -1876,6 +2524,8 @@ def stamp_structured_affected_assets(
         extract_affected_assets,
     )
 
+    if member_example_for is None and workspace_dir:
+        member_example_for = _safe_member_example_resolver(workspace_dir, domain_name)
     changed = False
     for finding in findings:
         if not isinstance(finding, dict):
@@ -1896,7 +2546,7 @@ def stamp_structured_affected_assets(
             source_details = {
                 key_name: value
                 for key_name, value in details.items()
-                if key_name != SERIALIZED_KEY
+                if key_name not in (SERIALIZED_KEY, AFFECTED_ASSETS_DISPLAY_ONLY_KEY)
             }
             flat = extract_affected_assets(
                 key,
@@ -1911,9 +2561,26 @@ def stamp_structured_affected_assets(
                 index=index,
                 relation_aliases=aliases,
                 flat_assets=flat,
+                member_example_for=member_example_for,
             )
+            display_only = [
+                entity.to_dict()
+                for entity in build_display_only_exposures(
+                    key,
+                    source_details,
+                    domain_name=domain_name,
+                    index=index,
+                    relation_aliases=aliases,
+                )
+            ]
         except Exception:  # noqa: BLE001 - one bad finding never breaks the pass
             continue
+        if (details.get(AFFECTED_ASSETS_DISPLAY_ONLY_KEY) or []) != display_only:
+            if display_only:
+                details[AFFECTED_ASSETS_DISPLAY_ONLY_KEY] = display_only
+            else:
+                details.pop(AFFECTED_ASSETS_DISPLAY_ONLY_KEY, None)
+            changed = True
         if details.get(SERIALIZED_KEY) != serialized:
             if serialized:
                 details[SERIALIZED_KEY] = serialized
@@ -1929,6 +2596,7 @@ def stamp_report_vulnerabilities(
     domain_name: str,
     index: AssetIndex | None,
     attack_paths: list[dict[str, Any]] | None = None,
+    workspace_dir: str | Path | None = None,
 ) -> bool:
     """Stamp the typed entities onto an in-memory report's vulnerability map.
 
@@ -1963,8 +2631,29 @@ def stamp_report_vulnerabilities(
         # same finding in the same kit.
         finding["details"].pop("_affected_assets", None)
     return stamp_structured_affected_assets(
-        findings, domain_name=domain_name, index=index, attack_paths=attack_paths
+        findings,
+        domain_name=domain_name,
+        index=index,
+        attack_paths=attack_paths,
+        workspace_dir=workspace_dir,
     )
+
+
+def safe_member_example_resolver(
+    workspace_dir: str | Path, domain_name: str
+) -> GroupMemberExampleResolver | None:
+    """Public, never-raising :func:`build_group_member_example_resolver`."""
+    return _safe_member_example_resolver(workspace_dir, domain_name)
+
+
+def _safe_member_example_resolver(
+    workspace_dir: str | Path, domain_name: str
+) -> GroupMemberExampleResolver | None:
+    """:func:`build_group_member_example_resolver`, never raising."""
+    try:
+        return build_group_member_example_resolver(workspace_dir, domain_name)
+    except Exception:  # noqa: BLE001 - enrichment never breaks the stamp
+        return None
 
 
 def stamp_workspace_affected_assets(
@@ -2026,6 +2715,7 @@ def stamp_workspace_affected_assets(
             if index is not None
             else load_asset_index(workspace_dir, domain_name),
             attack_paths=attack_paths,
+            workspace_dir=workspace_dir,
         )
         # The ADscan rating is derived from the entities above, so the two have
         # to be settled together. A workspace whose entities did NOT move can

@@ -25,9 +25,11 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from adscan_internal import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.posture_sink import PostureSink
 from adscan_internal.services.smb_transport import (
@@ -96,6 +98,7 @@ class SMBPrivilegeConfig:
         # services/credential_routing.py for the rationale.
         from adscan_internal.services.credential_routing import (
             promote_credential_fields,
+            require_credential_material,
         )
 
         new_pwd, new_hash, new_aes, new_cc = promote_credential_fields(
@@ -112,6 +115,14 @@ class SMBPrivilegeConfig:
             object.__setattr__(self, "aes_key", new_aes)
         if new_cc != self.ccache_path:
             object.__setattr__(self, "ccache_path", new_cc)
+        require_credential_material(
+            transport="SMB privilege check",
+            username=self.username,
+            password=self.password,
+            nt_hash=self.nt_hash,
+            aes_key=self.aes_key,
+            ccache_path=self.ccache_path,
+        )
 
 
 @dataclass(frozen=True)
@@ -271,13 +282,14 @@ async def check_smb_privilege(config: SMBPrivilegeConfig) -> SMBPrivilegeResult:
 async def check_smb_privilege_batch(
     configs: Sequence[SMBPrivilegeConfig],
     *,
-    max_concurrency: int = 10,
+    max_concurrency: int | None = None,
     per_host_budget: float | None = None,
 ) -> list[SMBPrivilegeResult]:
     """Run multiple SMB privilege checks concurrently with bounded parallelism.
 
     Returns results in the same order as configs.
-    max_concurrency controls simultaneous SMB connections (default 10).
+    max_concurrency controls simultaneous SMB connections (default from the scan
+    pacing, ``sweep.smb_privilege``: 10 at the default level).
 
     ``per_host_budget`` is a wall-clock bound (seconds) on the WHOLE per-host
     probe — connect + Kerberos pre-mint + the ADMIN$/C$ tree_connects — NOT just
@@ -287,7 +299,10 @@ async def check_smb_privilege_batch(
     indefinitely (the >10min stall this fixes). ``None`` derives it per-config
     from the connection timeout.
     """
-    semaphore = asyncio.Semaphore(max_concurrency)
+    if max_concurrency is None:
+        max_concurrency = int(component_pacing(active_pacing(), "sweep.smb_privilege")["max_concurrency"])
+    runtime = active_runtime()
+    semaphore = runtime.semaphore(max_concurrency)
     # Per-host probe timings (host, elapsed_s, status) — debug-only diagnostics so
     # we can see WHICH host makes the sweep feel "stuck at the end" (the gather
     # waits for the slowest probe). Zero cost in non-debug runs (print_info_debug
@@ -304,11 +319,28 @@ async def check_smb_privilege_batch(
         )
         async with semaphore:
             started = time.monotonic()
+            if not await runtime.before_op(cfg.target_ip):
+                return SMBPrivilegeResult(
+                    target_ip=cfg.target_ip,
+                    target_hostname=cfg.target_hostname,
+                    username=cfg.username,
+                    domain=cfg.domain,
+                    status=SMBPrivilegeStatus.UNREACHABLE,
+                    error="paused_by_safeguard: the host stopped responding earlier in the assessment",
+                )
             try:
                 result = await asyncio.wait_for(
                     check_smb_privilege(cfg), timeout=budget
                 )
+                runtime.record(
+                    cfg.target_ip,
+                    Outcome.TIMEOUT
+                    if result.status == SMBPrivilegeStatus.UNREACHABLE
+                    else Outcome.OK,
+                    None,
+                )
             except (asyncio.TimeoutError, TimeoutError):
+                runtime.record(cfg.target_ip, Outcome.TIMEOUT)
                 result = SMBPrivilegeResult(
                     target_ip=cfg.target_ip,
                     target_hostname=cfg.target_hostname,
@@ -409,6 +441,82 @@ def local_account_logon_domain(host: str, account_domain: str | None = None) -> 
     return short or "."
 
 
+class LocalLogonToDomainControllerRefused(ValueError):
+    """A local-account sign-in was about to be built for a domain controller.
+
+    A domain controller has no local account database: the "local" logon is
+    validated against the DOMAIN account of the same name, so it would count
+    toward that account's lockout while the guard keyed it as host-local.
+    """
+
+
+def local_account_privilege_config(
+    *,
+    host: str,
+    username: str,
+    credential: str,
+    is_hash: bool | None = None,
+    account_domain: str | None = None,
+    target_hostname: str | None = None,
+    timeout: int = 15,
+    is_domain_controller: Callable[[str], bool] | None = None,
+) -> SMBPrivilegeConfig:
+    """The ONE way to build a sign-in as a host-LOCAL account on ``host``.
+
+    Every local-account SMB logon (verifying a local credential, trying a
+    recovered local credential on other hosts) goes through here, so all of
+    them carry the same three properties:
+
+    * the NTLM domain is the host's own account domain
+      (:func:`local_account_logon_domain`), never the AD domain. With the AD
+      domain the target forwards the logon to a domain controller, so the
+      attempt is a DOMAIN logon: it never tests the local account, and a wrong
+      secret raises the DOMAIN account's failed sign-in count;
+    * ``is_local_account=True``: the auth planner never promotes the attempt to
+      Kerberos (a local account has no principal), and the lockout guard keys
+      it to the host (``auth_attempt_guard.local_realm``), counting failures
+      per local account per host;
+    * no KDC and ``use_kerberos=False``.
+
+    Args:
+        host: Target host (IP or name) to connect to.
+        username: Local account name.
+        credential: Password or NT hash.
+        is_hash: Whether ``credential`` is an NT hash; detected when ``None``.
+        account_domain: The account domain the host reported for itself, when known.
+        target_hostname: Optional host name for display.
+        timeout: Per-host connection timeout in seconds.
+        is_domain_controller: Optional ``is_dc(host)`` predicate
+            (``services.local_reuse_targets.domain_controller_matcher``). A sweep
+            passes it so a DC that slipped past its target filter is refused
+            here rather than signed in to as a "local" account.
+
+    Raises:
+        LocalLogonToDomainControllerRefused: ``host`` or ``target_hostname`` is
+            a domain controller according to ``is_domain_controller``.
+    """
+    if is_domain_controller is not None and any(
+        is_domain_controller(value) for value in (host, target_hostname) if value
+    ):
+        raise LocalLogonToDomainControllerRefused(
+            f"refusing a local-account sign-in to domain controller {host}"
+        )
+    hashed = _looks_like_nt_hash(credential) if is_hash is None else bool(is_hash)
+    logon_domain = local_account_logon_domain(host, account_domain)
+    return SMBPrivilegeConfig(
+        target_ip=host,
+        target_hostname=target_hostname,
+        domain=logon_domain,
+        username=username,
+        password=None if hashed else credential,
+        nt_hash=credential if hashed else None,
+        auth_domain=logon_domain,
+        use_kerberos=False,
+        is_local_account=True,
+        timeout=timeout,
+    )
+
+
 async def verify_local_account_smb_access(
     *,
     host: str,
@@ -432,17 +540,12 @@ async def verify_local_account_smb_access(
     """
     logon_domain = local_account_logon_domain(host, account_domain)
     try:
-        is_hash = _looks_like_nt_hash(credential)
-        cfg = SMBPrivilegeConfig(
-            target_ip=host,
-            target_hostname=target_hostname,
-            domain=logon_domain,
+        cfg = local_account_privilege_config(
+            host=host,
             username=username,
-            password=None if is_hash else credential,
-            nt_hash=credential if is_hash else None,
-            auth_domain=logon_domain,
-            use_kerberos=False,
-            is_local_account=True,
+            credential=credential,
+            account_domain=account_domain,
+            target_hostname=target_hostname,
             timeout=timeout,
         )
         return await check_smb_privilege(cfg)

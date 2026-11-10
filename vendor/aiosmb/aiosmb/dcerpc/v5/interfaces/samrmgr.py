@@ -606,8 +606,11 @@ class SAMRRPC:
 	async def change_account_password_4(self, uhandle, newpw):
 		return await samr.hSamrSetPasswordInternal4New(self.dce, uhandle, newpw)
 	
-	async def change_account_password_internal(self, uhandle, newpw):
-		return await samr.hSamrSetNTInternal1(self.dce, uhandle, newpw)
+	async def change_account_password_internal(self, uhandle, newpw, nt_hash=''):
+		# ADscan: ``nt_hash`` sets the account's NT OWF directly (SamrSetInformationUser,
+		# UserInternal1Information, info class 18). Used to put back a password the
+		# assessment reset when only its NT hash is held. ``newpw`` is ignored then.
+		return await samr.hSamrSetNTInternal1(self.dce, uhandle, newpw, nt_hash)
 
 	async def unroll_group(self, dhandle, grid, all_grids = None, grids_seen = None):
 		ghandle = None

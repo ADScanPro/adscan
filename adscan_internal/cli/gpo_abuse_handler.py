@@ -23,6 +23,8 @@ beyond delegated calls into the exploitation service.
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 import asyncio
 from pathlib import Path
 from typing import Any
@@ -80,10 +82,13 @@ def _resolve_active_credential(
         entry = domains_data.get(domain) if isinstance(domains_data, dict) else None
         if not isinstance(entry, dict):
             return None
-        username = (
-            getattr(shell, "username", None) or entry.get("username") or ""
-        ).strip()
-        password = (entry.get("password") or "").strip()
+        # Username and password from the SAME entry (pairing SSOT): shell.username
+        # can name a principal of another domain, whose password this is not.
+        from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+            resolve_principal_secret_pair,
+        )
+
+        username, password = resolve_principal_secret_pair(domains_data, domain=domain)
         dc_ip = (entry.get("pdc") or "").strip()
         if not (username and password and dc_ip):
             return None
@@ -316,6 +321,40 @@ def _print_gpo_preflight_warning(
 # ---------------------------------------------------------------------------
 
 
+def _filter_gpo_candidates_by_scan_policy(
+    shell: Any, candidates: list[WritableGPOCandidate]
+) -> tuple[list[WritableGPOCandidate], bool]:
+    """Keep the GPOs whose granting rights include a policy-allowed technique.
+
+    Returns ``(kept, refused)``; ``refused`` is True when the policy removed at
+    least one candidate (each excluded right is refused once).
+    """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        policy_active,
+        refuse_relation,
+        relation_excluded,
+    )
+
+    if not policy_active(shell) or not candidates:
+        return list(candidates), False
+    kept: list[WritableGPOCandidate] = []
+    refused = False
+    for candidate in candidates:
+        rights = tuple(candidate.granted_rights or ())
+        if any(not relation_excluded(shell, right) for right in rights):
+            kept.append(candidate)
+            continue
+        refused = True
+        for right in rights or ("genericwrite",):
+            refuse_relation(
+                shell,
+                right,
+                surface="gpo_abuse",
+                to_label=candidate.display_name or candidate.gpo_dn,
+            )
+    return kept, refused
+
+
 def run_exploit_gpo_abuse(shell: Any) -> bool:
     """Entry point for ``exploit-gpo-abuse`` on the CLI shell.
 
@@ -427,7 +466,7 @@ def run_exploit_gpo_immediate_task_for_step(
             )
             return False
 
-        ledger = getattr(shell, "environment_change_ledger", None)
+        ledger = ledger_or_warn(shell)
         if ledger is None:
             print_error(
                 "GPO step: no environment_change_ledger on the session; "
@@ -525,6 +564,7 @@ def run_exploit_gpo_immediate_task_for_step(
                     payload=payload,
                     task_name="ADscanPathTask",
                     principal_dn_for_guard=None,
+                    shell=shell,
                     # Attack-path execution policy: plant to prove the edge,
                     # then revert inline. GPO application is asynchronous (next
                     # gpupdate), so the chain cannot synchronously wield the
@@ -659,6 +699,15 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
                 print_error(f"GPO filter (unlinked pass) failed: {exc}")
                 return False
 
+    # Scan policy (spec 2026-11-04 § 7.2 S6, decision D-12): planting an
+    # Immediate Scheduled Task exercises the ACL right that grants write access
+    # to the GPO. A GPO is offered only when one of its granting rights is a
+    # technique the policy allows; when the policy leaves none, the wizard
+    # refuses through the enforcement SSOT and stops.
+    candidates, refused = _filter_gpo_candidates_by_scan_policy(shell, candidates)
+    if refused and not candidates:
+        return False
+
     if not candidates:
         _console.print(
             Panel(
@@ -772,7 +821,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             return False
 
     # ---- Phase 8: execution -------------------------------------------------
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         print_error(
             "No environment_change_ledger on the active session. The "
@@ -807,6 +856,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
                     gpc_path=chosen.gpc_path,
                     payload=payload,
                     principal_dn_for_guard=None,
+                    shell=shell,
                     auto_rollback=False,
                 )
             )
@@ -1067,7 +1117,7 @@ def run_exploit_gpo_rollback(shell: Any, ledger_id: str | None = None) -> bool:
     a manual rollback. Returns True on a clean rollback.
     """
     try:
-        ledger = getattr(shell, "environment_change_ledger", None)
+        ledger = ledger_or_warn(shell)
         if ledger is None:
             print_error("No active ledger (workspace not loaded).")
             return False
@@ -1169,8 +1219,16 @@ def run_exploit_gpo_rollback(shell: Any, ledger_id: str | None = None) -> bool:
             default=False,
         ):
             try:
-                ledger.mark_reverted(str(chosen_entry.get("change_id", "")))
-                print_success("Entry marked as reverted.")
+                from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+                    record_operator_attested_revert,
+                )
+
+                record_operator_attested_revert(
+                    ledger,
+                    str(chosen_entry.get("change_id", "")),
+                    operator=str(getattr(shell, "username", "") or ""),
+                )
+                print_success("Entry marked as reverted by the operator's manual cleanup.")
                 return True
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)

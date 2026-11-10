@@ -383,6 +383,45 @@ def render_no_extracted_findings_preview(
     )
 
 
+#: Detail keys whose VALUE is credential material. The processing report records
+#: which account and which file a finding came from; the secret itself already
+#: lives in the credential store, so the report never persists it.
+_SECRET_DETAIL_KEYS = frozenset(
+    {
+        "ntlm_hash",
+        "nt_hash",
+        "lm_hash",
+        "hash",
+        "secret",
+        "password",
+        "passwd",
+        "cpassword",
+        "aes_key",
+        "aes128",
+        "aes256",
+        "ticket",
+        "private_key",
+    }
+)
+_REDACTED = "redacted"
+
+
+def _redact_secret_values(value: Any) -> Any:
+    """Return ``value`` with every secret-keyed field replaced by ``"redacted"``."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED
+                if str(key).strip().lower() in _SECRET_DETAIL_KEYS and item not in (None, "")
+                else _redact_secret_values(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_secret_values(item) for item in value]
+    return value
+
+
 def persist_artifact_processing_report(
     *,
     phase_root_abs: str,
@@ -401,7 +440,7 @@ def persist_artifact_processing_report(
                 "status": item.status,
                 "note": item.note,
                 "manual_review": bool(item.manual_review),
-                "details": dict(item.details or {}),
+                "details": _redact_secret_values(dict(item.details or {})),
             }
             for item in normalized_records
         ]

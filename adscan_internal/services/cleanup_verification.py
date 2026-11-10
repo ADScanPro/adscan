@@ -36,6 +36,17 @@ VERIFY_SPN = "spn_reread"
 VERIFY_KEYCREDENTIAL = "keycredentiallink_reread"
 VERIFY_RBCD = "rbcd_reread"
 VERIFY_MACHINE_ACCOUNT = "machine_account_reread"
+VERIFY_ACCOUNT_DISABLED = "account_disabled_reread"
+VERIFY_UPN = "upn_reread"
+VERIFY_ALTSECID = "altsecurityidentities_reread"
+VERIFY_ATTRIBUTE = "attribute_reread"
+VERIFY_TEMPLATE = "certificate_template_reread"
+VERIFY_CA_RIGHT = "ca_security_reread"
+VERIFY_CA_TEMPLATE_LIST = "ca_certificate_templates_reread"
+VERIFY_SMB_PATH = "smb_path_reread"
+VERIFY_FILE_CONTENT = "smb_file_content_reread"
+VERIFY_GPO_VERSION = "gpo_version_reread"
+VERIFY_ACCOUNT_DELETED = "account_deleted_reread"
 
 
 def _domain_dn(conn: Any) -> str:
@@ -256,6 +267,26 @@ def verify_spn_removed(conn: Any, *, target: str, spn: str) -> bool:
         return False
 
 
+def verify_account_disabled(conn: Any, *, target: str) -> bool:
+    """Confirm ``target`` carries ACCOUNTDISABLE again after a re-disable. Fail-closed."""
+    try:
+        target_dn = _resolve_object_dn(conn, target, group=False)
+        if not target_dn:
+            return False
+        values = _read_attr_values(conn, target_dn, "userAccountControl")
+        if not values:
+            return False
+        raw = values[0]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "ignore")
+        return bool(int(str(raw).strip()) & 0x2)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"cleanup-verify account-disabled re-read failed: {exc}")
+        return False
+
+
 def verify_keycredential_removed(conn: Any, *, target: str, key_credential_value: str) -> bool:
     """Confirm the added msDS-KeyCredentialLink value is gone from ``target``.
 
@@ -317,6 +348,27 @@ def verify_rbcd_removed(conn: Any, *, target_dn: str, delegate_sid: str | None =
         return False
 
 
+def verify_machine_account_deleted(conn: Any, *, sam_account_name: str) -> bool:
+    """Confirm a computer account no longer exists (deleted, not merely disabled)."""
+    try:
+        sam = str(sam_account_name or "").strip()
+        base = _domain_dn(conn)
+        if not sam or not base:
+            return False
+        conn.search(
+            search_base=base,
+            search_filter=(
+                f"(&(objectClass=computer)(sAMAccountName={_escape_filter_value(sam)}))"
+            ),
+            attributes=["distinguishedName"],
+        )
+        return not list(getattr(conn, "entries", []) or [])
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def verify_machine_account_gone(conn: Any, *, sam_account_name: str) -> bool:
     """Confirm a machine account is deleted OR disabled. Fail-closed.
 
@@ -356,6 +408,55 @@ def verify_machine_account_gone(conn: Any, *, sam_account_name: str) -> bool:
         return False
 
 
+def resolve_object_dn(conn: Any, identity: str, *, group: bool = False) -> str | None:
+    """Public form of the DN resolver: a DN passes through, a name is searched."""
+    return _resolve_object_dn(conn, identity, group=group)
+
+
+def read_attribute_strings(conn: Any, dn: str, attribute: str) -> list[str]:
+    """Every value of ``attribute`` on ``dn`` as text (empty when absent)."""
+    values: list[str] = []
+    for value in _read_attr_values(conn, dn, attribute):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        text = str(value or "").strip()
+        if text:
+            values.append(text)
+    return values
+
+
+def attribute_values_match(current: Any, expected: Any) -> bool:
+    """Directory-string equality of two value lists (order and case ignored).
+
+    ``None`` and an empty list both mean the attribute is absent.
+    """
+    return {_norm(v) for v in (current or ()) if _norm(v)} == {
+        _norm(v) for v in (expected or ()) if _norm(v)
+    }
+
+
+def verify_attribute_values(
+    conn: Any, *, target: str, attribute: str, expected: Any
+) -> bool:
+    """Confirm ``attribute`` on ``target`` holds exactly ``expected``. Fail-closed.
+
+    ``expected`` empty means the attribute must be absent. ``target`` may be a DN
+    or a principal name.
+    """
+    try:
+        dn = _resolve_object_dn(conn, target)
+        if not dn:
+            return False
+        return attribute_values_match(read_attribute_strings(conn, dn, attribute), expected)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"cleanup-verify attribute re-read failed ({mark_sensitive(attribute, 'text')}): {exc}"
+        )
+        return False
+
+
 __all__ = [
     "VERIFY_GROUP_MEMBERSHIP",
     "VERIFY_DACL_ACE",
@@ -371,4 +472,8 @@ __all__ = [
     "verify_keycredential_removed",
     "verify_rbcd_removed",
     "verify_machine_account_gone",
+    "resolve_object_dn",
+    "read_attribute_strings",
+    "attribute_values_match",
+    "verify_attribute_values",
 ]

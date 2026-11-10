@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from adscan_core.adcs_relations import ADCS_RELATIONS, is_adcs_relation
+
 #: Key an ADCS finding's state block is stamped under, in the persisted finding
 #: and in the renderer's data. One name so the writer, the PDF and the web
 #: platform cannot drift apart on where the record lives.
@@ -64,35 +66,20 @@ _STATE_LABELS: dict[str, str] = {
 
 _VALID_STATES = frozenset(_STATE_LABELS)
 
-#: Relation names (lower-cased) that are ADCS ESC escalations. A step / edge whose
-#: relation is one of these renders under the three honest ADCS states. Shared so
-#: the report SSOT and the web CTEM gate identically on "is this an ADCS finding".
-ADCS_ESC_RELATIONS = frozenset(
-    {
-        "adcsesc1",
-        "adcsesc2",
-        "adcsesc3",
-        "adcsesc4",
-        "adcsesc5",
-        "adcsesc6",
-        "adcsesc7",
-        "adcsesc8",
-        "adcsesc9",
-        "adcsesc10",
-        "adcsesc11",
-        "adcsesc13",
-        "adcsesc14",
-        "adcsesc15",
-        "certighost",
-        "coerceandrelayntlmtoadcs",
-    }
-)
+#: Relation names that are AD CS escalations. Re-exported from the one
+#: definition in :mod:`adscan_core.adcs_relations` so the report SSOT, the
+#: engine and the web CTEM gate identically on "is this an AD CS finding".
+#: Before the consolidation this was a local 16-entry copy that was missing
+#: every lettered variant (``ADCSESC6a``/``6b``/``9a``/``9b``/``10a``/``10b``)
+#: plus ``ADCSESC16`` and ``ADCSESC17``, so those escalations never rendered
+#: under the three honest states below.
+ADCS_ESC_RELATIONS = ADCS_RELATIONS
 
 
 def is_adcs_esc_relation(relation: Any) -> bool:
-    """Return whether ``relation`` is an ADCS ESC escalation (case-insensitive)."""
+    """Return whether ``relation`` is an AD CS escalation (case-insensitive)."""
 
-    return str(relation or "").strip().lower() in ADCS_ESC_RELATIONS
+    return is_adcs_relation(relation)
 
 
 #: Attack-path / step statuses that mean the technique actually executed against a

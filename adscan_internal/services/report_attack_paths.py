@@ -33,7 +33,7 @@ from adscan_core import telemetry
 from adscan_core.reporting.attack_path_memory_gate import (
     _AttackPathMemoryBudgetExceeded,
 )
-from adscan_core.reporting.domain_scope import has_collection_evidence
+from adscan_core.reporting.domain_scope import domain_collection_verdict
 from adscan_core.rich_output import (
     mark_sensitive,
     print_exception,
@@ -169,7 +169,9 @@ def compute_report_attack_paths(
         )
         if not isinstance(paths, list):
             return []
-        return [path for path in paths if isinstance(path, dict)]
+        bounded = [path for path in paths if isinstance(path, dict)]
+        annotate_report_policy_exclusions(workspace_dir, domain, bounded)
+        return bounded
     except Exception as exc:  # noqa: BLE001 - a report never crashes on paths
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -179,6 +181,73 @@ def compute_report_attack_paths(
         )
         return []
 
+    if not isinstance(paths, list):
+        return []
+    shaped = as_report_attack_paths(paths)
+    annotate_report_policy_exclusions(workspace_dir, domain, shaped)
+    return shaped
+
+
+def report_policy_excluded_relations(workspace_dir: str, domain: str) -> dict[str, Any]:
+    """``{relation: {check_id, label}}`` the run's scan policy kept from running.
+
+    Empty when the workspace carries no block (no policy, or an older run).
+    Best-effort: a read failure means "nothing to annotate".
+    """
+    try:
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            _load_technical_report,
+        )
+        from adscan_core.scan_policy.annotate import (  # noqa: PLC0415
+            excluded_relations_from_block,
+        )
+        from adscan_core.scan_policy.coverage import (  # noqa: PLC0415
+            SCAN_POLICY_COVERAGE_KEY,
+        )
+
+        report = _load_technical_report(_ReportShell(workspace_dir))
+        entry = (report.get("domains") or {}).get(domain)
+        block = entry.get(SCAN_POLICY_COVERAGE_KEY) if isinstance(entry, dict) else None
+        return excluded_relations_from_block(block)
+    except Exception as exc:  # noqa: BLE001 - annotation never breaks a report
+        telemetry.capture_exception(exc)
+        return {}
+
+
+def annotate_report_policy_exclusions(
+    workspace_dir: str, domain: str, paths: list[dict[str, Any]]
+) -> int:
+    """Mark the steps the scan policy kept from running (display metadata only).
+
+    Runs at the shared report seam so the PRO report, the LITE report and the
+    web CTEM (which calls ``annotate_policy_exclusions`` with the same block)
+    show one "not executed, excluded by the scan policy" note. Never changes the
+    path set, a status or the order. Returns how many routes were annotated.
+    """
+    try:
+        from adscan_core.scan_policy.annotate import (  # noqa: PLC0415
+            annotate_policy_exclusions,
+        )
+
+        return annotate_policy_exclusions(
+            paths, report_policy_excluded_relations(workspace_dir, domain)
+        )
+    except Exception as exc:  # noqa: BLE001 - annotation never breaks a report
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return 0
+
+
+def as_report_attack_paths(paths: Any) -> list[dict[str, Any]]:
+    """Shape a canonical domain listing exactly as the report pipelines take it.
+
+    The canonical listing (``compute_display_paths_for_domain`` at the report
+    scope) becomes report input by one step: the ADCS views every surface reads
+    are stamped onto its steps. The scan's own finalization seam already holds
+    that listing, so it calls this rather than recomputing it, and the report
+    stamps it identically: a block derived at scan end and the same block
+    derived at report time are fed the same paths. Idempotent; never raises.
+    """
     if not isinstance(paths, list):
         return []
     clean = [path for path in paths if isinstance(path, dict)]
@@ -390,15 +459,56 @@ def resolve_domain_assessment(
     """
     from adscan_internal.services import attack_graph_service
 
+    graph_present = False
     try:
         graph_path = attack_graph_service._graph_path(  # noqa: SLF001
             _ReportShell(workspace_dir), domain
         )
-        if graph_path and os.path.exists(graph_path):
-            return True, "attack_graph"
+        graph_present = bool(graph_path and os.path.exists(graph_path))
     except Exception:  # noqa: BLE001 - a resolution error just means "no graph"
-        pass
+        graph_present = False
 
-    if has_collection_evidence(report_entry):
-        return True, "report_evidence"
-    return False, "no_collection_evidence"
+    # The ladder itself is shared with every reader of the workspace (the web
+    # included), so the verdict recorded here is the verdict they compute.
+    return domain_collection_verdict(
+        graph_present=graph_present, report_entry=report_entry
+    )
+
+
+def stamp_domain_assessment(
+    workspace_dir: str,
+    domain: str,
+    report_entry: Any = None,
+) -> tuple[bool, str] | None:
+    """Resolve and persist the assessed/discovered verdict for one domain.
+
+    The one composition of :func:`resolve_domain_assessment` and the LITE-safe
+    recorder, called by the scan's finalization seam AND by both report flows,
+    so the verdict ``adscan_web`` ingests after a scan is the verdict any later
+    report writes. Returns ``(enumerated, basis)`` (also when only the write
+    failed, so a render still states the verdict it resolved), or ``None`` when
+    it could not be resolved. Best-effort: never raises.
+    """
+    from types import SimpleNamespace
+
+    from adscan_core.reporting.technical_report import record_domain_assessment
+
+    try:
+        enumerated, basis = resolve_domain_assessment(
+            str(workspace_dir), domain, report_entry
+        )
+    except Exception as exc:  # noqa: BLE001 - a verdict never breaks its caller
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+    try:
+        record_domain_assessment(
+            SimpleNamespace(current_workspace_dir=str(workspace_dir)),
+            domain,
+            enumerated=enumerated,
+            basis=basis,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unwritable workspace still renders
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    return enumerated, basis

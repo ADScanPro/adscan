@@ -194,6 +194,12 @@ class PasswordHygiene:
     #: authored. Carried with the block so the PDF, the operator panel and the
     #: web platform read identical wording without reaching the tier classifier.
     tier_labels: dict[str, str] = field(default_factory=dict)
+    #: The Tier 0 accounts whose password was recovered, named, so the headline
+    #: can say WHICH administrative accounts it counts. Every surface that
+    #: counts administrative recoveries otherwise names a different subset (the
+    #: assessment report's recovered-password finding counts enabled accounts
+    #: only) and the reader cannot reconcile the two.
+    tier0_recovered_accounts: tuple[str, ...] = ()
 
     @property
     def has_figures(self) -> bool:
@@ -234,6 +240,7 @@ class PasswordHygiene:
             "high_value_extracted": self.high_value_extracted,
             "high_value_recovered": self.high_value_recovered,
             "tier_labels": dict(self.tier_labels),
+            "tier0_recovered_accounts": list(self.tier0_recovered_accounts),
             "segments": [segment.as_dict() for segment in self.segments],
             "reuse_groups_recovered": [
                 group.as_dict() for group in self.reuse_groups_recovered
@@ -363,6 +370,7 @@ def build_password_hygiene(
     by_secret_recovered: dict[str, list[str]] = {}
     by_secret_unrecovered: dict[str, list[str]] = {}
     segment_by_account: dict[str, str] = {}
+    tier0_recovered_accounts: list[str] = []
 
     for record in accounts or ():
         if not isinstance(record, Mapping):
@@ -382,6 +390,8 @@ def build_password_hygiene(
         if was_recovered:
             recovered[segment] += 1
             recovered_total += 1
+            if token_is_tier0(segment):
+                tier0_recovered_accounts.append(username)
             if is_high_value:
                 high_value_recovered += 1
             if username.casefold() == "krbtgt":
@@ -434,6 +444,9 @@ def build_password_hygiene(
         high_value_extracted=high_value_extracted,
         high_value_recovered=high_value_recovered,
         tier_labels={tier: _label_for(tier) for tier in SEGMENT_ORDER},
+        tier0_recovered_accounts=tuple(
+            sorted(set(tier0_recovered_accounts), key=str.casefold)
+        ),
     )
 
 
@@ -668,6 +681,11 @@ def merge_recovered_into_hygiene(
             except Exception:  # noqa: BLE001 — a flag never fails the fold
                 return
 
+    tier0_named: list[str] = [
+        str(account)
+        for account in block.get("tier0_recovered_accounts") or ()
+        if str(account or "").strip()
+    ]
     consumed: set[str] = set()
     for display, folded in names:
         if folded in already_recovered or folded in consumed:
@@ -681,7 +699,15 @@ def merge_recovered_into_hygiene(
             None,
         )
         if group is None:
-            _credit(_segment_of(display), 1)
+            before = credited
+            segment_key = _segment_of(display)
+            _credit(segment_key, 1)
+            # Named only when the credit landed AND the account grades into
+            # Tier 0; the headline names them only when the list matches the
+            # Tier 0 count, so a credit that fell back to another row never
+            # puts a wrong name on the page.
+            if credited > before and token_is_tier0(segment_key):
+                tier0_named.append(display)
             _credit_high_value((display,))
             consumed.add(folded)
             if folded == "krbtgt":
@@ -762,6 +788,9 @@ def merge_recovered_into_hygiene(
         }
         if isinstance(block.get("tier_labels"), Mapping)
         else {},
+        tier0_recovered_accounts=tuple(
+            sorted({name.casefold(): name for name in tier0_named}.values(), key=str.casefold)
+        ),
     ).as_dict()
 
 
@@ -796,9 +825,15 @@ def _headline(block: Mapping[str, Any]) -> str:
     if extracted <= 0:
         return ""
     accounts_noun = "account" if extracted == 1 else "accounts"
+    # The population is stated in the sentence: this block counts EVERY account
+    # whose material was extracted, disabled ones included, while the
+    # assessment report's recovered-password finding counts enabled accounts
+    # only. Unlabelled, "9 of 18, 2 administrative" sat next to "8 accounts, 1
+    # administrative" in one kit with nothing to reconcile them.
     lead = (
         f"Password recovery resolved the password of {recovered:,} of the "
-        f"{extracted:,} {accounts_noun} whose credential material was extracted."
+        f"{extracted:,} {accounts_noun} whose credential material was extracted, "
+        "enabled and disabled alike."
     )
     # The boundary leads the sentence, then the directness split, because a
     # recovered Domain Admins password and a recovered Backup Operators password
@@ -820,8 +855,80 @@ def _headline(block: Mapping[str, Any]) -> str:
             )
         else:
             clause = f"{noun} one step from control of the domain"
-        lead = f"{lead} Of those, {total:,} {verb} {clause}, which is where to act first."
+        named = _named_tier0_recoveries(block, total)
+        lead = (
+            f"{lead} Of those, {total:,} {verb} {clause}{named}, "
+            "which is where to act first."
+        )
     return lead
+
+
+def _named_tier0_recoveries(block: Mapping[str, Any], total: int) -> str:
+    """`` (name, name)`` for the Tier 0 recoveries, or ``""``.
+
+    Named only when the persisted list accounts for EXACTLY the Tier 0 count the
+    sentence states, so a name is never attached to a figure it does not match.
+    A block written before the names were recorded renders without them.
+    """
+    names = [
+        str(account).strip()
+        for account in block.get("tier0_recovered_accounts") or ()
+        if str(account or "").strip()
+    ]
+    if total <= 0 or len(names) != total:
+        return ""
+    return f" ({', '.join(names)})"
+
+
+def recovered_password_population_note(details: Any) -> str:
+    """State which population the recovered-password FINDING counts.
+
+    The finding's ratio is against the ENABLED accounts (the population a client
+    can act on and verify against their own directory). The Password Hygiene
+    Report counts every account whose credential material was extracted, so a
+    disabled account's recovered password is in its totals and not in the
+    finding's. This sentence names that difference, and the disabled accounts
+    when the scan recorded them, so the two documents reconcile on the page.
+
+    Args:
+        details: The ``recovered_account_passwords`` finding's details.
+
+    Returns:
+        One client-facing sentence, or ``""`` when the details carry no ratio.
+    """
+    if not isinstance(details, Mapping):
+        return ""
+    enabled_recovered = _non_negative_int(details.get("enabled_recovered"))
+    enabled_total = _non_negative_int(details.get("enabled_total"))
+    recovered_total = _non_negative_int(details.get("recovered_total"))
+    if enabled_total <= 0 or enabled_recovered <= 0:
+        return ""
+    note = (
+        f"This finding counts enabled accounts only: {enabled_recovered:,} of "
+        f"the {enabled_total:,} enabled accounts."
+    )
+    extra = max(recovered_total - enabled_recovered, 0)
+    if extra <= 0:
+        return note
+    raw_names = details.get("not_enabled_recovered")
+    names = (
+        [str(name).strip() for name in raw_names if str(name or "").strip()]
+        if isinstance(raw_names, (list, tuple))
+        else []
+    )
+    named = f" ({', '.join(names)})" if len(names) == extra else ""
+    if extra == 1:
+        tail = f" One further recovered password belongs to a disabled account{named}"
+    else:
+        tail = (
+            f" {extra:,} further recovered passwords belong to disabled "
+            f"accounts{named}"
+        )
+    return (
+        f"{note}{tail}; the AD Password Hygiene Report counts every account whose "
+        "credential material was extracted, enabled or disabled, so its totals "
+        f"include {'it' if extra == 1 else 'them'}."
+    )
 
 
 def password_hygiene_view(block: Any) -> dict[str, Any]:

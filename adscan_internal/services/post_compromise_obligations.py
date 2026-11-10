@@ -78,6 +78,10 @@ from adscan_core.reporting.clock_frame import (
     resolve_stamp_frame,
     stamp_post_dates,
 )
+from adscan_core.reporting.engagement_timeline import (
+    AssessmentWindow,
+    assessment_window,
+)
 from adscan_internal.principal_utils import is_machine_account
 from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.services.credentials.credential_origin import (
@@ -94,8 +98,11 @@ from adscan_internal.services.credentials.credential_origin import (
     classify_origin_acquisition,
     is_blank_anonymous_credential,
 )
-from adscan_internal.services.session_compromise_state_service import (
-    NON_COMPROMISE_ORIGINS,
+from adscan_core.credential_origins import (
+    adscan_created_accounts,
+    is_recovered_credential_origin,
+    ledger_changes,
+    mark_adscan_provisioned_origins,
 )
 
 __all__ = [
@@ -241,12 +248,18 @@ class ObligationStep:
 
     Attributes:
         text: What to do and why, in one or two sentences.
-        commands: Native commands that perform the step. Empty when the step is
-            a decision or a wait rather than something to run.
+        commands: Native commands that perform the step, each one a command and
+            nothing else: no comment line. Empty when the step is a decision or
+            a wait rather than something to run.
+        where: Where and as whom the commands run ("Run on the affected host,
+            as an administrator."), shown as prose before them. It used to sit
+            inside the command list as a ``#`` line, which a client copying the
+            block pasted into a shell.
     """
 
     text: str
     commands: tuple[str, ...] = ()
+    where: str = ""
 
 
 @dataclass(frozen=True)
@@ -359,11 +372,13 @@ def is_compromised_credential_origin(origin: Any) -> bool:
         origin: ``credentials_meta[<user>]["credential_origin"]``.
 
     Returns:
-        False for the operator-supplied login and for a manually entered
-        credential; True for everything else, including an unrecorded origin
-        (an account in the store with no provenance was still obtained).
+        False for the operator-supplied login, for a manually entered credential
+        and for the credential of an account ADscan itself created
+        (``adscan_provisioned``); True for everything else, including an
+        unrecorded origin (an account in the store with no provenance was still
+        obtained).
     """
-    return str(origin or "").strip().lower() not in NON_COMPROMISE_ORIGINS
+    return is_recovered_credential_origin(origin)
 
 
 def load_workspace_credential_store(workspace_dir: Any) -> dict[str, dict[str, Any]]:
@@ -728,20 +743,25 @@ def _host_artifact_counts(environment_changes: Any) -> tuple[bool, int, int]:
     return determined, artifacts, manual
 
 
-def _log_window_day(observed_at: str) -> str:
+def _log_window_day(observed_at: str, window: AssessmentWindow) -> str:
     """Return the calendar day of an extraction stamp, for a log query.
 
     The stamp records when the read COMPLETED, to the microsecond. A client
     searching their own security log needs a start boundary that is certain to
     sit before the read, so the query opens at the start of that day and the
-    prose carries the exact moment. A stamp we cannot parse yields an obvious
-    fill-in rather than a half-formed date.
+    prose carries the exact moment.
+
+    A stamp this cannot parse falls back to the day the ENGAGEMENT opened, from
+    the timeline record, which is a boundary certain to sit before any read this
+    assessment performed. Only when that is unresolved too does the query carry
+    an obvious fill-in. It used to carry a token naming a timeline the report
+    did not have, inside a command the client was told to run.
     """
     text = str(observed_at or "").strip()
     day = text[:10]
     if len(day) == 10 and day[4] == "-" and day[7] == "-" and day.replace("-", "").isdigit():
         return day
-    return "<assessment date, from the timeline>"
+    return window.query_start
 
 
 @dataclass(frozen=True)
@@ -761,11 +781,39 @@ class _ContainmentWindow:
     query_start: str
 
 
+def _window_phrase(window: AssessmentWindow) -> tuple[str, str]:
+    """Return ``(what to search, which clock those boundaries are on)``.
+
+    States the engagement window INLINE when the timeline resolved one, rather
+    than referring them to a section. The old wording pointed at "the assessment
+    window recorded in this report's timeline" and no timeline existed, so the
+    client met a dead cross-reference on the page that asks them to reset
+    krbtgt. An inline interval cannot dangle.
+
+    The clock comes back SEPARATELY rather than appended, because the interval
+    lands mid-sentence in front of the event list, and a clause about clock
+    agreement wedged in there pushes the events out of the reader's reach. It is
+    its own short sentence, and it is never dropped: an interval searched in the
+    wrong clock returns nothing.
+    """
+    if not window.resolved:
+        return "the window in which this assessment ran", ""
+    if window.end:
+        body = f"the assessment window, {window.start} to {window.end}"
+    else:
+        body = f"the assessment window, which opened at {window.start}"
+    label = window.frame_label
+    return body, (
+        f"The window given below is stated on the {label}." if label else ""
+    )
+
+
 def _resolve_containment_window(
     extraction: CredentialStoreExtraction,
     *,
     host: str,
     generated_at: datetime | None,
+    window: AssessmentWindow,
 ) -> _ContainmentWindow:
     """Decide which instant, if any, the containment step may name.
 
@@ -786,11 +834,11 @@ def _resolve_containment_window(
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
     stamp = extraction.observed_at
-    timeline = "the assessment window recorded in this report's timeline"
-    fallback_start = "<assessment date, from the timeline>"
+    timeline, clock_sentence = _window_phrase(window)
+    fallback_start = window.query_start
     if not stamp:
         return _ContainmentWindow(
-            when_sentence=f"It was performed against {host}.",
+            when_sentence=f"It was performed against {host}. {clock_sentence}".strip(),
             search_window=timeline,
             query_start=fallback_start,
         )
@@ -803,8 +851,8 @@ def _resolve_containment_window(
                 "instant: the only stamp recorded for the read sits after the "
                 "moment this document was generated, so the two did not come "
                 "from the same clock, and naming either of them would point you "
-                "at a window that may never have existed."
-            ),
+                "at a window that may never have existed. " + clock_sentence
+            ).strip(),
             search_window=timeline,
             query_start=fallback_start,
         )
@@ -832,7 +880,7 @@ def _resolve_containment_window(
     return _ContainmentWindow(
         when_sentence=when,
         search_window="that day",
-        query_start=_log_window_day(stamp),
+        query_start=_log_window_day(stamp, window),
     )
 
 
@@ -894,8 +942,11 @@ def _custody_step(*, self_operated: bool, workspace_label: str) -> ObligationSte
             "workspace left in place keeps authenticating material for as long "
             "as it sits there."
         ),
+        where=(
+            "On the host that ran the assessment, when the retention date arrives. "
+            "The first command is for a Linux host, the second for Windows."
+        ),
         commands=(
-            "# On the host that ran the assessment, when the retention date arrives:",
             f"rm -rf ~/.adscan/workspaces/{workspace}",
             "Remove-Item -Recurse -Force "
             f'"$env:LOCALAPPDATA\\ADscan\\workspaces\\{workspace}"',
@@ -911,6 +962,7 @@ def _extraction_obligation(
     self_operated: bool = False,
     workspace_label: str = "",
     generated_at: datetime | None = None,
+    engagement_window: AssessmentWindow | None = None,
 ) -> Obligation:
     """Build the custody obligation for one proven credential-store copy.
 
@@ -1050,8 +1102,8 @@ def _extraction_obligation(
                     "snapshot of the system volume carries the directory database "
                     "with it, so it is as sensitive as the database itself."
                 ),
+                where="Run on the affected host, as an administrator.",
                 commands=(
-                    "# Run on the affected host, as an administrator:",
                     "vssadmin list shadows",
                     "Get-ChildItem -Path $env:windir\\Temp -File | "
                     "Sort-Object LastWriteTime -Descending | "
@@ -1083,8 +1135,8 @@ def _extraction_obligation(
                     "confirm the path is gone rather than assuming the deletion "
                     "ran: the expected result is False."
                 ),
+                where="Run on the affected host, as an administrator.",
                 commands=(
-                    "# Run on the affected host, as an administrator:",
                     "Test-Path '<path from the environment modifications record>'",
                     "vssadmin list shadows",
                 ),
@@ -1102,8 +1154,8 @@ def _extraction_obligation(
                     "a snapshot carries the directory database with it, so it is "
                     "as sensitive as the database."
                 ),
+                where="Run on the affected host, as an administrator.",
                 commands=(
-                    "# Run on the affected host, as an administrator:",
                     "vssadmin list shadows",
                     "Get-ChildItem -Path $env:windir\\Temp -File | "
                     "Sort-Object LastWriteTime -Descending | "
@@ -1113,7 +1165,10 @@ def _extraction_obligation(
         )
 
     window = _resolve_containment_window(
-        extraction, host=host, generated_at=generated_at
+        extraction,
+        host=host,
+        generated_at=generated_at,
+        window=engagement_window or AssessmentWindow(),
     )
     target = extraction.host or "<domain-controller>"
     steps.append(
@@ -1157,7 +1212,8 @@ def _extraction_obligation(
                 ),
                 commands=(
                     "Get-ADUser -Filter 'Enabled -eq $true' "
-                    "-Properties PasswordLastSet, MemberOf -Server <a-domain-controller> | "
+                    "-Properties PasswordLastSet, MemberOf "
+                    f"-Server {extraction.host or '<a-domain-controller>'} | "
                     "Select-Object SamAccountName, PasswordLastSet | "
                     "Sort-Object PasswordLastSet",
                     "Get-ADComputer -Filter 'Enabled -eq $true' "
@@ -1418,8 +1474,8 @@ def _credential_obligation(
                         else " rather than in the routine batch."
                     )
                 ),
+                where="Run on the affected host, as an administrator.",
                 commands=(
-                    "# Run on the affected host, as an administrator:",
                     "Reset-ComputerMachinePassword -Server <a-domain-controller>",
                     "Test-ComputerSecureChannel -Repair -Server <a-domain-controller>",
                 ),
@@ -1545,6 +1601,7 @@ def build_post_compromise_obligations(
     self_operated: bool = False,
     workspace_label: str = "",
     generated_at: datetime | None = None,
+    engagement_window: AssessmentWindow | None = None,
 ) -> tuple[Obligation, ...]:
     """Derive the obligations this engagement's PROVEN outcomes impose.
 
@@ -1581,6 +1638,14 @@ def build_post_compromise_obligations(
             known to come from a different clock: a client sent to search a
             moment that has not happened finds nothing, and an empty search is
             exactly what the step that follows must not read as a verdict.
+        engagement_window: When the assessment ran, from the timeline record
+            (:func:`~adscan_core.reporting.engagement_timeline.assessment_window`).
+            Supplies the log-query boundary whenever the read's own stamp cannot
+            be named, which is the half of the containment instruction that used
+            to ship an unfilled token inside a runnable command. ``None`` is
+            legitimate and resolves to an obvious fill-in: the record genuinely
+            may not place the engagement in time, and inventing a date a client
+            would search by is the one thing worse than asking them for it.
 
     Returns:
         The obligations, in the order the client should act on them. Empty when
@@ -1591,9 +1656,16 @@ def build_post_compromise_obligations(
         generated_at = datetime.now(timezone.utc)
     store: dict[str, Any] = {}
     if isinstance(credential_store, Mapping):
+        # An account ADscan created is not a client credential, whatever origin
+        # the store recorded for it: the ledger names it, so it is tagged here
+        # and every rotation and custody list below leaves it out.
+        tagged = mark_adscan_provisioned_origins(
+            credential_store,
+            adscan_created_accounts(ledger_changes(environment_changes)),
+        )
         store = {
             str(name).strip(): payload
-            for name, payload in credential_store.items()
+            for name, payload in tagged.items()
             if isinstance(payload, Mapping) and str(name).strip()
         }
 
@@ -1680,6 +1752,7 @@ def build_post_compromise_obligations(
                 self_operated=self_operated,
                 workspace_label=workspace_label,
                 generated_at=generated_at,
+                engagement_window=engagement_window,
             )
         )
     if krbtgt_domains:
@@ -1753,6 +1826,45 @@ def _workspace_label(workspace_dir: Any) -> str:
         return ""
 
 
+def _resolve_engagement_window(
+    workspace_dir: Any, environment_changes: Mapping[str, Any] | None
+) -> AssessmentWindow:
+    """Return the engagement window for a workspace. Never raises.
+
+    Prefers the block already PERSISTED on ``technical_report.json``, because
+    that one was built during the scan and its instants carry the clock they
+    came from, which can only be resolved from in-scan state. Falling back to
+    deriving the record here is still correct for a workspace written before the
+    block existed, and it degrades to an unresolved window rather than to a
+    guess.
+    """
+    try:
+        from adscan_core.reporting.engagement_timeline import (  # noqa: PLC0415
+            load_engagement_timeline,
+            read_engagement_timeline,
+        )
+
+        path = os.path.join(str(workspace_dir), "technical_report.json")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                persisted = read_engagement_timeline(json.load(handle))
+        except (OSError, ValueError):
+            persisted = None
+        if persisted:
+            window = assessment_window(persisted)
+            if window.resolved:
+                return window
+        return assessment_window(
+            load_engagement_timeline(
+                workspace_dir,
+                environment_changes=environment_changes,
+                change_kind_label=_tax.kind_display,
+            )
+        )
+    except Exception:  # noqa: BLE001 - a report must ship
+        return AssessmentWindow()
+
+
 def load_post_compromise_obligations(
     workspace_dir: Any,
     *,
@@ -1797,9 +1909,19 @@ def load_post_compromise_obligations(
             domain_order=domain_order,
             self_operated=_resolve_self_operated(),
             workspace_label=_workspace_label(workspace_dir),
+            engagement_window=_resolve_engagement_window(workspace_dir, block),
         )
     except Exception:  # noqa: BLE001 — a report must ship
         return ()
+
+
+def _runbook_steps(lines: Iterable[str]) -> list[dict[str, Any]]:
+    from adscan_core.reporting.cleanup_remediation import (  # noqa: PLC0415
+        remediation_steps,
+    )
+
+    text = "\n".join(str(line) for line in lines)
+    return remediation_steps(text) if text.strip() else []
 
 
 def obligation_to_dict(obligation: Obligation) -> dict[str, Any]:
@@ -1813,9 +1935,12 @@ def obligation_to_dict(obligation: Obligation) -> dict[str, Any]:
         "domains": list(obligation.domains),
         "accounts": list(obligation.accounts),
         "runbook": list(obligation.runbook),
+        # The same procedure as steps in the shared command shape (prose apart
+        # from each command), for a document that prints it inline.
+        "runbook_steps": _runbook_steps(obligation.runbook),
         "containment_kind": obligation.containment_kind,
         "steps": [
-            {"text": step.text, "commands": list(step.commands)}
+            {"text": step.text, "where": step.where, "commands": list(step.commands)}
             for step in obligation.steps
         ],
     }

@@ -146,7 +146,7 @@ DISPLAY_NAME_OVERRIDES: dict[str, str] = {
     "managerodcprp": "RODC Password Replication Policy Control",
     "memberof": "Group Membership",
     "ms17-010": "MS17-010 (EternalBlue)",
-    "mseven": "MS14-068 / Kerberos PAC Forgery",
+    "mseven": "MS-EVEN Coercion (EventLog Remoting)",
     "mssql_impersonate_login": "MSSQL Login Impersonation",
     "mssql_linked_server_lateral": "MSSQL Linked Server Lateral Movement",
     "mssql_ntlmv2_theft": "MSSQL NetNTLMv2 Theft",

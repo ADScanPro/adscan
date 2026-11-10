@@ -48,13 +48,14 @@ from adscan_core.theme import (
     COLOR_MUTED,
     COLOR_STEEL,
 )
+from adscan_internal.services.attack_relation_labels import format_relation_label
 from adscan_internal.services.attack_step_catalog import (
     NO_NATIVE_EVENT_DETECTION_NOTES,
     declares_no_native_event_telemetry,
     get_attack_step_entry,
     render_step_manual_command,
     render_step_narrative,
-    render_step_verify,
+    render_step_verification,
 )
 
 
@@ -119,23 +120,19 @@ class ExplainLevel(str, Enum):
             return None
 
 
-#: Default level per workspace type. CTF / lab is where people LEARN, so it
-#: defaults to the full card; an audit engagement defaults to a one-liner that
+#: Default level per scan-policy environment. A lab is where people LEARN, so it
+#: defaults to the full card; a real environment defaults to a one-liner that
 #: orients without slowing the operator down.
-_DEFAULT_LEVEL_BY_TYPE: dict[str, ExplainLevel] = {
-    "ctf": ExplainLevel.DEEP,
+_DEFAULT_LEVEL_BY_ENVIRONMENT: dict[str, ExplainLevel] = {
     "lab": ExplainLevel.DEEP,
-    "training": ExplainLevel.DEEP,
-    "audit": ExplainLevel.BASIC,
-    "pentest": ExplainLevel.BASIC,
-    "red_team": ExplainLevel.OFF,
+    "real": ExplainLevel.BASIC,
 }
 
 
-def default_level_for_type(workspace_type: Any) -> ExplainLevel:
-    """Return the didactic default for a workspace type (``shell.type``)."""
-    key = str(workspace_type or "").strip().lower()
-    return _DEFAULT_LEVEL_BY_TYPE.get(key, ExplainLevel.BASIC)
+def default_level_for_environment(environment: Any) -> ExplainLevel:
+    """Return the didactic default for a scan policy's environment (``lab`` / ``real``)."""
+    key = str(environment or "").strip().lower()
+    return _DEFAULT_LEVEL_BY_ENVIRONMENT.get(key, ExplainLevel.BASIC)
 
 
 def resolve_explain_level(shell: Any) -> ExplainLevel:
@@ -147,8 +144,8 @@ def resolve_explain_level(shell: Any) -> ExplainLevel:
        non-interactive ``ci`` runner and the web worker pin a level.
     2. An explicit per-session override the operator set (``set explain_level …``
        / ``--learn`` / ``--quiet``), stored on ``shell.explain_level``.
-    3. The default for the workspace type (``shell.type``): ctf/lab → deep,
-       audit/pentest → basic, red_team → off.
+    3. The default for the scan policy's environment: a lab → deep, a real
+       environment (or none yet) → basic.
 
     Never raises — an unreadable shell falls back to ``BASIC``.
     """
@@ -158,7 +155,9 @@ def resolve_explain_level(shell: Any) -> ExplainLevel:
     override = ExplainLevel.coerce(getattr(shell, "explain_level", None))
     if override is not None:
         return override
-    return default_level_for_type(getattr(shell, "type", None))
+    from adscan_core.scan_policy.settings import policy_environment  # noqa: PLC0415
+
+    return default_level_for_environment(policy_environment(shell))
 
 
 # --------------------------------------------------------------------------- #
@@ -211,6 +210,11 @@ def render_basic_line(step_or_relation: Any) -> Text | None:
         sentence = render_step_narrative(step_or_relation, short=True) or ""
     if not sentence:
         sentence = str(getattr(entry, "short_narrative_template", "") or "").strip()
+    if sentence:
+        # The catalog one-liner is a plain sentence about the step (the client
+        # surfaces carry the technique as their own heading). The shell speaks
+        # the technical register, so the learner line names the technique.
+        sentence = f"{format_relation_label(relation)}: {sentence}"
     if not sentence:
         sentence = str(getattr(entry, "description", "") or "").strip()
     if not sentence:
@@ -251,6 +255,77 @@ def _render_manual_command(command: str) -> RenderableType:
         else:
             body.append(stripped, style=f"bold {COLOR_STEEL}")
     return body
+
+
+def _render_command_items(items: list[dict[str, Any]]) -> RenderableType:
+    """Render structured verify / exploit commands: dim intro, bright command.
+
+    Each item's ``intro`` is the explanation (a dim line above the command), so
+    no comment ever sits inside the command itself. An ``unfilled`` secret or
+    unknown value stays as its ``<...>`` token, exactly as the client sees it.
+    """
+    body = Text()
+    for idx, item in enumerate(items):
+        if idx:
+            body.append("\n")
+        intro = str(item.get("intro") or "").strip()
+        if intro:
+            body.append(intro + "\n", style=COLOR_MUTED)
+        command = str(item.get("command") or "").rstrip()
+        for line_idx, line in enumerate(command.splitlines()):
+            if line_idx:
+                body.append("\n")
+            body.append(line.rstrip(), style=f"bold {COLOR_STEEL}")
+    return body
+
+
+def _step_safety_verdict(step_or_relation: Any, relation: str) -> Any:
+    """Return the destructive-action verdict for a CONCRETE step, else None."""
+    if not isinstance(step_or_relation, dict):
+        return None
+    from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+        classify_destructive,
+        step_target_identity,
+    )
+
+    details = (
+        step_or_relation.get("details")
+        if isinstance(step_or_relation.get("details"), dict)
+        else {}
+    )
+    return classify_destructive(
+        relation,
+        str(details.get("target_kind") or "") or None,
+        target=step_target_identity(details),
+    )
+
+
+def _step_safety_note(step_or_relation: Any, relation: str) -> str:
+    """The "why ADscan does not run it" text, or "" when ADscan runs it.
+
+    A concrete step reads its own verdict (the reason names the account class it
+    would have reset); a bare technique reads the general note of what ADscan
+    never runs for it. Both come from the destructive-action SSOT.
+    """
+    verdict = _step_safety_verdict(step_or_relation, relation)
+    if verdict is not None:
+        return verdict.client_safe_reason if verdict.hard_blocked else ""
+    from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
+        relation_safety_note,
+    )
+
+    return relation_safety_note(relation)
+
+
+def _step_is_refused_reset(step_or_relation: Any, relation: str) -> bool:
+    """True for a concrete password-reset step ADscan refuses for safety."""
+    if str(relation or "").strip().lower() not in {
+        "forcechangepassword",
+        "allextendedrights",
+    }:
+        return False
+    verdict = _step_safety_verdict(step_or_relation, relation)
+    return bool(verdict is not None and verdict.hard_blocked)
 
 
 def render_deep_card(step_or_relation: Any) -> Panel | None:
@@ -306,29 +381,64 @@ def render_deep_card(step_or_relation: Any) -> Panel | None:
     # Offensive manual command with the standard tool. For a concrete step,
     # substitute the real principal/target names; for a bare relation, show the
     # template as-is.
-    manual = ""
-    if isinstance(step_or_relation, dict):
-        manual = render_step_manual_command(step_or_relation) or ""
-    if not manual:
-        manual = str(getattr(entry, "manual_command", "") or "").strip()
-    manual = manual.strip()
-    if manual:
+    # Built from the structured exploit block (the same SSOT the report prints),
+    # so each command carries its explanation as a dim line above it rather than
+    # a comment inside it. A bare relation renders the template as-is.
+    step_for_render = (
+        step_or_relation
+        if isinstance(step_or_relation, dict)
+        else {"action": relation}
+    )
+    # Why ADscan does not run it. A concrete step ADscan refuses for safety (a
+    # password reset of krbtgt, say) gets its own reason and NO "try it by hand"
+    # command: teaching the reset of an account the tool itself refuses to touch
+    # would hand the learner the one action that breaks the domain. A bare
+    # technique gets the general note on what ADscan never runs.
+    safety_note = _step_safety_note(step_or_relation, relation)
+    if safety_note:
+        _section(what, "Why ADscan does not run it", safety_note)
+    refused_reset = _step_is_refused_reset(step_or_relation, relation)
+    exploit_items = (
+        []
+        if refused_reset
+        else render_step_verification(step_for_render).get("exploit") or []
+    )
+    if refused_reset:
+        pass
+    elif exploit_items:
         _section(
             offensive_cmd,
             "Try it by hand",
-            _render_manual_command(manual),
+            _render_command_items(exploit_items),
         )
+    else:
+        manual = ""
+        if isinstance(step_or_relation, dict):
+            manual = render_step_manual_command(step_or_relation) or ""
+        if not manual:
+            manual = str(getattr(entry, "manual_command", "") or "").strip()
+        manual = manual.strip()
+        if manual:
+            _section(
+                offensive_cmd,
+                "Try it by hand",
+                _render_manual_command(manual),
+            )
 
     # Native Windows verification command — the one a defender actually runs. Only
     # surfaced (as its own section) for the defensive lead; for the offensive lead
     # it stays in the report's independent-verification block, not the card.
     if defensive and isinstance(step_or_relation, dict):
-        verify_windows = (render_step_verify(step_or_relation).get("windows") or "").strip()
-        if verify_windows:
+        windows_verify = [
+            item
+            for item in render_step_verification(step_or_relation).get("verify") or []
+            if item.get("platform") == "windows"
+        ]
+        if windows_verify:
             _section(
                 defensive_cmd,
                 "Check it on Windows",
-                _render_manual_command(verify_windows),
+                _render_command_items(windows_verify),
             )
 
     # MITRE ATT&CK.

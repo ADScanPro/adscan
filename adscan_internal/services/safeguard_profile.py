@@ -67,7 +67,16 @@ from typing import Any
 from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.services.attack_step_catalog import (
     ATTACK_STEP_CATALOG,
+    REQUIRED_RIGHT_CA_HOST_ADMIN,
+    REQUIRED_RIGHT_NONE_ON_TARGET,
+    REQUIRED_RIGHT_OWNER,
+    REQUIRED_RIGHT_SENTINELS,
     declares_no_native_event_telemetry,
+)
+from adscan_core.scan_policy.model import (
+    REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
+    REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK,
+    REVERT_RIGHT_WRITE_RBCD_DELEGATION,
 )
 from adscan_internal.services.coverage_stats import STEP_CATEGORY_EXCLUDE
 from adscan_internal.services.destructive_action_policy import (
@@ -85,7 +94,6 @@ __all__ = [
     "KIND_LABEL_ES",
     "LEDGER_UNTRACKED_WRITES",
     "LEDGER_UNSETTLED_WRITES",
-    "NO_EXECUTOR_RELATIONS",
     "UNREGISTERED_WRITE_KINDS",
     "VERIFIED_AUTO_REVERT_KINDS",
     "NEVER_AUTO_REVERT_KINDS",
@@ -116,6 +124,22 @@ _ROLLBACK_MANUAL = (
     "limpieza manual."
 )
 _ROLLBACK_NA = "No aplica: la técnica no modifica nada."
+#: Reverted only with an account allowed to undo it (the client's cleanup
+#: account, or a privileged credential the run verified). Without one the
+#: object is named for manual cleanup, and a policy that allows no manual
+#: cleanup skips the step instead.
+_ROLLBACK_CLEANUP_ACCOUNT = (
+    "Se revierte y se comprueba releyendo el objeto con una cuenta autorizada a "
+    "deshacerlo, como la cuenta de limpieza que aportes. Sin ella, se reporta "
+    "nombrando el objeto para limpieza manual."
+)
+#: Reverted by the step's own rollback at its end (on success and on error), with
+#: the write's own response checked but no confirming re-read. A failed revert is
+#: recorded ``revert_failed`` and surfaces as a manual item naming the object.
+_ROLLBACK_AUTO_UNCONFIRMED = (
+    "Se revierte automáticamente al terminar el paso y queda registrado. Si la "
+    "reversión falla, se reporta nombrando el objeto para limpiarlo a mano."
+)
 #: Registered in the ledger AND removed by the step's own RAII scope on exit,
 #: but the record is never SETTLED, so ``EnvironmentChangeLedger.finalize``
 #: force-transitions it to ``manual_required(session_died)``. The client is
@@ -173,7 +197,10 @@ KIND_LABEL_ES: dict[str, str] = {
     _tax.KIND_REMOTE_FILE_UPLOADED: "Fichero subido al equipo evaluado",
     "mssql_xp_cmdshell_enabled": "Ajuste de ejecución de comandos en SQL Server",
     "mssql_clr_assembly_loaded": "Ensamblado CLR cargado en SQL Server",
-    "mssql_postex_account": "Cuenta de base de datos creada",
+    "mssql_postex_account": (
+        "Cuenta de administrador creada, o pertenencia a Domain Admins añadida a una "
+        "cuenta existente"
+    ),
     "dns_record_added": "Registro ADIDNS creado",
     "rodc_prp_modified": (
         "Política de replicación de contraseñas del RODC "
@@ -182,26 +209,18 @@ KIND_LABEL_ES: dict[str, str] = {
     "user_created": "Cuenta de usuario creada",
     "scheduled_task_created": "Tarea programada creada en el equipo",
     "logon_script_path_modified": "Script de inicio de sesión del usuario (scriptPath)",
+    "upn_changed": "Nombre principal de usuario (userPrincipalName)",
+    "computer_account_created": "Cuenta de equipo creada por ADscan",
+    "altsecurityidentities_written": "Asignación de certificado (altSecurityIdentities)",
+    "victim_attribute_written": "Atributo de la cuenta de equipo creada por ADscan",
+    "ca_template_enabled": "Plantilla de certificado publicada en el CA",
+    "dacl_grant_dcsync": "Derechos de replicación concedidos sobre el objeto del dominio",
+    "mssql_admin_account_created": "Cuenta de administrador creada en el servidor SQL",
+    "mssql_clr_config_changed": "Configuración CLR de SQL Server",
+    _tax.KIND_ACCOUNT_ENABLED: "Habilitación de una cuenta que estaba deshabilitada",
+    _tax.KIND_OBJECT_RESTORED: "Objeto eliminado restaurado desde la papelera de reciclaje de AD",
+    _tax.KIND_CA_OFFICER_ADDED: "Permiso de administrador de certificados (officer) en el CA",
 }
-
-#: Relations the catalog marks ``supported`` that have NO executor branch. They
-#: write nothing because they DO NOT RUN, which is a weaker and different claim
-#: from "its execution path was audited and only reads". Saying so plainly is
-#: the honest form, and it also flags the catalog overstatement.
-NO_EXECUTOR_RELATIONS: frozenset[str] = frozenset(
-    {
-        "scheduledtask",
-        "mssql_impersonate_login",
-        "mssql_trustworthy_db_escalation",
-        "fullcontrolshare",
-        "writeshare",
-        "guestsession",
-        # No executor branch dispatches this relation, and the only xp_dirtree
-        # code ADscan runs is the read-only credential-hygiene review, which
-        # never coerces authentication.
-        "mssql_ntlmv2_theft",
-    }
-)
 
 #: Writes CONFIRMED by reading the execution path that do NOT reach
 #: ``EnvironmentChangeLedger``. The modification is real, so the matrix must
@@ -292,8 +311,48 @@ VERIFIED_AUTO_REVERT_KINDS: frozenset[str] = frozenset(
         # WriteLogonScript restores the overwritten scriptPath with a
         # confirming re-read in _attempt_writelogonscript_cleanup_if_ready.
         "logon_script_path_modified",
+        # The MSSQL SeImpersonate escalation deletes the administrator account it
+        # minted and confirms the deletion with a re-read
+        # (``_settle_account_record`` -> ``mark_reverted_confirmed``).
+        "mssql_admin_account_created",
+        # An account ADscan enabled as step preparation is disabled again at
+        # exit by the ACL cleanup service and confirmed by re-reading
+        # userAccountControl (services/account_lifecycle_ledger.py).
+        _tax.KIND_ACCOUNT_ENABLED,
+        # ESC5's transient service and temporary key file are removed in
+        # ``adcs/ca_backup.py``'s ``finally`` and settled only after a
+        # verifying re-read (``esc_cleanup.resolve_ca_backup_service`` /
+        # ``resolve_ca_backup_temp_pfx`` -> ``mark_reverted_confirmed``). They
+        # are NOT operator-confirmed: nobody is asked, the step removes them.
+        _tax.KIND_CA_BACKUP_SERVICE,
+        _tax.KIND_CA_BACKUP_TEMP_PFX,
+        # Step-scoped reverts settled through the shared revert precedence
+        # (``revert_credentials.run_revert_with_precedence``): undone at the end
+        # of the step and confirmed by a re-read, or reported manual naming the
+        # object. ESC9 UPN swap, ESC14 machine account, altSecurityIdentities and
+        # victim attribute (adcs/esc_principal_write.py); ESC7 SubCA template and
+        # officer right, re-read over LDAP and GetCASecurity (adcs/esc_ca_manage.py).
+        "upn_changed",
+        "computer_account_created",
+        "altsecurityidentities_written",
+        "victim_attribute_written",
+        "ca_template_enabled",
+        _tax.KIND_CA_OFFICER_ADDED,
+        # GPO Immediate Scheduled Task, undone right after the plant: SYSVOL
+        # folder and file re-read as absent, gpt.ini re-read byte for byte, the
+        # GPO's versionNumber re-read (services/gpo_immediate_task_service.py).
+        "gpo_sysvol_dir_created",
+        "gpo_sysvol_file_created",
+        "gpo_gpt_ini_modified",
+        "gpo_ldap_attribute_modified",
     }
 )
+
+#: Change kinds reverted at the end of their step WITHOUT a confirming re-read.
+#: Empty since every step-scoped revert goes through the shared revert seam; a
+#: kind belongs here only if a future step cannot re-read what it undid, and
+#: then it gets this weaker sentence instead of borrowing the verified one.
+REVERTED_UNCONFIRMED_KINDS: frozenset[str] = frozenset()
 
 #: Change kinds that CANNOT be reverted by the tool, whatever the ledger's
 #: lifecycle class says. ``password_changed`` is the load-bearing one: the
@@ -306,21 +365,31 @@ NEVER_AUTO_REVERT_KINDS: frozenset[str] = frozenset(
         _tax.KIND_ISSUED_CERTIFICATE,
         _tax.KIND_FORGED_CERTIFICATE,
         _tax.KIND_CA_PRIVATE_KEY_EXFILTRATED,
+        # Legacy ESC15 method A record (workspaces written before the grant was
+        # recorded as a revertible ``dacl_ace_added``): it was settled straight
+        # to ``manual_required`` with the native removal command.
+        "dacl_grant_dcsync",
+        # A deleted object ADscan restored is left for the client to decide:
+        # deleting it again is not an action ADscan takes on its own.
+        _tax.KIND_OBJECT_RESTORED,
     }
 )
 
 _MODIFIES_NOTHING = "Nada: la técnica solo lee."
+_MODIFIES_SINGLE_SIGN_IN = (
+    "No cambia ningún objeto. Inicia sesión una vez con cada contraseña que "
+    "encuentra, sin reintentos."
+)
 _MODIFIES_NOT_EXECUTED = (
     "Nada: ADscan no ejecuta esta técnica (la detecta y la mapea)."
-)
-_MODIFIES_NO_EXECUTOR = (
-    "Nada, porque hoy no llega a ejecutarse: la técnica está catalogada pero no "
-    "tiene ruta de ejecución. No es lo mismo que una técnica auditada como de "
-    "solo lectura."
 )
 
 _SCOPE_DIRECTORY = "Solo directorio (objeto de AD)."
 _SCOPE_DIRECTORY_READ = "Solo lectura: no escribe en el directorio ni en los equipos."
+_SCOPE_SIGNS_IN = (
+    "No escribe en el directorio ni en los equipos; inicia sesión contra los "
+    "controladores de dominio con las contraseñas que encuentra."
+)
 _SCOPE_HOST_FILE = "Toca el endpoint: escribe un fichero en el host evaluado."
 _SCOPE_HOST_MEMORY = (
     "Requiere sesión de administrador local y lee memoria o registro del host."
@@ -336,9 +405,17 @@ _SCOPE_CA_OFFLINE = (
     "base de datos del CA."
 )
 _SCOPE_CA_HOST = "Toca el host del CA (servicio y sistema de ficheros)."
+_SCOPE_CA_SECURITY = "Servicio de CA: cambia los permisos del propio CA."
 _SCOPE_SQL_SERVER = "Toca el servidor SQL (configuración de la instancia)."
 _SCOPE_DIRECTORY_DNS = "Solo directorio (zona DNS integrada en AD)."
 _SCOPE_HOST_TASK = "Toca el endpoint: registra una tarea programada en el host."
+#: The MSSQL takeover account: a domain account added to Domain Admins when the
+#: SQL host is a domain controller, a local Administrator elsewhere, or Domain
+#: Admins membership added to an account the run already controls (cli/mssql.py).
+_SCOPE_ADMIN_ACCOUNT = (
+    "Escribe en el directorio (en un controlador de dominio) o en las cuentas "
+    "locales del host."
+)
 
 
 #: ``allextendedrights`` is remapped at execution time to the concrete extended
@@ -393,18 +470,100 @@ _BLOCK_HARD = (
 #: override a prompt that is preset to no. Stronger than a bare "opt-in", and
 #: deliberately NOT stated as "never", because an authorised operator can still
 #: choose to run it.
-_BLOCK_AUDIT_SKIP = (
-    "No se ejecuta en una auditoría salvo que la autorices a mano: en una "
-    "ejecución desatendida se omite, y si estás delante la pregunta viene "
-    "respondida que no. En un entorno desechable (laboratorio o CTF) sí se "
-    "ejecuta sola."
-)
+_AUDIT_SKIP_LEAD = "Se ejecuta "
 _BLOCK_OPT_IN = (
     "Opt-in explícito: desactivada por defecto; solo corre si el operador la "
     "habilita de forma interactiva, y se omite en modo no interactivo."
 )
 _BLOCK_NOT_EXECUTED = "No se ejecuta: ADscan la detecta y la mapea."
 _BLOCK_NONE = "Sin restricción específica (sujeta al modo de ejecución elegido)."
+
+#: The consent the opt-in directory changes share. Since the two-groups scan
+#: policy (be36c143d) the answer is the POLICY's
+#: (``directory_change_consent.confirm_directory_change``): unattended it
+#: follows the policy without asking, attended the prompt is preset to the
+#: policy's answer, and a "decide during the scan" run with no operator refuses.
+_CONSENT_CLAUSE = (
+    "solo si la política de escaneo lo permite. Una ejecución desatendida sigue "
+    "la política sin preguntar; con un operador, la pregunta viene preseleccionada "
+    "con la respuesta de la política; con «decidir durante el escaneo» y sin "
+    "operador, no se hace."
+)
+#: Gates that live in the step's own code rather than in classify_destructive.
+#: Each sentence names what is gated and is grounded where it is enforced:
+#: * allextendedrights: on a user it is remapped to ForceChangePassword
+#:   (cli/ace_step_execution.py, _all_ext_remap) and goes through its choke point.
+#: * genericall / genericwrite / writeaccountrestrictions / owns: enabling a
+#:   disabled target or restoring a deleted one goes through
+#:   confirm_directory_change (cli/ace_step_execution.py). On a user in a domain
+#:   without AD CS, GenericAll / GenericWrite offer a targeted Kerberoast (and
+#:   GenericAll a password reset) with the answer preset by the same consent
+#:   default, Cancel in an assessment (cli/exploits.py,
+#:   directory_change_consent_default in run_exploit_generic_all_user).
+#: * writelogonscript: its own prompt in audit mode, default no, declined when
+#:   unattended (cli/attack_path_execution.py, "Proceed with WriteLogonScript
+#:   staging?").
+#: * adcsesc5: durable_change_policy.ca_key_backup_allowed skips it unattended
+#:   in an assessment workspace unless the scan configuration enables it.
+#: * adcsesc15: method A (the replication grant) goes through
+#:   confirm_directory_change; declined, it uses method B, which changes no DACL
+#:   (services/adcs/esc_enrollment.py).
+#: * xp_cmdshell / sqladmin / sqlaccess: enabling command execution asks at the
+#:   console with the answer preset to no; unattended it is applied, recorded
+#:   and reverted with a re-read (cli/mssql.py).
+_BLOCK_AUDIT_SKIP = _AUDIT_SKIP_LEAD + _CONSENT_CLAUSE
+#: The password reset's hard block, by target class. The classes are the ones
+#: ``destructive_action_policy.HARD_BLOCKED_TARGET_VARIANTS`` refuses; a unit
+#: test keeps this sentence naming each of them.
+_FCP_PROTECTED_ACCOUNTS_BLOCK = (
+    "Bloqueo duro contra cuentas de equipo, krbtgt, cuentas de servicio "
+    "administradas (gMSA, sMSA, dMSA) y cuentas de sincronización con Entra ID: "
+    "nunca se ejecuta, en ningún modo."
+)
+_FCP_USER_CLAUSE = " Contra una cuenta de usuario se ejecuta " + _CONSENT_CLAUSE
+_ENABLE_RESTORE_GATE = (
+    "Habilitar una cuenta objetivo deshabilitada o restaurar una borrada se hace "
+    + _CONSENT_CLAUSE
+)
+_STEP_GATES: dict[str, str] = {
+    "allextendedrights": (
+        "Contra una cuenta de usuario es un reinicio de contraseña, como "
+        "ForceChangePassword, y se hace " + _CONSENT_CLAUSE
+    ),
+    "genericall": (
+        "El Kerberoasting dirigido y el reinicio de contraseña que ofrece contra un "
+        "usuario, y habilitar una cuenta objetivo deshabilitada o restaurar una "
+        "borrada, se hacen " + _CONSENT_CLAUSE
+    ),
+    "genericwrite": (
+        "El Kerberoasting dirigido que ofrece contra un usuario, y habilitar una "
+        "cuenta objetivo deshabilitada o restaurar una borrada, se hacen "
+        + _CONSENT_CLAUSE
+    ),
+    "writeaccountrestrictions": _ENABLE_RESTORE_GATE,
+    "owns": _ENABLE_RESTORE_GATE,
+    # Workspace-type gates that sit under the policy (they only subtract).
+    "writelogonscript": (
+        "En un espacio de trabajo de cliente pide además su propia confirmación, "
+        "preseleccionada en no, y una ejecución desatendida la omite."
+    ),
+    "adcsesc5": (
+        "En un espacio de trabajo de cliente, una ejecución desatendida la omite "
+        "salvo que la configuración del escaneo la habilite expresamente."
+    ),
+    "adcsesc15": (
+        "El método A, que concede derechos de replicación sobre el dominio, se "
+        "hace " + _CONSENT_CLAUSE + " Si no, usa el método B, que no cambia "
+        "ninguna DACL."
+    ),
+}
+_SQL_COMMAND_GATE = (
+    "Habilitar la ejecución de comandos en SQL Server se pregunta en consola con "
+    "la respuesta preseleccionada en no; en una ejecución desatendida se aplica "
+    "sin preguntar, queda registrado y se revierte comprobándolo."
+)
+for _sql_rel in ("xp_cmdshell", "sqladmin", "sqlaccess"):
+    _STEP_GATES[_sql_rel] = _SQL_COMMAND_GATE
 
 
 def _blocked_axis(relation: str, entry: Any) -> tuple[str, str]:
@@ -419,16 +578,12 @@ def _blocked_axis(relation: str, entry: Any) -> tuple[str, str]:
         return _BLOCK_HARD, src
     if verdict_computer.hard_blocked and verdict_user.opt_in_only:
         audit_clause = (
-            " Contra una cuenta de usuario tampoco se ejecuta en una auditoría "
-            "salvo que la autorices a mano: desatendida se omite, y si estás "
-            "delante la pregunta viene respondida que no. En un entorno "
-            "desechable (laboratorio o CTF) sí se ejecuta sola."
+            _FCP_USER_CLAUSE
             if skipped_by_default_in_audit(relation, "user")
             else " Contra una cuenta de usuario está desactivada por defecto."
         )
         return (
-            "Bloqueo duro contra cuentas de equipo: nunca se ejecuta, en ningún "
-            "modo." + audit_clause,
+            _FCP_PROTECTED_ACCOUNTS_BLOCK + audit_clause,
             src,
         )
     if verdict_user.opt_in_only or verdict_computer.opt_in_only:
@@ -441,6 +596,8 @@ def _blocked_axis(relation: str, entry: Any) -> tuple[str, str]:
         return _BLOCK_HARD, "attack_step_catalog.support_kind == 'policy_blocked'"
     if getattr(entry, "support_kind", "") != "supported":
         return _BLOCK_NOT_EXECUTED, "attack_step_catalog.support_kind"
+    if relation in _STEP_GATES:
+        return _STEP_GATES[relation], "safeguard_profile._STEP_GATES (step-local gates)"
     return _BLOCK_NONE, "attack_step_catalog.support_kind == 'supported'"
 
 
@@ -453,6 +610,83 @@ _MIN_PRIV_BY_CONTEXT: dict[str, str] = {
     "mssql_rce_session": "Canal de ejecución de comandos ya establecido en el servidor SQL.",
 }
 _TARGET_REACHABLE_SUFFIX = " Además necesita alcanzar el equipo objetivo por red."
+#: The access on the target a step needs (``required_target_right``), which is
+#: what limits it: "any authenticated account" is true of the session the step
+#: starts from, not of who can actually run it.
+_MIN_PRIV_TARGET_RIGHT = "Una cuenta con {right} sobre el objeto objetivo."
+_MIN_PRIV_TARGET_OWNER = "El propietario del objeto objetivo."
+_MIN_PRIV_CA_HOST_ADMIN = "Administrador en el host del CA."
+#: One sentence per ``required_target_right`` sentinel that is not a directory
+#: right name. ``none_on_target`` is absent on purpose: it keeps the sentence of
+#: the source context ("cualquier cuenta de dominio autenticada", "ninguno").
+_MIN_PRIV_BY_SENTINEL: dict[str, str] = {
+    REQUIRED_RIGHT_OWNER: _MIN_PRIV_TARGET_OWNER,
+    REQUIRED_RIGHT_CA_HOST_ADMIN: _MIN_PRIV_CA_HOST_ADMIN,
+    "host_local_admin": "Administrador local en el equipo objetivo.",
+    "host_winrm": (
+        "Acceso por WinRM al equipo objetivo (Remote Management Users o "
+        "administradores locales)."
+    ),
+    "host_rdp": (
+        "Acceso por Escritorio remoto al equipo objetivo (Remote Desktop Users o "
+        "administradores locales)."
+    ),
+    "backup_operators": (
+        "Pertenencia a Backup Operators (privilegio SeBackupPrivilege en el "
+        "controlador de dominio)."
+    ),
+    "rodc_host_admin": "Administrador local en el controlador de dominio de solo lectura (RODC).",
+    "rodc_krbtgt_key": (
+        "La clave krbtgt del controlador de dominio de solo lectura, obtenida en un "
+        "paso anterior."
+    ),
+    "spn_jacking": (
+        "Una cuenta con delegación restringida con transición de protocolo y "
+        "WriteSPN sobre el equipo objetivo y sobre la cuenta que tiene hoy el SPN "
+        "delegado."
+    ),
+    "constrained_delegation": (
+        "Control de una cuenta configurada con delegación restringida hacia el "
+        "servicio objetivo."
+    ),
+    "rbcd_trustee": (
+        "Control de una cuenta que el equipo objetivo ya admite en "
+        "msDS-AllowedToActOnBehalfOfOtherIdentity."
+    ),
+    "child_domain_compromised": (
+        "El dominio hijo ya comprometido (su clave de confianza o su krbtgt)."
+    ),
+    "trusted_forest_compromised": (
+        "El bosque de confianza ya comprometido (las claves de la cuenta de equipo "
+        "de su controlador de dominio, de una replicación anterior)."
+    ),
+    "key_credential_private_key": (
+        "La clave privada de la credencial de clave que el objeto objetivo ya tiene."
+    ),
+    "sql_login": "Un inicio de sesión aceptado por la instancia de SQL Server.",
+    "sql_sysadmin": "El rol sysadmin en la instancia de SQL Server.",
+    "dnsadmins": "Pertenencia a DnsAdmins.",
+    "print_operators": "Pertenencia a Print Operators (SeLoadDriverPrivilege en el controlador de dominio).",
+    "privileged_group_member": "Pertenencia a un grupo privilegiado.",
+    "recovered_domain_password": "Una contraseña de cuenta de dominio recuperada en la evaluación.",
+    "recovered_local_password": "Una contraseña de cuenta local recuperada de un equipo.",
+    "unauthenticated_network": "Ninguno: basta con alcanzar el servicio por red.",
+    "authenticated_any": "Cualquier cuenta de dominio autenticada (sin privilegios).",
+    "unconstrained_delegation_host": "Administrador en un equipo de confianza para delegación sin restricciones.",
+    "sql_impersonate": "Un inicio de sesión de SQL con permiso IMPERSONATE sobre otro con más privilegios.",
+    "sql_trustworthy_db_owner": "El rol db_owner en una base de datos TRUSTWORTHY propiedad de un sysadmin.",
+    "guest_enabled": "Ninguno: la cuenta Guest está habilitada en el equipo.",
+    "host_dcom": "Permisos de inicio y activación DCOM en el equipo objetivo (normalmente administradores locales).",
+    "share_write": "Una cuenta con escritura en el recurso compartido.",
+    "share_read": "Una cuenta con lectura en el recurso compartido.",
+    "share_full_control": "Una cuenta con control total sobre el recurso compartido.",
+    "captured_netntlmv1": "Una respuesta NetNTLMv1 capturada.",
+}
+
+
+#: Printed when a step declares no required right. Never a default such as
+#: "any authenticated account": a missing declaration is a gap the reader sees.
+_MIN_PRIV_NOT_STATED = "No consta."
 
 
 def _min_privilege_axis(entry: Any) -> tuple[str, str]:
@@ -460,10 +694,25 @@ def _min_privilege_axis(entry: Any) -> tuple[str, str]:
     base = _MIN_PRIV_BY_CONTEXT.get(ctx)
     if not base:
         return PENDING, ""
+    right = getattr(entry, "required_target_right", None)
+    if right is None:
+        return _MIN_PRIV_NOT_STATED, "attack_step_catalog.required_target_right (undeclared)"
+    if right and right != REQUIRED_RIGHT_NONE_ON_TARGET:
+        if right in _MIN_PRIV_BY_SENTINEL:
+            base = _MIN_PRIV_BY_SENTINEL[right]
+        elif right in REQUIRED_RIGHT_SENTINELS:
+            # A sentinel nobody worded: fail loudly, never print the token.
+            raise KeyError(
+                f"safeguard_profile: required_target_right sentinel {right!r} has no "
+                "Spanish sentence. Add it to _MIN_PRIV_BY_SENTINEL."
+            )
+        else:
+            base = _MIN_PRIV_TARGET_RIGHT.format(right=right)
     if getattr(entry, "execution_target_access_requirement", "") == "computer_reachable":
         base += _TARGET_REACHABLE_SUFFIX
     return base, (
         "attack_step_catalog.source_context_requirement"
+        " + .required_target_right"
         " + .execution_target_access_requirement"
     )
 
@@ -532,7 +781,13 @@ def _soc_axis(entry: Any) -> tuple[str, str]:
             _no_native_event_soc_es(str(getattr(entry, "relation", "") or "")),
             "attack_step_catalog.NO_NATIVE_EVENT_TELEMETRY",
         )
-    ids = tuple(str(i) for i in (raw or ()))
+    from adscan_internal.services.change_kind_events import (  # noqa: PLC0415
+        signal_event_ids,
+    )
+
+    # The catalog's own events plus those its declared changes produce
+    # (services/change_kind_events.py), so a write is never signal-less.
+    ids = signal_event_ids(entry)
     if not ids:
         return PENDING, ""
     return (
@@ -622,12 +877,13 @@ _KIND_SCOPE: dict[str, str] = {
     _tax.KIND_CA_PRIVATE_KEY_EXFILTRATED: _SCOPE_CA_HOST,
     _tax.KIND_CA_BACKUP_SERVICE: _SCOPE_CA_HOST,
     _tax.KIND_CA_BACKUP_TEMP_PFX: _SCOPE_CA_HOST,
+    _tax.KIND_CA_OFFICER_ADDED: _SCOPE_CA_SECURITY,
     _tax.KIND_REMOTE_FILE_WRITTEN: _SCOPE_HOST_FILE,
     _tax.KIND_REMOTE_FILE_UPLOADED: _SCOPE_HOST_FILE,
     "mssql_xp_cmdshell_enabled": _SCOPE_SQL_SERVER,
     "mssql_clr_assembly_loaded": _SCOPE_SQL_SERVER,
     "mssql_clr_config_changed": _SCOPE_SQL_SERVER,
-    "mssql_postex_account": _SCOPE_SQL_SERVER,
+    "mssql_postex_account": _SCOPE_ADMIN_ACCOUNT,
     "mssql_admin_account_created": _SCOPE_SQL_SERVER,
     "scheduled_task_created": _SCOPE_HOST_TASK,
     "dns_record_added": _SCOPE_DIRECTORY_DNS,
@@ -644,32 +900,121 @@ def _scope_for_kind(kind: str) -> str:
     :func:`_kind_label_es` first, so it cannot reach here unnoticed.
     """
     return _KIND_SCOPE.get(kind, _SCOPE_DIRECTORY)
-#: Change kinds the owning service keeps on a successful run and reverts only on
-#: operator confirmation at exit (the ledger's ``OPERATOR_CONFIRMED`` class).
+
+
+_SCOPE_TOKEN_BY_SENTENCE: dict[str, str] = {
+    _SCOPE_DIRECTORY: "directory",
+    _SCOPE_DIRECTORY_DNS: "directory",
+    _SCOPE_HOST_FILE: "host",
+    _SCOPE_HOST_TASK: "host",
+    _SCOPE_SQL_SERVER: "sql_server",
+    # A domain account on a domain controller, a local account elsewhere: the
+    # directory is the wider of the two, so it is the token kept.
+    _SCOPE_ADMIN_ACCOUNT: "directory",
+    _SCOPE_CA_DATABASE: "certificate_authority",
+    _SCOPE_CA_OFFLINE: "certificate_authority",
+    _SCOPE_CA_HOST: "certificate_authority",
+    _SCOPE_CA_SECURITY: "certificate_authority",
+}
+
+
+def change_scope_token_for_kind(kind: str) -> str:
+    """Language-neutral token for WHERE a change kind lives.
+
+    One of ``directory``, ``host``, ``sql_server`` or ``certificate_authority``,
+    derived from the same classification as :func:`_scope_for_kind` so the
+    scan-policy registry and the coverage matrix cannot disagree.
+    """
+    return _SCOPE_TOKEN_BY_SENTENCE.get(_scope_for_kind(kind), "directory")
+#: Change kinds the owning service keeps on a successful run and that the
+#: workspace-exit hook resolves (``relay_rbcd.run_operator_confirmed_exit_cleanup``
+#: through ``durable_change_policy``: reverted when unattended, asked
+#: interactively). A kind belongs here ONLY if that hook is its revert path; a
+#: kind its own step removes and verifies is ``VERIFIED_AUTO_REVERT_KINDS``.
+#: Locked by tests/unit/services/test_operator_confirmed_kinds_contract.py.
 _OPERATOR_CONFIRMED_KINDS: frozenset[str] = frozenset(
     {
         "machine_account_created",
         "rbcd_delegation_added",
         "keycredentiallink_added",
-        _tax.KIND_CA_BACKUP_SERVICE,
-        _tax.KIND_CA_BACKUP_TEMP_PFX,
     }
 )
 
 
-def _rollback_for_kind(kind: str) -> str:
-    """Rollback lifecycle sentence for ONE change kind, or :data:`PENDING`.
+#: Change kinds whose revert completes only with an account allowed to undo it,
+#: which the assessment does not normally hold, keyed to the right it needs.
+#: Established from the revert code, not assumed:
+#:
+#: * ``machine_account_created`` / ``computer_account_created``: a computer
+#:   created under the machine-account quota is owned by Domain Admins and its
+#:   creator holds no Delete right on it, so ``relay_rbcd._delete_delegate`` (and
+#:   ESC14's ``_delete_machine_account_with_cascade``) succeed only as the
+#:   cleanup account or a privileged credential; as the creator they fall back
+#:   to disabling it and record ``manual_required``.
+#: * ``rbcd_delegation_added`` / ``keycredentiallink_added`` written by the NTLM
+#:   relay: the RELAYED COMPUTER wrote the attribute on itself and its identity
+#:   is gone when the exit hook runs, so ``relay_rbcd._cascade_revert_unit`` has
+#:   no creator candidate and the session account cannot write the attribute.
+#:   (Written through ``cli/delegations.py`` by a GenericWrite holder, RBCD is
+#:   restorable by that holder; the kind is classified by its worst case.)
+#:
+#: The exit hook and the final retry pass try the client cleanup account FIRST
+#: (``revert_credentials.revert_candidates``), revert as it, and settle the entry
+#: only after a re-read. Locked by tests/unit/services/test_revert_permission.py.
+CLEANUP_ACCOUNT_REVERT_RIGHTS: dict[str, str] = {
+    "machine_account_created": REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
+    "computer_account_created": REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
+    "rbcd_delegation_added": REVERT_RIGHT_WRITE_RBCD_DELEGATION,
+    "keycredentiallink_added": REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK,
+}
+
+
+#: Rollback lifecycle classes: the language-neutral SSOT that both this module's
+#: Spanish coverage matrix and the scan-policy registry derive from.
+ROLLBACK_CLASS_NEVER = "never_reverted"
+#: Reverted and confirmed only with an account allowed to undo it (above).
+ROLLBACK_CLASS_CLEANUP_ACCOUNT = "cleanup_account"
+ROLLBACK_CLASS_OPERATOR = "operator_confirmed"
+ROLLBACK_CLASS_AUTO_VERIFIED = "auto_verified"
+ROLLBACK_CLASS_AUTO_UNCONFIRMED = "auto_unconfirmed"
+ROLLBACK_CLASS_HOST_ARTIFACT = "host_artifact"
+
+
+def rollback_class_for_kind(kind: str) -> str:
+    """Rollback lifecycle CLASS for ONE change kind, or :data:`PENDING`.
 
     Ordered strictest-first so a kind that cannot be reverted is never described
-    by a weaker guarantee.
+    by a weaker guarantee. This is the single derivation; the sentence tables
+    (Spanish here, English in ``adscan_core.scan_policy.model``) only word it.
     """
     if kind in NEVER_AUTO_REVERT_KINDS:
-        return _ROLLBACK_MANUAL
+        return ROLLBACK_CLASS_NEVER
+    if kind in CLEANUP_ACCOUNT_REVERT_RIGHTS:
+        return ROLLBACK_CLASS_CLEANUP_ACCOUNT
     if kind in _OPERATOR_CONFIRMED_KINDS:
-        return _ROLLBACK_OPERATOR
-    if kind in VERIFIED_AUTO_REVERT_KINDS or _tax.kind_is_host_artifact(kind):
-        return _ROLLBACK_AUTO
+        return ROLLBACK_CLASS_OPERATOR
+    if kind in VERIFIED_AUTO_REVERT_KINDS:
+        return ROLLBACK_CLASS_AUTO_VERIFIED
+    if kind in REVERTED_UNCONFIRMED_KINDS:
+        return ROLLBACK_CLASS_AUTO_UNCONFIRMED
+    if _tax.kind_is_host_artifact(kind):
+        return ROLLBACK_CLASS_HOST_ARTIFACT
     return PENDING
+
+
+_ROLLBACK_SENTENCE_BY_CLASS: dict[str, str] = {
+    ROLLBACK_CLASS_NEVER: _ROLLBACK_MANUAL,
+    ROLLBACK_CLASS_CLEANUP_ACCOUNT: _ROLLBACK_CLEANUP_ACCOUNT,
+    ROLLBACK_CLASS_OPERATOR: _ROLLBACK_OPERATOR,
+    ROLLBACK_CLASS_AUTO_VERIFIED: _ROLLBACK_AUTO,
+    ROLLBACK_CLASS_AUTO_UNCONFIRMED: _ROLLBACK_AUTO_UNCONFIRMED,
+    ROLLBACK_CLASS_HOST_ARTIFACT: _ROLLBACK_AUTO,
+}
+
+
+def _rollback_for_kind(kind: str) -> str:
+    """Rollback lifecycle sentence for ONE change kind, or :data:`PENDING`."""
+    return _ROLLBACK_SENTENCE_BY_CLASS.get(rollback_class_for_kind(kind), PENDING)
 
 
 # Strictness order for combining several kinds on one technique: the weakest
@@ -679,8 +1024,10 @@ _ROLLBACK_STRICTNESS: dict[str, int] = {
     _ROLLBACK_UNTRACKED: 1,
     _ROLLBACK_UNSETTLED: 1,
     _ROLLBACK_MANUAL: 2,
-    _ROLLBACK_OPERATOR: 3,
-    _ROLLBACK_AUTO: 4,
+    _ROLLBACK_CLEANUP_ACCOUNT: 3,
+    _ROLLBACK_OPERATOR: 4,
+    _ROLLBACK_AUTO_UNCONFIRMED: 4,
+    _ROLLBACK_AUTO: 5,
 }
 
 
@@ -703,11 +1050,15 @@ def _writes_axes(relation: str, entry: Any) -> tuple[str, str, str, dict[str, st
     if not kinds:
         # Declared as writing nothing. Distinguish "runs and only reads" from
         # "ADscan does not run it at all": both modify nothing, but a CISO reads
-        # them differently.
-        if relation in NO_EXECUTOR_RELATIONS:
-            sources["modifies"] = "safeguard_profile.NO_EXECUTOR_RELATIONS"
-            return _MODIFIES_NO_EXECUTOR, _ROLLBACK_NA, _SCOPE_DIRECTORY_READ, sources
+        # them differently. Whether ADscan runs it is the catalog's
+        # ``support_kind`` and nothing else: a technique with no executor is
+        # ``unsupported`` THERE, so this document, the headline "executed" count
+        # (coverage_stats) and the execution engine read one declaration.
         if getattr(entry, "support_kind", "") == "supported":
+            # Writes nothing, but signs in with each password it finds: not
+            # read-only (lockout_guard single_attempt_per_candidate).
+            if getattr(entry, "lockout_guard", "") == "single_attempt_per_candidate":
+                return _MODIFIES_SINGLE_SIGN_IN, _ROLLBACK_NA, _SCOPE_SIGNS_IN, sources
             return _MODIFIES_NOTHING, _ROLLBACK_NA, _SCOPE_DIRECTORY_READ, sources
         return _MODIFIES_NOT_EXECUTED, _ROLLBACK_NA, _SCOPE_DIRECTORY_READ, sources
 
@@ -830,27 +1181,87 @@ def pending_fields() -> list[tuple[str, str, tuple[str, ...]]]:
 # and the hard block. The wording of (2) and (3) is FIXED — it is the exact
 # formulation we are allowed to make, and it must not be paraphrased into
 # "everything is reversible" or "it executes nothing".
+#
+# (2) used to say EVERY change is recorded and reverted with verification. That
+# is false (2026-11-03): the authenticated RBCD route records nothing, several
+# cleanup paths mark "reverted" from the operation's own result without a
+# re-read, and some kinds cannot be reverted at all. Each of those is stated in
+# its own row of the per-technique table, so the header claims only what holds
+# for all of them.
 HEADER_SAFEGUARDS: tuple[tuple[str, str], ...] = (
     (
-        "Modo de solo mapeo",
-        "Hay un modo que mapea y reporta las vías sin ejecutarlas, se elige al "
-        "lanzarlo.",
+        # The three built-in scan policies, by the names the product shows
+        # (adscan_core.scan_policy.policy.BUILTIN_LABELS); a test locks them.
+        "Políticas de escaneo",
+        "Antes del escaneo, el cliente elige qué comprobaciones corren. Los pasos "
+        "de ataque siempre se mapean, y su interruptor decide si se ejecutan; las "
+        "detecciones de vulnerabilidades se comprueban o no. Cada comprobación está "
+        "encendida, apagada pero activable, o bloqueada (nunca se ejecuta). Hay "
+        "tres políticas de partida: una política de laboratorio, que lo enciende "
+        "todo salvo lo bloqueado, al ritmo Fast; «Audit», que enciende los pasos "
+        "cuyos cambios se revierten solos y las comprobaciones que no envían "
+        "inicios de sesión fallidos o los mantienen dentro del margen de bloqueo de "
+        "cada cuenta, al ritmo Normal; y «Production-sensitive», que solo "
+        "enciende lo que no cambia nada en el directorio, no envía intentos de "
+        "contraseña que puedan contar para el bloqueo de una cuenta y no hace que "
+        "otros sistemas se autentiquen contra el escáner, al ritmo Polite, y deja "
+        "que un operador "
+        "decida cada paso de ataque durante el escaneo (sin operador, los mapea sin "
+        "ejecutarlos). La política de laboratorio relaja la protección contra "
+        "bloqueos (no lee el contador en vivo, su margen puede ser 0 e intenta "
+        "iniciar sesión cuando no conoce el umbral) y no debe usarse nunca sobre una "
+        "organización evaluada. Los ritmos que se nombran aquí se definen en la nota "
+        "del ritmo del escaneo que sigue. Una ejecución desatendida ejecuta solo "
+        "lo que el cliente ha encendido.",
     ),
     (
-        "Registro y reversión comprobada",
-        "Cada cambio queda registrado y se revierte comprobándolo; lo que no se "
-        "puede verificar se reporta nombrando el objeto.",
+        "Registro y reversión",
+        "La mayoría de los cambios se registran y se revierten. Los que no, "
+        "aparecen en su fila de la tabla como limpieza manual o como no "
+        "reversibles.",
     ),
     (
         "Bloqueo duro",
-        "Las técnicas que tumbarían un servicio en producción no se ejecutan en "
-        "ningún modo, y un operador no puede forzarlas.",
+        "Los pasos que se sabe que tumban un servicio están bloqueados en todos "
+        "los modos, y un operador no puede forzarlos: la explotación de "
+        "Zerologon, noPac, PrintNightmare y DnsAdmins se rechaza siempre, igual "
+        "que reiniciar la contraseña de una cuenta de equipo. La comprobación de "
+        "Zerologon que corre por defecto es una prueba de detección cuyos "
+        "intentos y ritmo siguen el nivel de ritmo elegido; un presupuesto "
+        "reducido se indica en el informe.",
     ),
     (
-        "En auditoría no se ejecutan solas",
+        "Lo disruptivo no corre solo",
         "Las técnicas disruptivas pero recuperables, como reiniciar la "
-        "contraseña de un usuario, no se ejecutan en una auditoría salvo que el "
-        "operador las autorice a mano: en una ejecución desatendida se omiten. "
-        "Solo se ejecutan solas en un entorno desechable, de laboratorio o CTF.",
+        "contraseña de un usuario, vienen apagadas en «Audit» y en "
+        "«Production-sensitive». Una ejecución desatendida solo las ejecuta si el "
+        "cliente las enciende en su política; con un operador, se le pregunta con "
+        "la respuesta de la política.",
+    ),
+    (
+        # adscan_core/reporting/client_secret_redaction.py (no value reaches a
+        # client artifact), workspaces/manager.py (delete = rmtree of the
+        # workspace root, credential store included), and the appliance disk:
+        # LUKS full-disk in the OVA, and the bare-metal USB installer writes the
+        # same golden disk and checks it ends in the LUKS partition
+        # (appliance/pov-appliance/luks-prod/installer/adscan_installer.py).
+        "Credenciales recuperadas",
+        "Se quedan en el disco cifrado del appliance que ejecuta ADscan, "
+        "instalado en un portátil o como máquina virtual. Ningún informe imprime "
+        "su valor: donde iría un secreto aparece «[redacted: N characters]». Se "
+        "borran con el espacio de trabajo.",
+    ),
+    (
+        # cli/smb.py (_resolve_smb_rclone_phase_cache_paths and the run folder),
+        # services/smb_sensitive_file_policy.py (extensions), adscan_core/
+        # workspace_secret_purge.py + node_link/artifact_classes.py ("**/loot/**"),
+        # workspaces/manager.py (delete = rmtree of the workspace root).
+        "Datos copiados de los equipos evaluados",
+        "La búsqueda de credenciales en recursos legibles copia al espacio de trabajo "
+        "los ficheros de texto y de documento que busca, según su extensión, bajo "
+        "domains/<dominio>/smb/. Con una política de escaneo activa quedan en "
+        "rclone/cache/<usuario>/<fase>/loot/<equipo>/<recurso>/. No escribe nada en los "
+        "equipos. El comando workspace purge-secrets borra esas carpetas loot, y borrar "
+        "el espacio de trabajo lo borra todo.",
     ),
 )

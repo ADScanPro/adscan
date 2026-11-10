@@ -51,6 +51,7 @@ from adscan_core.reporting.technical_report import (
     _save_technical_report,
     _utc_now_iso,
     finding_catalog,
+    finding_excluded_by_scan_policy,
 )
 from adscan_core import telemetry
 from adscan_core.reporting.unauthenticated_reach import reached_via_from_notes
@@ -677,6 +678,75 @@ def edge_qualifies_as_finding(
     return _edge_is_tier_jump_finding(edge, nodes_map, domains_data)
 
 
+def _graph_node_kind(node: dict[str, Any]) -> str:
+    """Return a graph node's kind lower-cased (``computer``, ``group``, …)."""
+    kind = node.get("kind") or node.get("labels") or node.get("type")
+    if isinstance(kind, list):
+        kind = kind[0] if kind else ""
+    return str(kind or "").strip().lower()
+
+
+def stamp_adcs_edge_display_contract(
+    graph: dict[str, Any],
+    domains_data: Any = None,
+) -> int:
+    """Give every AD CS edge the same display contract before it is persisted.
+
+    Two stamps on ``notes``, both written at the ONE graph-write seam
+    (``attack_graph_service.save_attack_graph``):
+
+    * ``source_label`` / ``target_label`` / ``source_kind`` / ``target_kind`` —
+      filled from the graph's own nodes when absent. The choke-point classifier
+      writes them only when control RISES along the edge, so a Tier 0 holder
+      over its own CA, a same-tier ESC14 and the ESC8 relay used to reach the
+      web with no endpoint labels at all. A value already present (the
+      classifier's bare label) is left alone: this fills blanks only.
+    * ``client_finding`` — the report's own verdict for this edge, from
+      :func:`edge_qualifies_as_finding`, recomputed on every save so it tracks
+      the current stamped tiers. The AD CS view in the web reads it instead of
+      re-implementing the tier-jump gate, so it counts exactly the edges the
+      report turns into findings. The EDGE stays in the graph either way: a CA
+      host's ``ADCSESC5`` is the vehicle the CA-key-theft step executes through,
+      so it remains an attack-path stepping stone even though it is not a
+      finding of its own (the exposure is the step that reaches the host).
+
+    Returns:
+        The number of AD CS edges stamped.
+    """
+    from adscan_core.adcs_relations import is_adcs_relation  # noqa: PLC0415
+
+    edges = graph.get("edges")
+    nodes_map = graph.get("nodes")
+    if not isinstance(edges, list) or not isinstance(nodes_map, dict):
+        return 0
+    stamped = 0
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        if not is_adcs_relation(str(edge.get("relation") or "")):
+            continue
+        notes = edge.get("notes")
+        if not isinstance(notes, dict):
+            notes = {}
+            edge["notes"] = notes
+        for side, key in (("from", "source"), ("to", "target")):
+            node_id = str(edge.get(side) or "").strip()
+            node = nodes_map.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            label = str(node.get("label") or node.get("name") or "").strip()
+            if label and not str(notes.get(f"{key}_label") or "").strip():
+                notes[f"{key}_label"] = label
+            kind = _graph_node_kind(node)
+            if kind and not str(notes.get(f"{key}_kind") or "").strip():
+                notes[f"{key}_kind"] = kind
+        notes["client_finding"] = bool(
+            edge_qualifies_as_finding(edge, nodes_map, domains_data)
+        )
+        stamped += 1
+    return stamped
+
+
 def _tier_gated_edge_suppressed(
     edge: dict[str, Any],
     nodes_map: dict[str, Any],
@@ -785,6 +855,28 @@ def _reconcile_external_tenant_replication(shell: ReportShell) -> None:
         )
 
         reconcile_external_tenant_replication(shell)
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _reconcile_cross_attributed_attribute_secrets(
+    shell: ReportShell, workspace_dir: str
+) -> None:
+    """Promote attribute leaks a later spray proved on a different principal.
+
+    Thin, best-effort bridge into
+    :func:`adscan_internal.services.attribute_secret_cross_attribution.promote_cross_attributed_attribute_secrets`,
+    co-located with the reconciliations above because it is the same subject:
+    settling, once the whole report exists, a fact no single phase could settle
+    on its own. Never raises into the caller.
+    """
+    try:
+        from adscan_internal.services.attribute_secret_cross_attribution import (  # noqa: PLC0415
+            promote_cross_attributed_attribute_secrets,
+        )
+
+        promote_cross_attributed_attribute_secrets(shell, workspace_dir)
     except Exception as exc:  # pragma: no cover - best effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -978,6 +1070,17 @@ _ESC15_VULN_KEY = "adcs_esc15"
 #: The ESC14 (weak explicit certificate mapping) finding key. Same confirmation
 #: lift as ESC15, keyed on the ``esc14_confirmed`` edge-note marker.
 _ESC14_VULN_KEY = "adcs_esc14"
+
+#: ESC9 / ESC10 (implicit certificate mapping). Same confirmation lift, keyed on
+#: the ``esc9_confirmed`` marker the ESC9 confirmation phase stamps on both
+#: relations (they share the binding-enforcement existence condition). A
+#: candidate the phase could not confirm (registry read indeterminate and the
+#: confirmation enrollment not allowed by the scan policy, declined, or opted
+#: out) reaches the finding as confirmation-pending, never as a confirmed one.
+_ESC9_CONFIRMATION_NOTE_KEYS: dict[str, str] = {
+    "adcs_esc9": "esc9_confirmed",
+    "adcs_esc10": "esc9_confirmed",
+}
 
 
 def _esc15_note_flag_is_true(value: Any) -> bool:
@@ -1247,8 +1350,70 @@ def _group_reportable_edges_by_key(
     return reportable, gated
 
 
+def _node_domain_for_display(nodes_map: dict[str, Any] | None, node_id: str) -> str:
+    """Return a node's own domain, lower-cased, for the display humanizer."""
+    if not nodes_map or not node_id:
+        return ""
+    node = nodes_map.get(node_id)
+    if not isinstance(node, dict):
+        return ""
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    return str(props.get("domain") or node.get("domain") or "").strip().lower()
+
+
+def _endpoint_display_label(
+    raw: str,
+    node: dict[str, Any] | None,
+    *,
+    report_domain: str,
+    partner_domain: str,
+) -> str:
+    """Return one edge endpoint's client-facing name through the shared SSOT.
+
+    A principal (``NAME@REALM``) with a graph node behind it goes through
+    ``humanize_principal_for_prose`` with the node's own object class and
+    sAMAccountName, because the label alone cannot tell a group from a user: a
+    shouting group label (``SPYS@CORP``) would otherwise be typed lower case like
+    an account. The synthetic ``@WELLKNOWN`` realm is rebound to the partner's
+    domain first, exactly as ``format_graph_node_label`` does for the report
+    graph. Every other shape (a host FQDN, a bare SID, the domain node, a label
+    with no node) goes through ``format_graph_node_label`` itself.
+    """
+    from adscan_core.reporting.principal_display import (  # noqa: PLC0415
+        format_graph_node_label,
+        humanize_principal_for_prose,
+    )
+
+    if node is not None and "@" in raw:
+        name, _, realm = raw.partition("@")
+        label = raw
+        if realm.strip().lower() == "wellknown" and name and partner_domain:
+            label = f"{name}@{partner_domain}"
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        sam = str(props.get("samaccountname") or node.get("samaccountname") or "")
+        return (
+            humanize_principal_for_prose(
+                label=label,
+                samaccountname=sam,
+                kind=_graph_node_kind(node),
+                report_domain=report_domain,
+            )
+            or raw
+        )
+    return (
+        format_graph_node_label(
+            raw, report_domain or None, context_domain=partner_domain or None
+        )
+        or raw
+    )
+
+
 def _edge_report_entry(
-    edge: dict[str, Any], label_fn: Callable[[str], str]
+    edge: dict[str, Any],
+    label_fn: Callable[[str], str],
+    *,
+    nodes_map: dict[str, Any] | None = None,
+    report_domain: str | None = None,
 ) -> dict[str, Any]:
     """Build the label-based ``attack_graph_edges`` entry for a graph edge.
 
@@ -1258,6 +1423,16 @@ def _edge_report_entry(
     those edges to empty strings. Shared by the surviving-edge stamping and the
     suppressed-edge pruning so both build byte-identical entries (``_append_unique``
     / list membership match on value equality).
+
+    ``source`` / ``target`` are the raw graph labels and stay that way: they are
+    the IDENTITY the affected-assets index, the remediation placeholders, the
+    CVSS context and the identity merge all key on. When ``report_domain`` is
+    given, the client-facing form travels beside them as ``source_display`` /
+    ``target_display``, produced by the shared node-label SSOT
+    (``format_graph_node_label``) with the edge partner's domain as context, so a
+    renderer reads a humanized name (``khal.drogo``, ``Domain Admins``, never
+    ``KHAL.DROGO@ESSOS.LOCAL`` or ``Authenticated Users@WELLKNOWN``) without
+    re-deriving it.
     """
     from_id = str(edge.get("from") or "")
     to_id = str(edge.get("to") or "")
@@ -1270,6 +1445,22 @@ def _edge_report_entry(
         if to_id
         else str(edge.get("target") or "").strip(),
     }
+    if report_domain is not None:
+        source_domain = _node_domain_for_display(nodes_map, from_id)
+        target_domain = _node_domain_for_display(nodes_map, to_id)
+        for key, node_id, partner_domain in (
+            ("source", from_id, target_domain),
+            ("target", to_id, source_domain),
+        ):
+            raw = entry[key]
+            if raw:
+                node = nodes_map.get(node_id) if nodes_map and node_id else None
+                entry[f"{key}_display"] = _endpoint_display_label(
+                    raw,
+                    node if isinstance(node, dict) else None,
+                    report_domain=report_domain,
+                    partner_domain=partner_domain,
+                )
     # Carry the per-edge STEP status onto the summarized entry. The roasting
     # affected-assets builder reads it to stamp a per-account crack status
     # (success -> CRACKED, attempted/failed -> attempted, discovered -> exposed);
@@ -1353,6 +1544,12 @@ def _edge_entry_identity(entry: Any) -> tuple[str, str, str] | None:
     )
 
 
+#: ``attack_graph_edges`` entry keys recomputed from the identity on every sync.
+_DERIVED_EDGE_DISPLAY_KEYS: frozenset[str] = frozenset(
+    {"source_display", "target_display"}
+)
+
+
 def _merge_edge_entries_by_identity(
     existing: list[Any], new_entries: Any
 ) -> list[dict[str, Any]]:
@@ -1380,7 +1577,12 @@ def _merge_edge_entries_by_identity(
             continue
         if ident in by_identity:
             for key, value in entry.items():
-                if value not in (None, "") and not by_identity[ident].get(key):
+                if value in (None, ""):
+                    continue
+                # The display labels are DERIVED from the identity on every
+                # sync, so the latest derivation wins: a humanizer fix must reach
+                # an artifact written before it, not stay frozen at first write.
+                if key in _DERIVED_EDGE_DISPLAY_KEYS or not by_identity[ident].get(key):
                     by_identity[ident][key] = value
         else:
             by_identity[ident] = dict(entry)
@@ -2167,7 +2369,12 @@ def sync_attack_graph_findings(
         for edge in key_edges:
             # Status is now carried by the shared ``_edge_report_entry`` helper
             # (so the suppressed-edge builder stays byte-identical for the prune).
-            _append_unique(entries, _edge_report_entry(edge, _label))
+            _append_unique(
+                entries,
+                _edge_report_entry(
+                    edge, _label, nodes_map=nodes_map, report_domain=domain
+                ),
+            )
         edges_by_key[vuln_key] = entries
 
     # Tier-0-source exploitation edges the grouping gate drops (held by design,
@@ -2214,6 +2421,25 @@ def sync_attack_graph_findings(
 
     updated = False
     now = _utc_now_iso()
+
+    # S7, the same gate ``record_technical_finding`` applies: a detection the scan
+    # policy left unchecked is never reported as confirmed, so the document cannot
+    # list it as not assessed and rank it as a priority at once. A detection
+    # paired with an attack step the policy only kept from EXECUTING is still
+    # mapped and passes the gate (two-groups spec § 2.1). A graph-derived finding
+    # an earlier pass wrote for an excluded key is retracted the same narrow way
+    # the tier gate retracts its own.
+    policy_excluded = {
+        key
+        for key in edges_by_key
+        if finding_excluded_by_scan_policy(shell, domain_entry, key)
+    }
+    if policy_excluded:
+        if _retract_gated_findings(findings, findings_by_key, policy_excluded):
+            updated = True
+        edges_by_key = {
+            key: entries for key, entries in edges_by_key.items() if key not in policy_excluded
+        }
 
     # Heal FIRST: a workspace written before this gate landed carries findings
     # the graph no longer backs, and leaving them in place would have the report
@@ -2372,6 +2598,12 @@ def sync_attack_graph_findings(
             _stamp_esc14_variant_summary_into_details(
                 details,
                 raw_edges_by_key.get(vuln_key, []),
+            )
+        if vuln_key in _ESC9_CONFIRMATION_NOTE_KEYS:
+            _stamp_adcs_confirmation_into_details(
+                details,
+                raw_edges_by_key.get(vuln_key, []),
+                confirmed_note_key=_ESC9_CONFIRMATION_NOTE_KEYS[vuln_key],
             )
         if any(details.get(key) != previous_context[key] for key in previous_context):
             updated = True
@@ -2540,7 +2772,16 @@ def _workspace_graph_path(workspace_dir: str, domain: str) -> str:
 
 
 def _discover_graph_domains(workspace_dir: str) -> list[str]:
-    """Return the workspace domains that have an ``attack_graph.json`` on disk."""
+    """Return the workspace domains that have an ``attack_graph.json`` on disk.
+
+    Reserved buckets under ``domains/`` are excluded explicitly rather than
+    relying on them happening to carry no graph: that is a property of today's
+    bucket content, not a rule, and this function names the workspace's DOMAINS.
+    """
+    from adscan_core.workspace_domain_buckets import (  # noqa: PLC0415
+        is_reserved_domain_bucket,
+    )
+
     domains_root = os.path.join(str(workspace_dir), _DOMAINS_DIRNAME)
     try:
         entries = sorted(os.listdir(domains_root))
@@ -2549,7 +2790,8 @@ def _discover_graph_domains(workspace_dir: str) -> list[str]:
     return [
         name
         for name in entries
-        if os.path.isfile(_workspace_graph_path(workspace_dir, name))
+        if not is_reserved_domain_bucket(name)
+        and os.path.isfile(_workspace_graph_path(workspace_dir, name))
     ]
 
 
@@ -2588,6 +2830,9 @@ def reconcile_workspace_attack_graph_findings(
         The residual correlation errors, one message per unmatched edge. Empty
         when the artifacts agree. Best-effort — never raises.
     """
+    from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+        scrub_technical_report_secrets,
+    )
     from adscan_internal.workspaces import read_json_file  # noqa: PLC0415
 
     residual: list[str] = []
@@ -2606,6 +2851,13 @@ def reconcile_workspace_attack_graph_findings(
                 os.path.abspath(str(technical_report_path))
             )
 
+        # Before any renderer reads the report: a file an older build wrote with
+        # an inline recovered secret is scrubbed on disk (the original bytes are
+        # retained beside it as a node-only secret file). Every kit document and
+        # the LITE report call this seam first, so none of them can be handed a
+        # value however it reads the file.
+        scrub_technical_report_secrets(shell)
+
         # Cross-domain reconciliation of the external-tenant replication finding.
         # It reads ONLY the technical report (the persisted Tier-0 hardening
         # control evidence), so it runs above the per-domain graph loop and
@@ -2613,6 +2865,15 @@ def reconcile_workspace_attack_graph_findings(
         # every assessed domain at once, which is why it cannot be settled by the
         # per-domain emit during the scan.
         _reconcile_external_tenant_replication(shell)
+
+        # Promote an attribute leak a later spray PROVED against a DIFFERENT
+        # principal. It reads the credential store and the technical report
+        # only, never an attack graph, so it runs above the per-domain graph
+        # loop: a workspace whose leak was reported and whose spray hit landed
+        # must converge even when no graph is on disk for that domain. The
+        # proof it needs is recorded by the spray flow, which grades nothing —
+        # the decision is taken here, where both report tiers see it.
+        _reconcile_cross_attributed_attribute_secrets(shell, workspace_dir)
 
         if not names:
             return residual

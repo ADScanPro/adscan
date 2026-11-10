@@ -12,6 +12,8 @@ WinRM, SMB, RDP, SSH, or from any specific pivot tool such as Ligolo.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -316,6 +318,11 @@ def _already_classified_ips(shell: Any, domain: str) -> set[str]:
     return classified
 
 
+#: The Phase 1 subphase this follow-up sweep is (``domain_analysis``), so the
+#: post-pivot helper resolves the same check id and the same scan-config switch.
+_NTLM_SWEEP_SUBPHASE: tuple[str, str] = ("domain_analysis", "ntlm_auth_type_sweep")
+
+
 def _run_ntlm_sweep_for_newly_reachable_after_pivot(
     shell: Any,
     *,
@@ -336,12 +343,29 @@ def _run_ntlm_sweep_for_newly_reachable_after_pivot(
     not re-coerced; hosts already holding a positive verdict are also skipped.
     The OPSEC heads-up and the >=2-reachable relay gate inside the sweep stay
     intact. Best-effort: a sweep failure never aborts the follow-up recalc.
+
+    The sweep is the same scan-policy check as the Phase 1 sweep
+    (``module:domain_analysis.ntlm_auth_type_sweep``) and the same scan-config
+    subphase, so it passes the same gates: when either switches it off, nothing
+    is asked and nothing is sent to the new hosts. The policy refusal goes
+    through the enforcement seam, so it is explained and recorded like every
+    other excluded check.
     """
     from adscan_core.output import questionary_select_index  # noqa: PLC0415
     from adscan_internal.cli.ntlm_capture import (  # noqa: PLC0415
         run_ntlm_auth_type_sweep_for_hosts,
     )
     from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        SUBPHASE_CHECK_BINDINGS,
+        subphase_is_enabled,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+    from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+        announce_phase_skip,
+    )
 
     domain = context.domain
     marked_domain = mark_sensitive(domain, "domain")
@@ -364,6 +388,35 @@ def _run_ntlm_sweep_for_newly_reachable_after_pivot(
         )
         return
 
+    # Policy and scan-config gates, before any prompt or packet. Checked only
+    # once there is something to sweep, so a pivot with no new host prints no
+    # skip notice.
+    if not gate_check_runner(
+        shell,
+        SUBPHASE_CHECK_BINDINGS[_NTLM_SWEEP_SUBPHASE],
+        surface="followup",
+    ):
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep: excluded by the active scan policy for "
+            f"{marked_domain}; nothing asked, nothing sent."
+        )
+        return
+    if not subphase_is_enabled(shell, *_NTLM_SWEEP_SUBPHASE):
+        # The Phase 1 step already printed the configuration line for this
+        # subphase, so the follow-up stays quiet on a configuration disable.
+        announce_phase_skip(
+            shell,
+            _NTLM_SWEEP_SUBPHASE[0],
+            label="NTLM Auth-Type Sweep",
+            subphase_id=_NTLM_SWEEP_SUBPHASE[1],
+            config_line=False,
+        )
+        print_info_debug(
+            "[post-pivot] NTLMv1 sweep: disabled by the scan configuration for "
+            f"{marked_domain}; nothing asked, nothing sent."
+        )
+        return
+
     dc_ips = _dc_ips_for_domain(shell, domain)
     dc_candidates = [ip for ip in candidate_ips if ip in dc_ips]
 
@@ -377,12 +430,11 @@ def _run_ntlm_sweep_for_newly_reachable_after_pivot(
         "Skip the NTLM auth-type sweep for new hosts",
     ]
 
-    # Engagement-type default: ctf -> sweep all newly-reachable; audit (and any
-    # non-ctf) -> skip UNLESS a DC is newly reachable, in which case classify the
-    # DC (a quiet, reportable win). Non-interactive/CI auto-resolves to this
-    # default via the centralized helper and NEVER blocks.
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type == "ctf":
+    # Scope-expansion default: automatic -> sweep all newly-reachable; ask ->
+    # skip UNLESS a DC is newly reachable, in which case classify the DC (a
+    # quiet, reportable win). Non-interactive/CI auto-resolves to this default
+    # via the centralized helper and NEVER blocks.
+    if policy_settings.expands_scope_automatically(shell):
         default_idx = _POST_PIVOT_SWEEP_OPTION_ALL_NEW
     elif dc_candidates:
         default_idx = _POST_PIVOT_SWEEP_OPTION_DCS_ONLY
@@ -408,7 +460,8 @@ def _run_ntlm_sweep_for_newly_reachable_after_pivot(
     if is_non_interactive(shell):
         print_info_debug(
             "[post-pivot] NTLMv1 sweep scope auto-resolved (non-interactive): "
-            f"idx={selected_idx} domain={marked_domain} type={workspace_type or 'unknown'}"
+            f"idx={selected_idx} domain={marked_domain} "
+            f"scope_expansion={policy_settings.policy_setting(shell, policy_settings.SCOPE_EXPANSION)}"
         )
 
     if selected_idx == _POST_PIVOT_SWEEP_OPTION_SKIP:

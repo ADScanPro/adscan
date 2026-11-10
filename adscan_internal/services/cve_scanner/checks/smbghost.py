@@ -42,7 +42,8 @@ if TYPE_CHECKING:  # pragma: no cover
 CVE_ID = "CVE-2020-0796"
 AKA = "SMBGhost"
 CVSS_V3 = 10.0
-CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+# NVD (NIST, primary) publishes 10.0 at S:C (not S:U, which computes 9.8).
+CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
 
 
 @dataclass(frozen=True)

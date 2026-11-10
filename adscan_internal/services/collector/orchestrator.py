@@ -35,6 +35,8 @@ from adscan_internal.services.collector.group_inference_analyzer import (
 from adscan_internal.services import attack_graph_service
 from adscan_internal.services.collector.ldap_collector import ADscanLDAPCollector
 from adscan_internal.services.collector.models import (
+    COLLECTION_SCOPE_DOMAIN_COMPROMISE,
+    COLLECTION_SCOPE_FULL_ASSESSMENT,
     CollectionResult,
     ForeignNodeRef,
 )
@@ -198,7 +200,7 @@ class CollectionOrchestrator:
         credential: _Credential,
         kerberos_target_hostname: str | None = None,
         use_ldaps: bool = True,
-        collection_scope: str = "ctf",
+        collection_scope: str = COLLECTION_SCOPE_DOMAIN_COMPROMISE,
         collect_smb: bool = True,
         collect_shares: bool = True,
         posture_sink: Optional["PostureSink"] = None,
@@ -213,6 +215,7 @@ class CollectionOrchestrator:
         host_cap: int = 0,
         scale_gate_callback: "Callable[[int], Any] | None" = None,
         shell: Any = None,
+        defer_ca_registry_rerun: bool = False,
     ) -> tuple[CollectionResult, CollectionTiming]:
         """Collect a single domain and return the raw result with per-phase timing.
 
@@ -267,6 +270,7 @@ class CollectionOrchestrator:
             posture_sink=posture_sink,
             posture_snapshot=posture_snapshot,
             shell=shell,
+            defer_ca_registry_rerun=defer_ca_registry_rerun,
         )
         timing.adcs = result.adcs_elapsed
         timing.ldap = time.monotonic() - _t - timing.adcs
@@ -295,7 +299,7 @@ class CollectionOrchestrator:
         # Machine-account password rotation policy (audit scope): read the GPO
         # SYSVOL security templates over SMB to flag disabled/relaxed rotation — a
         # domain-wide static-machine-password (Timeroast) surface. Best-effort.
-        if collection_scope == "audit":
+        if collection_scope == COLLECTION_SCOPE_FULL_ASSESSMENT:
             self._inspect_machine_password_policy(
                 result,
                 target_domain=target_domain,
@@ -414,6 +418,38 @@ class CollectionOrchestrator:
                 except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
+            # Persist what the host fan-out could NOT examine (unreachable on the
+            # 445 gate, per-host budget timeouts) so the run's coverage record can
+            # keep host-scoped items from being closed on a host nobody reached.
+            # Counts only (JSON-safe ints); read by ``coverage_recorder``.
+            if shell is not None:
+                try:
+                    domains_data = getattr(shell, "domains_data", None)
+                    if isinstance(domains_data, dict):
+                        _candidates = int(host_timing.candidate_count)
+                        _reachable = int(host_timing.reachable_445_count)
+                        domains_data.setdefault(target_domain, {})[
+                            "host_collection"
+                        ] = {
+                            "candidates": _candidates,
+                            "reachable": _reachable,
+                            "unreachable": max(0, _candidates - _reachable),
+                            "budget_timeouts": int(host_timing.host_budget_timeouts),
+                        }
+                except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
+                # Which hosts this sweep fully examined (every stage, no error).
+                # Only meaningful when every stage was collected: a sweep that
+                # skipped SAMR or shares examined no host completely.
+                if collect_smb and collect_shares:
+                    from adscan_internal.services.engagement.coverage_recorder import (
+                        note_collection_hosts,
+                    )
+
+                    note_collection_hosts(
+                        shell, target_domain, host_timing.examined_host_ids
+                    )
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
             timing.host_shares = host_timing.shares
@@ -609,7 +645,7 @@ class CollectionOrchestrator:
         # of the END-of-run host-enrichment coverage statement. Advise, then
         # continue automatically; a re-scan is an explicit opt-out, never a prompt.
         self._announce_resume(shell=shell, domain=domain)
-        scan_type = "audit" if collection_scope == "audit" else "ctf"
+        scan_type = collection_scope
         host_cap = int(getattr(host_cfg, "host_cap", 0) or 0)
 
         def _on_sweep_start(hosts_total: int) -> None:
@@ -724,7 +760,7 @@ class CollectionOrchestrator:
         scopes: list[DomainScope],
         credential: _Credential,
         use_ldaps: bool = True,
-        collection_scope: str = "ctf",
+        collection_scope: str = COLLECTION_SCOPE_DOMAIN_COMPROMISE,
         collect_smb: bool = True,
         collect_shares: bool = True,
         posture_sink: Optional["PostureSink"] = None,
@@ -775,6 +811,10 @@ class CollectionOrchestrator:
                 host_cap=host_cap,
                 scale_gate_callback=scale_gate_callback,
                 shell=shell,
+                # The AD CS registry probe needs a proven CA-host administrator;
+                # CAs without one on the LDAP pass are finished below, after the
+                # persist that lets the graph resolve roles.
+                defer_ca_registry_rerun=True,
             )
             results[scope.domain] = result
             timings[scope.domain] = timing
@@ -794,7 +834,42 @@ class CollectionOrchestrator:
             counters[scope.domain] = self._persistence.persist(
                 shell, domain=scope.domain, result=result
             )
+            # AD CS registry probe, second pass: the graph just persisted now
+            # resolves roles the LDAP pass could not see (a local administrator
+            # of the CA host found by the SMB sweep). Every deferred CA is
+            # recorded once here; new ESC6 / ESC11 / Certighost edges go
+            # through the same persistence path as the rest of the result.
+            from adscan_internal.services.adcs.ca_registry_rerun import (
+                rerun_pending_ca_registry_probes,
+            )
+
+            if rerun_pending_ca_registry_probes(
+                shell, domain=scope.domain, result=result, dc_ip=scope.dc_address
+            ):
+                counters[scope.domain] = self._persistence.persist(
+                    shell, domain=scope.domain, result=result
+                )
+            # Patch-level CVE checks, second pass: a host the run's CVE scan left
+            # not assessed (its registry refused the scan credential) is read
+            # again now that the persisted graph may prove an administrator of it
+            # (the privileged refresh after a domain compromise, a local admin
+            # found by the SMB sweep). No-op until a CVE scan ran in this run.
+            if shell is not None:
+                from adscan_internal.services.cve_scanner.patch_level_rerun import (
+                    rerun_not_assessed_patch_level_checks,
+                )
+
+                rerun_not_assessed_patch_level_checks(
+                    shell, domain=scope.domain, dc_ip=scope.dc_address
+                )
             timing.persist = time.monotonic() - _persist_start
+            # The domain was collected and persisted in THIS run: the coverage
+            # record may now trust the directory read for it.
+            from adscan_internal.services.engagement.coverage_recorder import (
+                note_collection_ran,
+            )
+
+            note_collection_ran(shell, scope.domain)
             # Host-granular Domain-Collection resume: the end-of-sweep persist
             # above wrote the full partial graph, so finalize the checkpoint now
             # (ordering: graph first, then the record). A clean sweep flips to

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable, NamedTuple, TYPE_CHECKING, Any
 
 from adscan_internal import telemetry
@@ -16,6 +19,14 @@ from adscan_internal.rich_output import (
     print_warning,
 )
 from adscan_internal.services.attack_graph_service import load_attack_graph
+from adscan_internal.services.collector.collection_integrity import (
+    begin_collection_attempt,
+    declare_collection_integrity,
+)
+from adscan_internal.services.collector.models import (
+    COLLECTION_SCOPE_DOMAIN_COMPROMISE,
+    COLLECTION_SCOPE_FULL_ASSESSMENT,
+)
 from adscan_internal.services.collector.orchestrator import (
     CollectionOrchestrator,
     CollectionTiming,
@@ -56,18 +67,58 @@ def build_collection_credential(
     ccache_path: str | None = None,
     aes_key: str | None = None,
 ) -> CollectionCredential:
-    """Extract collector credentials from shell domain metadata."""
+    """Extract collector credentials from shell domain metadata.
+
+    The username and every piece of secret material come from the SAME
+    principal (pairing SSOT ``resolve_principal_credential``): an explicit
+    ``auth_username`` is paired with its own password / stored secret, never with
+    the domain's active password, ccache or AES key, which belong to whichever
+    principal is active. Mixing them sent a wrong secret for a real account on
+    every bind (an account-lockout hazard).
+    """
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_credential,
+    )
+
     domain_data = _domain_data(shell, domain)
     auth_mode = str(domain_data.get("auth") or "").strip().lower()
+    resolved = resolve_principal_credential(
+        getattr(shell, "domains_data", {}),
+        domain=domain,
+        username=auth_username,
+        secret=auth_password,
+    )
+    username = resolved.username if resolved is not None else None
+    active_user = str(domain_data.get("username") or "").strip().lower()
+    is_active_principal = bool(username) and str(username).strip().lower() == active_user
     return CollectionCredential(
-        username=auth_username or domain_data.get("username") or None,
-        password=auth_password or domain_data.get("password") or None,
+        username=username or None,
+        password=(resolved.secret if resolved is not None else None) or None,
         use_kerberos=(auth_mode == "kerberos")
         if use_kerberos is None
         else use_kerberos,
-        ccache_path=ccache_path or domain_data.get("ccache_path") or None,
-        aes_key=aes_key or domain_data.get("aes_key") or None,
+        ccache_path=ccache_path
+        or (domain_data.get("ccache_path") if is_active_principal else None)
+        or None,
+        aes_key=aes_key
+        or (domain_data.get("aes_key") if is_active_principal else None)
+        or None,
     )
+
+
+def _active_principal_aes_key(
+    domain_data: dict[str, Any], username: str | None
+) -> str | None:
+    """Return the domain's stored AES key only when it belongs to ``username``.
+
+    ``domain_data["aes_key"]`` is part of the ACTIVE principal's material; handing
+    it to a different username is a wrong-secret pre-auth (a ``badPwdCount``
+    increment) on that account.
+    """
+    active = str(domain_data.get("username") or "").strip().lower()
+    if not active or str(username or "").strip().lower() != active:
+        return None
+    return str(domain_data.get("aes_key") or "").strip() or None
 
 
 def _domain_data(shell: Any, domain: str) -> dict[str, Any]:
@@ -154,7 +205,7 @@ def _prepare_native_kerberos_credential(
             password=None,
             use_kerberos=True,
             ccache_path=credential.ccache_path,
-            aes_key=credential.aes_key or auth_domain_data.get("aes_key") or None,
+            aes_key=credential.aes_key or _active_principal_aes_key(auth_domain_data, credential.username),
         )
 
     # Otherwise mint/get a ccache for THIS EXACT principal from its stored secret
@@ -202,7 +253,7 @@ def _prepare_native_kerberos_credential(
         password=None,
         use_kerberos=True,
         ccache_path=user_ccache,
-        aes_key=credential.aes_key or auth_domain_data.get("aes_key") or None,
+        aes_key=credential.aes_key or _active_principal_aes_key(auth_domain_data, credential.username),
     )
 
 
@@ -560,6 +611,7 @@ def run_native_collection(
     aes_key: str | None = None,
 ) -> list[str]:
     """Collect and persist native graph artifacts for one Phase 1 domain."""
+    collector_result: Any = None
     try:
         dc_ip, dc_hostname = _resolve_dc_info(shell, target_domain)
         domain_data = _domain_data(shell, target_domain)
@@ -595,8 +647,13 @@ def run_native_collection(
         # monotonic: the host wall clock is stepped mid-scan for DC sync, which
         # would corrupt any wall-clock elapsed measured across the step.
         started = time.monotonic()
-        workspace_type = str(getattr(shell, "type", "ctf") or "ctf").lower()
-        collection_scope = "audit" if workspace_type == "audit" else "ctf"
+        # The collection scope follows the policy's objective: a full assessment
+        # adds the directory-hygiene collection.
+        collection_scope = (
+            COLLECTION_SCOPE_FULL_ASSESSMENT
+            if policy_settings.runs_full_assessment(shell)
+            else COLLECTION_SCOPE_DOMAIN_COMPROMISE
+        )
         from adscan_internal import get_console
         from adscan_internal.cli.widgets.intelligence_update import (
             render_intelligence_update,
@@ -656,6 +713,10 @@ def run_native_collection(
         )
 
         _workspace_root = getattr(shell, "current_workspace_dir", None)
+
+        # This attempt is judged on its own: an earlier attempt's "incomplete"
+        # mark is dropped here and re-raised below only if THIS one is cut off.
+        begin_collection_attempt(shell, target_domain)
 
         def _run_sweep_once() -> tuple[Any, Any, Any, Any]:
             # A FRESH cancellation token per sweep pass so a "continue enriching"
@@ -736,6 +797,12 @@ def run_native_collection(
         )
         _surface_host_enrichment_coverage(shell, target_domain, timing)
         collector_result = collection_results.get(target_domain)
+        # Did the collection read the whole directory? A stage cut off mid-read
+        # marks Domain Collection incomplete (the run then cannot read as a
+        # completed assessment) and the summary panel says what was not read.
+        unread_parts = declare_collection_integrity(
+            shell, target_domain, collector_result
+        )
         # Set the shell's logical domain context to the domain we just collected
         # BEFORE the persist calls below, so save_domain_data() can write
         # variables.json. See _ensure_shell_domain_context for why the automated
@@ -792,12 +859,18 @@ def run_native_collection(
             auth_domain=resolved_auth_domain,
             auth_kdc=auth_kdc,
         )
-        _print_collection_summary_from_graph(shell, target_domain, elapsed)
+        _print_collection_summary_from_graph(
+            shell, target_domain, elapsed, unread_parts=unread_parts
+        )
         _print_collector_enrichment_panel(collector_result, target_domain, shell=shell)
-        _persist_collector_findings(shell, target_domain, collector_result)
+        # The posture inventory is merged into BEFORE the findings persist,
+        # because the anti-malware control reading emitted there is derived
+        # from the merged inventory (every host any run examined), not from
+        # this run's hosts alone.
         _persist_defensive_posture_inventory(
             shell, target_domain, collector_result, _workspace_root
         )
+        _persist_collector_findings(shell, target_domain, collector_result)
         # Record the client-facing endpoint-defense block from what collection
         # just observed. The dump paths record it again after each attempt;
         # this call is what makes a collection-only scan (no credential dump
@@ -857,6 +930,9 @@ def run_native_collection(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_error(f"Native collection failed: {exc}")
+        # The collection ended early: whatever it persisted is not the whole
+        # directory, so the phase is incomplete (never silently "done").
+        declare_collection_integrity(shell, target_domain, collector_result, aborted=exc)
         # The collector long step ended (in error) — clear the live strip so the
         # "SMB collector" operation never freezes on its last tick after a
         # failed collection. Best-effort, mirrors the success-path done emit.
@@ -1224,8 +1300,14 @@ def _persist_defensive_posture_inventory(
             HostFingerprint,
         )
 
+        from adscan_core.reporting.endpoint_capability import (
+            credential_guard_from_registry,
+            lsa_protection_from_registry,
+        )
+
         fingerprints: dict[str, Any] = {}
         dns_names: dict[str, str] = {}
+        hardening: dict[str, dict[str, str]] = {}
         for node in getattr(result, "nodes", {}).values():
             props = getattr(node, "properties", None) or {}
             if props.get("endpoint_posture_assessed") is not True:
@@ -1233,29 +1315,67 @@ def _persist_defensive_posture_inventory(
             host_object_id = str(getattr(node, "object_id", "") or "").strip()
             if not host_object_id:
                 continue
-            products = [
-                DetectedProduct(
-                    name=str(p.get("name") or ""),
-                    category=str(p.get("category") or ""),
-                    installed=bool(p.get("active")),
-                    running=bool(p.get("active")),
-                    svc_start=-1,
-                    realtime_protection=bool(p.get("active")),
+            # A detected product IS installed. Whether it protects the host is
+            # what ``active`` (observed) and ``activity_unconfirmed`` (its
+            # real-time-protection state was assumed, not read) carry. The old
+            # reconstruction wrote ``installed=active``, so an antivirus seen
+            # installed with protection off was serialized as not installed.
+            products = []
+            for p in props.get("endpoint_products") or []:
+                if not isinstance(p, dict) or not p.get("name"):
+                    continue
+                unconfirmed = bool(p.get("activity_unconfirmed"))
+                observed_active = bool(p.get("active"))
+                products.append(
+                    DetectedProduct(
+                        name=str(p.get("name") or ""),
+                        category=str(p.get("category") or ""),
+                        installed=True,
+                        running=observed_active or unconfirmed,
+                        svc_start=-1,
+                        realtime_protection=observed_active or unconfirmed,
+                        realtime_protection_confirmed=not unconfirmed,
+                    )
                 )
-                for p in (props.get("endpoint_products") or [])
-                if isinstance(p, dict) and p.get("name")
-            ]
             fingerprints[host_object_id] = HostFingerprint(
                 target_ip="",
                 products=products,
             )
+            # Read off the SAME registry stage the lsa_protection finding
+            # reads, so the per-host state and the finding cannot disagree. A
+            # value the stage never read stays "not_checked", never "off".
+            hardening[host_object_id] = {
+                "lsa_protection": lsa_protection_from_registry(
+                    props.get("reg_lsa_runasppl_state"),
+                    props.get("reg_lsa_runasppl"),
+                ),
+                "credential_guard": credential_guard_from_registry(
+                    lsa_state=props.get("reg_lsa_lsacfgflags_state"),
+                    lsa_value=props.get("reg_lsa_lsacfgflags"),
+                    policy_state=props.get("reg_deviceguard_policy_lsacfgflags_state"),
+                    policy_value=props.get("reg_deviceguard_policy_lsacfgflags"),
+                ),
+            }
             host_name = str(getattr(node, "name", "") or "").strip()
             if host_name:
                 dns_names[host_object_id] = host_name
         if not fingerprints:
             return
+        observed_at = datetime.now(timezone.utc)
+        # MERGED into the domain's inventory, never replaced by this run: a
+        # collection that reaches only some hosts (another was access-denied
+        # or unreachable this time) used to overwrite the file and erase the
+        # hosts an earlier run had examined, which is how a host examined with
+        # its antivirus off vanished from the Endpoint Defense section and
+        # from the anti-malware verdict.
         write_defensive_posture_inventory(
-            workspace_root, domain, fingerprints, dns_name_lookup=dns_names
+            workspace_root,
+            domain,
+            fingerprints,
+            dns_name_lookup=dns_names,
+            hardening_lookup=hardening,
+            observed_at_lookup={host_id: observed_at for host_id in fingerprints},
+            merge_existing=True,
         )
     except Exception as exc:  # noqa: BLE001 — inventory write never breaks persistence
         from adscan_internal import telemetry as _tel
@@ -1298,12 +1418,36 @@ def _record_recovered_password_finding(
     if not isinstance(credentials, dict) or not credentials:
         return
 
+    from adscan_core.credential_origins import (  # noqa: PLC0415
+        is_client_recovered_credential,
+    )
+    from adscan_internal.services.session_compromise_state_service import (  # noqa: PLC0415
+        adscan_created_accounts_for_shell,
+    )
+
+    created_accounts = adscan_created_accounts_for_shell(shell)
+
+    meta_map = domain_data.get("credentials_meta")
+    meta_map = meta_map if isinstance(meta_map, dict) else {}
+
     # A recovered PLAINTEXT only. A stored NT hash is not a recovered password,
-    # and a ccache path is a ticket rather than a secret the user types.
+    # and a ccache path is a ticket rather than a secret the user types. The
+    # password the scan started with, a hand-entered one and the password of an
+    # account ADscan created were never recovered: the same predicate the
+    # compromised-credentials table uses keeps them out.
     recovered: set[str] = set()
     for username, secret in credentials.items():
         value = str(secret or "").strip()
         if not value or looks_like_ntlm_hash(value):
+            continue
+        user_meta = meta_map.get(username)
+        origin = user_meta.get("credential_origin") if isinstance(user_meta, dict) else None
+        if not is_client_recovered_credential(
+            domain=domain,
+            account=str(username or ""),
+            origin=origin,
+            created=created_accounts,
+        ):
             continue
         if value.endswith(".ccache") or "/" in value or "\\" in value:
             continue
@@ -1349,6 +1493,10 @@ def _record_recovered_password_finding(
             # Drives the contextual elevation to critical.
             "admin_like_recovered": summary.admin_like_recovered,
             "recovered_total": summary.recovered_total,
+            # The recovered accounts outside the enabled population, named so
+            # the finding states which population it counts and the Password
+            # Hygiene Report (every extracted account) reconciles with it.
+            "not_enabled_recovered": list(summary.not_enabled_recovered_usernames),
             # The accounts themselves, so the affected-assets block names real
             # objects and the remediation commands fill with them. Administrative
             # accounts first: they are the ones that make this an incident.
@@ -1474,6 +1622,32 @@ def _persist_collector_findings(
         _tel.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[intelligence] domain policy positives emit failed: {exc}")
+
+    # ── Enumerated-surface evidence (the TECHNIQUE layer, not configuration) ──
+    # The positives above all read configuration, which is the layer every
+    # directory-auditing product reads. These record the outcome of an
+    # ENUMERATION: how many accounts the collector read the Kerberos attributes
+    # of, how many security descriptors it parsed, how many principals it
+    # evaluated the replication right for. Green only where a surface was walked
+    # and nothing met the abusable condition; not_assessed where it was not
+    # walked or its precondition is absent; nothing at all where the walk did
+    # find exposure, because that is a finding.
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_enumerated_surface_positives,
+        )
+
+        emit_enumerated_surface_positives(
+            shell, domain, getattr(result, "enumerated_surfaces", None)
+        )
+    except Exception as exc:  # noqa: BLE001 — positive emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[intelligence] enumerated surface positives emit failed: {exc}"
+        )
 
     # ── Recovered account passwords (the measured password-recovery outcome) ──
     # The run's most client-actionable output had no finding at all: 227 cleartext
@@ -1865,9 +2039,17 @@ def _run_esc9_confirmation_phase(
 
 
 def _print_collection_summary_from_graph(
-    shell: Any, domain: str, elapsed: float
+    shell: Any,
+    domain: str,
+    elapsed: float,
+    *,
+    unread_parts: tuple[str, ...] = (),
 ) -> None:
-    """Render collection counters from the persisted attack graph."""
+    """Render collection counters from the persisted attack graph.
+
+    ``unread_parts`` (from ``collection_integrity.declare_collection_integrity``)
+    turns the panel into "Collection Incomplete" and names what was not read.
+    """
     try:
         from adscan_core.rich_output_collection import (
             CollectionSummary,
@@ -1910,6 +2092,7 @@ def _print_collection_summary_from_graph(
                     1 for edge in edges if edge.get("relation") == "TrustedBy"
                 ),
                 elapsed_seconds=elapsed,
+                unread_parts=tuple(unread_parts),
             )
         )
         _print_tactical_findings(
@@ -2339,7 +2522,7 @@ def _print_collector_enrichment_panel(
     audit_findings = list(result.audit_findings or [])
     domain_policy = result.domain_policy
 
-    if result.collection_scope == "audit" and (audit_findings or domain_policy):
+    if result.collection_scope == COLLECTION_SCOPE_FULL_ASSESSMENT and (audit_findings or domain_policy):
         from adscan_internal.cli.widgets.widget_artifacts import publish_widget
         from adscan_internal.cli.widgets.widget_builders import (
             build_hygiene_kpi_widget,
@@ -2380,10 +2563,10 @@ def _print_collector_enrichment_panel(
         # Emit live + persist for the web (same payload, both halves).
         publish_widget(shell, domain=domain, widget=kpi_widget)
         publish_widget(shell, domain=domain, widget=hygiene_widget)
-    elif result.collection_scope != "audit":
+    elif result.collection_scope != COLLECTION_SCOPE_FULL_ASSESSMENT:
         print_info_verbose(
-            "[collector] Audit findings skipped — scope is ctf. "
-            "Use audit workspace type for hygiene checks."
+            "[collector] Directory-hygiene findings skipped: the scan policy's "
+            "objective is domain compromise. A full-assessment objective adds them."
         )
 
 
@@ -3261,9 +3444,9 @@ def run_attack_path_discovery(
     # silent ``build_only=True`` graph builds still run because other phases
     # depend on those artefacts.
     if not build_only and not phase_is_enabled(shell, "attack_paths_discovery"):
-        from adscan_core.rich_output import print_info
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
 
-        print_info("Attack Paths Discovery skipped (disabled in scan configuration).")
+        announce_phase_skip(shell, "attack_paths_discovery", label="Attack Paths Discovery")
         return
 
     from adscan_internal.cli.attack_graph_reports import run_attack_paths

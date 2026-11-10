@@ -19,10 +19,13 @@ from typing import Any, Optional
 from adscan_core import telemetry
 from adscan_core.rich_output import background_console_context, print_info_debug
 from adscan_internal.cli.creds import save_ntlm_hash
+from adscan_core.workspace_domain_buckets import reserved_bucket_display_label
 from adscan_internal.cli.poisoning import (
     _record_poison_captured_ntlmv2_user,
-    _resolve_full_domain,
     _run_suite,
+)
+from adscan_internal.services.captured_credential_attribution import (
+    storage_domain_for_capture,
 )
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.background_jobs.cracking_enqueue import enqueue_cracking_job
@@ -180,14 +183,21 @@ def _handle_capture_to_sink(runtime: "PoisoningJobRuntime", item: dict) -> None:
     fullhash = item.get("fullhash") or ""
     version = item.get("version") or "v2"
 
-    domain = _resolve_full_domain(shell, netbios)
-    if not domain:
-        domain = (netbios or "captured").strip().lower() or "captured"
+    # Attribution through the shared ladder: the principal's realm, the recorded
+    # NetBIOS map, the machine account's own machine, then the NetBIOS-as-label
+    # convention. Unattributable material goes to the reserved bucket, never to
+    # a made-up domain name and never to a bare NetBIOS short name.
+    domain, attributed = storage_domain_for_capture(
+        shell, netbios=netbios, principal=user
+    )
 
     if not save_ntlm_hash(shell, domain, version, user, fullhash):
         return  # already recorded for this user
 
-    if version == "v2":
+    # Domain-scoped provenance only applies when the capture IS attributed: the
+    # reserved bucket is not a domain, so recording a graph-edge precursor
+    # against it would key the follow-up attack step to nothing.
+    if version == "v2" and attributed:
         _record_poison_captured_ntlmv2_user(shell, domain, user)
 
     runtime.captured += 1
@@ -216,8 +226,19 @@ def _handle_capture_to_sink(runtime: "PoisoningJobRuntime", item: dict) -> None:
         telemetry.capture_exception(_poison_tel_exc)
 
     marked_user = mark_sensitive(user, "user")
-    marked_domain = mark_sensitive(domain, "domain")
-    summary = f"Poisoning captured a NetNTLM{version} response for {marked_user}@{marked_domain}"
+    if attributed:
+        marked_domain = mark_sensitive(domain, "domain")
+        summary = (
+            f"Poisoning captured a NetNTLM{version} response for "
+            f"{marked_user}@{marked_domain}"
+        )
+    else:
+        # Say what is true: the response is real, its domain is not yet known.
+        # Rendering the bucket name where a domain goes is the defect itself.
+        summary = (
+            f"Poisoning captured a NetNTLM{version} response for {marked_user} "
+            f"({reserved_bucket_display_label(domain)})"
+        )
     runtime.sink(
         JobResult(
             job_id=runtime.job_id,

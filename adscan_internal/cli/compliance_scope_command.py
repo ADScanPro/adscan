@@ -38,6 +38,9 @@ import shlex
 from pathlib import Path
 from typing import Any, Optional
 
+from rich import box
+
+from adscan_core.output import create_styled_table, print_table
 from adscan_core.reporting.compliance_scope_declaration import (
     COMPLIANCE_SCOPE_ENV,
     compliance_scope_path,
@@ -102,12 +105,19 @@ _USAGE = (
 
 
 class _Refused(Exception):
-    """One refusal, carrying the line the operator reads and an optional hint."""
+    """One refusal: the line the operator reads, hints, and whether to list
+    the accepted profiles after them.
 
-    def __init__(self, message: str, *hints: str) -> None:
+    The profile list is a flag rather than one more hint string because it is
+    rendered as a table, which is what keeps its second column aligned at a
+    container's 80 columns.
+    """
+
+    def __init__(self, message: str, *hints: str, profiles: bool = False) -> None:
         super().__init__(message)
         self.message = message
         self.hints = tuple(h for h in hints if h)
+        self.profiles = profiles
 
 
 class _Request:
@@ -248,8 +258,8 @@ def _validate(request: _Request) -> EnsScope:
     if request.profile is None:
         raise _Refused(
             "No compliance profile was declared, so the scope is incomplete.",
-            f"Add {_FLAG_PROFILE} <profile>. The profiles are:\n"
-            + _profile_help(),
+            f"Add {_FLAG_PROFILE} <profile>. This build accepts:",
+            profiles=True,
         )
     # Resolved rather than matched against the registry keys, so a documented
     # alias ("890a") is read as the document it names instead of refused, and a
@@ -258,7 +268,8 @@ def _validate(request: _Request) -> EnsScope:
     if profile is None:
         raise _Refused(
             f"{request.profile!r} is not a compliance profile this build holds.",
-            "The profiles are:\n" + _profile_help(),
+            "It accepts:",
+            profiles=True,
         )
 
     missing = [d for d in DIMENSION_ORDER if d not in request.levels]
@@ -295,20 +306,46 @@ def _validate(request: _Request) -> EnsScope:
     )
 
 
-def _profile_help() -> str:
-    """The profiles, in the order and with the labels the wizard offers them.
+def _print_refusal(refusal: _Refused) -> None:
+    """Print one refusal: the line, its hints, then the profiles if asked."""
+    print_error(refusal.message)
+    for hint in refusal.hints:
+        print_info(hint)
+    if refusal.profiles:
+        _print_profile_table()
 
-    Read off the wizard's own choice builder so the two surfaces cannot list
-    different profiles, or list them in a different order: the general profile
-    first, the superseded family last.
+
+def _print_profile_table() -> None:
+    """Print the profiles this build accepts, grouped and aligned.
+
+    This is the surface that enumerates what the verb ACCEPTS, which is why it
+    carries the superseded CCN-STIC 883 family the undeclared panel does not
+    suggest: a client who certified under the repealed ENS can declare it
+    truthfully and read why no verdict follows. The two groups and their
+    captions come from :func:`profile_groups`, so the two surfaces answer two
+    stated questions rather than silently differing by four rows.
+
+    A Rich table rather than padded strings: a description padded to a fixed
+    column wraps back to column 0 at a container's 80 columns, which is where
+    this is read. Printed through the shared console, so it lands in the
+    session recording like every other panel.
     """
     from adscan_internal.cli.compliance_scope_wizard import (  # noqa: PLC0415
-        profile_choices,
+        profile_groups,
     )
 
-    return "\n".join(
-        f"  {key:<24} {label}" for key, label in profile_choices()
+    table = create_styled_table(
+        show_header=False, show_edge=False, box_style=box.SIMPLE
     )
+    table.add_column("profile", style="bold", no_wrap=True)
+    table.add_column("document", overflow="fold")
+    for index, (caption, choices) in enumerate(profile_groups()):
+        if index:
+            table.add_row("", "")
+        table.add_row("", f"[dim]{caption}[/dim]")
+        for key, label in choices:
+            table.add_row(key, label)
+    print_table(table)
 
 
 # --------------------------------------------------------------------------- #
@@ -322,38 +359,55 @@ def _print_undeclared(workspace_dir: Any) -> None:
     An undeclared workspace is a legitimate state, not an error, and the honest
     answer is the one the resolver already gives: the measures Anexo II requires
     at every category. Every figure is read off ``as_header()``.
+
+    The profiles named here are the ones in CURRENT use, read from
+    :func:`profile_groups`, and the line says so: this surface suggests what
+    an operator can usefully declare today, where a refusal enumerates
+    everything the build accepts, which is four rows wider. Two questions, two
+    answers, each stated rather than left to be inferred from two lists.
     """
+    from adscan_internal.cli.compliance_scope_wizard import (  # noqa: PLC0415
+        current_profile_keys,
+    )
+
     header = resolve_ens_applicability(None).as_header()
+    # The two-field block is a table, not padded strings: at a container's 80
+    # columns a hand-padded second column wraps back to column 0, and the
+    # profile list is derived now, so hand-wrapping it would go stale the day
+    # a profile is added.
+    fields = create_styled_table(
+        show_header=False, show_edge=False, box_style=box.SIMPLE
+    )
+    fields.add_column("field", style="bold", no_wrap=True)
+    fields.add_column("value", overflow="fold")
+    fields.add_row(
+        "profile",
+        ", ".join(current_profile_keys())
+        + "\n[dim]the profiles published against the ENS in force[/dim]",
+    )
+    fields.add_row(
+        "levels",
+        "C=medio,I=medio,T=bajo,A=medio,D=bajo"
+        "\n[dim]one per dimension, all five: bajo, medio, alto, na[/dim]",
+    )
     print_panel(
-        "\n".join(
-            [
-                "No ENS scope is declared for this workspace.",
-                "",
-                "The compliance section maps the common core of "
-                f"{header['common_core_total']} of {header['measures_total']} "
-                "Anexo II measures, the ones required at every category, and "
-                "states that the category was not declared. Nothing is "
-                "inferred from the scan: the security category belongs to the "
-                "system and is the client's own categorisation decision "
-                f"({header['category_derivation_citation']}).",
-                "",
-                # Shape first, then the two valid sets, rather than one long
-                # example: at a container's 80 columns a full example wraps,
-                # and a wrapped command is one an operator retypes wrong.
-                "[bold]To declare it, in one command[/bold]",
-                "  compliance_scope --profile <profile> --levels <C,I,T,A,D>",
-                "",
-                "  profile     general, ccn_stic_890a, ccn_stic_890c,",
-                "              other_specific_profile",
-                "  levels      C=medio,I=medio,T=bajo,A=medio,D=bajo",
-                "              one per dimension, all five: bajo, medio, "
-                "alto, na",
-                "",
-                f"Or point {COMPLIANCE_SCOPE_ENV} at the client's written "
-                "categorisation, which every surface reads in place of the "
-                "workspace file.",
-            ]
-        ),
+        [
+            "No ENS scope is declared for this workspace.\n",
+            "The compliance section maps the common core of "
+            f"{header['common_core_total']} of {header['measures_total']} "
+            "Anexo II measures, the ones required at every category, and "
+            "states that the category was not declared. Nothing is inferred "
+            "from the scan: the security category belongs to the system and "
+            "is the client's own categorisation decision "
+            f"({header['category_derivation_citation']}).\n",
+            "[bold]To declare it, in one command[/bold]",
+            "  compliance_scope --profile <profile> --levels <C,I,T,A,D>",
+            "",
+            fields,
+            f"\nOr point {COMPLIANCE_SCOPE_ENV} at the client's written "
+            "categorisation, which every surface reads in place of the "
+            "workspace file.",
+        ],
         title="ENS scope: not declared",
         title_align="left",
     )
@@ -415,11 +469,12 @@ def _declare(scope: EnsScope, workspace_dir: Any) -> int:
         )
     render_declared_scope(scope, title="Declared ENS scope")
     if scope.profile_out_of_scope_reason:
+        # The panel above already carries the reason and the profile that
+        # applies instead, read off the engine note. This adds only the flag
+        # that declares it, which is what the flag path is missing.
         print_warning(
-            f"{scope.profile_out_of_scope_reason} The report will state that "
-            "the profile does not reach the system rather than reading its "
-            "table anyway. To have the measures scoped instead, declare the "
-            f"general profile of Anexo II ({_FLAG_PROFILE} {PROFILE_GENERAL})."
+            "To have the measures scoped instead, declare the general profile "
+            f"of Anexo II: {_FLAG_PROFILE} {PROFILE_GENERAL}."
         )
     print_info(f"Declaration saved to {written}.")
     return EXIT_OK
@@ -448,8 +503,7 @@ def _refuse_ephemeral_write() -> int:
     )
     print_info(
         "Declare into a workspace that persists: pass -w <workspace>, the one "
-        "the report is rendered from. A workspace `execute` creates itself is "
-        "removed on exit unless --keep-workspace is also passed."
+        "the report is rendered from, or drop --ephemeral."
     )
     return EXIT_REFUSED
 
@@ -485,18 +539,14 @@ def run_compliance_scope_command(
     try:
         request = _parse(args)
     except _Refused as refusal:
-        print_error(refusal.message)
-        for hint in refusal.hints:
-            print_info(hint)
+        _print_refusal(refusal)
         return EXIT_REFUSED
 
     if request.declares:
         try:
             scope = _validate(request)
         except _Refused as refusal:
-            print_error(refusal.message)
-            for hint in refusal.hints:
-                print_info(hint)
+            _print_refusal(refusal)
             return EXIT_REFUSED
         if os.environ.get(COMPLIANCE_SCOPE_ENV, "").strip():
             return _refuse_overridden_write()

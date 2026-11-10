@@ -75,7 +75,7 @@ def _set_adcs_detection_state(
 def _is_inconclusive_adcs_reason(reason: str) -> bool:
     """Return True when the detection outcome should not be cached as negative."""
     normalized = str(reason or "").strip().lower()
-    if normalized == "missing_credentials":
+    if normalized in ("missing_credentials", ADCS_REASON_COLLECTION_INCOMPLETE):
         return True
     if normalized.startswith("auth_"):
         return True
@@ -119,6 +119,8 @@ def _extract_adcs_metadata(result: CollectionResult) -> tuple[str | None, str | 
 # to decide it can CONSUME the already-collected result instead of re-running a
 # second ``ADCSCollector.collect()``.
 ADCS_DETECTED_VIA_NATIVE_COLLECTOR = "native_collector"
+#: The native collection was cut off, so no AD CS verdict can be drawn from it.
+ADCS_REASON_COLLECTION_INCOMPLETE = "native_collection_incomplete"
 
 
 def populate_adcs_metadata_from_collection(
@@ -160,6 +162,25 @@ def populate_adcs_metadata_from_collection(
     try:
         enrollment_server, ca_name = _extract_adcs_metadata(result)
         detected = bool(enrollment_server or ca_name)
+        if not detected and getattr(result, "stage_failures", None):
+            # The collection did not finish (a stage was cut off), so finding no
+            # EnterpriseCA proves nothing: it may never have been read. Leave
+            # the verdict unset (inconclusive) rather than stamping a negative,
+            # and drop any verdict an earlier run left behind.
+            _set_adcs_detection_state(
+                shell,
+                domain=domain,
+                detected=None,
+                via=ADCS_DETECTED_VIA_NATIVE_COLLECTOR,
+                reason=ADCS_REASON_COLLECTION_INCOMPLETE,
+                source_context="phase2_native_collection",
+            )
+            print_info_debug(
+                f"[adcs] Phase 2 ADCS scope for {mark_sensitive(domain, 'domain')} "
+                "is inconclusive: the collection did not finish, so no AD CS "
+                "verdict is recorded."
+            )
+            return None
 
         domain_data = shell.domains_data.get(domain, {})
         if not isinstance(domain_data, dict):

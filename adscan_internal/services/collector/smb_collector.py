@@ -241,13 +241,12 @@ def _source_ip_toward(target_ip: str) -> str | None:
     """
     if not target_ip:
         return None
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect((str(target_ip), 9))
-            src = probe.getsockname()[0]
-            return str(src).lower() if src else None
-    except Exception:  # noqa: BLE001 - best-effort source-IP probe
-        return None
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        kernel_source_ip_toward,
+    )
+
+    src = kernel_source_ip_toward(str(target_ip))
+    return str(src).lower() if src else None
 
 
 def _normalize_session_username(username: str) -> str:
@@ -298,7 +297,9 @@ async def collect_sessions(
 ) -> tuple[list[tuple[str, str]], str | None]:
     """Return ``(sessions, error_reason)`` — (username, origin) third-party SMB
     sessions via SRVSVC NetSessEnum, with the collector's OWN session and noise
-    filtered out (see :func:`keep_session`). ``error_reason`` is ``None`` on
+    filtered out (see :func:`keep_session`), plus the accounts logged on to the
+    host (WKSSVC, origin ``""``) when SRVSVC succeeded (see
+    :func:`_add_logged_on_users`). ``error_reason`` is ``None`` on
     success, else the failure string (denial vs connection drop), surfaced for
     per-stage outcome telemetry.
 
@@ -334,12 +335,65 @@ async def collect_sessions(
     except Exception as exc:
         error_reason = f"{type(exc).__name__}: {exc}"
         print_info_debug(f"sessions enum error: {exc}")
+    logged_on = 0
+    if error_reason is None:
+        logged_on = await _add_logged_on_users(machine, sessions, self_user=self_user)
     print_info_debug(
-        f"sessions: kept={len(sessions)} dropped={dropped} "
+        f"sessions: kept={len(sessions)} dropped={dropped} logged_on_added={logged_on} "
         f"self_user={mark_sensitive(self_user or '-', 'user')} "
         f"own_ips={','.join(sorted(own_ips)) or '-'}"
     )
     return sessions, error_reason
+
+
+async def _add_logged_on_users(
+    machine: Any,
+    sessions: list[tuple[str, str]],
+    *,
+    self_user: str | None,
+) -> int:
+    """Append the accounts logged on to the host itself (WKSSVC NetrWkstaUserEnum
+    level 1) that SRVSVC did not already report. Returns how many were added.
+
+    SRVSVC lists INBOUND SMB sessions: a user signed in at the console or over
+    Remote Desktop appears there only while some process of theirs happens to
+    hold an SMB connection to the host, so a session the collector should see
+    shows up or not depending on timing. NetrWkstaUserEnum lists the logons on
+    the host, which is exactly what HasSession means (the credential sits in
+    that host's LSASS). Both need local administrator rights on Windows Server
+    2016 and later, so this runs only after SRVSVC succeeded: a host that
+    refused SRVSVC is not asked a second time.
+
+    Runs on the same connection AFTER SRVSVC completed (one pipe in flight per
+    aiosmb connection). Best-effort: a failure here leaves the SRVSVC result
+    and the stage outcome untouched. Logon entries carry no origin; the
+    machine account and the collector's own account are dropped by
+    :func:`keep_session`.
+    """
+    enumerate_logons = getattr(machine, "wkstlist_sessions", None)
+    if enumerate_logons is None:
+        return 0
+    seen = {_normalize_session_username(name) for name, _origin in sessions}
+    added = 0
+    try:
+        async for sess, err in enumerate_logons(level=1):
+            if err is not None:
+                print_info_debug(f"logged-on users enum error: {err}")
+                break
+            if sess is None:
+                continue
+            raw = str(getattr(sess, "username", "") or "").strip()
+            name = _normalize_session_username(raw)
+            if not name or name in seen:
+                continue
+            if not keep_session(raw, "", self_user=self_user):
+                continue
+            seen.add(name)
+            sessions.append((name, ""))
+            added += 1
+    except Exception as exc:  # noqa: BLE001 -- best-effort, SRVSVC result stands
+        print_info_debug(f"logged-on users enum error: {type(exc).__name__}: {exc}")
+    return added
 
 
 # BUILTIN group RIDs relevant for attack paths

@@ -68,6 +68,20 @@ MAQ_EXHAUSTED_REASON = (
     "created for RBCD."
 )
 
+# The CERTAIN close (decision D3, 2026-11-03): the DOMAIN quota was observed 0
+# this run AND no computer account is under the assessment's control other than
+# the ones ADscan itself provisioned. ADscan-provisioned accounts are artifacts of
+# the assessment, not attacker-held assets, so they do not keep the avenue open.
+# This is the client's configuration closing the avenue: a positive
+# ``closed_by_configuration``. An ACTOR whose own quota is used up while the
+# domain quota is above 0 is never this (the quota is not the client's setting
+# there, and ADscan's own objects may be what consumed it).
+MAQ_CLOSED_BY_CONFIGURATION_REASON = (
+    "MachineAccountQuota is set to 0 for the domain and no other computer account "
+    "is under the assessment's control, so no delegate account is available for "
+    "RBCD."
+)
+
 RelayTargetKind = Literal[
     "ldap_389_dropmic",
     "ldaps_636",
@@ -157,6 +171,9 @@ class RelayFeasibilityInputs:
             stays informational-ok).
         relay_target_host: The host the coerced auth is relayed TO (the DC's
             LDAP endpoint). ``None`` => not supplied.
+        domain_machine_account_quota: The domain quota observed this run.
+        controlled_computer_available: A non-ADscan controlled computer account
+            exists (``False`` with a domain quota of 0 is the certain close).
         alternate_dc_available: Whether a DC distinct from ``coerce_host`` exists
             to relay to (so a coerced-DC's auth can land on a DIFFERENT DC rather
             than reflect to itself). ``True`` => a real alternate exists (no
@@ -176,6 +193,12 @@ class RelayFeasibilityInputs:
     coerce_host: Optional[str] = None
     relay_target_host: Optional[str] = None
     alternate_dc_available: Optional[bool] = None
+    #: Domain-level ms-DS-MachineAccountQuota observed THIS run (the client's
+    #: setting), distinct from the actor's remaining capacity above.
+    domain_machine_account_quota: Optional[int] = None
+    #: Whether a computer account OTHER than an ADscan-provisioned one is under
+    #: the assessment's control. ``None`` => unknown (never a certain close).
+    controlled_computer_available: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -654,6 +677,22 @@ def check_machine_account_quota(
     """
     is_rbcd = inputs.method == "rbcd"
     maq = inputs.machine_account_quota
+    if maq is None:
+        # The actor's capacity is unknown; the domain quota bounds it.
+        maq = inputs.domain_machine_account_quota
+    if (
+        is_rbcd
+        and inputs.domain_machine_account_quota == 0
+        and inputs.controlled_computer_available is False
+    ):
+        return FeasibilityVerdict(
+            check_id="machine_account_quota",
+            status="blocking",
+            observed="domain MAQ=0, no controlled computer account",
+            why=MAQ_CLOSED_BY_CONFIGURATION_REASON,
+            remediation=None,
+            confidence=SignalConfidence.HIGH,
+        )
     if maq is None:
         return FeasibilityVerdict(
             check_id="machine_account_quota",

@@ -153,7 +153,12 @@ def resolve_engagement_type(
     """
     if workspace_dir is not None:
         return workspace_engagement_type(workspace_dir)
-    shell_type = normalize_workspace_type(getattr(shell, "type", None))
+    from adscan_core.scan_policy.policy import workspace_type_for_environment  # noqa: PLC0415
+    from adscan_core.scan_policy.settings import policy_environment  # noqa: PLC0415
+
+    # The engagement label the live shell's scan policy derives (lab → ctf,
+    # real → audit): the policy's environment, in the report's vocabulary.
+    shell_type = workspace_type_for_environment(policy_environment(shell))
     return shell_type if shell_type in KNOWN_ENGAGEMENT_TYPES else None
 
 

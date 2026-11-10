@@ -69,6 +69,15 @@ class KerberosTransportError(Exception):
     """Base class for all ADscan Kerberos transport errors."""
 
 
+class KerberosAttemptRefused(KerberosTransportError):
+    """The account-lockout guard withheld the sign-in; nothing reached the KDC.
+
+    Not an authentication failure: the credential was never judged, so callers
+    must not record it as invalid, retry it on another protocol or client, or
+    report it as an error. The original ``AuthAttemptRefused`` is the cause.
+    """
+
+
 class KerberosAuthError(KerberosTransportError):
     """Authentication failed (KDC_ERR_PREAUTH_FAILED, bad password/hash)."""
 
@@ -170,6 +179,7 @@ class KerberosConfig:
         # services/credential_routing.py.
         from adscan_internal.services.credential_routing import (
             promote_credential_fields,
+            require_credential_material,
         )
 
         self.password, self.nt_hash, self.aes_key, self.ccache_path = (
@@ -179,6 +189,15 @@ class KerberosConfig:
                 aes_key=self.aes_key,
                 ccache_path=self.ccache_path,
             )
+        )
+        require_credential_material(
+            transport="Kerberos",
+            username=self.username,
+            password=self.password,
+            nt_hash=self.nt_hash,
+            aes_key=self.aes_key,
+            ccache_path=self.ccache_path,
+            extra_material=(self.ccache_bytes, self.kirbi_path, self.cert_pfx_path),
         )
 
         # Promote bare KDC addresses to FQDN — same contract as
@@ -372,6 +391,11 @@ def _raise_translated_kerbad_error(exc: Exception) -> NoReturn:
 
     Always raises; never returns.
     """
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+
+    refusal = refusal_in_chain(exc)
+    if refusal is not None:
+        raise KerberosAttemptRefused(str(refusal)) from exc
     try:
         from kerbad.protocol.errors import KerberosErrorCode  # noqa: PLC0415
 
@@ -658,9 +682,16 @@ def _render_tgt_mint_failure(config: "KerberosConfig", exc: Exception) -> None:
       ``capture_exception`` + the default ``print_exception`` (generic line at
       INFO, full traceback under ``--debug``).
     """
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
     from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
         is_credential_rejection_error,
     )
+
+    if refusal_in_chain(exc) is not None:
+        # Deliberate lockout-safety skip: the guard already told the operator.
+        # Not a fault to report and not a rejection to explain.
+        print_exception(exception=exc, visible=False)
+        return
 
     if not is_credential_rejection_error(exc):
         # (C) Unclassifiable / genuine fault — keep the full debugging path.

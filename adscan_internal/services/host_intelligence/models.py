@@ -40,6 +40,11 @@ class DetectedProduct:
             unreadable.
         realtime_protection: False only for products whose RTP toggle is
             explicitly disabled (currently Defender ``DisableRealtimeMonitoring``).
+        realtime_protection_confirmed: False when the product has an RTP
+            toggle and its state could NOT be read, so ``realtime_protection``
+            is an assumption ("on", the conservative choice for picking a
+            technique) rather than an observation. Reporting reads
+            :attr:`observed_active`, which never credits an assumption.
     """
 
     name: str
@@ -48,16 +53,38 @@ class DetectedProduct:
     running: bool
     svc_start: int
     realtime_protection: bool = True
+    realtime_protection_confirmed: bool = True
 
     @property
     def active(self) -> bool:
-        """True if the product is process-running AND its RTP is on."""
+        """True if the product is process-running AND its RTP is on.
+
+        Conservative for OPSEC decisions: an RTP state that could not be read
+        counts as on, so a technique is never chosen on the assumption that
+        protection is off. NOT an observation; reporting reads
+        :attr:`observed_active`.
+        """
         process_running = self.running or (
             self.installed
             and self.svc_start
             in (SVC_START_BOOT, SVC_START_SYSTEM, SVC_START_AUTOMATIC)
         )
         return process_running and self.realtime_protection
+
+    @property
+    def activity_unconfirmed(self) -> bool:
+        """True when ``active`` rests on an RTP state that was assumed, not read."""
+        return self.active and not self.realtime_protection_confirmed
+
+    @property
+    def observed_active(self) -> bool:
+        """True only when the product was OBSERVED protecting the host.
+
+        The three-state doctrine: an assumed real-time-protection state is not
+        an observation, so a product whose RTP toggle could not be read is
+        never observed active, and never observed inactive either.
+        """
+        return self.active and self.realtime_protection_confirmed
 
     @property
     def status_label(self) -> str:
@@ -91,6 +118,10 @@ class HostFingerprint:
     target_ip: str
     products: list[DetectedProduct] = field(default_factory=list)
     defender_rtp: bool = True
+    defender_rtp_state: Literal["on", "off", "unknown"] = "unknown"
+    """What the Defender RTP read actually returned. ``defender_rtp`` stays the
+    conservative boolean (unknown counts as on) for technique selection; this
+    is the observation, and only ``on`` / ``off`` were read."""
     defender_cloud: bool | None = None
     """Cloud-delivered protection (MAPS). None = not yet probed."""
     defender_behavior: bool | None = None
@@ -113,6 +144,7 @@ class HostFingerprint:
             return
         if cfg.rtp_enabled is not None:
             self.defender_rtp = cfg.rtp_enabled
+            self.defender_rtp_state = "on" if cfg.rtp_enabled else "off"
         self.defender_cloud                = cfg.cloud_enabled
         self.defender_behavior             = cfg.behavior_enabled
         self.defender_block_at_first_sight = cfg.block_at_first_sight
@@ -139,6 +171,11 @@ class HostFingerprint:
     @property
     def active_products(self) -> list[DetectedProduct]:
         return [p for p in self.products if p.active]
+
+    @property
+    def observed_active_products(self) -> list[DetectedProduct]:
+        """Products OBSERVED active (never on an assumed RTP state)."""
+        return [p for p in self.products if p.observed_active]
 
 
 __all__ = [

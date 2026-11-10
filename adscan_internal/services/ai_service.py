@@ -34,6 +34,7 @@ from adscan_internal.services.ai_context_builder import build_ai_system_prompt
 from adscan_internal.services.ai_tools import AIAgentDependencies, register_ai_tools
 from adscan_internal.services.llm.config import (
     AIConfig,
+    ai_offline_reason,
     apply_model_environment,
     load_ai_config,
 )
@@ -259,6 +260,9 @@ class AIService:
 
     def validate_backend_ready(self) -> tuple[bool, str]:
         """Validate backend configuration and runtime prerequisites."""
+        offline_reason = ai_offline_reason()
+        if offline_reason is not None:
+            return False, offline_reason
         if not self._config.enabled:
             return False, "AI is disabled in configuration."
 

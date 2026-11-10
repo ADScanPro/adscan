@@ -262,7 +262,7 @@ class LDAPCredentials:
             posture_snapshot=posture_snapshot,
         )
 
-    def to_transport_config(self, *, paged_size: int = 1000) -> ADscanLDAPConfig:
+    def to_transport_config(self, *, paged_size: int | None = None) -> ADscanLDAPConfig:
         """Map onto the transport-layer ``ADscanLDAPConfig``.
 
         Centralizes the kwargs translation so callers never need to know about
@@ -286,7 +286,7 @@ class LDAPCredentials:
             aes_key=self.aes_key,
             ccache_path=self.ccache_path,
             use_simple_bind=self.use_simple_bind,
-            paged_size=paged_size,
+            **({} if paged_size is None else {"paged_size": paged_size}),
             posture_sink=self.posture_sink,
             posture_snapshot=self.posture_snapshot,
         )

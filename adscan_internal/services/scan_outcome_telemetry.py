@@ -361,6 +361,30 @@ def _read_attack_paths_count(ws_dir: str) -> int:
     return 0
 
 
+def _resolve_attack_paths_count(shell: Any, ws_dir: str) -> int:
+    """The attack-path total the client's report states, for ``scan_summary.json``.
+
+    Routes through the canonical session resolver
+    (:func:`adscan_internal.session_summary.resolve_client_path_totals`), the one
+    the exit summary and the report use. Reading the interactive snapshot here
+    counted whatever that file held at the moment of the write: the scan-end
+    re-materialization rewrites it a second later, so the summary said 11 routes
+    where the report, from the same run, said 17. The snapshot reader stays as
+    the fallback for a session the resolver cannot answer. Never raises.
+    """
+    try:
+        from adscan_internal.session_summary import (  # noqa: PLC0415
+            resolve_client_path_totals,
+        )
+
+        totals = resolve_client_path_totals(shell)
+        if int(getattr(totals, "paths_total", 0) or 0) > 0:
+            return int(totals.paths_total)
+    except Exception:  # noqa: BLE001 - best effort; fall back to the snapshot
+        pass
+    return _read_attack_paths_count(ws_dir)
+
+
 def _any_domain_pwned(ws_dir: str) -> bool:
     """Return True when ANY domain is marked fully compromised on disk.
 
@@ -496,7 +520,7 @@ def build_scan_summary(shell: Any, command_name: str) -> dict[str, Any]:
         "time_to_compromise_minutes": props.get("time_to_compromise_minutes"),
         "time_to_first_cred_minutes": props.get("time_to_first_cred_minutes"),
         "duration_minutes": props.get("duration_minutes"),
-        "attack_paths_count": _read_attack_paths_count(ws_dir),
+        "attack_paths_count": _resolve_attack_paths_count(shell, ws_dir),
         "path_state": path_state,
         "flags": _read_flags(ws_dir),
     }

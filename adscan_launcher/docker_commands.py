@@ -417,6 +417,26 @@ def _prepare_runtime_session_dir(*, command_name: str) -> Path:
         print_info_debug(
             f"[runtime-session] stale-cleanup failed: {mark_sensitive(str(exc), 'error')}"
         )
+    # Workspace lock files are unlinked on release; this removes the ones a
+    # killed run or an older launcher left behind (their name is the workspace's).
+    try:
+        _runtime_session.sweep_stale_workspace_locks()
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    # A scan's hidden ``.run_<workspace>_<scanid>`` directory is a SIBLING of
+    # the workspace, so deleting the workspace never took it and it kept a full
+    # copy of the engagement. Sweep the ones whose workspace is already gone:
+    # that delete was the end-of-engagement procedure, and this finishes it.
+    try:
+        swept = _runtime_session.sweep_orphaned_execution_workspaces()
+        if swept:
+            print_info_debug(
+                f"[runtime-session] removed {swept} orphaned execution workspace(s)"
+            )
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return _runtime_session.create_session_dir(command_name=command_name)
 
 
@@ -2011,6 +2031,27 @@ def _get_state_dir() -> Path:
     return get_state_dir()
 
 
+#: Passthrough commands whose interactive flow offers to save a copy of the
+#: deliverable in the operator's deliverables folder, so the folder is mounted.
+#: ``start`` gets it through ``handle_start_docker``.
+_DELIVERABLES_MOUNT_PASSTHROUGH_COMMANDS: frozenset[str] = frozenset({"deliver"})
+
+
+def _prepare_deliverables_mount() -> Path | None:
+    """Create the operator's deliverables folder and return it for mounting.
+
+    Best-effort: a folder that cannot be created never blocks the run, the
+    REPL just does not offer the copy. Resolved through the shared SSOT
+    (``ADSCAN_DELIVERABLES_DIR``, default ``~/ADscan-deliverables``).
+    """
+    from adscan_core.deliverable_destination import host_deliverables_dir  # noqa: PLC0415
+
+    folder = host_deliverables_dir()
+    if not _ensure_host_mount_dir_writable(folder, description="Deliverables"):
+        return None
+    return folder
+
+
 def _resolve_self_executable() -> str:
     """Return an absolute path to the running ADscan executable (best effort)."""
     try:
@@ -2810,7 +2851,11 @@ def _spawn_host_helper_process(
 
     def _build_host_helper_launch() -> tuple[list[str], dict[str, str], str]:
         env = os.environ.copy()
+        # ADSCAN_DELIVERABLES_DIR lets the helper's ``open_file`` resolve the
+        # same deliverables folder the launcher mounted (operator override).
         preserve_env_vars = ["CONTAINER_SHARED_TOKEN"]
+        if env.get("ADSCAN_DELIVERABLES_DIR", "").strip():
+            preserve_env_vars.append("ADSCAN_DELIVERABLES_DIR")
         launch_mode = "self-executable"
         # Avoid root-owned __pycache__ files in repo/workspace when helper is
         # started via sudo Python in CI/self-hosted runners.
@@ -3846,6 +3891,7 @@ def handle_start_docker(
                 + list(extra_env)
             ),
             run_host_dir=acq.session_dir,
+            deliverables_host_dir=_prepare_deliverables_mount(),
         )
 
         adscan_args: list[str] = []
@@ -3878,7 +3924,6 @@ def handle_start_docker(
 def _build_ci_container_argv(
     *,
     mode: str,
-    workspace_type: str,
     interface: str,
     hosts: str | None,
     domain: str | None,
@@ -3889,7 +3934,7 @@ def _build_ci_container_argv(
     workspace: str | None,
     verbose: bool,
     debug: bool,
-    keep_workspace: bool,
+    ephemeral: bool,
     generate_report: bool,
     report_format: str,
     report_engine: str = "",
@@ -3897,6 +3942,9 @@ def _build_ci_container_argv(
     report_template: str = "",
     report_theme: str = "",
     report_only: str = "",
+    policy: str | None = None,
+    legacy_type: str | None = None,
+    report_args: Sequence[str] = (),
 ) -> list[str]:
     """Build the container ``adscan ci …`` argv forwarded across the docker seam.
 
@@ -3906,13 +3954,29 @@ def _build_ci_container_argv(
     ``--dns-server`` so the containerized ``ci`` run resolves against the separate
     AD-zone DNS host while ``dc_ip`` stays the auth/enum target. ``None`` omits the
     flag, byte-identical to before.
+
+    ``report_args`` carries the deliverable options already rendered as argv
+    tokens (``adscan_core.report_options.forward_report_options``): they are
+    forwarded whether or not a report is requested, because ``--frameworks``
+    also scopes the scan's own compliance mapping. The ``report_*`` keyword
+    arguments remain for callers that predate the shared model.
     """
     adscan_args: list[str] = ["ci", mode]
     if debug:
         adscan_args.append("--debug")
     if verbose:
         adscan_args.append("--verbose")
-    adscan_args.extend(["--type", workspace_type, "--interface", interface])
+    # The scan policy is what the run follows; the container refuses a run that
+    # names none. A retired ``--type`` is forwarded only as typed, so the
+    # container answers it with its guidance panel.
+    if policy:
+        adscan_args.extend(["--policy", policy])
+    if legacy_type:
+        adscan_args.extend(["--type", legacy_type])
+    # Only broadcast poisoning needs a named interface, so ``--interface`` is
+    # optional: forward it when given, omit it (never an empty value) otherwise.
+    if interface:
+        adscan_args.extend(["--interface", interface])
 
     if hosts:
         adscan_args.extend(["--hosts", hosts])
@@ -3930,11 +3994,13 @@ def _build_ci_container_argv(
         adscan_args.extend(["--password", password])
     if workspace:
         adscan_args.extend(["--workspace", workspace])
-    if keep_workspace:
-        adscan_args.append("--keep-workspace")
+    if ephemeral:
+        adscan_args.append("--ephemeral")
     if generate_report:
         adscan_args.append("--generate-report")
-        adscan_args.extend(["--report-format", report_format])
+        # ``report_format`` is retired (the report is always a PDF with its HTML
+        # twin), so it is no longer forwarded: the container would only print
+        # its deprecation line. Kept in the signature for existing callers.
         if report_engine:
             adscan_args.extend(["--report-engine", report_engine])
         if report_renderer:
@@ -3945,13 +4011,13 @@ def _build_ci_container_argv(
             adscan_args.extend(["--report-theme", report_theme])
         if report_only:
             adscan_args.extend(["--only", report_only])
+    adscan_args.extend(str(token) for token in report_args)
     return adscan_args
 
 
 def handle_ci_docker(
     *,
     mode: str,
-    workspace_type: str,
     interface: str,
     hosts: str | None,
     domain: str | None,
@@ -3961,7 +4027,7 @@ def handle_ci_docker(
     workspace: str | None,
     verbose: bool,
     debug: bool,
-    keep_workspace: bool,
+    ephemeral: bool,
     generate_report: bool,
     report_format: str,
     report_engine: str = "",
@@ -3972,6 +4038,9 @@ def handle_ci_docker(
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
     dns_server: str | None = None,
+    policy: str | None = None,
+    legacy_type: str | None = None,
+    report_args: Sequence[str] = (),
 ) -> int:
     """Run `adscan ci` inside Docker and return the docker exit code.
 
@@ -4074,7 +4143,6 @@ def handle_ci_docker(
 
         adscan_args = _build_ci_container_argv(
             mode=mode,
-            workspace_type=workspace_type,
             interface=interface,
             hosts=hosts,
             domain=domain,
@@ -4085,7 +4153,7 @@ def handle_ci_docker(
             workspace=workspace,
             verbose=verbose,
             debug=debug,
-            keep_workspace=keep_workspace,
+            ephemeral=ephemeral,
             generate_report=generate_report,
             report_format=report_format,
             report_engine=report_engine,
@@ -4093,6 +4161,9 @@ def handle_ci_docker(
             report_template=report_template,
             report_theme=report_theme,
             report_only=report_only,
+            policy=policy,
+            legacy_type=legacy_type,
+            report_args=report_args,
         )
 
         probe_and_warn_reduced_runtime(cfg)
@@ -4156,6 +4227,8 @@ def run_adscan_passthrough_docker(
     allow_low_memory: bool = False,
     extra_env: list[tuple[str, str]] | None = None,
     extra_mounts: list[tuple[str, str]] | None = None,
+    extra_rw_mounts: list[tuple[str, str]] | None = None,
+    env_exclude_keys: tuple[str, ...] = (),
 ) -> int:
     """Run an arbitrary `adscan ...` command inside the container (host-side).
 
@@ -4274,7 +4347,14 @@ def run_adscan_passthrough_docker(
                 + list(extra_env or [])
             ),
             extra_mounts=tuple(extra_mounts or []),
+            extra_rw_mounts=tuple(extra_rw_mounts or []),
+            env_exclude_keys=tuple(env_exclude_keys or ()),
             run_host_dir=acq.session_dir,
+            deliverables_host_dir=(
+                _prepare_deliverables_mount()
+                if passthrough_command in _DELIVERABLES_MOUNT_PASSTHROUGH_COMMANDS
+                else None
+            ),
         )
 
         container_args: list[str] = list(adscan_args)

@@ -70,12 +70,15 @@ from typing import Any
 
 from adscan_core import tier
 from adscan_core.lab_context import normalize_workspace_type
+from adscan_core.scan_policy import settings as policy_settings
+from adscan_core.scan_policy.policy import ENVIRONMENT_LAB, ENVIRONMENT_REAL
 from adscan_core.rich_output import get_console, print_exception
 from adscan_core.theme import ADSCAN_PRIMARY_BRIGHT
 from adscan_internal import telemetry
 from adscan_internal.interaction import is_non_interactive
 
-# Workspace types (SSOT: ``PentestShell.type``, validated to these two values).
+# The workspace label telemetry carries (derived from the scan policy's
+# environment); decisions read the environment itself.
 WORKSPACE_TYPE_AUDIT = "audit"
 WORKSPACE_TYPE_CTF = "ctf"
 WORKSPACE_TYPE_UNKNOWN = "unknown"
@@ -394,24 +397,64 @@ def generate_report_with_telemetry(
     properties.update(_content_properties(artifacts))
     properties.update(_lab_fields(shell))
     _emit_generated(properties)
+    if resolved and trigger in _OPERATOR_REQUESTED_TRIGGERS:
+        _offer_copy_and_open(shell, artifacts)
     return resolved
 
 
-def _resolve_report_disposition(shell: Any, workspace_type: str) -> str:
+#: The on-ramps where the operator asked for the report in the REPL, so the
+#: same "save a copy, then open it" step as the PRO ``deliver`` follows. The
+#: automatic post-scan render and ``ci`` never prompt.
+_OPERATOR_REQUESTED_TRIGGERS = frozenset({TRIGGER_REPL_REPORT, TRIGGER_REPL_DELIVER})
+
+
+def _offer_copy_and_open(shell: Any, artifacts: Any) -> None:
+    """Offer the shared copy step and the open step for a LITE report.
+
+    The PDF is what gets opened (and forwarded); the HTML when Chromium could
+    not render one. Best-effort: never fails the report.
+    """
+    html_path = getattr(artifacts, "html_path", None)
+    pdf_path = getattr(artifacts, "pdf_path", None)
+    files = [path for path in (pdf_path, html_path) if isinstance(path, str) and path]
+    if not files:
+        return
+    try:
+        from adscan_internal.services.deliverable_copy_flow import (  # noqa: PLC0415
+            offer_copy_and_open,
+        )
+
+        workspace = str(
+            getattr(shell, "current_workspace", None)
+            or getattr(shell, "current_workspace_dir", None)
+            or ""
+        )
+        offer_copy_and_open(
+            shell,
+            files=files,
+            headline=files[0],
+            workspace=workspace,
+            open_prompt="Open the exposure report now?",
+        )
+    except Exception as exc:  # noqa: BLE001 - the report is already written
+        _swallow(exc)
+
+
+def _resolve_report_disposition(shell: Any, environment: str | None) -> str:
     """Decide what this scan-completion moment does with the exposure report.
 
-    Workspace type and tier are ORTHOGONAL, so the workspace type is branched on
-    first and each branch resolves the tier inside it. Written as one flat chain
-    with the tier tested first, a ``tier.is_pro()`` early return swallows every
-    workspace type below it — which is how a PRO operator on a practice box
+    The scan policy's environment and the tier are ORTHOGONAL, so the
+    environment is branched on first and each branch resolves the tier inside
+    it. Written as one flat chain with the tier tested first, a
+    ``tier.is_pro()`` early return swallows every environment below it — which is how a PRO operator on a practice box
     would be handed a client-deliverable call to action for a client that does
     not exist. Keep the split; do not flatten this back into a chain.
     """
     if get_post_scan_report_path(shell):
         return DISPOSITION_ALREADY_GENERATED
-    if workspace_type == WORKSPACE_TYPE_CTF:
+    if environment == ENVIRONMENT_LAB:
         return _lab_report_disposition(shell)
-    return _engagement_report_disposition(shell, workspace_type)
+    return _engagement_report_disposition(shell, environment)
 
 
 def _lab_report_disposition(shell: Any) -> str:
@@ -433,12 +476,12 @@ def _lab_report_disposition(shell: Any) -> str:
     return DISPOSITION_OFFERED
 
 
-def _engagement_report_disposition(shell: Any, workspace_type: str) -> str:
-    """Resolve the report decision on an engagement or an unlabelled workspace.
+def _engagement_report_disposition(shell: Any, environment: str | None) -> str:
+    """Resolve the report decision on a real environment or a workspace without a policy.
 
-    An unlabelled workspace is treated as an engagement for PRO and as a lab for
-    LITE, and both are the fail-safe direction for their tier: hiding the paid
-    tier's only call to action because nobody set a workspace type is worse than
+    A workspace without a policy is treated as an engagement for PRO and as a
+    lab for LITE, and both are the fail-safe direction for their tier: hiding the
+    paid tier's only call to action because nobody chose a policy is worse than
     naming it once too often, and auto-rendering a client report for a run that
     was never declared an engagement is worse than offering it.
     """
@@ -449,7 +492,7 @@ def _engagement_report_disposition(shell: Any, workspace_type: str) -> str:
         if not _technical_report_exists(shell):
             return DISPOSITION_NO_SCAN_DATA
         return DISPOSITION_PRO_KIT
-    if workspace_type == WORKSPACE_TYPE_AUDIT:
+    if environment == ENVIRONMENT_REAL:
         if not _technical_report_exists(shell):
             return DISPOSITION_NO_SCAN_DATA
         return DISPOSITION_AUTO_GENERATED
@@ -458,7 +501,7 @@ def _engagement_report_disposition(shell: Any, workspace_type: str) -> str:
     return DISPOSITION_OFFERED
 
 
-def _resolve_writeup_disposition(shell: Any, workspace_type: str) -> str:
+def _resolve_writeup_disposition(shell: Any, environment: str | None) -> str:
     """Decide what this scan-completion moment does with the writeup spine.
 
     Deliberately does NOT consult the tier. The spine is a lab artifact, it
@@ -472,7 +515,7 @@ def _resolve_writeup_disposition(shell: Any, workspace_type: str) -> str:
     unasked-for churn rather than the artifact-while-it-is-fresh this exists
     for.
     """
-    if workspace_type != WORKSPACE_TYPE_CTF:
+    if environment != ENVIRONMENT_LAB:
         return WRITEUP_NOT_A_LAB
     if get_post_scan_writeup_path(shell):
         return WRITEUP_ALREADY_GENERATED
@@ -483,11 +526,11 @@ def _resolve_writeup_disposition(shell: Any, workspace_type: str) -> str:
     return WRITEUP_AUTO_GENERATED
 
 
-def _resolve_disposition(shell: Any, workspace_type: str) -> PostScanDisposition:
+def _resolve_disposition(shell: Any, environment: str | None) -> PostScanDisposition:
     """Resolve both artifact decisions for this scan-completion moment."""
     return PostScanDisposition(
-        report=_resolve_report_disposition(shell, workspace_type),
-        writeup=_resolve_writeup_disposition(shell, workspace_type),
+        report=_resolve_report_disposition(shell, environment),
+        writeup=_resolve_writeup_disposition(shell, environment),
     )
 
 
@@ -541,14 +584,13 @@ def run_post_scan_report(shell: Any, verb: str) -> str | None:
         :func:`get_post_scan_writeup_path`.
     """
     try:
-        workspace_type = resolve_workspace_type(shell)
-        disposition = _resolve_disposition(shell, workspace_type)
+        disposition = _resolve_disposition(shell, policy_settings.policy_environment(shell))
         _remember(shell, _DISPOSITION_ATTR, disposition.report)
         _remember(shell, _WRITEUP_DISPOSITION_ATTR, disposition.writeup)
 
         properties: dict[str, Any] = {
             "command": str(verb),
-            "workspace_type": workspace_type,
+            "workspace_type": resolve_workspace_type(shell),
             "disposition": disposition.report,
             "auto_generated": disposition.report == DISPOSITION_AUTO_GENERATED,
             "writeup_disposition": disposition.writeup,
@@ -629,9 +671,7 @@ def print_post_scan_report_offer(shell: Any) -> None:
     if getattr(shell, _DISPOSITION_ATTR, None) != DISPOSITION_OFFERED:
         return
     try:
-        if resolve_workspace_type(
-            shell
-        ) == WORKSPACE_TYPE_CTF and not get_post_scan_writeup_path(shell):
+        if policy_settings.is_lab(shell) and not get_post_scan_writeup_path(shell):
             _print_offer_line(
                 "Build the writeup spine from this run's evidence:", "writeup"
             )

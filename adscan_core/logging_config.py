@@ -6,10 +6,13 @@ to files regardless of verbose/debug mode, while console output is controlled
 by verbose/debug flags.
 """
 
+import collections
+import copy
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 import sys
+import threading
 from pathlib import Path
 import subprocess
 import shutil
@@ -162,6 +165,36 @@ _telemetry_console_handler: Optional[RichHandler] = None
 # (``update_workspace_logging(None)``).
 _active_workspace_dir: Optional[Path] = None
 
+# ---------------------------------------------------------------------------
+# Where log FILES go (decided 2026-11-05)
+# ---------------------------------------------------------------------------
+#
+# Every line written while a workspace is active goes to that workspace's
+# ``logs/`` and nowhere else, so deleting the workspace deletes its logs. There
+# is no global sink for workspace activity any more: the old global
+# ``~/.adscan/logs/adscan*.log`` collected the domain, DC IPs, users and the
+# ``-p`` secret of every engagement on the machine and nothing ever removed it.
+#
+# A process records what it logs BEFORE any workspace is active into a bounded
+# in-memory buffer. When a workspace activates, the buffer is written into that
+# workspace's log (so the ``ci`` preamble lands with its run). A process that
+# never activates one drops the buffer at exit, unless it is a maintenance
+# command in ``GLOBAL_LOG_COMMANDS`` (install, update, check, version): only
+# those keep a global log, and they never touch an engagement.
+GLOBAL_LOG_COMMANDS: frozenset[str] = frozenset(
+    {"install", "update", "upgrade", "check", "version", "uninstall"}
+)
+_PRE_WORKSPACE_BUFFER_CAPACITY = 20000
+_global_log_dir: Optional[Path] = None
+_global_log_enabled: bool = False
+_global_log_command: Optional[str] = None
+# File level of the INFO sinks (adscan.log): INFO by default, DEBUG under --debug.
+# The ``*.debug.log`` sinks are always DEBUG.
+_file_level: int = logging.INFO
+
+_LOG_LINE_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 class MarkerStrippingFormatter(logging.Formatter):
     """Formatter that strips invisible sensitivity markers from rendered logs."""
@@ -169,6 +202,339 @@ class MarkerStrippingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         rendered = super().format(record)
         return strip_sensitive_markers(rendered)
+
+
+_masking_guard = threading.local()
+
+
+class SecretMaskingFileFormatter(logging.Formatter):
+    """Formatter of every log FILE: secrets masked, identifiers kept.
+
+    Log files are what users paste into issues and send to support, so a
+    password, hash, ticket or key never reaches one in clear. Users, domains,
+    hosts and IPs stay readable: the operator debugs with them, and they live
+    in the workspace (and leave with it) anyway.
+
+    The masking is ``adscan_core.telemetry.mask_secrets``, the secrets-only
+    layer of the telemetry sanitizer, so there is one set of detectors. This is
+    deliberately NOT chained into the telemetry handler: that one has its own
+    ``TelemetrySanitizingFormatter`` running the full sanitizer once.
+
+    The masked line is cached on the record, so the INFO and DEBUG file sinks
+    of one record share one masking pass. Fail-closed: if masking raises, the
+    message body is withheld rather than written raw.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_LOG_LINE_FORMAT, datefmt=_LOG_DATE_FORMAT)
+
+    def format(self, record: logging.LogRecord) -> str:
+        cached = record.__dict__.get("_adscan_masked_file_line")
+        if cached is not None:
+            return cached
+        if getattr(_masking_guard, "active", False):
+            # A record emitted from INSIDE the masking pass (sanitizer
+            # internals). Never recurse into the sanitizer; withhold the body.
+            return self._withheld(record, "nested")
+        rendered = super().format(record)
+        _masking_guard.active = True
+        try:
+            from adscan_core.telemetry import mask_secrets
+
+            masked = mask_secrets(rendered)
+        except Exception as exc:  # noqa: BLE001 — fail closed, never raw
+            masked = self._withheld(record, type(exc).__name__)
+        finally:
+            _masking_guard.active = False
+        record.__dict__["_adscan_masked_file_line"] = masked
+        return masked
+
+    def _withheld(self, record: logging.LogRecord, reason: str) -> str:
+        stamp = self.formatTime(record, self.datefmt)
+        return (
+            f"{stamp} - {record.name} - {record.levelname} - "
+            f"<log line withheld: secret masking unavailable ({reason})>"
+        )
+
+
+class _PreWorkspaceBufferHandler(logging.Handler):
+    """Hold the records a process emits before any workspace is active.
+
+    Nothing here touches disk. The records are written into the workspace log
+    when one activates, into the global log only for a maintenance command,
+    and are otherwise discarded with the process.
+    """
+
+    def __init__(self, capacity: int = _PRE_WORKSPACE_BUFFER_CAPACITY) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: "collections.deque[logging.LogRecord]" = collections.deque(
+            maxlen=capacity
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            # Freeze a COPY now: args can mutate later and the traceback
+            # objects would pin whole frames in memory. The record itself is
+            # shared with the handlers after this one (console, telemetry),
+            # which must still see its args and its exc_info.
+            held = copy.copy(record)
+            held.msg = record.getMessage()
+            held.args = None
+            if record.exc_info and not held.exc_text:
+                held.exc_text = logging.Formatter().formatException(record.exc_info)
+            held.exc_info = None
+            self.records.append(held)
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+
+    def drain_into(self, handlers: list[logging.Handler]) -> None:
+        """Replay the held records into ``handlers`` (level-filtered) and clear."""
+        pending = list(self.records)
+        self.records.clear()
+        for record in pending:
+            for handler in handlers:
+                if record.levelno >= handler.level:
+                    try:
+                        handler.handle(record)
+                    except Exception:  # noqa: BLE001
+                        continue
+
+    def discard(self) -> None:
+        self.records.clear()
+
+
+_pre_workspace_buffer = _PreWorkspaceBufferHandler()
+
+
+def _make_file_handler(path: Path, *, max_bytes: int, level: int) -> RotatingFileHandler:
+    handler = RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=5, encoding="utf-8"
+    )
+    handler.setLevel(level)
+    handler.setFormatter(SecretMaskingFileFormatter())
+    return handler
+
+
+def _make_sink_pair(log_dir: Path) -> tuple[RotatingFileHandler, RotatingFileHandler]:
+    """Return the ``adscan.log`` (INFO+, DEBUG under --debug) + ``adscan.debug.log`` pair."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    info_handler = _make_file_handler(
+        log_dir / "adscan.log", max_bytes=10 * 1024 * 1024, level=_file_level
+    )
+    try:
+        debug_handler = _make_file_handler(
+            log_dir / "adscan.debug.log", max_bytes=25 * 1024 * 1024, level=logging.DEBUG
+        )
+    except Exception:
+        info_handler.close()
+        raise
+    return info_handler, debug_handler
+
+
+def _detach(logger: logging.Logger, handler: Optional[logging.Handler]) -> None:
+    if handler is not None and handler in logger.handlers:
+        logger.removeHandler(handler)
+
+
+def _attach(logger: logging.Logger, handler: Optional[logging.Handler]) -> None:
+    if handler is not None and handler not in logger.handlers:
+        logger.addHandler(handler)
+
+
+def _active_file_sinks() -> list[logging.Handler]:
+    """The file sinks a record goes to right now (workspace, else global)."""
+    workspace = [
+        h for h in (_workspace_file_handler, _workspace_debug_file_handler) if h is not None
+    ]
+    if workspace:
+        return workspace
+    if _global_log_enabled:
+        return [h for h in (_file_handler, _debug_file_handler) if h is not None]
+    return []
+
+
+def _route_file_sinks(logger: logging.Logger) -> None:
+    """Attach exactly one family of file sinks to ``logger``.
+
+    Workspace sinks when a workspace is active (global ones detached), else the
+    global sinks for a maintenance command, else the in-memory buffer. Whatever
+    the buffer held is written into the sinks that take over.
+    """
+    workspace = [
+        h for h in (_workspace_file_handler, _workspace_debug_file_handler) if h is not None
+    ]
+    global_sinks = [h for h in (_file_handler, _debug_file_handler) if h is not None]
+    if workspace:
+        for handler in global_sinks:
+            _detach(logger, handler)
+        _detach(logger, _pre_workspace_buffer)
+        for handler in workspace:
+            _attach(logger, handler)
+        _pre_workspace_buffer.drain_into(workspace)
+        return
+    if _global_log_enabled and global_sinks:
+        _detach(logger, _pre_workspace_buffer)
+        for handler in global_sinks:
+            _attach(logger, handler)
+        _pre_workspace_buffer.drain_into(global_sinks)
+        return
+    for handler in global_sinks:
+        _detach(logger, handler)
+    _attach(logger, _pre_workspace_buffer)
+
+
+def emit_to_file_sinks(record: logging.LogRecord, *, respect_levels: bool = True) -> bool:
+    """Write ``record`` to the log files only (no console, no telemetry).
+
+    Routes like a normal record: the active workspace's files, else the global
+    files of a maintenance command, else the pre-workspace buffer.
+
+    Args:
+        record: The record to persist.
+        respect_levels: When False every active sink takes the record whatever
+            its level (the historical ``log_to_file_only`` behaviour).
+
+    Returns:
+        True when a file sink (or the buffer) took the record.
+    """
+    sinks = _active_file_sinks()
+    if not sinks:
+        _pre_workspace_buffer.handle(record)
+        return True
+    for handler in sinks:
+        if not respect_levels or record.levelno >= handler.level:
+            try:
+                handler.handle(record)
+            except Exception:  # noqa: BLE001
+                continue
+    return True
+
+
+# Lines an engagement command logged outside any workspace, kept for the
+# operator's diagnosis and written through the full telemetry sanitizer.
+OUTSIDE_WORKSPACE_LOG_NAME = "adscan-outside-workspace.log"
+_OUTSIDE_WORKSPACE_LOG_MAX_BYTES = 10 * 1024 * 1024
+_outside_workspace_flush_dir: Optional[Path] = None
+
+
+def _resolve_global_log_dir() -> Path:
+    if _global_log_dir is not None:
+        return _global_log_dir
+    adscan_home = os.getenv("ADSCAN_HOME")
+    if adscan_home:
+        return Path(expand_effective_user_path(adscan_home)) / "logs"
+    return get_adscan_home() / "logs"
+
+
+def _register_outside_workspace_flush(log_dir: Path) -> None:
+    """Arrange for the leftover pre-workspace buffer to be flushed at exit.
+
+    The target directory is fixed now, at the entry point, so a later change of
+    environment cannot redirect it.
+    """
+    global _outside_workspace_flush_dir
+    first = _outside_workspace_flush_dir is None
+    _outside_workspace_flush_dir = Path(log_dir)
+    if first:
+        import atexit  # noqa: PLC0415
+
+        atexit.register(flush_outside_workspace_log)
+
+
+def flush_outside_workspace_log() -> Optional[Path]:
+    """Write what is still buffered (logged outside any workspace), sanitized.
+
+    The lines go through ``telemetry._sanitize_rich_output``, the same
+    sanitizer as an uploaded session recording: domains, hosts, IPs, users,
+    SIDs and secrets are replaced by pseudonyms. Fail-closed: when the
+    sanitizer cannot run, only a count of withheld lines is written.
+
+    Returns:
+        The file written, or None when there was nothing to write.
+    """
+    target_dir = _outside_workspace_flush_dir
+    records = list(_pre_workspace_buffer.records)
+    _pre_workspace_buffer.discard()
+    if target_dir is None or not records:
+        return None
+    formatter = logging.Formatter(_LOG_LINE_FORMAT, datefmt=_LOG_DATE_FORMAT)
+    lines = []
+    for record in records:
+        try:
+            lines.append(formatter.format(record))
+        except Exception:  # noqa: BLE001
+            continue
+    raw = "\n".join(lines)
+    try:
+        from adscan_core.telemetry import (  # noqa: PLC0415
+            _sanitize_rich_output,
+            register_home_workspace_names,
+        )
+
+        # The flushing process (the host launcher, or one whose workspace is
+        # already gone) does not run inside a workspace, so the sanitizer would
+        # not know the workspace names it must pseudonymize.
+        register_home_workspace_names()
+        body = strip_sensitive_markers(_sanitize_rich_output(raw))
+    except Exception as exc:  # noqa: BLE001 — fail closed: never write raw
+        body = (
+            f"<{len(lines)} line(s) withheld: sanitizer unavailable "
+            f"({type(exc).__name__})>"
+        )
+    path = target_dir / OUTSIDE_WORKSPACE_LOG_NAME
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _OUTSIDE_WORKSPACE_LOG_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"--- pid {os.getpid()}: lines logged outside any workspace "
+                "(sanitized like telemetry) ---\n"
+            )
+            handle.write(body.rstrip("\n") + "\n")
+    except Exception:  # noqa: BLE001
+        return None
+    return path
+
+
+def enable_global_log_for_command(command: Optional[str]) -> bool:
+    """Open the global log for a maintenance command; no-op for anything else.
+
+    Called by the launcher and the runtime entry points once the command is
+    known. Only ``GLOBAL_LOG_COMMANDS`` (install, update, check, version) get a
+    log in clear outside a workspace. For every engagement command, what it
+    logged outside any workspace (a launcher failing to pull the image, a crash
+    before a workspace was selected, the lines after its workspace was removed)
+    is written at exit to ``OUTSIDE_WORKSPACE_LOG_NAME`` through the FULL
+    telemetry sanitizer: the operator keeps a usable error, and no domain, IP,
+    user or secret of the engagement reaches a global file in clear.
+
+    Returns:
+        True when the global log is now active for this process.
+    """
+    global _global_log_enabled, _global_log_command, _file_handler, _debug_file_handler
+    name = str(command or "").strip().lower()
+    log_dir = _resolve_global_log_dir()
+    if name not in GLOBAL_LOG_COMMANDS:
+        _register_outside_workspace_flush(log_dir)
+        return False
+    if _file_handler is None or _debug_file_handler is None:
+        try:
+            _file_handler, _debug_file_handler = _make_sink_pair(log_dir)
+        except PermissionError:
+            console = getattr(_console_handler, "console", None)
+            if console is None or not _try_fix_log_dir_permissions(console, log_dir):
+                return False
+            try:
+                _file_handler, _debug_file_handler = _make_sink_pair(log_dir)
+            except Exception:
+                return False
+        except Exception:
+            return False
+    _global_log_enabled = True
+    _global_log_command = name
+    _route_file_sinks(logging.getLogger("adscan"))
+    return True
 
 
 class TelemetrySanitizingFormatter(logging.Formatter):
@@ -324,6 +690,7 @@ def init_logging(
     global _logger, _console_handler, _file_handler, _debug_file_handler
     global _workspace_file_handler, _workspace_debug_file_handler
     global _telemetry_console_handler, _active_workspace_dir
+    global _global_log_dir, _file_level
 
     # Re-attach the last-known workspace on an in-process re-init that passes no
     # workspace_dir. adscan.py's module top-level re-executes mid-run (a spawn
@@ -371,28 +738,12 @@ def init_logging(
     except Exception:
         pass  # Don't fail if diagnostic logging fails
 
-    # Create log directory (best-effort). If ~/.adscan is not writable (e.g., it
-    # was created earlier under sudo), fall back to a user-writable location so
-    # even `adscan --version` won't crash at import time.
-    if log_dir is None:
-        adscan_home = os.getenv("ADSCAN_HOME")
-        if adscan_home:
-            log_dir = Path(expand_effective_user_path(adscan_home)) / "logs"
-        else:
-            log_dir = get_adscan_home() / "logs"
-
+    # Remember where the GLOBAL log would live. Nothing is created here: only a
+    # maintenance command opens it (``enable_global_log_for_command``), and every
+    # engagement command logs into its workspace only. See GLOBAL_LOG_COMMANDS.
+    if log_dir is not None:
+        _global_log_dir = Path(log_dir)
     requested_log_dir = log_dir
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        repaired = _try_fix_log_dir_permissions(console, log_dir)
-        if repaired:
-            try:
-                log_dir.mkdir(parents=True, exist_ok=True)
-            except PermissionError:
-                log_dir = None
-        else:
-            log_dir = None
 
     # Create logger
     logger = logging.getLogger("adscan")
@@ -465,105 +816,45 @@ def init_logging(
     # Remove existing handlers to avoid duplicates
     logger.handlers.clear()
 
-    # Global file handler (always active, INFO+ by default) - best-effort.
-    file_handler: RotatingFileHandler | None = None
-    debug_file_handler: RotatingFileHandler | None = None
-    if log_dir is not None:
-        try:
-            log_file = log_dir / "adscan.log"
-            file_handler = RotatingFileHandler(
-                log_file,
-                maxBytes=10 * 1024 * 1024,  # 10 MB
-                backupCount=5,
-                encoding="utf-8",
-            )
-            # Default to INFO+ in files so DEBUG-level internals are not written
-            # unless the user explicitly enables debug mode. Telemetry handlers
-            # still receive DEBUG in all modes.
-            file_handler.setLevel(logging.INFO)
-            file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            logger.addHandler(file_handler)
+    # File sinks. The level of the adscan.log sinks follows --debug (INFO by
+    # default); the *.debug.log sinks are always DEBUG.
+    _file_level = logging.DEBUG if debug_mode else logging.INFO
+    for _handler in (_file_handler, _workspace_file_handler):
+        if _handler is not None:
+            _handler.setLevel(_file_level)
 
-            debug_log_file = log_dir / "adscan.debug.log"
-            debug_file_handler = RotatingFileHandler(
-                debug_log_file,
-                maxBytes=25 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            debug_file_handler.setLevel(logging.DEBUG)
-            debug_file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            logger.addHandler(debug_file_handler)
-        except PermissionError:
-            file_handler = None
-            debug_file_handler = None
-        except Exception:
-            file_handler = None
-            debug_file_handler = None
-    _file_handler = file_handler
-    _debug_file_handler = debug_file_handler
-
-    # Workspace-specific file handler (if workspace_dir is provided)
+    # Workspace-specific sinks: every record of a workspace session goes here
+    # and nowhere else (see the module note above GLOBAL_LOG_COMMANDS).
     if workspace_dir:
-        try:
-            workspace_log_dir = Path(workspace_dir) / "logs"
-            workspace_log_dir.mkdir(parents=True, exist_ok=True)
-            workspace_log_file = workspace_log_dir / "adscan.log"
-            workspace_debug_log_file = workspace_log_dir / "adscan.debug.log"
-            workspace_file_handler = RotatingFileHandler(
-                workspace_log_file,
-                maxBytes=10 * 1024 * 1024,  # 10 MB
-                backupCount=5,
-                encoding="utf-8",
-            )
-            # Same policy as the global file handler: INFO+ by default.
-            workspace_file_handler.setLevel(logging.INFO)
-            workspace_file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            logger.addHandler(workspace_file_handler)
-            _workspace_file_handler = workspace_file_handler
-
-            workspace_debug_file_handler = RotatingFileHandler(
-                workspace_debug_log_file,
-                maxBytes=25 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            workspace_debug_file_handler.setLevel(logging.DEBUG)
-            workspace_debug_file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            logger.addHandler(workspace_debug_file_handler)
-            _workspace_debug_file_handler = workspace_debug_file_handler
+        same_workspace = (
+            _active_workspace_dir is not None
+            and Path(workspace_dir) == _active_workspace_dir
+            and _workspace_file_handler is not None
+            and _workspace_debug_file_handler is not None
+        )
+        if not same_workspace:
+            for _handler in (_workspace_file_handler, _workspace_debug_file_handler):
+                if _handler is not None:
+                    try:
+                        _handler.close()
+                    except Exception:
+                        pass
+            try:
+                (
+                    _workspace_file_handler,
+                    _workspace_debug_file_handler,
+                ) = _make_sink_pair(Path(workspace_dir) / "logs")
+            except Exception:
+                _workspace_file_handler = None
+                _workspace_debug_file_handler = None
+        if _workspace_file_handler is not None:
             # Remember the active workspace so a later re-init with no
             # workspace_dir re-attaches these handlers (see the top of init_logging).
             _active_workspace_dir = Path(workspace_dir)
-        except PermissionError:
-            _workspace_file_handler = None
-            _workspace_debug_file_handler = None
-        except Exception:
-            _workspace_file_handler = None
-            _workspace_debug_file_handler = None
     else:
         _workspace_file_handler = None
         _workspace_debug_file_handler = None
+    _route_file_sinks(logger)
 
     # Console handler (Rich, conditional based on verbose/debug mode).
     # _VisibleRichHandler: MarkupSafeRichHandler that renders WITHOUT triggering
@@ -855,11 +1146,8 @@ def init_logging(
     logger.propagate = False
 
     # Attach selected directories for debug purposes (do not include full paths in output).
-    logger.adscan_log_dir_is_fallback = (
-        log_dir is not None
-        and requested_log_dir is not None
-        and log_dir != requested_log_dir
-    )
+    logger.adscan_log_dir_is_fallback = False
+    del requested_log_dir
 
     _logger = logger
 
@@ -963,13 +1251,14 @@ def update_logging_console_level(
     # File handlers control what is persisted to disk. We default to INFO+ so
     # DEBUG-level internals are only written when debug mode is explicitly
     # enabled, while telemetry handlers still receive DEBUG in all modes.
-    file_level = logging.DEBUG if debug_mode else logging.INFO
+    global _file_level
+    _file_level = logging.DEBUG if debug_mode else logging.INFO
 
     if _file_handler is not None:
-        _file_handler.setLevel(file_level)
+        _file_handler.setLevel(_file_level)
 
     if _workspace_file_handler is not None:
-        _workspace_file_handler.setLevel(file_level)
+        _workspace_file_handler.setLevel(_file_level)
 
     # Telemetry console handler should always be at DEBUG level
     # Ensure it remains at DEBUG even after mode updates
@@ -999,7 +1288,14 @@ def get_logger() -> logging.Logger:
 
 
 def update_workspace_logging(workspace_dir: Optional[Path]):
-    """Update logging to include workspace-specific log file.
+    """Point the log files at a workspace, or detach them from it.
+
+    With a directory, ``<workspace>/logs/adscan.log`` and ``adscan.debug.log``
+    become the ONLY file sinks: the global ones are detached and whatever the
+    process logged before (held in memory) is written into the workspace log.
+    With ``None`` the workspace files are closed (so the directory can be
+    removed, also on Windows) and later records go back to the in-memory
+    buffer, or to the global log of a maintenance command.
 
     Args:
         workspace_dir: Workspace directory path. If None, removes workspace handler.
@@ -1015,66 +1311,37 @@ def update_workspace_logging(workspace_dir: Optional[Path]):
     # re-attach) these handlers. See the top of init_logging.
     _active_workspace_dir = Path(workspace_dir) if workspace_dir else None
 
-    # Remove existing workspace handler if present
-    if _workspace_file_handler is not None:
-        _logger.removeHandler(_workspace_file_handler)
-        _workspace_file_handler.close()
-        _workspace_file_handler = None
-    if _workspace_debug_file_handler is not None:
-        _logger.removeHandler(_workspace_debug_file_handler)
-        _workspace_debug_file_handler.close()
-        _workspace_debug_file_handler = None
+    # The dev-only sanitizer trace also writes into the workspace's logs/:
+    # release its handle too (it reopens lazily under the new workspace).
+    _telemetry_module = sys.modules.get("adscan_core.telemetry")
+    if _telemetry_module is not None:
+        try:
+            _telemetry_module.close_sanitizer_trace()
+        except Exception:
+            pass
 
-    # Add new workspace handler if workspace_dir is provided
+    # Remove existing workspace handler if present
+    for handler in (_workspace_file_handler, _workspace_debug_file_handler):
+        if handler is not None:
+            _logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+    _workspace_file_handler = None
+    _workspace_debug_file_handler = None
+
     if workspace_dir:
         try:
-            workspace_log_dir = Path(workspace_dir) / "logs"
-            workspace_log_dir.mkdir(parents=True, exist_ok=True)
-            workspace_log_file = workspace_log_dir / "adscan.log"
-            workspace_debug_log_file = workspace_log_dir / "adscan.debug.log"
-            workspace_file_handler = RotatingFileHandler(
-                workspace_log_file,
-                maxBytes=10 * 1024 * 1024,  # 10 MB
-                backupCount=5,
-                encoding="utf-8",
-            )
-            # Match the current global file handler level (INFO by default,
-            # potentially DEBUG if debug mode was enabled before workspace
-            # logging is configured).
-            if _file_handler is not None:
-                workspace_file_handler.setLevel(_file_handler.level)
-            else:
-                workspace_file_handler.setLevel(logging.INFO)
-            workspace_file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            _logger.addHandler(workspace_file_handler)
-            _workspace_file_handler = workspace_file_handler
-
-            workspace_debug_file_handler = RotatingFileHandler(
-                workspace_debug_log_file,
-                maxBytes=25 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            workspace_debug_file_handler.setLevel(logging.DEBUG)
-            workspace_debug_file_handler.setFormatter(
-                MarkerStrippingFormatter(
-                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                )
-            )
-            _logger.addHandler(workspace_debug_file_handler)
-            _workspace_debug_file_handler = workspace_debug_file_handler
-        except PermissionError:
-            _workspace_file_handler = None
-            _workspace_debug_file_handler = None
+            (
+                _workspace_file_handler,
+                _workspace_debug_file_handler,
+            ) = _make_sink_pair(Path(workspace_dir) / "logs")
         except Exception:
             _workspace_file_handler = None
             _workspace_debug_file_handler = None
+            _active_workspace_dir = None
+    _route_file_sinks(_logger)
 
 
 def log_to_file_only(level: int, message: str):
@@ -1082,17 +1349,13 @@ def log_to_file_only(level: int, message: str):
 
     This is used by print_*_verbose/debug functions to avoid duplicate
     console output (they handle console output themselves via Rich).
+    Every active file sink receives it regardless of its level, as before.
 
     Args:
         level: Logging level (logging.DEBUG, logging.INFO, etc.)
         message: Message to log
     """
-    global _file_handler, _debug_file_handler
-    global _workspace_file_handler, _workspace_debug_file_handler
-
     logger = get_logger()
-
-    # Create a log record
     record = logger.makeRecord(
         logger.name,
         level,
@@ -1102,15 +1365,4 @@ def log_to_file_only(level: int, message: str):
         (),
         None,  # exc_info
     )
-
-    # Emit to global file handler
-    if _file_handler is not None:
-        _file_handler.emit(record)
-    if _debug_file_handler is not None:
-        _debug_file_handler.emit(record)
-
-    # Emit to workspace file handler if present
-    if _workspace_file_handler is not None:
-        _workspace_file_handler.emit(record)
-    if _workspace_debug_file_handler is not None:
-        _workspace_debug_file_handler.emit(record)
+    emit_to_file_sinks(record, respect_levels=False)

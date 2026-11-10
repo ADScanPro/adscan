@@ -280,7 +280,7 @@ class DomainService(BaseService):
                     # phase.
                     try:
                         dc_entries = query_domain_controllers(
-                            conn, ldap_cfg.config_dn
+                            conn, conn.config_dn, domain_dn=ldap_cfg.domain_dn
                         )
                     except Exception as dc_exc:  # noqa: BLE001
                         telemetry.capture_exception(dc_exc)

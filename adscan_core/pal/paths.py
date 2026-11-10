@@ -37,7 +37,15 @@ __all__ = [
     "container_adscan_root",
     "container_workspaces_dir",
     "host_adscan_root_display",
+    "deliverables_dir",
+    "DELIVERABLES_DIR_ENV",
 ]
+
+#: Operator setting: the folder deliverables are copied to (host path). Read
+#: on the host by the launcher and natively by the Windows bundle; never inside
+#: the container, which reaches the folder through a fixed mount instead.
+DELIVERABLES_DIR_ENV = "ADSCAN_DELIVERABLES_DIR"
+_DELIVERABLES_FOLDER_NAME = "ADscan-deliverables"
 
 # The FIXED container-side mount root. Inside the Docker runtime the host
 # ``~/.adscan`` is always bind-mounted at ``/opt/adscan`` (see CLAUDE.md
@@ -129,3 +137,32 @@ def container_workspaces_dir() -> str:
 def host_adscan_root_display() -> str:
     """Return the host-side display root (``~/.adscan``); presentation-only."""
     return _HOST_ADSCAN_ROOT_DISPLAY
+
+
+def deliverables_dir() -> Path:
+    """Return the folder deliverables are copied to on THIS host.
+
+    ``ADSCAN_DELIVERABLES_DIR`` wins on any OS (``~`` expands against the
+    invoking user's home, sudo-safe). Otherwise:
+
+    * Windows: ``%USERPROFILE%\\Documents\\ADscan-deliverables`` (the folder a
+      Windows user browses), or the profile root when there is no Documents.
+    * POSIX: ``~/ADscan-deliverables`` of the invoking user.
+
+    Host/native only: inside the Docker runtime ``HOME`` is the container's,
+    so callers there go through ``adscan_core.deliverable_destination``.
+    """
+    from adscan_core.path_utils import (  # noqa: PLC0415 - avoid import cycle
+        expand_effective_user_path,
+        get_effective_user_home,
+    )
+
+    override = os.getenv(DELIVERABLES_DIR_ENV, "").strip()
+    if override:
+        return Path(expand_effective_user_path(override))
+    home = get_effective_user_home()
+    if is_windows():
+        documents = home / "Documents"
+        base = documents if documents.is_dir() else home
+        return base / _DELIVERABLES_FOLDER_NAME
+    return home / _DELIVERABLES_FOLDER_NAME

@@ -39,7 +39,18 @@ AFFECTED_ASSETS_STRUCT_KEY = "_affected_assets_struct"
 #: code; read :data:`AFFECTED_ASSETS_STRUCT_KEY` and fall back to this one.
 LEGACY_AFFECTED_ASSETS_KEY = "_affected_assets"
 
+#: The key under which the engine stamps the objects an attack step EXPOSES but
+#: that are deliberately kept OUT of :data:`AFFECTED_ASSETS_STRUCT_KEY`: the
+#: escalation's landing point (Domain Admins for ESC1, Domain Controllers for
+#: ESC8), which the struct drops as "where the escalation lands". They are shown
+#: under "What it exposes" and NOTHING else reads them: the severity overlay, the
+#: counts, the appendix and the command resolvers read the struct key only, so
+#: showing them can never move a score. Same entity shape, ``role`` ``target``,
+#: plus ``display_only: true``.
+AFFECTED_ASSETS_DISPLAY_ONLY_KEY = "_affected_assets_display_only"
+
 __all__ = [
+    "AFFECTED_ASSETS_DISPLAY_ONLY_KEY",
     "AFFECTED_ASSETS_STRUCT_KEY",
     "LEGACY_AFFECTED_ASSETS_KEY",
 ]

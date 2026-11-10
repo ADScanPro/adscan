@@ -32,7 +32,7 @@ from aiosmb import logger
 from aiosmb.dcerpc.v5 import system_errors
 from aiosmb.dcerpc.v5.dcom.remunknown import IRemUnknown
 from aiosmb.dcerpc.v5.dcom.dcomrt import DCOMCALL, DCOMANSWER
-from aiosmb.dcerpc.v5.dtypes import DWORD, LONG, LPWSTR
+from aiosmb.dcerpc.v5.dtypes import DWORD, FILETIME, LONG, LPWSTR
 from aiosmb.dcerpc.v5.rpcrt import DCERPCException
 from aiosmb.dcerpc.v5.uuid import string_to_bin, uuidtup_to_bin
 
@@ -253,6 +253,75 @@ class ICertAdminDResubmitRequestResponse(DCOMANSWER):
 
 
 # =========================================================================
+# Protocol Structures for MS-CSRA RevokeCertificate (opnum 10, ICertAdminD)
+# =========================================================================
+
+#: CRL reason codes (RFC 5280 5.3.1) accepted by RevokeCertificate.
+CRL_REASON_UNSPECIFIED = 0
+CRL_REASON_KEY_COMPROMISE = 1
+
+
+#: IsValidCertificate dispositions (certadm.h CA_DISP_*).
+CA_DISP_REVOKED = 2
+CA_DISP_VALID = 3
+
+
+class ICertAdminDIsValidCertificate(DCOMCALL):
+    """
+    ICertAdminD::IsValidCertificate DCOM call structure.
+
+    Defined in [MS-CSRA] section 3.1.4.1.5. Opnum 7. Reads a certificate's
+    status from the CA database; used to CONFIRM a revocation by re-reading.
+    """
+    opnum = 7
+    structure = (
+        ('pwszAuthority', LPWSTR),
+        ('pSerialNumber', LPWSTR),
+    )
+
+
+class ICertAdminDIsValidCertificateResponse(DCOMANSWER):
+    """ICertAdminD::IsValidCertificate response: reason, disposition, HRESULT."""
+    structure = (
+        ('pRevocationReason', LONG),
+        ('pDisposition', LONG),
+        ('ErrorCode', LONG),
+    )
+
+
+class ICertAdminDRevokeCertificate(DCOMCALL):
+    """
+    ICertAdminD::RevokeCertificate DCOM call structure.
+
+    Defined in [MS-CSRA] section 3.1.4.1.8.
+    Opnum 10 on the ICertAdminD vtable (3 SetExtension, 4 SetAttributes,
+    5 ResubmitRequest, 6 DenyRequest, 7 IsValidCertificate, 8 PublishCRL,
+    9 GetCRL, 10 RevokeCertificate).
+
+    Revokes an issued certificate by serial number. Requires the
+    ManageCertificates (officer) right on the CA. A FileTime of zero revokes
+    it as of now. The revocation reaches relying parties once the CA
+    publishes its next CRL.
+    """
+    opnum = 10
+    structure = (
+        ('pwszAuthority', LPWSTR),      # CA name (e.g., "CORP-CA")
+        ('pwszSerialNumber', LPWSTR),   # Hex serial as the CA database stores it
+        ('Reason', DWORD),              # CRL_REASON_*
+        ('FileTime', FILETIME),         # 0 = revoke now
+    )
+
+
+class ICertAdminDRevokeCertificateResponse(DCOMANSWER):
+    """
+    ICertAdminD::RevokeCertificate DCOM response structure (HRESULT only).
+    """
+    structure = (
+        ('ErrorCode', LONG),
+    )
+
+
+# =========================================================================
 # ICertAdminD2 DCOM Interface (GetCASecurity read + SetCASecurity write)
 # =========================================================================
 
@@ -282,6 +351,8 @@ class ICertAdminD2(IRemUnknown):
         """
         IRemUnknown.__init__(self, interface)
         self._iid = IID_ICertAdminD2
+        # certsrv refuses anything below an encrypted binding (Certipy parity).
+        self.require_packet_privacy()
 
     async def __aenter__(self):
         return self
@@ -418,6 +489,8 @@ class ICertAdminD(IRemUnknown):
         """
         IRemUnknown.__init__(self, interface)
         self._iid = IID_ICertAdminD
+        # certsrv refuses anything below an encrypted binding (Certipy parity).
+        self.require_packet_privacy()
 
     async def __aenter__(self):
         return self
@@ -467,6 +540,66 @@ class ICertAdminD(IRemUnknown):
         disposition = resp['pdwDisposition']
         logger.info(f'ResubmitRequest for {ca_name} id={request_id} returned disposition={disposition}')
         return disposition
+
+    async def certificate_disposition(self, ca_name: str, serial_number: str) -> int:
+        """
+        Read a certificate's CA-database status (MS-CSRA IsValidCertificate).
+
+        Returns:
+            ``pDisposition`` (CA_DISP_REVOKED = 2, CA_DISP_VALID = 3, ...).
+
+        Raises:
+            CertAdminSecurityError: on any DCERPC-layer failure.
+        """
+        req = ICertAdminDIsValidCertificate()
+        req['pwszAuthority'] = ca_name + '\x00'
+        req['pSerialNumber'] = str(serial_number).replace(' ', '').replace(':', '') + '\x00'
+        resp, err = await self._request(req, IID_ICertAdminD, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'IsValidCertificate failed for {ca_name} (serial={serial_number}): '
+                f'{_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        return int(resp['pDisposition'])
+
+    async def revoke_certificate(
+        self, ca_name: str, serial_number: str, reason: int = CRL_REASON_KEY_COMPROMISE
+    ) -> int:
+        """
+        Revoke an issued certificate by serial (MS-CSRA RevokeCertificate).
+
+        Args:
+            ca_name: CA name (e.g. "CORP-CA").
+            serial_number: Hex serial number, no separators.
+            reason: CRL reason code (default: key compromise).
+
+        Returns:
+            The CA's ``ErrorCode`` (0 = revoked).
+
+        Raises:
+            CertAdminSecurityError: on any DCERPC-layer failure (for example
+                access denied when the caller is not a certificate manager).
+        """
+        req = ICertAdminDRevokeCertificate()
+        req['pwszAuthority'] = ca_name + '\x00'
+        req['pwszSerialNumber'] = str(serial_number).replace(' ', '').replace(':', '') + '\x00'
+        req['Reason'] = int(reason)
+        req['FileTime']['dwLowDateTime'] = 0
+        req['FileTime']['dwHighDateTime'] = 0
+
+        logger.debug(f'Revoking certificate {serial_number} via RevokeCertificate: {ca_name}')
+
+        resp, err = await self._request(req, IID_ICertAdminD, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'RevokeCertificate failed for {ca_name} (serial={serial_number}): '
+                f'{_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        error_code = resp['ErrorCode']
+        logger.info(f'RevokeCertificate for {ca_name} serial={serial_number} returned ErrorCode={error_code}')
+        return error_code
 
     async def _request(self, req, iid, uuid):
         """Internal DCOM request wrapper (parity with ICertAdminD2)."""

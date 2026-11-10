@@ -84,6 +84,11 @@ def _request_tgt_pair_impacket(
     (test injection / module missing). Source citation:
     ``reference/NetExec/nxc/modules/nopac.py:28-48``.
     """
+    from adscan_internal.services.impacket_auth_guard import (  # noqa: PLC0415
+        install_impacket_auth_guard,
+    )
+
+    install_impacket_auth_guard()
     from impacket.krb5 import constants
     from impacket.krb5.kerberosv5 import getKerberosTGT
     from impacket.krb5.types import Principal
@@ -206,6 +211,11 @@ def _request_one_tgt_impacket_no_pac(
     kdc_host: str,
 ) -> bytes:
     """One-shot impacket call for the no-PAC half of the pair."""
+    from adscan_internal.services.impacket_auth_guard import (  # noqa: PLC0415
+        install_impacket_auth_guard,
+    )
+
+    install_impacket_auth_guard()
     from impacket.krb5 import constants
     from impacket.krb5.kerberosv5 import getKerberosTGT
     from impacket.krb5.types import Principal

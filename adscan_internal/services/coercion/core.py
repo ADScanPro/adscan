@@ -33,6 +33,13 @@ RpcTransport = Literal["ncan_np", "ncacn_ip_tcp"]
 CaptureSignal = Callable[[], bool]
 
 
+def _coercion_method_delay() -> float:
+    """Pause between coercion methods on one host, from the scan pacing."""
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    return float(component_pacing(active_pacing(), "coercion.methods")["delay_s"])
+
+
 @dataclass(frozen=True)
 class CoercionListener:
     """Listener endpoint that the target should authenticate to."""
@@ -184,7 +191,9 @@ class CoercionRunConfig:
     listeners: tuple[CoercionListener, ...]
     methods: tuple[CoercionMethod, ...]
     timeout_seconds: float = 60.0
-    delay_seconds: float = 0.05
+    delay_seconds: float = field(
+        default_factory=lambda: _coercion_method_delay()
+    )  # pause between methods on one host; scan pacing ``coercion.methods`` (0.05 s default)
     protocols: tuple[str, ...] = ()
     transports: tuple[RpcTransport, ...] = ()
     method_names: tuple[str, ...] = ()

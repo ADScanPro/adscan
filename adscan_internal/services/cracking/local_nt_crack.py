@@ -959,12 +959,13 @@ def _resolve_blocking_tiers(
         )
         from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
             resolve_effort,
+            shell_wordlist_profile,
         )
 
         return list(
             resolve_effort(
                 effort,
-                workspace_type=str(getattr(shell, "type", "") or "audit"),
+                workspace_type=shell_wordlist_profile(shell),
                 domain=domain,
                 wordlists_dir=_wordlists_dir(),
                 benchmark=get_or_run_benchmark(shell),

@@ -2,15 +2,15 @@
    editorial — Warm Ink Authority
    Premium, editorial-grade light theme for ADscan reports and the full Client
    Deliverable Kit (report + AD Hardening Playbook + MITRE Checklist + Coverage
-   Matrix). Ink on warm bone paper, one decisive ADscan brand-teal accent, a
+   Report). Ink on warm bone paper, one decisive ADscan brand-teal accent, a
    disciplined semantic severity scale (warm reds/ambers) confined to data.
 
    Built on corporate_light's proven class-coverage structure (it correctly
    skins every report section), re-tinted from institutional blue to the warm
    editorial palette established by premium_dark / the bonus templates. Every
-   token vocabulary the kit uses is defined here so the report (--bg-0/--text),
-   the bonuses (--paper/--ink/--sev-*) and the coverage matrix (--cm-*) all read
-   as one premium document family.
+   token vocabulary the kit uses is defined here so the report (--bg-0/--text)
+   and the bonuses (--paper/--ink/--sev-*) read as one premium document family.
+   The Coverage Report carries its own tokens.
 
    Optimised for Chromium/Playwright print rendering.
    ═══════════════════════════════════════════════════════════════════════════ */

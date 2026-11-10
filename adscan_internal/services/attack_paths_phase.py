@@ -80,6 +80,12 @@ ATTACK_PATHS_DISCOVERY_PHASE_ID = "attack_paths_discovery"
 _ATTACK_PATHS_DISCOVERY_TITLE = "Attack Paths Discovery"
 
 
+def _phase_family(shell: Any) -> str:
+    from adscan_core.scan_policy.settings import scan_phase_family  # noqa: PLC0415
+
+    return scan_phase_family(shell)
+
+
 def run_attack_paths_discovery_phase(
     shell: Any,
     *,
@@ -172,7 +178,7 @@ def run_attack_paths_discovery_phase(
             effective_scan_type = (
                 scan_type
                 if scan_type is not None
-                else (getattr(shell, "type", "default") or "default")
+                else _phase_family(shell)
             )
             # ``emit_chapter`` is the single transition point (chapter strip AND
             # the structured phase event); emit it exactly ONCE per phase run.

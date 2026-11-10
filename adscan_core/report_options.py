@@ -1,0 +1,472 @@
+"""Single source of truth for the options that describe a deliverable.
+
+One scan should produce the branded deliverable in one command, so the options
+that describe a deliverable (which documents, which compliance frameworks, the
+theme, the branding posture, the client identity, the composition seams, the
+output formats) are declared ONCE here and registered on every surface that
+renders one:
+
+* the container ``ci`` subparser (``adscan.py`` ``add_ci_subparser``), whose
+  ``--generate-report`` renders through the kit pipeline of ``deliver``;
+* the container ``deliver`` subparser (``adscan_internal/cli/deliver.py``),
+  which the REPL ``deliver`` command reuses verbatim;
+* the host launcher's ``deliver`` parser (``adscan_launcher/cli.py``), which
+  declares them under ``ws_*`` dests and forwards them with
+  :func:`forward_report_options`;
+* the launcher ``ci --help`` epilog, through
+  ``adscan_core.cli_passthrough_spec`` (``ci`` forwards through REMAINDER).
+
+Before this module each surface declared its own copy, and they had drifted:
+the launcher rejected ``--theme editorial`` while the container advertised it,
+``ci`` had no ``--branding`` at all, and the launcher refused four ``deliver``
+flags the platform worker sends. The option set is now one tuple, and
+``tests/unit/core/test_report_options_contract.py`` fails when any surface
+stops declaring it.
+
+The module lives in ``adscan_core`` because the host launcher and the LITE
+container must import it (the PRO-only ``deliver`` module is stripped from the
+LITE image). It imports only the standard library. The value vocabularies it
+carries (deliverable slugs, framework keys, branding postures, ``--emit``
+values) are the CLI-facing mirror of the engine SSOTs; the contract test binds
+each one to its engine definition.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
+
+# ---------------------------------------------------------------------------
+# Value vocabularies (bound to the engine SSOTs by the contract test)
+# ---------------------------------------------------------------------------
+
+#: Internal kit slugs, in canonical kit order. Mirrors
+#: ``adscan_internal.cli.deliver.DELIVERABLE_SLUGS``.
+REPORT_DELIVERABLE_SLUGS: tuple[str, ...] = (
+    "executive",
+    "playbook",
+    "coverage-matrix",
+    "password-hygiene",
+)
+
+#: Public ``--only`` names that resolve to an internal slug. ``report`` is the
+#: name users are told to type; ``checklist`` is the retired standalone MITRE
+#: checklist, folded into the report. ``deliver.py`` imports this mapping.
+REPORT_ONLY_ALIASES: Mapping[str, str] = {"report": "executive", "checklist": "executive"}
+
+#: The deliverable names shown in help text (public alias first).
+REPORT_PUBLIC_DELIVERABLES: tuple[str, ...] = (
+    "report",
+    "playbook",
+    "coverage-matrix",
+    "password-hygiene",
+)
+
+#: What ``ci --generate-report`` renders when ``--only`` is omitted: the
+#: Security Assessment Report alone. ``deliver`` defaults to the full kit.
+CI_DEFAULT_ONLY: str = "report"
+
+#: Compliance framework keys. Mirrors
+#: ``adscan_internal.cli.common._VALID_FRAMEWORK_KEYS``.
+REPORT_FRAMEWORK_KEYS: tuple[str, ...] = ("ens", "nis2", "iso27001", "dora", "pci_dss", "cis")
+
+#: Branding postures. Mirrors
+#: ``adscan_internal.services.report_branding.VALID_BRANDING_POSTURES``.
+BRANDING_POSTURES: tuple[str, ...] = ("adscan", "cobrand", "whitelabel")
+
+#: Security Assessment Report output formats. ``deliver.py`` imports this.
+REPORT_EMIT_VALUES: tuple[str, ...] = ("pdf", "html", "data")
+
+#: The two themes advertised to customers. ``premium_dark`` and the short
+#: aliases (``dark``/``light``/``warm``) stay accepted for internal preview, and
+#: a ``.css`` path applies a bring-your-own skin, which is why the theme options
+#: carry no argparse ``choices`` (``deliver._resolve_theme`` validates them).
+REPORT_ADVERTISED_THEMES: tuple[str, ...] = ("editorial", "corporate_light")
+
+_THEME_METAVAR = "{" + ",".join(REPORT_ADVERTISED_THEMES) + "}"
+
+#: What ``--emit`` produces when omitted: the PDF and its HTML twin.
+REPORT_DEFAULT_EMIT: tuple[str, ...] = ("pdf", "html")
+
+
+def parse_only_slugs(raw: str | None) -> tuple[str, ...]:
+    """Resolve an ``--only`` value to internal kit slugs, in kit order.
+
+    Args:
+        raw: The comma-separated value, or ``None``/empty for every deliverable.
+
+    Returns:
+        The selected slugs (aliases resolved), in :data:`REPORT_DELIVERABLE_SLUGS`
+        order. Empty input selects all of them.
+
+    Raises:
+        ValueError: A token is neither a slug nor an alias. The message names
+            the bad token and the accepted set.
+    """
+    if raw is None or not raw.strip():
+        return REPORT_DELIVERABLE_SLUGS
+    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        return REPORT_DELIVERABLE_SLUGS
+    normalised = [REPORT_ONLY_ALIASES.get(tok, tok) for tok in tokens]
+    invalid = [tok for tok in normalised if tok not in REPORT_DELIVERABLE_SLUGS]
+    if invalid:
+        allowed = ", ".join(list(REPORT_DELIVERABLE_SLUGS) + list(REPORT_ONLY_ALIASES))
+        raise ValueError(
+            f"--only: unknown deliverable(s): {', '.join(invalid)}. "
+            f"Use one of: {allowed}."
+        )
+    selected = set(normalised)
+    return tuple(slug for slug in REPORT_DELIVERABLE_SLUGS if slug in selected)
+
+
+def parse_emit_values(raw: str | None) -> tuple[str, ...]:
+    """Resolve an ``--emit`` value to output formats, in canonical order.
+
+    Omitting the flag returns :data:`REPORT_DEFAULT_EMIT`.
+
+    Raises:
+        ValueError: A token is not one of :data:`REPORT_EMIT_VALUES`.
+    """
+    if raw is None or not raw.strip():
+        return REPORT_DEFAULT_EMIT
+    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        return REPORT_DEFAULT_EMIT
+    invalid = [tok for tok in tokens if tok not in REPORT_EMIT_VALUES]
+    if invalid:
+        raise ValueError(
+            f"--emit: unknown format(s): {', '.join(invalid)}. "
+            f"Use a comma-separated list of: {', '.join(REPORT_EMIT_VALUES)}."
+        )
+    selected = set(tokens)
+    return tuple(fmt for fmt in REPORT_EMIT_VALUES if fmt in selected)
+
+
+# ---------------------------------------------------------------------------
+# The option model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReportOption:
+    """One option that describes a deliverable.
+
+    Attributes:
+        flags: Option strings, canonical long form first.
+        dest: The namespace attribute the container parsers store it under.
+        help: One-line, user-facing description.
+        metavar: Value placeholder for a value-taking option.
+        choices: Allowed values, or ``None`` when free-form.
+        switch: ``True`` for a boolean flag that takes no value.
+    """
+
+    flags: tuple[str, ...]
+    dest: str
+    help: str
+    metavar: str | None = None
+    choices: tuple[str, ...] | None = None
+    switch: bool = False
+
+    @property
+    def primary(self) -> str:
+        """The canonical flag (``--only``)."""
+        return self.flags[0]
+
+
+REPORT_OPTIONS: tuple[ReportOption, ...] = (
+    ReportOption(
+        ("--only",),
+        "only",
+        "Deliverables to render, comma-separated: "
+        f"{', '.join(REPORT_PUBLIC_DELIVERABLES)} (executive is the earlier name of "
+        "report). `ci --generate-report` renders the report alone unless you widen "
+        "it; `deliver` renders the full kit.",
+        metavar="LIST",
+    ),
+    ReportOption(
+        ("--frameworks",),
+        "frameworks",
+        "Compliance frameworks, comma-separated: "
+        f"{', '.join(REPORT_FRAMEWORK_KEYS)}. No default; a policy for a real "
+        "environment requires one. On `ci` the scan also maps its findings onto "
+        "them at scan end, with or without a report.",
+        metavar="LIST",
+    ),
+    ReportOption(
+        ("--theme",),
+        "theme",
+        "Visual theme for every deliverable: editorial or corporate_light "
+        "(default). A path to a .css file applies your own skin.",
+        metavar=_THEME_METAVAR,
+    ),
+    ReportOption(
+        ("--report-theme",),
+        "report_theme",
+        "Earlier name for --theme, still accepted.",
+        metavar=_THEME_METAVAR,
+    ),
+    ReportOption(
+        ("--branding",),
+        "branding",
+        "Branding posture: adscan, cobrand (default) or whitelabel. whitelabel "
+        "needs the white-label entitlement; without it the deliverable is cobranded.",
+        choices=BRANDING_POSTURES,
+    ),
+    ReportOption(
+        ("--client",),
+        "client",
+        "Client name on the cover and in the kit metadata (default: the "
+        "workspace name).",
+        metavar="NAME",
+    ),
+    ReportOption(
+        ("--engagement",),
+        "engagement",
+        "Engagement code embedded in the kit metadata.",
+        metavar="CODE",
+    ),
+    ReportOption(
+        ("--client-logo",),
+        "client_logo",
+        "Client logo (PNG, SVG or JPG) placed on the cover; kept and reused on "
+        "later runs.",
+        metavar="PATH",
+    ),
+    ReportOption(
+        ("--client-cover",),
+        "client_cover",
+        "HTML fragment, or a directory of per-deliverable fragments, that "
+        "replaces the cover page. Needs the composition_seams entitlement.",
+        metavar="PATH",
+    ),
+    ReportOption(
+        ("--client-back",),
+        "client_back",
+        "HTML fragment, or a directory of per-deliverable fragments, rendered as "
+        "a closing back page. Needs the composition_seams entitlement.",
+        metavar="PATH",
+    ),
+    ReportOption(
+        ("--emit",),
+        "emit",
+        "Security Assessment Report outputs, comma-separated: "
+        f"{', '.join(REPORT_EMIT_VALUES)}. The PDF and HTML are always produced; "
+        "data adds report_model.json and needs the data_export entitlement.",
+        metavar="LIST",
+    ),
+    ReportOption(
+        ("--no-navigator",),
+        "no_navigator",
+        "Leave the MITRE ATT&CK Navigator extras out of the kit ZIP.",
+        switch=True,
+    ),
+)
+
+#: Every flag string the model declares.
+REPORT_OPTION_FLAGS: frozenset[str] = frozenset(
+    flag for option in REPORT_OPTIONS for flag in option.flags
+)
+
+#: Every dest the model declares.
+REPORT_OPTION_DESTS: tuple[str, ...] = tuple(option.dest for option in REPORT_OPTIONS)
+
+
+def add_report_arguments(parser: argparse.ArgumentParser, *, dest_prefix: str = "") -> None:
+    """Register every :data:`REPORT_OPTIONS` entry on ``parser``.
+
+    Args:
+        parser: The subparser to extend (``ci``, ``deliver``, launcher ``deliver``).
+        dest_prefix: Prefix for the namespace dest. The host launcher passes
+            ``"ws_"`` so the forwarded values never collide with its own
+            ``--output``/``--theme`` handling; the container parsers pass nothing.
+    """
+    for option in REPORT_OPTIONS:
+        kwargs: dict[str, Any] = {"dest": f"{dest_prefix}{option.dest}", "help": option.help}
+        if option.switch:
+            kwargs["action"] = "store_true"
+        else:
+            kwargs["default"] = None
+            if option.choices:
+                kwargs["choices"] = option.choices
+            if option.metavar:
+                kwargs["metavar"] = option.metavar
+        parser.add_argument(*option.flags, **kwargs)
+
+
+def report_option_values(ns: argparse.Namespace, *, dest_prefix: str = "") -> dict[str, Any]:
+    """Read every model option off ``ns``, keyed by the container dest.
+
+    Missing attributes read as ``None`` (``False`` for a switch), so a namespace
+    built by hand (the run-plan entry, a test) needs no knowledge of the model.
+    """
+    values: dict[str, Any] = {}
+    for option in REPORT_OPTIONS:
+        raw = getattr(ns, f"{dest_prefix}{option.dest}", None)
+        values[option.dest] = bool(raw) if option.switch else raw
+    return values
+
+
+def forward_report_options(
+    ns: argparse.Namespace,
+    *,
+    dest_prefix: str = "",
+    exclude: Iterable[str] = (),
+) -> list[str]:
+    """Turn the model options set on ``ns`` back into argv tokens.
+
+    Used by the host launcher to forward ``deliver`` options into the container,
+    and by the legacy host-side ``ci`` docker mode. An option that is unset,
+    empty or a ``False`` switch is omitted, so the receiving parser applies its
+    own default.
+
+    Args:
+        ns: The parsed namespace.
+        dest_prefix: The prefix the options were registered with.
+        exclude: Dests the caller forwards itself (the launcher stages
+            ``client_logo`` into the mounted volume before forwarding it).
+
+    Returns:
+        ``["--flag", "value", "--switch", ...]`` in model order.
+    """
+    skipped = set(exclude)
+    argv: list[str] = []
+    for option in REPORT_OPTIONS:
+        if option.dest in skipped:
+            continue
+        value = getattr(ns, f"{dest_prefix}{option.dest}", None)
+        if option.switch:
+            if value:
+                argv.append(option.primary)
+            continue
+        if value is None or str(value).strip() == "":
+            continue
+        argv.extend([option.primary, str(value)])
+    return argv
+
+
+# ---------------------------------------------------------------------------
+# Retired ``ci`` report flags: still parsed, one warning line each
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetiredReportFlag:
+    """A ``ci`` report flag kept for existing scripts.
+
+    Usage is read off the parsed value (anything other than ``default``), not
+    recorded by a custom action, so a namespace rebuilt from a run plan reports
+    the same notices as one parsed from flags.
+
+    Attributes:
+        flags: Option strings.
+        dest: Namespace dest, unchanged from before so existing readers work.
+        notice: The one warning line printed when the flag is used, or ``None``
+            when the flag still means exactly what the model does
+            (``--report-format pdf``: the report is a PDF).
+        choices: The values it used to accept (still enforced).
+        metavar: Value placeholder when ``choices`` is ``None``.
+        default: The value the parser stored before the model existed.
+    """
+
+    flags: tuple[str, ...]
+    dest: str
+    notice: str | None
+    choices: tuple[str, ...] | None = None
+    metavar: str | None = None
+    default: str | None = None
+
+
+CI_RETIRED_REPORT_FLAGS: tuple[RetiredReportFlag, ...] = (
+    RetiredReportFlag(("--report-format",), "report_format", None, choices=("pdf",), default="pdf"),
+    RetiredReportFlag(
+        ("--report-engine",),
+        "report_engine",
+        "--report-engine is deprecated and has no effect: reports always render "
+        "with Chromium.",
+        choices=("chromium",),
+    ),
+    RetiredReportFlag(
+        ("--report-renderer",),
+        "report_renderer",
+        "--report-renderer is deprecated and has no effect: attack paths always "
+        "render with the built-in renderer.",
+        choices=("cytoscape",),
+    ),
+    RetiredReportFlag(
+        ("--report-template",),
+        "report_template",
+        "--report-template is deprecated and has no effect: the report always "
+        "uses the premium template.",
+        choices=("premium",),
+    ),
+    RetiredReportFlag(
+        ("--display-name",),
+        "display_name",
+        "--display-name is deprecated: use --client, which names the client on "
+        "every deliverable.",
+        metavar="NAME",
+    ),
+)
+
+
+def add_ci_report_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the deliverable options on the container ``ci`` subparser.
+
+    The shared model, plus two ``ci`` rules: ``--only`` defaults to the report
+    alone (:data:`CI_DEFAULT_ONLY`, where ``deliver`` defaults to the full kit),
+    and the retired report flags stay parsed, hidden from ``--help``, so
+    existing scripts keep working and get one warning line instead.
+    """
+    add_report_arguments(parser)
+    parser.set_defaults(only=CI_DEFAULT_ONLY)
+    for flag in CI_RETIRED_REPORT_FLAGS:
+        kwargs: dict[str, Any] = {
+            "dest": flag.dest,
+            "default": flag.default,
+            "help": argparse.SUPPRESS,
+        }
+        if flag.choices:
+            kwargs["choices"] = flag.choices
+        if flag.metavar:
+            kwargs["metavar"] = flag.metavar
+        parser.add_argument(*flag.flags, **kwargs)
+
+
+def report_deprecation_notices(ns: argparse.Namespace) -> list[str]:
+    """The warning lines for the retired report flags set on ``ns``."""
+    notices: list[str] = []
+    for flag in CI_RETIRED_REPORT_FLAGS:
+        if flag.notice is None:
+            continue
+        value = getattr(ns, flag.dest, flag.default)
+        if value is not None and value != flag.default and str(value).strip():
+            notices.append(flag.notice)
+    return notices
+
+
+__all__ = (
+    "BRANDING_POSTURES",
+    "CI_DEFAULT_ONLY",
+    "CI_RETIRED_REPORT_FLAGS",
+    "REPORT_ADVERTISED_THEMES",
+    "REPORT_DEFAULT_EMIT",
+    "REPORT_DELIVERABLE_SLUGS",
+    "REPORT_EMIT_VALUES",
+    "REPORT_FRAMEWORK_KEYS",
+    "REPORT_ONLY_ALIASES",
+    "REPORT_OPTIONS",
+    "REPORT_OPTION_DESTS",
+    "REPORT_OPTION_FLAGS",
+    "REPORT_PUBLIC_DELIVERABLES",
+    "ReportOption",
+    "RetiredReportFlag",
+    "add_ci_report_arguments",
+    "add_report_arguments",
+    "forward_report_options",
+    "parse_emit_values",
+    "parse_only_slugs",
+    "report_deprecation_notices",
+    "report_option_values",
+)

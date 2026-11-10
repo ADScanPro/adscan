@@ -79,6 +79,8 @@ class FreshnessOutcome(str, Enum):
     FAILED = "failed"
     SKIPPED_NO_DOMAIN = "skipped_no_domain"
     SKIPPED_DISABLED = "skipped_disabled"
+    #: Every probe of the phase is switched off by the scan policy.
+    SKIPPED_BY_POLICY = "skipped_by_policy"
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,57 @@ def _is_disabled() -> bool:
     from adscan_internal.cli.posture_probe_lifecycle import is_posture_probe_disabled
 
     return is_posture_probe_disabled()
+
+
+def posture_categories_excluded_by_policy(
+    shell: Any, *, explain: bool = True
+) -> frozenset[ConstraintCategory]:
+    """Posture categories whose probe check the active scan policy switches off.
+
+    One check per probe (``scan_phases.POSTURE_PROBE_CHECK_BY_CATEGORY``, family
+    ``connection_posture``). A switched-off probe sends nothing and its category
+    stays UNKNOWN: nothing is cached, and the reactive layer learns it from a
+    real failure. With ``explain`` each refusal is explained once through the
+    scan-policy notice SSOT. No policy in force: nothing is excluded.
+
+    Args:
+        shell: The pentest shell (``None`` -> nothing excluded).
+        explain: Explain each switched-off probe once.
+
+    Returns:
+        The excluded categories.
+    """
+    if shell is None:
+        return frozenset()
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        POSTURE_PROBE_CHECK_BY_CATEGORY,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        check_excluded,
+        policy_active,
+        refuse,
+    )
+
+    try:
+        if not policy_active(shell):
+            return frozenset()
+        excluded: set[ConstraintCategory] = set()
+        refused: set[str] = set()
+        for category in ConstraintCategory:
+            check_id = POSTURE_PROBE_CHECK_BY_CATEGORY.get(category.value, "")
+            if not check_id or not check_excluded(shell, check_id):
+                continue
+            excluded.add(category)
+            if explain and check_id not in refused:
+                refused.add(check_id)
+                refuse(shell, check_id, surface="posture_probe")
+        return frozenset(excluded)
+    except Exception as exc:  # noqa: BLE001 - a broken policy probes nothing extra
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        # Fail closed, like every other seam: with an unreadable policy, no
+        # proactive probe is sent; the reactive layer still learns the posture.
+        return frozenset(ConstraintCategory)
 
 
 async def _get_lock(key: tuple[str, ProbePhase]) -> asyncio.Lock:
@@ -161,7 +214,9 @@ def _is_category_fresh(state) -> bool:  # type: ignore[no-untyped-def]
     return True
 
 
-def _emit_positive_control_evidence(shell: Any, domain: str) -> None:
+def _emit_positive_control_evidence(
+    shell: Any, domain: str, *, record_evidence: bool = True
+) -> None:
     """Record positive control evidence for the domain's OBSERVED-GOOD posture.
 
     Best-effort: an OBSERVED hardened+HIGH constraint (LDAP signing, LDAP channel
@@ -169,8 +224,11 @@ def _emit_positive_control_evidence(shell: Any, domain: str) -> None:
     domain password policy become green controls in the compliance scorecard. Never
     raises into the freshness guard. Emitted on the probed / already-fresh paths so
     the positive is recorded whenever posture is finalized for the domain and a shell
-    is in scope.
+    is in scope. ``record_evidence=False`` (a recheck) records nothing: the scan's
+    report is never rewritten by a later run.
     """
+    if not record_evidence:
+        return
     try:
         from adscan_internal.services.positive_control_evidence import (
             emit_password_policy_positive,
@@ -194,6 +252,7 @@ async def ensure_posture_fresh(
     render_ui: bool = True,
     force: bool = False,
     probe_runner: Optional[ProbeRunner] = None,
+    record_evidence: bool = True,
 ) -> PostureFreshness:
     """Idempotent posture freshness guard. Safe to call from any consumer.
 
@@ -208,6 +267,9 @@ async def ensure_posture_fresh(
         force: Force re-probe even if posture is fresh. Used by ``posture probe``.
         probe_runner: Injectable probe orchestrator. Defaults to
             ``arun_posture_probe`` from posture_probe_lifecycle.
+        record_evidence: When False, the guard never writes positive control
+            evidence into the scan's technical report (used by a recheck, which
+            states its observations in its own run record).
 
     Returns:
         :class:`PostureFreshness` with outcome + results + elapsed time.
@@ -265,10 +327,30 @@ async def ensure_posture_fresh(
             if effective_phase == ProbePhase.UNAUTH
             else _AUTH_CATEGORIES
         )
+        # Probes the scan policy switched off are not "missing": they are never
+        # sent, so they neither force a probe run nor count as fresh. When every
+        # probe the runner could send is off, nothing runs at all.
+        excluded = posture_categories_excluded_by_policy(shell, explain=False)
+        runnable = (
+            _UNAUTH_CATEGORIES
+            if effective_phase == ProbePhase.UNAUTH
+            else (_AUTH_CATEGORIES | _UNAUTH_CATEGORIES)
+        )
+        if excluded and not (runnable - excluded):
+            posture_categories_excluded_by_policy(shell, explain=True)
+            return PostureFreshness(
+                domain=domain_str,
+                phase=effective_phase,
+                outcome=FreshnessOutcome.SKIPPED_BY_POLICY,
+                elapsed_s=time.monotonic() - started,
+            )
+        relevant = frozenset(relevant - excluded)
 
         if not force and posture is not None:
             if all(_is_category_fresh(posture.get(cat)) for cat in relevant):
-                _emit_positive_control_evidence(shell, domain_str)
+                _emit_positive_control_evidence(
+                    shell, domain_str, record_evidence=record_evidence
+                )
                 return PostureFreshness(
                     domain=domain_str,
                     phase=effective_phase,
@@ -322,7 +404,9 @@ async def ensure_posture_fresh(
             f"[posture_orchestration] probed domain={domain_str} "
             f"phase={effective_phase.value} results={len(results_tuple)}"
         )
-        _emit_positive_control_evidence(shell, domain_str)
+        _emit_positive_control_evidence(
+                    shell, domain_str, record_evidence=record_evidence
+                )
         return PostureFreshness(
             domain=domain_str,
             phase=effective_phase,
@@ -338,4 +422,5 @@ __all__ = [
     "ProbeRunner",
     "clear_session_cache",
     "ensure_posture_fresh",
+    "posture_categories_excluded_by_policy",
 ]

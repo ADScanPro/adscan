@@ -90,7 +90,9 @@ def run_esc14_confirmation_phase(
             return  # no ESC14 candidate in this domain
 
         marked_domain = mark_sensitive(domain, "domain")
-        username, secret = resolve_reading_credential(shell, domain, credential)
+        username, secret = resolve_reading_credential(
+            shell, domain, credential, auth_domain=auth_domain
+        )
 
         # Opt-out / no usable credential: never read, leave every edge pending.
         if esc14_confirmation_disabled():

@@ -11,6 +11,7 @@ import base64
 import contextlib
 import hashlib
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -49,6 +50,32 @@ from adscan_internal.services.auth_error_classification import (
 )
 
 _EMPTY_LM_HASH = "aad3b435b51404eeaad3b435b51404ee"
+
+#: A query that runs on the far side of a linked server: ``EXEC (...) AT [link]``
+#: or ``OPENQUERY(link, ...)``. Matched on the final T-SQL text, so every caller
+#: (collector probes, attack steps, the token-theft payloads) is held to the
+#: engagement scope.
+_AT_LINK_RE = re.compile(r"\bAT\s*\[((?:[^\]]|\]\])+)\]", re.IGNORECASE)
+_OPENQUERY_RE = re.compile(
+    r"\bOPENQUERY\s*\(\s*(?:\[((?:[^\]]|\]\])+)\]|([A-Za-z0-9_.\-]+))", re.IGNORECASE
+)
+
+
+def referenced_linked_servers(query: str) -> list[str]:
+    """Linked-server names a T-SQL text executes on, in order, without duplicates."""
+    names: list[str] = []
+    for match in _AT_LINK_RE.finditer(query or ""):
+        names.append(match.group(1).replace("]]", "]"))
+    for match in _OPENQUERY_RE.finditer(query or ""):
+        names.append((match.group(1) or match.group(2) or "").replace("]]", "]"))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in names:
+        key = name.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(name.strip())
+    return unique
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +156,12 @@ class ImpacketMSSQLBackend:
         # penalty), timing out the whole instance and emitting ZERO edges. Once set,
         # ``execute_query`` skips the Kerberos attempt and goes straight to NTLM.
         self._kerberos_infra_failed = False
+        # ``sys.servers`` data source per linked-server name on THIS instance,
+        # read once (a local read) for the engagement-scope check of the far side.
+        self._linked_data_sources: dict[str, str] = {}
+        # The domain of this instance: its computer inventory resolves a link
+        # whose data source is a bare name or an IP.
+        self._domain = str(domain or "").strip()
 
     @staticmethod
     def _default_client_factory(host: str, port: int, remote_name: str) -> Any:
@@ -177,6 +210,23 @@ class ImpacketMSSQLBackend:
         if ntlm_fallback_secret is None:
             ntlm_fallback_secret = self._ntlm_fallback_secret
         final_query = self._wrap_linked_query(query, linked_server)
+        refused = self._linked_server_scope_refusal(
+            final_query,
+            domain=domain,
+            username=username,
+            secret=secret,
+            timeout=timeout,
+            use_kerberos=use_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+        )
+        if refused:
+            return NativeMSSQLQueryResult(
+                success=False,
+                query=final_query,
+                rows=[],
+                stderr=refused,
+                error_message=refused,
+            )
         started_at = time.perf_counter()
         final_error: Exception | None = None
         # Resolve the NTLM fallback secret (password / NT hash) usable for an NTLM
@@ -635,7 +685,86 @@ class ImpacketMSSQLBackend:
             method=results[-1].method if results else None,
         )
 
+    def _guard_target(
+        self, *, domain: str, username: str, secret: str, use_kerberos: bool
+    ) -> "tuple[str, str, str] | None":
+        """``(realm, principal, secret)`` for the lockout guard, or ``None``.
+
+        * A ccache sends no secret (its AS exchange, if any, went through the
+          Kerberos seam) and is not judged.
+        * A Kerberos login with a password or hash is judged where the AS
+          exchange happens: impacket ``getKerberosTGT``, wrapped by
+          ``impacket_auth_guard``. It is not judged twice here.
+        * An integrated (NTLM) login is judged against the domain ledger, or the
+          host's own ledger for a local account (domain ``"."``).
+        * A SQL login (no domain) is not a domain principal: it is judged
+          against the instance's own ledger and never shares the domain budget.
+        """
+        if self._is_ccache_secret(secret):
+            return None
+        if not str(username or "").strip():
+            return None
+        from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+            local_realm,
+            sql_login_realm,
+        )
+
+        realm = str(domain or "").strip()
+        if not realm:
+            return sql_login_realm(self.host, self.port), str(username), str(secret or "")
+        if use_kerberos:
+            return None
+        if realm == ".":
+            realm = local_realm(self.host)
+        return realm, str(username), str(secret or "")
+
     def _authenticate(
+        self,
+        client: Any,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        use_kerberos: bool = False,
+    ) -> bool:
+        """Authenticate behind the sign-in lockout guard.
+
+        The guard refuses a known-bad secret, an unusable account, a principal at
+        its failure budget or an empty secret BEFORE anything is sent, and the
+        reply is classified by ``adscan_core.auth_outcome.classify_tds_login``.
+        SQL Server hides why a login failed (18456 state 1, 18452 for an
+        integrated logon), so a plain failure is UNKNOWN and is not counted;
+        only the explicit lockout / disabled / expiry replies and a success
+        change the ledger.
+        """
+        from adscan_core import auth_attempt_guard  # noqa: PLC0415
+        from adscan_core.auth_outcome import SUCCESS, classify_tds_login  # noqa: PLC0415
+        from adscan_internal.services.impacket_auth_guard import (  # noqa: PLC0415
+            install_impacket_auth_guard,
+        )
+
+        install_impacket_auth_guard()
+        target = self._guard_target(
+            domain=domain, username=username, secret=secret, use_kerberos=use_kerberos
+        )
+        if target is not None:
+            auth_attempt_guard.check_attempt(*target)
+        authenticated = self._authenticate_unguarded(
+            client,
+            domain=domain,
+            username=username,
+            secret=secret,
+            use_kerberos=use_kerberos,
+        )
+        if target is not None:
+            if authenticated:
+                auth_attempt_guard.record_verdict(*target, SUCCESS)
+            else:
+                reply, _infos = self._collect_reply_messages(client)
+                auth_attempt_guard.record_verdict(*target, classify_tds_login(reply))
+        return authenticated
+
+    def _authenticate_unguarded(
         self,
         client: Any,
         *,
@@ -867,6 +996,107 @@ class ImpacketMSSQLBackend:
             with contextlib.suppress(Exception):
                 return base64.b64decode(value, validate=True)
         return None
+
+    def _linked_server_scope_refusal(
+        self,
+        final_query: str,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int,
+        use_kerberos: bool,
+        allow_ntlm_fallback: bool,
+    ) -> str:
+        """Refuse a query whose far side the engagement keeps closed ("" = allowed).
+
+        Every query reaches the wire through :meth:`execute_query`, so this is
+        the one seam no caller can bypass. A linked server's host is resolved
+        from this instance's own ``sys.servers`` (a local read, cached) and
+        judged by ``engagement_scope.linked_server_query_refusal``: it must be
+        in the engagement scope, during a collection's read-only probes and an
+        attack step alike. A host whose domain cannot be determined is refused.
+        """
+        from adscan_internal.services import engagement_scope  # noqa: PLC0415
+
+        if not engagement_scope.linked_server_gate_active():
+            return ""
+        for name in referenced_linked_servers(final_query):
+            data_source = self._linked_server_data_source(
+                name,
+                domain=domain,
+                username=username,
+                secret=secret,
+                timeout=timeout,
+                use_kerberos=use_kerberos,
+                allow_ntlm_fallback=allow_ntlm_fallback,
+            )
+            verdict = engagement_scope.linked_server_query_refusal(
+                data_source=data_source, inventory_domain=self._domain or None
+            )
+            if verdict is not None:
+                print_info_debug(
+                    "mssql_native: query through linked server not sent: "
+                    f"link={mark_sensitive(name, 'hostname')} "
+                    f"host={mark_sensitive(verdict.host or '?', 'hostname')} "
+                    f"reason={verdict.reason}"
+                )
+                return (
+                    f"Not sent: linked server {name} ({verdict.host or 'unknown host'}) "
+                    f"is not checked from here ({verdict.reason})."
+                )
+        return ""
+
+    def linked_server_data_source(
+        self, name: str, *, domain: str, username: str, secret: str, timeout: int = 30
+    ) -> str:
+        """The host ``data_source`` this instance records for linked server ``name``.
+
+        A local ``sys.servers`` read (nothing runs on the linked host). ``""``
+        when the link is unknown or the read failed.
+        """
+        return self._linked_server_data_source(
+            name,
+            domain=domain,
+            username=username,
+            secret=secret,
+            timeout=timeout,
+            use_kerberos=False,
+            allow_ntlm_fallback=False,
+        )
+
+    def _linked_server_data_source(
+        self,
+        name: str,
+        *,
+        domain: str,
+        username: str,
+        secret: str,
+        timeout: int,
+        use_kerberos: bool,
+        allow_ntlm_fallback: bool,
+    ) -> str:
+        """The ``data_source`` this instance's ``sys.servers`` records for ``name``."""
+        key = name.strip().lower()
+        if key in self._linked_data_sources:
+            return self._linked_data_sources[key]
+        literal = self._escape_tsql_literal(name.strip())
+        result = self.execute_query(
+            domain=domain,
+            username=username,
+            secret=secret,
+            query=f"SELECT data_source FROM sys.servers WHERE name = N'{literal}'",
+            timeout=timeout,
+            use_kerberos=use_kerberos,
+            allow_ntlm_fallback=allow_ntlm_fallback,
+        )
+        data_source = ""
+        if result.success and result.rows:
+            data_source = str(result.rows[0].get("data_source") or "").strip()
+        if result.success:
+            # Only a completed read is cached: a failed one is retried next time.
+            self._linked_data_sources[key] = data_source
+        return data_source
 
     @staticmethod
     def _wrap_linked_query(query: str, linked_server: str | None) -> str:

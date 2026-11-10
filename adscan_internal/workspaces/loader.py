@@ -6,6 +6,8 @@ them to the CLI shell instance, including DNS reconfiguration and telemetry upda
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import json
 import os
 import time
@@ -31,6 +33,7 @@ from adscan_internal.rich_output import (
     print_warning_verbose,
 )
 from adscan_internal.interaction import is_non_interactive
+from adscan_internal.services.listener_ip import myip_is_declared
 from rich.prompt import Confirm, Prompt
 from adscan_internal.workspaces.io import read_json_file
 from adscan_internal.workspaces.state import apply_workspace_variables_to_shell
@@ -80,6 +83,38 @@ def _reconcile_loaded_credential_stores(shell: Any) -> None:
         )
 
 
+def _announce_secret_purge(workspace_path: str) -> None:
+    """Say so when recovered credentials were removed from this workspace.
+
+    The next scan cannot reuse a foothold the earlier runs recovered, so the
+    operator hears it once, at load, before choosing what to run.
+    """
+    try:
+        from adscan_core.workspace_secret_purge import read_purge_records  # noqa: PLC0415
+
+        records = read_purge_records(workspace_path)
+    except Exception as exc:  # noqa: BLE001 - an unreadable record must not block a load
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return
+    if not records:
+        return
+    last = records[-1]
+    when = str(last.get("at") or "")[:10] or "an earlier date"
+    print_info(purge_notice_text(when))
+
+
+def purge_notice_text(when: str) -> str:
+    """The load-time notice for a workspace whose recovered credentials were removed."""
+    return (
+        f"Recovered credentials were removed from this workspace on {when}. Findings, "
+        "attack paths and the engagement history are still here. A new scan starts from "
+        "the credential you give it and recovers the rest again wherever the route still "
+        "works. A route that started from a removed credential is reported as not "
+        "re-checked when the scan cannot recover it."
+    )
+
+
 def _apply_workspace_name_inference(shell: Any) -> None:
     """Populate lab inference metadata from the workspace name if not already known.
 
@@ -103,7 +138,8 @@ def _apply_workspace_name_inference(shell: Any) -> None:
         return  # Already known — nothing to do
 
     workspace_name = str(getattr(shell, "current_workspace", None) or "").strip()
-    if not workspace_name or getattr(shell, "type", None) != "ctf":
+    # Lab identification from the workspace name is genuinely environment.
+    if not workspace_name or not policy_settings.is_lab(shell):
         return
 
     try:
@@ -160,7 +196,6 @@ class WorkspaceLoaderShell(Protocol):
     telemetry: bool
     variables: dict[str, Any] | None
 
-    def _clean_netexec_workspaces(self, *, use_sudo_if_needed: bool = True) -> bool: ...
     def do_cd(self, path: str) -> None: ...
     def do_update_resolv_conf(self, domain_pdc: str) -> bool: ...
     def convert_hostnames_to_ips_and_scan(
@@ -617,7 +652,16 @@ def _build_workspace_dns_repair_network_context(shell: WorkspaceLoaderShell) -> 
     current_ip = str(staleness.get("current_ip") or "").strip()
     if current_ip:
         marked_current_ip = mark_sensitive(current_ip, "ip")
-        if stored_myip and current_ip != stored_myip:
+        if stored_myip and current_ip != stored_myip and myip_is_declared(shell):
+            # An operator-declared address is a decision (for example a tunnel
+            # or VPS address on no local interface), never interface drift.
+            marked_stored_myip = mark_sensitive(stored_myip, "ip")
+            lines.append(f"Declared myip: {marked_stored_myip}")
+            lines.append(
+                f"Current interface IP: {marked_current_ip} "
+                "[dim](your declared myip is kept)[/dim]"
+            )
+        elif stored_myip and current_ip != stored_myip:
             marked_stored_myip = mark_sensitive(stored_myip, "ip")
             lines.append(f"Stored myip: {marked_stored_myip}")
             lines.append(
@@ -976,8 +1020,6 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             in-memory credential store (see
             ``apply_workspace_variables_to_shell``).
     """
-    # Clean NetExec workspaces to avoid schema mismatch errors
-    shell._clean_netexec_workspaces(use_sudo_if_needed=False)
 
     print_info(f"Loading workspace data from: {workspace_path}")
     shell.do_cd(workspace_path)  # Change current directory context if necessary
@@ -1034,6 +1076,34 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             if activation_current_workspace_dir:
                 shell.current_workspace_dir = activation_current_workspace_dir
 
+            # Scan policy (scan_policy.json) and scan pace (variables.json
+            # ``pacing``): resolve them once for this workspace and publish the
+            # pace, so `start`, `execute` and every later command run under
+            # the workspace's controls. `adscan ci` re-resolves after this with
+            # its explicit configuration. Applied before anything reads the
+            # workspace type, which is derived from the policy; the stored
+            # ``type`` is a migration input only (a workspace saved before the
+            # policy carried the environment gets the built-in its type stood
+            # for, see scan_controls).
+            applied_scan_controls = None
+            try:
+                from adscan_internal.services.scan_controls import (
+                    apply_workspace_scan_controls,
+                )
+
+                applied_scan_controls = apply_workspace_scan_controls(
+                    shell,
+                    workspace_path,
+                    stored_workspace_type=variables.get("type"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_warning(
+                    "The scan policy and scan pace of this workspace could not be "
+                    "loaded. Run 'policy show' and 'show pacing' to check them."
+                )
+
             # Infer lab from workspace name, backfilling inference metadata
             # even for existing workspaces that already have lab_provider set.
             _apply_workspace_name_inference(shell)
@@ -1044,6 +1114,7 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
             # checks read it as NOT owned while its Kerberos keys sit unread
             # beside it. Restores only material the store already holds.
             _reconcile_loaded_credential_stores(shell)
+            _announce_secret_purge(workspace_path)
 
             # Update telemetry context
             telemetry_context = build_telemetry_context(
@@ -1165,6 +1236,19 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
 
             shell.variables = variables  # Store all loaded variables
             print_info(f"Variables loaded from {variables_file}")
+
+            # The scan controls were applied right after the variables (the
+            # workspace type is derived from the policy); state them here.
+            if applied_scan_controls is not None:
+                try:
+                    from adscan_internal.cli.scan_policy_cmd import (
+                        announce_workspace_scan_controls,
+                    )
+
+                    announce_workspace_scan_controls(applied_scan_controls)
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                    print_exception(exception=exc)
 
             try:
                 from adscan_internal.services.pivot_runtime_state_service import (

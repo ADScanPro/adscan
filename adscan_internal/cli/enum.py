@@ -7,6 +7,8 @@ instance (`self`) as first argument.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import os
 
 from rich.prompt import Prompt
@@ -38,7 +40,24 @@ from adscan_core.rich_output_collection import (
 
 
 def ask_for_enum_shares(self, domain: str, username: str, password: str) -> None:
-    """Prompt user to enumerate SMB shares with authenticated access."""
+    """Prompt user to enumerate SMB shares with authenticated access.
+
+    Consent seam of ``module:new_credential.share_access`` (re-running the share
+    collection as this account; it also needs ``module:domain_collection.shares``).
+    Off: nothing is asked and nothing is sent. The default is yes only under a
+    scan policy in force, so an unattended run maps shares only when the policy
+    turns the check on.
+    """
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+        policy_active,
+    )
+
+    if not gate_check_runner(self, NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID):
+        return
     pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
 
     if confirm_operation(
@@ -50,7 +69,7 @@ def ask_for_enum_shares(self, domain: str, username: str, password: str) -> None
             "Username": username,
             "Credential Type": "Hash" if self.is_hash(password) else "Password",
         },
-        default=True,
+        default=policy_active(self),
         icon="📁",
     ):
         self.smb_auth_shares(domain, username, password)
@@ -661,7 +680,7 @@ def execute_generate_relay_list(self, domain: str) -> None:
         print_exception(show_locals=False, exception=e)
 
 
-def _cve_scope_summary(*, has_credentials: bool) -> str:
+def _cve_scope_summary(*, has_credentials: bool, shell: object = None) -> str:
     """Return the operator-facing CVE list for the DC-scoped confirmation panel.
 
     Data-driven from the native CVE catalog so the panel can never drift
@@ -677,6 +696,8 @@ def _cve_scope_summary(*, has_credentials: bool) -> str:
         has_credentials: Whether a domain credential is available for the
             scan (drops auth-only checks from the displayed list when
             ``False``).
+        shell: The pentest shell; when it carries a scan policy, the probes
+            the policy excludes are dropped so the panel lists only what runs.
 
     Returns:
         A comma-separated, human-readable CVE list (e.g.
@@ -684,11 +705,14 @@ def _cve_scope_summary(*, has_credentials: bool) -> str:
     """
 
     from adscan_internal.services.cve_scanner.catalog import cves_for_target
+    from adscan_internal.services.scan_policy_enforcement import cve_excluded
 
     akas: list[str] = []
     seen: set[str] = set()
     for cve in cves_for_target(is_dc=True):
         if cve.requires_auth and not has_credentials:
+            continue
+        if shell is not None and cve_excluded(shell, cve.id):
             continue
         if cve.aka not in seen:
             seen.add(cve.aka)
@@ -701,9 +725,9 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
     from adscan_internal.services.scan_phases import phase_is_enabled
 
     if not phase_is_enabled(self, "audit_extras"):
-        from adscan_core.rich_output import print_info
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
 
-        print_info("CVE Verification skipped (disabled in scan configuration).")
+        announce_phase_skip(self, "audit_extras", label="CVE Verification")
         return
     if self.auto:
         # CVE target scope (audit_extras.target_scope). ``default`` keeps today's
@@ -716,7 +740,7 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
         self.do_enum_cve_dcs(target_domain)
         run_all_hosts = (
             scope == "all_hosts"
-            or (scope == "default" and self.type == "audit")
+            or (scope == "default" and policy_settings.runs_full_assessment(self))
         )
         if run_all_hosts:
             self.do_enum_cve_all(target_domain)
@@ -730,7 +754,9 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
         # (the auth domain's user), so the CVE scope + panel reflect that rather than
         # falling to an anonymous "N/A".
         username = resolve_effective_username_for_domain(self, target_domain)
-        cves_to_check = _cve_scope_summary(has_credentials=username != "N/A")
+        cves_to_check = _cve_scope_summary(
+            has_credentials=username != "N/A", shell=self
+        )
 
         if confirm_operation(
             operation_name="CVE Enumeration",
@@ -748,8 +774,8 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
             icon="🐛",
             show_panel=True,
         ):
-            if self.type == "ctf":
-                # CTF mode: only enumerate DCs to save time
+            if policy_settings.aims_at_domain_compromise(self):
+                # Domain-compromise objective: only enumerate DCs to save time
                 self.do_enum_cve_dcs(target_domain)
             else:
                 # Show menu for scope selection

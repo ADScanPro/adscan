@@ -16,7 +16,14 @@ Construct via the named factories:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from adscan_core.scan_pacing import active_pacing, component_pacing
+
+
+def _pacing_page_size() -> int:
+    """LDAP page size from the scan pacing (``ldap.paged_search``)."""
+    return int(component_pacing(active_pacing(), "ldap.paged_search")["page_size"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +51,8 @@ class LDAPCollectionScope:
     max_users: int | None = None
     max_groups: int | None = None
     max_computers: int | None = None
-    paged_size: int = 1000
+    # Page size from the scan pacing (``ldap.paged_search``: 1000 at the default level).
+    paged_size: int = field(default_factory=_pacing_page_size)
 
     # ------------------------------------------------------------------ #
     # Convenience

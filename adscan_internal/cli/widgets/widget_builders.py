@@ -14,7 +14,10 @@ carry no offensive-tool names.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Iterable
+
+from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
 
 from adscan_internal.cli.widgets.widget_contract import (
     FindingRow,
@@ -58,6 +61,29 @@ _HYGIENE_CATEGORY_LABELS: dict[str, str] = {
     "weak_password_policy": "Weak password policy",
     "pwd_policy_never_modified": "Password policy never modified",
 }
+
+
+
+def hygiene_category_label(category: str) -> str:
+    """Client-facing label for a hygiene finding category, never the raw key.
+
+    The short panel label wins when one is curated above. Otherwise the
+    finding catalog's name is used: the registry-hardening categories are named
+    after their catalog key, so a category added to the analyser shows its real
+    name instead of ``snake_case``. A category in neither place still renders
+    as words, so the panel can never print an internal identifier.
+    """
+    curated = _HYGIENE_CATEGORY_LABELS.get(category)
+    if curated:
+        return curated
+    entry = VULN_CATALOG_META.get(category)
+    if isinstance(entry, Mapping):
+        name = str(entry.get("name") or entry.get("title") or "").strip()
+        if name:
+            return name
+    words = category.replace("_", " ").strip()
+    return words[:1].upper() + words[1:] if words else category
+
 
 _USER_HYGIENE_CATS = frozenset(
     {"stale_user", "pwd_never_expires", "pwd_predates_policy", "passwd_notreqd"}
@@ -104,7 +130,7 @@ def build_hygiene_widget(
     for cat, items in by_category.items():
         if not cat:
             continue
-        label = _HYGIENE_CATEGORY_LABELS.get(cat, cat)
+        label = hygiene_category_label(cat)
         worst = min(
             (str(getattr(f, "severity", "info")) for f in items),
             key=lambda s: _SEVERITY_ORDER.get(s, 9),

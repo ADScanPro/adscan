@@ -1,37 +1,59 @@
 """Shared :445 NTLM-capture listener broker.
 
-One process-wide owner of a SINGLE ``NativeListenerCapture`` per bind IP, so
-every coercion vector — broadcast poisoning, the write-share bait job, and the
-NTLM auth-type sweep — CONSUMES one listener instead of each trying to ``bind()``
-:445 independently (which collides: ``[Errno 98] address already in use`` — the
-exact prod bug where poisoning held :445 and the NTLM auth-type sweep was
-silently dropped from an audit).
+One process-wide owner of the :445 ``NativeListenerCapture`` socket(s), so every
+coercion vector (broadcast poisoning, the write-share bait job, the NTLM
+auth-type sweep, a single coercion probe) CONSUMES a shared listener instead of
+each trying to ``bind()`` :445 independently, which collides with
+``[Errno 98] address already in use`` (the prod bug where poisoning held :445 and
+the NTLM auth-type sweep was silently dropped from an audit).
 
-**Refcounted.** The listener starts on the FIRST ``acquire`` and stops only on
-the LAST ``release`` — so stopping one consumer (e.g. ``stop_poisoning``) never
-tears :445 down while another consumer (e.g. the write-share bait) still needs
-it, in ANY launch/stop ordering.
+**Bind is the broker's decision, advertise is the consumer's.** A consumer hands
+the broker the LOCAL address its callback will land on (``bind_ip``, or a
+wildcard when it has no single one). That is a statement about where the target
+connects, not an instruction for the socket. The broker binds the WILDCARD of
+that address family first, which serves every local address at once. On a
+multi-NIC appliance (one NIC per client segment) that is what lets a coercion
+toward segment A and one toward segment B share one listener: the old broker
+bound the first consumer's concrete address and refused every other address, so
+a coercion toward the second segment had no listener and the refusal was a debug
+line. The relay listeners already bind the wildcard for the same reason
+(``esc_relay``, ``relay_rbcd``).
 
-**Fan-out.** A single internal poll thread drains the listener's capture queue
-(``wait_for_capture`` with NO username filter — every raw observation) and
-dispatches each capture to EVERY registered sink. Each consumer's sink applies
-its own relevance filter and de-duplication; the broker itself is
-capture-agnostic (it does not know or care which coercion produced the auth —
-the victim just connected to :445).
+**Contention fallback.** When the wildcard bind is refused with ``EADDRINUSE``
+(a local SMB service already holds :445 on one address), the broker binds the
+consumer's own concrete address instead, one listener per address, so each
+segment still gets served on the address its targets call. A consumer that asked
+for the wildcard cannot be served by one address and is refused. Every refusal
+is recorded with a classified reason (:meth:`last_refusal`) so the caller can
+tell the operator why, instead of the capture vanishing.
 
-The broker NEVER prints and NEVER raises into its callers — a sink that throws is
-captured to telemetry and the other sinks still run. It lives on the shell
-(one broker per session) via :func:`get_or_create_capture_broker`, mirroring
-``get_or_create_registry``.
+**Refcounted.** A listener starts on the first ``acquire`` that needs it and
+stops only when the last consumer it serves releases, so stopping one consumer
+(``stop_poisoning``) never tears :445 down while another (the write-share bait)
+still needs it, in any launch/stop ordering.
+
+**Fan-out.** One poll thread per listener drains its capture queue
+(``wait_for_capture`` with no username filter) and dispatches each capture to
+EVERY registered sink. Each sink applies its own relevance filter and
+de-duplication; the broker itself is capture-agnostic.
+
+The broker NEVER prints user-facing output and NEVER raises into its callers: a
+sink that throws is captured to telemetry and the other sinks still run. It lives
+on the shell (one broker per session) via :func:`get_or_create_capture_broker`,
+mirroring ``get_or_create_registry``. Cross-platform: binding ``0.0.0.0`` is the
+same stdlib call on Windows, and the classified errno codes come from
+``NativeListenerCapture.describe_start_error``, which reads portable ``errno``
+names.
 """
 from __future__ import annotations
 
+import ipaddress
 import threading
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_info_debug
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_info_debug
 
 #: A capture sink: called with one ``NtlmCaptureObservation`` per capture. Must
 #: not raise (a raising sink is isolated + telemetered); must not block long.
@@ -42,110 +64,265 @@ CaptureSink = Callable[[Any], None]
 #: blocking wait inside ``wait_for_capture``.
 _POLL_TIMEOUT_SECONDS = 2
 
+_IPV4_WILDCARD = "0.0.0.0"  # noqa: S104 - a capture listener serves every segment
+_IPV6_WILDCARD = "::"
+
+#: ``describe_start_error`` code for "another socket already holds the port".
+_CONTENDED_CODE = "eaddrinuse"
+
+
+def _normalize(address: object) -> str:
+    """Return ``address`` as a canonical IP literal, or ``""`` when not an IP."""
+    text = str(address or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
+def _wildcard_for(address: str) -> str:
+    """Return the wildcard of ``address``'s family."""
+    return _IPV6_WILDCARD if ":" in address else _IPV4_WILDCARD
+
+
+def _is_wildcard(address: str) -> bool:
+    return address in (_IPV4_WILDCARD, _IPV6_WILDCARD)
+
+
+@dataclass
+class _Served:
+    """One bound listener and the consumers it serves."""
+
+    listener: Any
+    poll_thread: Optional[threading.Thread] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    consumers: set[str] = field(default_factory=set)
+
 
 class SharedCaptureListenerBroker:
-    """Refcounted owner of one :445 ``NativeListenerCapture`` with sink fan-out."""
+    """Refcounted owner of the :445 capture listener(s) with sink fan-out."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, port: int = 445) -> None:
         self._lock = threading.RLock()
-        self._listener: Any = None
-        self._bind_ip: Optional[str] = None
+        self._port = int(port)
+        self._served: dict[str, _Served] = {}  # bound address -> listener
+        self._consumer_bind: dict[str, str] = {}  # consumer -> bound address
         self._sinks: dict[str, CaptureSink] = {}
-        self._poll_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
+        self._refusals: dict[str, tuple[str, str]] = {}
 
     # ── public API ──────────────────────────────────────────────────────────
 
     def acquire(self, consumer_id: str, *, bind_ip: str, on_capture: CaptureSink) -> bool:
-        """Register ``consumer_id``; start the shared listener if it is the first.
+        """Register ``consumer_id`` against a live listener that serves ``bind_ip``.
 
-        Returns ``True`` when the consumer is registered against a live listener.
-        Returns ``False`` (registering nothing) when the listener cannot bind, or
-        when a DIFFERENT ``bind_ip`` is requested than the one already serving
-        (only one :445 per host — the caller should reuse the active bind IP).
-        Idempotent per ``consumer_id``: re-acquiring updates the sink in place.
+        Args:
+            consumer_id: Stable id of the consumer (``poisoning@eth1``, ...).
+            bind_ip: The LOCAL address this consumer's callback lands on, or a
+                wildcard when it has no single one. It is where the target
+                connects, never the socket's bind address: the broker binds the
+                wildcard whenever it can (see the module docstring).
+            on_capture: The consumer's capture sink.
+
+        Returns:
+            ``True`` when the consumer is registered against a live listener.
+            ``False`` when no listener can serve it; :meth:`last_refusal` then
+            holds the classified reason. Idempotent per ``consumer_id``:
+            re-acquiring updates the sink in place.
         """
         cid = str(consumer_id or "").strip()
-        ip = str(bind_ip or "").strip()
-        if not cid or not ip:
+        requested = _normalize(bind_ip)
+        if not cid:
             return False
-        with self._lock:
-            if self._listener is not None and self._bind_ip and ip != self._bind_ip:
-                print_info_debug(
-                    f"capture-broker: consumer {cid} asked for bind {ip} but the "
-                    f"shared listener is already on {self._bind_ip}; refusing (one "
-                    ":445 per host)."
+        if not requested:
+            with self._lock:
+                self._refusals[cid] = (
+                    "no_address",
+                    f"no valid local callback address was given ({bind_ip!r})",
                 )
-                return False
-
-            if self._listener is None:
-                listener = self._make_listener(ip)
-                if listener is None or not self._start_listener(listener):
+            return False
+        to_stop: Optional[tuple[_Served, str]] = None
+        with self._lock:
+            address = self._serving_address_locked(requested)
+            if address is None:
+                address, refusal = self._bind_for_locked(requested)
+                if address is None:
+                    self._refusals[cid] = refusal
+                    print_info_debug(
+                        f"capture-broker: consumer {cid} refused for {requested}: "
+                        f"{refusal[0]}"
+                    )
                     return False
-                self._listener = listener
-                self._bind_ip = ip
-                self._stop_event.clear()
-                self._start_poll_thread()
-                print_info_debug(f"capture-broker: shared :445 listener started on {ip}")
 
+            previous = self._consumer_bind.get(cid)
+            if previous is not None and previous != address:
+                to_stop = self._detach_locked(cid)
+            self._served[address].consumers.add(cid)
+            self._consumer_bind[cid] = address
             self._sinks[cid] = on_capture
+            self._refusals.pop(cid, None)
             print_info_debug(
-                f"capture-broker: consumer {cid} acquired (refcount={len(self._sinks)})"
+                f"capture-broker: consumer {cid} acquired on {address} "
+                f"(callback address {requested}, refcount={len(self._sinks)})"
             )
-            return True
+        if to_stop is not None:
+            self._shutdown(*to_stop)
+        return True
 
     def release(self, consumer_id: str) -> None:
-        """Unregister ``consumer_id``; stop the listener when it was the last one."""
+        """Unregister ``consumer_id``; stop a listener once it serves nobody."""
         cid = str(consumer_id or "").strip()
         with self._lock:
             if cid not in self._sinks:
                 return
             self._sinks.pop(cid, None)
+            to_stop = self._detach_locked(cid)
             print_info_debug(
                 f"capture-broker: consumer {cid} released (refcount={len(self._sinks)})"
             )
-            if self._sinks:
-                return  # others still need :445 — keep it up (the ordering guarantee)
-            self._shutdown_listener_locked()
+        if to_stop is not None:
+            self._shutdown(*to_stop)
 
     def is_active(self) -> bool:
-        """True when the shared listener is bound and at least one consumer holds it."""
+        """True when a listener is bound and at least one consumer holds it."""
         with self._lock:
-            return self._listener is not None and bool(self._sinks)
+            return bool(self._served) and bool(self._sinks)
 
     def consumers(self) -> list[str]:
         with self._lock:
             return sorted(self._sinks.keys())
 
-    def bind_ip(self) -> Optional[str]:
-        """The IP the shared listener is currently bound to (None when down)."""
+    def bound_addresses(self) -> list[str]:
+        """Every local address a listener is bound to right now, sorted."""
         with self._lock:
-            return self._bind_ip
+            return sorted(self._served.keys())
 
-    def active_listener(self) -> Any:
-        """The live ``NativeListenerCapture`` (or None) for READ-ONLY use.
+    def bind_ip(self) -> Optional[str]:
+        """The primary bound address (the wildcard when bound), ``None`` when down."""
+        with self._lock:
+            for wildcard in (_IPV4_WILDCARD, _IPV6_WILDCARD):
+                if wildcard in self._served:
+                    return wildcard
+            return min(self._served) if self._served else None
 
-        For consumers that read the listener's append-only ``_observed`` buffer —
-        ``make_capture_signal`` / ``observed`` / ``connection_stats`` — which are
-        NOT consumed by the broker's queue-draining poll loop, so they are safe to
-        call alongside it. **NEVER call ``wait_for_capture`` on the returned
-        listener** — that drains the shared queue and races the broker's fan-out.
-        The caller MUST still hold the listener via ``acquire`` (refcount) for its
-        lifetime; this only exposes the object for the read-side operations the
-        broker's sink API cannot express.
+    def last_refusal(self, consumer_id: str) -> Optional[tuple[str, str]]:
+        """``(code, operator_message)`` for the consumer's last refused acquire.
+
+        ``code`` is host-free (``eaddrinuse`` / ``eacces`` / ``eaddrnotavail`` /
+        ``other`` / ``no_address``) and safe for telemetry; the message is an
+        operator string. ``None`` when the last acquire succeeded or never ran.
         """
         with self._lock:
-            return self._listener
+            return self._refusals.get(str(consumer_id or "").strip())
+
+    def listener_for(self, consumer_id: str) -> Any:
+        """The live listener serving ``consumer_id`` (or ``None``), READ-ONLY.
+
+        For consumers that read the listener's append-only ``_observed`` buffer
+        (``make_capture_signal`` / ``drain_observations`` / ``connection_stats``),
+        which the broker's queue-draining poll loop does NOT consume. **NEVER call
+        ``wait_for_capture`` on it**: that drains the shared queue and races the
+        fan-out. The caller must hold the listener via ``acquire`` for as long as
+        it uses it.
+        """
+        with self._lock:
+            address = self._consumer_bind.get(str(consumer_id or "").strip())
+            served = self._served.get(address) if address else None
+            return served.listener if served is not None else None
+
+    def active_listener(self) -> Any:
+        """The primary live listener (or ``None``); same rules as :meth:`listener_for`.
+
+        Kept for callers that predate per-consumer listeners. Prefer
+        :meth:`listener_for`, which is right when the wildcard was contended and
+        each segment has its own listener.
+        """
+        with self._lock:
+            address = self.bind_ip()
+            return self._served[address].listener if address else None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "active": self._listener is not None,
-                "bind_ip": self._bind_ip,
+                "active": bool(self._served),
+                "bind_ip": self.bind_ip(),
+                "bound_addresses": sorted(self._served.keys()),
                 "consumers": sorted(self._sinks.keys()),
             }
 
     # ── internals ───────────────────────────────────────────────────────────
+
+    def _serving_address_locked(self, requested: str) -> Optional[str]:
+        """Return the bound address that already serves ``requested``, if any."""
+        wildcard = _wildcard_for(requested)
+        if wildcard in self._served:
+            return wildcard
+        if requested in self._served:
+            return requested
+        return None
+
+    def _bind_for_locked(self, requested: str) -> tuple[Optional[str], tuple[str, str]]:
+        """Bind a listener that serves ``requested``: wildcard first, then itself."""
+        wildcard = _wildcard_for(requested)
+        ok, refusal = self._start_locked(wildcard)
+        if ok:
+            return wildcard, ("none", "")
+        if refusal[0] != _CONTENDED_CODE or _is_wildcard(requested):
+            return None, refusal
+        print_info_debug(
+            f"capture-broker: {wildcard}:{self._port} is held by another local "
+            f"service; binding the callback address {requested} only"
+        )
+        ok, concrete_refusal = self._start_locked(requested)
+        if ok:
+            return requested, ("none", "")
+        return None, concrete_refusal
+
+    def _start_locked(self, address: str) -> tuple[bool, tuple[str, str]]:
+        listener = self._make_listener(address)
+        if listener is None:
+            return False, ("other", "the capture listener could not be constructed")
+        if not self._start_listener(listener):
+            return False, self._describe_failure(listener, address)
+        served = _Served(listener=listener)
+        self._served[address] = served
+        served.poll_thread = threading.Thread(
+            target=self._poll,
+            args=(served,),
+            name=f"shared-capture-broker-{address}",
+            daemon=True,
+        )
+        served.poll_thread.start()
+        print_info_debug(f"capture-broker: shared :{self._port} listener started on {address}")
+        return True, ("none", "")
+
+    def _describe_failure(self, listener: Any, address: str) -> tuple[str, str]:
+        describe = getattr(listener, "describe_start_error", None)
+        if callable(describe):
+            try:
+                code, message = describe()
+                if code and code != "none":
+                    return str(code), str(message)
+            except Exception as exc:  # noqa: BLE001 - observability only
+                telemetry.capture_exception(exc)
+        return "other", f"the capture listener did not start on {address}:{self._port}"
+
+    def _detach_locked(self, cid: str) -> Optional[tuple[_Served, str]]:
+        """Detach ``cid``; return the listener to stop when it served nobody else.
+
+        The caller stops it AFTER releasing the lock, so the join on the poll
+        thread (which takes the lock to snapshot sinks) cannot stall.
+        """
+        address = self._consumer_bind.pop(cid, None)
+        served = self._served.get(address) if address else None
+        if served is None or address is None:
+            return None
+        served.consumers.discard(cid)
+        if served.consumers:
+            return None
+        self._served.pop(address, None)
+        return served, address
 
     def _make_listener(self, bind_ip: str) -> Any:
         try:
@@ -153,7 +330,7 @@ class SharedCaptureListenerBroker:
                 NativeListenerCapture,
             )
 
-            return NativeListenerCapture(listen_host=bind_ip)
+            return NativeListenerCapture(listen_host=bind_ip, listen_port=self._port)
         except Exception as exc:  # noqa: BLE001 — bind/import failure must not raise out
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -170,18 +347,10 @@ class SharedCaptureListenerBroker:
             print_info_debug(f"capture-broker: listener.start() failed: {exc}")
             return False
 
-    def _start_poll_thread(self) -> None:
-        self._poll_thread = threading.Thread(
-            target=self._poll, name="shared-capture-broker", daemon=True
-        )
-        self._poll_thread.start()
-
-    def _poll(self) -> None:
-        """Drain the listener queue and fan every capture out to all sinks."""
-        listener = self._listener
-        if listener is None:
-            return
-        while not self._stop_event.is_set():
+    def _poll(self, served: _Served) -> None:
+        """Drain one listener's queue and fan every capture out to all sinks."""
+        listener = served.listener
+        while not served.stop_event.is_set():
             try:
                 obs = listener.wait_for_capture(
                     timeout_seconds=_POLL_TIMEOUT_SECONDS, expected_usernames=None
@@ -189,7 +358,7 @@ class SharedCaptureListenerBroker:
             except Exception as exc:  # noqa: BLE001 — never let a poll error kill fan-out
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
-                self._stop_event.wait(0.5)
+                served.stop_event.wait(0.5)
                 continue
             if obs is None:
                 continue
@@ -203,26 +372,20 @@ class SharedCaptureListenerBroker:
                     telemetry.capture_exception(exc)
                     print_exception(exception=exc)
 
-    def _shutdown_listener_locked(self) -> None:
-        """Stop the poll thread + listener. Caller holds ``self._lock``."""
-        self._stop_event.set()
-        listener = self._listener
-        self._listener = None
-        self._bind_ip = None
-        thread = self._poll_thread
-        self._poll_thread = None
-        # Stop the listener OUTSIDE the join so a slow listener.stop() does not
-        # deadlock with the poll thread trying to take the lock. The poll thread
-        # only reads the lock briefly to snapshot sinks; stop_event ends it.
-        if listener is not None:
-            try:
-                listener.stop()
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
+    def _shutdown(self, served: _Served, address: Optional[str]) -> None:
+        """Stop one listener and its poll thread."""
+        served.stop_event.set()
+        # The poll thread only takes the lock briefly to snapshot sinks, and the
+        # stop event ends it, so stopping the listener first cannot deadlock.
+        try:
+            served.listener.stop()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        thread = served.poll_thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=8.0)
-        print_info_debug("capture-broker: shared :445 listener stopped (refcount=0)")
+        print_info_debug(f"capture-broker: shared :{self._port} listener on {address} stopped")
 
 
 def get_or_create_capture_broker(shell: Any) -> SharedCaptureListenerBroker:

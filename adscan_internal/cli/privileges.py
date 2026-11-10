@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from typing import Any
 import os
 
@@ -1090,14 +1092,26 @@ def run_user_postauth_access(
         print_error(f"Domain {marked_domain} not found.")
         return
 
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        check_consented,
+    )
+
     marked_username = mark_sensitive(username, "user")
     marked_domain = mark_sensitive(domain, "domain")
-    response = Confirm.ask(
-        "Do you want to enumerate host/service access for user "
-        f"{marked_username} on various services on hosts? "
-        f"(⚠ WARNING: This will saturate the network if the number of hosts in domain {marked_domain} is very high)"
-    )
-    if not response:
+    # Consent seam of module:new_credential.host_access: off -> nothing asked,
+    # nothing sent; the default is yes only under a policy that turns it on.
+    if not check_consented(
+        shell,
+        NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID,
+        prompt=(
+            "Do you want to enumerate host/service access for user "
+            f"{marked_username} on various services on hosts? "
+            f"(⚠ WARNING: This will saturate the network if the number of hosts in domain {marked_domain} is very high)"
+        ),
+    ):
         return
 
     run_service_access_sweep(
@@ -1127,10 +1141,19 @@ def run_postauth_service_and_share_followup(
     This is the shared "minimal valuable" post-auth workflow reused by attack-step
     follow-ups and post-pivot follow-ups:
 
-    1. Probe service access across SMB/WinRM/RDP/MSSQL.
-    2. Enumerate authenticated SMB shares reachable by that user.
+    1. Probe service access across SMB/WinRM/RDP/MSSQL
+       (``module:new_credential.host_access``, gated in ``run_service_access_sweep``).
+    2. Enumerate authenticated SMB shares reachable by that user
+       (``module:new_credential.share_access``, which also needs the share
+       collection ``module:domain_collection.shares``).
     """
     from adscan_internal.cli.smb_shares_view import SharesViewMode, run_native_shares_view
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
 
     run_service_access_sweep(
         shell,
@@ -1142,6 +1165,8 @@ def run_postauth_service_and_share_followup(
         prompt=prompt,
         scope_preference=scope_preference,
     )
+    if not gate_check_runner(shell, NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID):
+        return
     run_native_shares_view(
         shell,
         domain=domain,
@@ -1164,13 +1189,36 @@ def run_service_access_sweep(
     include_previously_tested: bool = False,
     workflow_intent: str | None = None,
 ) -> None:
-    """Enumerate access across a set of services for one user."""
+    """Enumerate access across a set of services for one user.
+
+    The execution seam of ``module:new_credential.host_access``: when the active
+    policy switches it off, nothing is sent and the refusal is explained once.
+    Every caller (the post-auth access check, the "Check New Host Access"
+    follow-up, the post-pivot and pivot-capable access probes, ESC13) converges
+    here. The SQL Server leg is also the action of
+    ``module:domain_collection.mssql`` and is skipped when that check is off.
+    """
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID,
+        NEW_CREDENTIAL_HOST_ACCESS_SERVICE_OWNERS,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, NEW_CREDENTIAL_HOST_ACCESS_CHECK_ID):
+        return
     if domain not in shell.domains_data:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(f"Domain {marked_domain} not found.")
         return
 
     for service in services:
+        owner_check = NEW_CREDENTIAL_HOST_ACCESS_SERVICE_OWNERS.get(
+            str(service or "").strip().lower(), ""
+        )
+        if owner_check and not gate_check_runner(shell, owner_check):
+            continue
         try:
             workspace_cwd = resolve_workspace_cwd(shell)
             domains_dir = getattr(shell, "domains_dir", "domains")
@@ -1494,6 +1542,45 @@ def run_service_access_sweep(
             print_exception(show_locals=False, exception=exc)
 
 
+_NEW_CREDENTIAL_PASSWORD_REUSE = "module:new_credential.password_reuse"
+
+
+def _owned_password_reuse_consented(shell: Any, *, prompt: str) -> bool:
+    """Decide whether to spray an obtained account's own password.
+
+    The spray is the owned-credential reuse of ``module:password_spraying.reuse``;
+    offering it for each obtained account is ``module:new_credential.password_reuse``,
+    which requires the reuse check, so the trigger runs only when BOTH are on.
+    Off: nothing is asked and nothing is sent (refusal explained once). The
+    question defaults to yes only under a scan policy in force.
+    """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        check_consented,
+    )
+
+    return check_consented(shell, _NEW_CREDENTIAL_PASSWORD_REUSE, prompt=prompt, surface="spray")
+
+
+#: Every network action ``run_user_postauth_access_with_orchestration`` can start
+#: for an account, mapped to the scan-policy check that gates it, or to the
+#: reason it is not a separate check. Locked by
+#: ``tests/unit/scan_policy/test_network_actions_are_checks.py``: a new call in
+#: that function must be classified here.
+POSTAUTH_ORCHESTRATION_ACTIONS: dict[str, str] = {
+    "run_user_postauth_access": "module:new_credential.host_access",
+    "ask_for_enum_shares": "module:new_credential.share_access",
+    "spraying_with_password": "module:new_credential.password_reuse",
+    "run_enum_adcs_privs": (
+        "not a check: reads the ADCS inventory already collected; each ESC it then "
+        "offers is gated by its own technique check"
+    ),
+    "ask_for_enumerate_user_aces": (
+        "not a check: reads ACLs from the attack graph already collected; only the "
+        "REPL command and an explicit include_acl_enumeration reach it"
+    ),
+}
+
+
 def run_user_postauth_access_with_orchestration(
     shell: Any,
     *,
@@ -1562,9 +1649,10 @@ def run_user_postauth_access_with_orchestration(
                 shell, domain=domain, username=username, password=password
             )
 
-    if not (shell.type == "ctf" and shell.domains_data[domain]["auth"] == "pwned"):
+    _objective_reached = policy_settings.domain_compromise_reached(shell, domain)
+    if not _objective_reached:
         shell.ask_for_enum_shares(domain, username, password)
-    if not (shell.type == "ctf" and shell.domains_data[domain]["auth"] == "pwned"):
+    if not _objective_reached:
         if shell.is_hash(password):
             marked_username = mark_sensitive(username, "user")
             marked_domain = mark_sensitive(domain, "domain")
@@ -1577,13 +1665,17 @@ def run_user_postauth_access_with_orchestration(
             marked_password = mark_sensitive(password, "password")
             marked_username = mark_sensitive(username, "user")
             marked_domain = mark_sensitive(domain, "domain")
-            respuesta = Confirm.ask(
-                "Do you want to perform a password spraying with the "
-                f"{marked_password} password of the user {marked_username} "
-                f"in the {marked_domain} domain?"
-            )
-            if respuesta:
-                shell.spraying_with_password(domain, password)
+            if _owned_password_reuse_consented(
+                shell,
+                prompt=(
+                    "Do you want to perform a password spraying with the "
+                    f"{marked_password} password of the user {marked_username} "
+                    f"in the {marked_domain} domain?"
+                ),
+            ):
+                shell.spraying_with_password(
+                    domain, password, check_id=_NEW_CREDENTIAL_PASSWORD_REUSE
+                )
     marked_username = mark_sensitive(username, "user")
     print_success(f"Complete enumeration for user {marked_username}")
 
@@ -1723,6 +1815,33 @@ def run_raise_child(shell: Any, *, domain: str, username: str, password: str) ->
             return None
 
         parent_domain = parts[1]
+        # Engagement scope is contractual: the forest root is acted on only when
+        # it is in scope, whoever asks (an attack-path step, the post-compromise
+        # drain or a manual command).
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            gate_cross_domain_technique,
+        )
+
+        if not gate_cross_domain_technique(
+            shell,
+            technique="RaiseChild",
+            source_domain=domain,
+            target_domain=parent_domain,
+            surface="raise_child",
+        ):
+            return None
+        # krbtgt cannot sign in (disabled by design); the escalation needs a
+        # real child-domain administrator to mint the TGT it re-signs.
+        from adscan_internal.services.cross_domain_escalation import (  # noqa: PLC0415
+            is_signin_principal,
+        )
+
+        if not is_signin_principal(username):
+            print_warning(
+                "RaiseChild needs a child-domain administrator that can sign in; "
+                f"{mark_sensitive(username, 'user')} cannot authenticate."
+            )
+            return None
         child_dc_ip = shell.domains_data[domain].get("pdc")
         parent_dc_ip = shell.domains_data[parent_domain].get("pdc")
         if not child_dc_ip or not parent_dc_ip:

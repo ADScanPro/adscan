@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -72,16 +74,6 @@ class TimeroastShell(Protocol):
     def _get_workspace_cwd(self) -> str: ...
 
     def _get_graph_service(self) -> Any: ...
-
-    def _run_netexec(
-        self,
-        command: str,
-        *,
-        domain: str | None = None,
-        timeout: int | None = None,
-        pre_sync: bool = True,
-        **kwargs: object,
-    ) -> Any: ...
 
     def build_auth_nxc(
         self, username: str, password: str, domain: str, kerberos: bool = True
@@ -473,7 +465,7 @@ def _should_skip_ctf_timeroast_due_to_single_computer(
 ) -> bool:
     """Return True when CTF Timeroast should be skipped due to a trivial computer set."""
 
-    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
+    if not policy_settings.aims_at_domain_compromise(shell):
         return False
 
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
@@ -746,11 +738,16 @@ def _collect_timeroast_hashes(
     paths = _build_timeroast_paths(shell, domain)
     os.makedirs(os.path.dirname(paths["log_abs"]), exist_ok=True)
 
+    # NTP packets per second and the lag window from the scan pacing
+    # (``kdc.timeroast``: 180 packets/s and 24 s at the default level).
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    timeroast_pacing = component_pacing(active_pacing(), "kdc.timeroast")
     cfg = TimeroastConfig(
         dc_ip=pdc,
         rids=rids,
-        rate=180,
-        timeout=24.0,
+        rate=int(timeroast_pacing["rate_pps"]),
+        timeout=float(timeroast_pacing["timeout_s"]),
     )
 
     print_timeroast_preflight(
@@ -817,10 +814,24 @@ def run_timeroast_quick_win(shell: TimeroastShell, target_domain: str) -> bool:
         subphase_is_enabled,
     )
 
+    from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
     if not phase_is_enabled(shell, "quick_credential_wins"):
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="Timeroast candidate check",
+            subphase_id="timeroast",
+            config_line=False,
+        )
         return False
     if not subphase_is_enabled(shell, "quick_credential_wins", "timeroast"):
-        print_info("Timeroast candidate check skipped (disabled in scan configuration).")
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="Timeroast candidate check",
+            subphase_id="timeroast",
+        )
         return False
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.run_summary/1",
+  "title": "ADscan run summary v1",
+  "description": "The metadata projection of one run: counts, ratios, booleans and closed enums only. It names no AD object, no domain, no host and no finding key, so it is the one result document a metadata-only data policy lets leave the assessed network. Every figure is read from the same engine-stamped blocks the report renders (exposure_kpis, exposure_score, the reportable findings); the summary computes nothing of its own.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "generated_at_frame", "kind", "status", "generated_at", "domain_count", "findings", "attack_paths", "exposure", "exposure_score"],
+  "properties": {
+    "schema": {"const": "adscan.run_summary/1"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "kind": {"enum": ["scan", "recheck", "postprocess", "doctor", "deliver"]},
+    "status": {"enum": ["completed", "failed", "cancelled", "interrupted"]},
+    "generated_at_frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Which clock generated_at came from (adscan_core/reporting/clock_frame.py): the host clock may be stepped to a domain controller mid-run.",
+      "required": ["frame", "stepped"],
+      "properties": {
+        "frame": {"enum": ["target_agreed", "unverified", "mixed"]},
+        "stepped": {"type": "boolean"}
+      }
+    },
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "report_available": {"type": "boolean"},
+    "domain_count": {"$ref": "#/$defs/count"},
+    "findings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "by_severity"],
+      "properties": {
+        "total": {"$ref": "#/$defs/count"},
+        "by_severity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical", "high", "medium", "low"],
+          "properties": {
+            "critical": {"$ref": "#/$defs/count"},
+            "high": {"$ref": "#/$defs/count"},
+            "medium": {"$ref": "#/$defs/count"},
+            "low": {"$ref": "#/$defs/count"}
+          }
+        }
+      }
+    },
+    "attack_paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "total", "open_exposure", "full_domain_compromise", "proven", "partial", "closed_by_configuration", "not_assessed", "open_by_class", "coverage_mode"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "total": {"$ref": "#/$defs/count"},
+        "open_exposure": {"$ref": "#/$defs/count"},
+        "full_domain_compromise": {"$ref": "#/$defs/count"},
+        "proven": {"$ref": "#/$defs/count"},
+        "partial": {"$ref": "#/$defs/count"},
+        "closed_by_configuration": {"$ref": "#/$defs/count"},
+        "not_assessed": {"$ref": "#/$defs/count"},
+        "open_by_class": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "domain_breaker": {"$ref": "#/$defs/count"},
+            "tier0_control": {"$ref": "#/$defs/count"},
+            "tier0_foothold": {"$ref": "#/$defs/count"},
+            "privileged_escalator": {"$ref": "#/$defs/count"},
+            "compromise_enabler": {"$ref": "#/$defs/count"},
+            "unauthenticated_principal": {"$ref": "#/$defs/count"},
+            "none": {"$ref": "#/$defs/count"}
+          }
+        },
+        "coverage_mode": {"enum": ["complete", "sampled", "bounded", "mixed"]}
+      }
+    },
+    "exposure": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The headline: standard (Tier 2) user accounts holding a reachable path to Tier 0.",
+      "required": ["available", "tier2_with_path", "tier2_total", "tier2_pct"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "tier2_with_path": {"$ref": "#/$defs/count"},
+        "tier2_total": {"$ref": "#/$defs/count"},
+        "tier2_pct": {"$ref": "#/$defs/percent"}
+      }
+    },
+    "exposure_score": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "The AD Exposure Score of the most exposed assessed domain (overall and proven share).",
+      "required": ["available"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "overall_pct": {"$ref": "#/$defs/percent"},
+        "proven_pct": {"$ref": "#/$defs/percent"}
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "count": {"type": "integer", "minimum": 0},
+    "percent": {"type": "number", "minimum": 0, "maximum": 100}
+  }
+}

@@ -8,6 +8,10 @@ post-route verification remain shared.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -104,6 +108,25 @@ def is_pivoting_enabled(shell: Any) -> bool:
         ``True`` when explicitly enabled, or when unset and the workspace is
         a CTF workspace. ``False`` otherwise.
     """
+    # The scan policy is the contractual boundary and wins over the scan-config
+    # toggle and the workspace default in BOTH directions: a policy that switches
+    # ``module:network_pivot`` off (Production-sensitive, sold as "writes nothing
+    # and opens no listener") makes pivoting unavailable even if ``pivoting.enabled``
+    # was set. The recorded refusal is emitted once at the single pivot seam
+    # (``orchestrate_ligolo_pivot_tunnel``); this predicate stays silent so the
+    # mssql pre-search just never starts.
+    try:
+        from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+            NETWORK_PIVOT_CHECK_ID,
+        )
+        from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+            check_excluded,
+        )
+
+        if check_excluded(shell, NETWORK_PIVOT_CHECK_ID):
+            return False
+    except Exception:  # noqa: BLE001 — a policy lookup must never break the gate
+        pass
     try:
         scan_config = getattr(shell, "scan_config", None)
         pivoting = getattr(scan_config, "pivoting", None)
@@ -113,11 +136,8 @@ def is_pivoting_enabled(shell: Any) -> bool:
     except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
         pass
 
-    try:
-        is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-    except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
-        return False
-    return is_ctf
+    # No explicit config → the scan policy's scope-expansion setting.
+    return policy_settings.expands_scope_automatically(shell)
 
 
 def _normalize_mssql_json_stdout(stdout: str) -> str:
@@ -205,8 +225,15 @@ def _build_ligolo_interface_name(*, domain: str, pivot_host: str) -> str:
     return f"lg{digest}"[:15]
 
 
-def _resolve_ligolo_connect_host(shell: Any, *, listen_addr: str) -> str:
-    """Resolve the host/IP that remote agents should use to reach the local proxy."""
+def _resolve_ligolo_connect_host(
+    shell: Any, *, listen_addr: str, pivot_host: str | None = None
+) -> str:
+    """Resolve the host/IP that remote agents should use to reach the local proxy.
+
+    ``pivot_host`` (the host the agent runs on) lets a session that never picked a
+    network interface still answer: the address is then the one the kernel routes
+    toward that host, resolved through the listener-IP SSOT.
+    """
 
     host_part, _separator, _port_text = str(listen_addr or "").strip().rpartition(":")
     normalized_host = host_part.strip()
@@ -220,8 +247,30 @@ def _resolve_ligolo_connect_host(shell: Any, *, listen_addr: str) -> str:
     myip = check_and_refresh_myip(shell, context="Ligolo pivot")
     if myip:
         return myip
+
+    pivot_target = str(pivot_host or "").strip()
+    if pivot_target:
+        import socket  # noqa: PLC0415
+
+        from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+            is_valid_ip_literal,
+            resolve_listener_ip,
+        )
+
+        if not is_valid_ip_literal(pivot_target):
+            try:
+                pivot_target = socket.getaddrinfo(
+                    pivot_target, None, socket.AF_INET, socket.SOCK_STREAM
+                )[0][4][0]
+            except OSError:
+                pivot_target = ""
+        if pivot_target:
+            selection = resolve_listener_ip(shell, target=pivot_target)
+            if selection.resolved:
+                return str(selection.ip)
     raise RuntimeError(
-        "Cannot determine the Ligolo proxy connect IP. Configure the ADscan 'myip' variable first."
+        "Cannot determine the Ligolo proxy connect IP. Run 'set listener-ip <ip>' "
+        "to declare the address the pivot host should connect to."
     )
 
 
@@ -955,10 +1004,28 @@ def orchestrate_ligolo_pivot_tunnel(
             that reach this function through an automatic, scan-config-gated
             hook (the operator already opted in via ``pivoting.enabled``) pass
             ``True`` here so a non-interactive run proceeds instead of
-            defaulting to the manual/interactive CTF heuristic. ``None``
-            (the default) preserves today's ``shell.type == "ctf"`` behavior
-            unchanged for every existing manual caller.
+            defaulting to the manual/interactive one. ``None`` (the default)
+            follows the scan policy's ``scope_expansion`` setting for every
+            manual caller.
     """
+
+    # The single enablement seam every pivot caller converges on (WinRM and
+    # MSSQL both reach here). When the active scan policy switches
+    # ``module:network_pivot`` off, pivoting never runs: the gate refuses before
+    # any subnet is rendered, any consent is asked, any agent is uploaded, or any
+    # listener is opened. The refusal is explained and recorded once through the
+    # scan-policy notice SSOT. Without a policy (or under one that enables it) the
+    # gate passes and the flow is unchanged. This is the hard guarantee behind the
+    # Production-sensitive claim "writes nothing and opens no listener".
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NETWORK_PIVOT_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, NETWORK_PIVOT_CHECK_ID, surface="pivot"):
+        return False
 
     workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
     if not workspace_dir:
@@ -982,7 +1049,7 @@ def orchestrate_ligolo_pivot_tunnel(
     default_confirm = (
         consent_default_override
         if consent_default_override is not None
-        else str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        else policy_settings.expands_scope_automatically(shell)
     )
 
     try:
@@ -1000,7 +1067,7 @@ def orchestrate_ligolo_pivot_tunnel(
             change id was created at upload, so every cleanup path (keepalive
             exit, failed tunnel, workspace exit) settles the SAME record.
             """
-            _led = getattr(shell, "environment_change_ledger", None)
+            _led = ledger_or_warn(shell)
             if _led is None or not ligolo_agent_change_id:
                 return
             try:
@@ -1073,7 +1140,9 @@ def orchestrate_ligolo_pivot_tunnel(
 
         service.wait_for_api_ready()
         connect_host = _resolve_ligolo_connect_host(
-            shell, listen_addr=str(proxy_state.get("listen_addr") or "")
+            shell,
+            listen_addr=str(proxy_state.get("listen_addr") or ""),
+            pivot_host=pivot_host,
         )
         connect_target = (
             f"{connect_host}:{str(proxy_state.get('listen_addr') or '').rpartition(':')[2]}"
@@ -1212,7 +1281,7 @@ def orchestrate_ligolo_pivot_tunnel(
         # session that dies before the tunnel is cleaned has finalize() report
         # the staged agent manual_required naming the host path, rather than
         # the artifact only being tracked if the exit cleanup happens to run.
-        _ligolo_ledger = getattr(shell, "environment_change_ledger", None)
+        _ligolo_ledger = ledger_or_warn(shell)
         if _ligolo_ledger is not None and remote_agent_path:
             try:
                 _ligolo_unc = f"\\\\{pivot_host}\\" + remote_agent_path.replace('/', '\\')
@@ -1232,10 +1301,10 @@ def orchestrate_ligolo_pivot_tunnel(
                 _ligolo_ledger.set_revert_metadata(
                     ligolo_agent_change_id,
                     remediation_command=(
-                        'Delete the staged pivot agent from the host and confirm it is '
-                        'gone:\n'
+                        'Delete the staged pivot agent from the host, then confirm it is '
+                        'gone. The check should print False.\n'
                         f'  Remove-Item -LiteralPath "{_ligolo_unc}" -Force\n'
-                        f'  Test-Path "{_ligolo_unc}"   # must return False'
+                        f'  Test-Path "{_ligolo_unc}"'
                     ),
                     remediation_object_dn=_ligolo_unc,
                 )

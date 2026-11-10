@@ -6,7 +6,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Iterable
 
 from adscan_internal import (
     print_info,
@@ -19,6 +19,10 @@ from adscan_internal.cli.ci_events import emit_event
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services import cleanup_taxonomy as _tax
 from adscan_internal.workspaces.io import read_json_file, write_json_file
+from adscan_core.reporting.cleanup_disclosures import still_in_place_count
+from adscan_core.reporting.cleanup_remediation import (
+    remediation_steps as _split_remediation_steps,
+)
 from adscan_core.rich_output import print_exception
 
 _LEDGER_FILENAME = "environment_changes.json"
@@ -325,8 +329,9 @@ class EnvironmentChangeLedger:
         entry = self._find(change_id)
         if entry is None:
             return
+        reason = _rights_adjusted_reason(entry, str(reason))
         entry["revert_status"] = STATUS_MANUAL_REQUIRED
-        entry["manual_reason"] = str(reason)
+        entry["manual_reason"] = reason
         if remediation_command:
             entry["remediation_command"] = str(remediation_command)
         if remediation_object_dn:
@@ -375,29 +380,170 @@ class EnvironmentChangeLedger:
             entry["min_credential_principal"] = str(min_credential_principal)
         self.flush()
 
-    def mark_kept(self, change_id: str) -> None:
-        """Mark an operator_confirmed change as intentionally kept by the operator.
+    def record_revert_rights(self, change_id: str, *, roles: Iterable[str]) -> None:
+        """Record which accounts with the rights to undo a change were available.
 
-        Used when the operator chooses to retain a durable AD object/grant at
-        exit (or when a successful run keeps it). Distinct from a failed revert:
-        the change is durable on purpose, not because cleanup failed. Flushes to
-        disk.
+        Called by every revert seam BEFORE it tries anything, with the roles of
+        every candidate it had (before any transport filter): the client cleanup
+        account and a verified privileged account are the two that carry the
+        rights. Accumulates across passes, so a later pass that holds a domain
+        administrator is recorded too. :meth:`mark_manual_required` reads it to
+        tell "no account with the rights was available" apart from "the revert
+        failed with the rights to do it", at the moment the revert gives up.
 
         Args:
             change_id: ID returned by register_change.
+            roles: ``revert_credentials.ROLE_*`` values of the candidates.
         """
         entry = self._find(change_id)
         if entry is None:
             return
+        found = {str(r or "") for r in roles}
+        previous = entry.get("revert_rights") if isinstance(entry.get("revert_rights"), dict) else {}
+        entry["revert_rights"] = {
+            "cleanup_account": bool(previous.get("cleanup_account"))
+            or bool(found & {"cleanup", "cleanup_saved"}),
+            "privileged_account": bool(previous.get("privileged_account"))
+            or "privileged" in found,
+        }
+        self.flush()
+
+    def record_revert_credential_attempt(
+        self,
+        change_id: str,
+        *,
+        principal: str,
+        role: str,
+        outcome: str,
+        at: str | None = None,
+    ) -> None:
+        """Append one credential attempt of the revert cascade to the record.
+
+        Every revert goes through ONE precedence (``revert_credentials``):
+        the client cleanup account, then a verified privileged account, then
+        the account that made the change. Each attempt is kept here, so the
+        report can name which account undid the change, and the final retry
+        pass can skip principals that already failed. No secret is recorded.
+
+        Args:
+            change_id: ID returned by register_change.
+            principal: The account the attempt ran as.
+            role: A ``revert_credentials.ROLE_*`` value.
+            outcome: ``"reverted"``, ``"failed"``, or ``"unconfirmed"`` (the
+                revert ran but no credential could re-read the object).
+            at: ISO timestamp (UTC wall clock); defaults to now.
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return
+        attempts = entry.get("revert_credential_attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+            entry["revert_credential_attempts"] = attempts
+        attempts.append(
+            {
+                "principal": str(principal or ""),
+                "role": str(role or ""),
+                "outcome": str(outcome or ""),
+                "at": at or _utc_now_iso(),
+            }
+        )
+        if outcome == "reverted":
+            entry["revert_principal"] = str(principal or "")
+            entry["revert_principal_role"] = str(role or "")
+            entry["min_credential_principal"] = _tax.revert_performed_as(role, principal)
+        self.flush()
+
+    def update_detail(self, change_id: str, **values: Any) -> None:
+        """Merge non-secret metadata into a record's ``detail`` and flush.
+
+        ``None`` removes the key. Used for facts learned after registration (an
+        object disabled rather than deleted, the identifiers a later revert needs).
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return
+        detail = entry.get("detail")
+        if not isinstance(detail, dict):
+            detail = {}
+            entry["detail"] = detail
+        for key, value in values.items():
+            if value is None:
+                detail.pop(key, None)
+            else:
+                detail[key] = value
+        self.flush()
+
+    def get_change(self, change_id: str) -> dict[str, Any] | None:
+        """Return one record (shallow copy, ``detail`` copied) or ``None``."""
+        entry = self._find(change_id)
+        if entry is None:
+            return None
+        copy = dict(entry)
+        copy["detail"] = dict(entry.get("detail") or {})
+        return copy
+
+    def mark_kept(self, change_id: str, *, reason: str | None = None) -> bool:
+        """Mark a change as left in place ON PURPOSE (nobody tried to undo it).
+
+        "Kept" is a deliberate state, distinct from a failed revert: the operator
+        chose it, automatic reversion was off for the run, or the account is kept
+        by agreement. It is still a change the client has to remove or accept,
+        so the record is stamped with the instruction that removes it (built
+        from its own values by ``cleanup_taxonomy.remediation_for_entry``) and
+        it counts among the changes left in place.
+
+        A change the assessment ALREADY tried to undo can never become "kept":
+        a revert that ran and could not be confirmed, or that failed, keeps its
+        own state and reason, and a confirmed revert stays reverted. Rewriting
+        either as "kept" would tell the client a change is in place on purpose
+        when it was in fact removed, or hide that removing it failed.
+
+        Args:
+            change_id: ID returned by register_change.
+            reason: Why it stays (``cleanup_disclosures.KEPT_REASON_*``).
+
+        Returns:
+            True when the record is now kept, False when it was left unchanged.
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return False
+        status = str(entry.get("revert_status") or "").strip().lower()
+        attempted = bool(entry.get("revert_credential_attempts")) or status in (
+            STATUS_REVERTED_CONFIRMED,
+            _tax.STATUS_LEGACY_REVERTED,
+            STATUS_MANUAL_REQUIRED,
+            _tax.STATUS_LEGACY_FAILED,
+        )
+        if attempted:
+            print_info_debug(
+                "ledger: not marking kept, a revert was already attempted · "
+                f"{entry.get('kind')} · {mark_sensitive(str(entry.get('target') or ''), 'text')} "
+                f"status={status}"
+            )
+            return False
         entry["revert_status"] = "kept"
         entry["reverted_at"] = None
         entry["revert_error"] = None
+        if reason:
+            entry["kept_reason"] = str(reason)
+        if _instruction_missing_or_superseded(entry):
+            entry["remediation_command"] = _tax.remediation_for_entry(entry)
+        if not str(entry.get("remediation_object_dn") or "").strip():
+            entry["remediation_object_dn"] = self._remediation_dn_for(entry)
         self._recompute_summary()
         self.flush()
         emit_event("environment_change_kept", change_id=change_id, revert_status="kept")
-        print_info(
-            f"Kept by operator · {entry['kind']} · {mark_sensitive(entry['target'], 'text')}"
+        from adscan_core.reporting.cleanup_disclosures import (  # noqa: PLC0415
+            kept_reason_label,
         )
+
+        print_info(
+            f"{kept_reason_label(entry.get('kept_reason'), entry.get('method'))} · "
+            f"{entry['kind']} · {mark_sensitive(entry['target'], 'text')}"
+        )
+        return True
 
     def discard_change(self, change_id: str) -> None:
         """Drop a change that was register-before-touch'd but NEVER actually applied.
@@ -513,7 +659,7 @@ class EnvironmentChangeLedger:
             is_retryable_fail = status == _tax.STATUS_LEGACY_FAILED or (
                 status == STATUS_MANUAL_REQUIRED
                 and str(entry.get("manual_reason") or "")
-                == _tax.MANUAL_REASON_REVERT_FAILED
+                in _tax.RETRYABLE_REVERT_REASONS
             )
             if (
                 entry.get("kind") == kind
@@ -557,7 +703,7 @@ class EnvironmentChangeLedger:
             is_standing = status in still_standing or (
                 status == STATUS_MANUAL_REQUIRED
                 and str(entry.get("manual_reason") or "")
-                == _tax.MANUAL_REASON_REVERT_FAILED
+                in _tax.RETRYABLE_REVERT_REASONS
             )
             if not is_standing:
                 continue
@@ -595,26 +741,23 @@ class EnvironmentChangeLedger:
                 remediation_object_dn=object_dn,
                 error="Session ended before rollback completed.",
             )
+        # Every change still in place (kept or manual) carries the instruction
+        # that removes it, whichever path settled it.
+        for entry in self._state["changes"]:
+            bucket = _tax.cleanup_bucket(entry.get("revert_status"))
+            if bucket not in (CLEANUP_BUCKET_MANUAL, CLEANUP_BUCKET_KEPT):
+                continue
+            if not _instruction_missing_or_superseded(entry):
+                continue
+            entry["remediation_command"] = self._remediation_command_for(entry)
+            if not str(entry.get("remediation_object_dn") or "").strip():
+                entry["remediation_object_dn"] = self._remediation_dn_for(entry)
         self._state["scan_completed_at"] = _utc_now_iso()
         self.flush()
 
     def _remediation_command_for(self, entry: dict[str, Any]) -> str:
         """Resolve a client-safe native remediation command for a record."""
-        existing = str(entry.get("remediation_command") or "").strip()
-        if existing:
-            return existing
-        existing_instr = str(entry.get("manual_cleanup_instructions") or "").strip()
-        if existing_instr:
-            return existing_instr
-        kind = str(entry.get("kind") or "")
-        target = str(entry.get("target") or "TARGET")
-        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
-        spn = str((detail or {}).get("spn") or "SPN")
-        return (
-            _tax.remediation_template_for_kind(kind)
-            .replace("TARGET", target)
-            .replace("SPN", spn)
-        )
+        return _tax.remediation_for_entry(entry)
 
     def _remediation_dn_for(self, entry: dict[str, Any]) -> str:
         """Resolve the best-known object DN for the client to act on."""
@@ -635,6 +778,8 @@ class EnvironmentChangeLedger:
         Returns:
             Dictionary with keys: total, reverted, reverted_confirmed,
             manual_required, kept, pending, pending_manual, failed, in_progress.
+            ``pending_manual`` is every change still in place for the client
+            to remove or accept: ``manual_required`` plus ``kept``.
         """
         return dict(self._state["summary"])
 
@@ -741,7 +886,16 @@ def _compute_summary(changes: list[dict[str, Any]]) -> dict[str, int]:
         "manual_required": buckets[_tax.CLEANUP_BUCKET_MANUAL],
         "kept": buckets[_tax.CLEANUP_BUCKET_KEPT],
         "pending": buckets[_tax.CLEANUP_BUCKET_IN_PROGRESS],
-        "pending_manual": buckets[_tax.CLEANUP_BUCKET_MANUAL],
+        # Every change still in place that the client has to remove or accept:
+        # the ones whose revert failed or could not be confirmed, the ones left
+        # in place on purpose, and the ones whose revert has not settled. A kept
+        # change is not a failure, but it is not done either, so it is never
+        # left out of this figure (shared definition, cleanup_disclosures).
+        "pending_manual": still_in_place_count(
+            manual_required=buckets[_tax.CLEANUP_BUCKET_MANUAL],
+            kept=buckets[_tax.CLEANUP_BUCKET_KEPT],
+            in_progress=buckets[_tax.CLEANUP_BUCKET_IN_PROGRESS],
+        ),
         "failed": buckets[_tax.CLEANUP_BUCKET_MANUAL],
         "in_progress": buckets[_tax.CLEANUP_BUCKET_IN_PROGRESS],
     }
@@ -776,7 +930,58 @@ def _backfill_schema_1_1(data: dict[str, Any]) -> None:
                 entry["manual_reason"] = _tax.MANUAL_REASON_REVERT_FAILED
             elif status == _tax.STATUS_LEGACY_OPERATOR_REQUIRED:
                 entry["manual_reason"] = _tax.MANUAL_REASON_NOT_ATTEMPTED
+        # An instruction an earlier version stored that does not work is
+        # rebuilt from the record, so the next flush hands every consumer (the
+        # web reads the persisted value as-is) the corrected command.
+        if _tax.stored_remediation_is_superseded(entry):
+            entry["remediation_command"] = None
+            entry["manual_cleanup_instructions"] = None
+            entry["remediation_command"] = _tax.remediation_for_entry(entry)
     data["schema_version"] = _SCHEMA_VERSION
+
+
+def _instruction_missing_or_superseded(entry: dict[str, Any]) -> bool:
+    """Whether a record needs its cleanup instruction (re)built."""
+    if not str(entry.get("remediation_command") or "").strip():
+        return True
+    return _tax.stored_remediation_is_superseded(entry)
+
+
+def _rights_adjusted_reason(entry: dict[str, Any], reason: str) -> str:
+    """The ``manual_reason`` a revert that gave up should carry, given its rights.
+
+    Decided when the revert ends, from what the seam recorded
+    (:meth:`EnvironmentChangeLedger.record_revert_rights`) and the attempts on
+    the entry, never from error text. A revert that ran out of credentials or
+    was refused, with no cleanup account and no verified privileged account
+    among its candidates, is ``no_privileged_credential``: a missing input. With
+    one of them available, it stays a failure ADscan owns. An entry whose seam
+    recorded nothing keeps the reason it was given.
+    """
+    from adscan_core.reporting.cleanup_outcome import (  # noqa: PLC0415
+        ELEVATED_REVERT_ROLES,
+        RIGHTS_SENSITIVE_REASONS,
+    )
+
+    rights = entry.get("revert_rights")
+    if not isinstance(rights, dict) or reason not in RIGHTS_SENSITIVE_REASONS:
+        return reason
+    attempts = entry.get("revert_credential_attempts")
+    tried = {
+        str(a.get("role") or "")
+        for a in (attempts if isinstance(attempts, list) else [])
+        if isinstance(a, dict)
+    }
+    elevated = (
+        bool(rights.get("cleanup_account"))
+        or bool(rights.get("privileged_account"))
+        or bool(tried & ELEVATED_REVERT_ROLES)
+    )
+    if not elevated:
+        return _tax.MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL
+    if reason == _tax.MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL:
+        return _tax.MANUAL_REASON_REVERT_FAILED
+    return reason
 
 
 def _remediation_lines(command: str) -> list[str]:
@@ -794,6 +999,11 @@ def _remediation_lines(command: str) -> list[str]:
     return [line for line in command.splitlines() if line.strip()]
 
 
+def _remediation_steps(command: str) -> list[dict[str, Any]]:
+    """Return ``command`` as ordered ``{"intro", "command"}`` steps (prose apart from commands)."""
+    return _split_remediation_steps(command)
+
+
 def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
     """Project one ledger record into the normalized render-ready shape."""
     status = str(entry.get("revert_status") or _tax.STATUS_PENDING)
@@ -807,6 +1017,14 @@ def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
             if candidate:
                 object_dn = candidate
                 break
+    from adscan_core.reporting.cleanup_outcome import (  # noqa: PLC0415
+        client_revert_error,
+        cleanup_outcome,
+        outcome_is_still_in_place,
+        revert_attempt_rows,
+    )
+
+    outcome = cleanup_outcome({"bucket": bucket, "manual_reason": entry.get("manual_reason")})
     # A remediation is either a single command or a whole procedure, and the
     # two want different composition: a one-liner reads fine beside its object,
     # a procedure has to be printed at the document's full width or its long
@@ -819,7 +1037,22 @@ def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
         or entry.get("manual_cleanup_instructions")
         or ""
     )
+    if outcome_is_still_in_place(outcome) and (
+        not remediation_command.strip() or _tax.stored_remediation_is_superseded(entry)
+    ):
+        # A change still in place is never listed without the way to remove it,
+        # and never with a stored form known not to work. Built here (not only
+        # at write time) so an older workspace renders the working instruction.
+        # "Still in place" is the same predicate that counts it in the figure,
+        # so the count and the instruction can never answer differently.
+        remediation_command = _tax.remediation_for_entry(entry)
     remediation_lines = _remediation_lines(remediation_command)
+    # The same instruction as prose-before-command steps. ``remediation_lines``
+    # prints every line in one monospace box, so an older stored string that
+    # carries an explanatory ``#`` line would put the comment in the command a
+    # client copies. Renderers print ``remediation_steps`` instead; deriving it
+    # here (not at write time) is what makes old workspaces render correctly.
+    remediation_steps = _remediation_steps(remediation_command)
     return {
         "change_id": str(entry.get("change_id") or ""),
         "kind": str(entry.get("kind") or ""),
@@ -834,16 +1067,46 @@ def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
         "verification_method": entry.get("verification_method"),
         "bucket": bucket,
         "status": status,
-        "status_label": _tax.status_label(status),
+        "status_label": _status_label_for(entry, status, bucket),
         "manual_reason": entry.get("manual_reason"),
         "manual_reason_label": _tax.manual_reason_label(entry.get("manual_reason"))
         if entry.get("manual_reason")
         else None,
         "remediation_command": remediation_command,
         "remediation_lines": remediation_lines,
+        "remediation_steps": remediation_steps,
         "remediation_is_procedure": len(remediation_lines) > 1,
         "performed_as": entry.get("min_credential_principal"),
+        # Why a kept change stays: only the client-safe retained-account wording,
+        # never the internal technique label the ledger ``method`` carries.
+        "kept_reason": _kept_reason(entry),
+        # Why it is still in place and whose action it needs (shared outcome SSOT,
+        # adscan_core.reporting.cleanup_outcome): decided from the reason the
+        # engine recorded when the revert gave up, never from error text.
+        "outcome": outcome,
+        "revert_error": client_revert_error(entry.get("revert_error"))
+        if bucket == _tax.CLEANUP_BUCKET_MANUAL
+        else "",
+        "revert_attempts": revert_attempt_rows(entry.get("revert_credential_attempts")),
     }
+
+
+def _kept_reason(entry: dict[str, Any]) -> str | None:
+    """Why a kept change stays, in client-safe words (never the internal method)."""
+    if _tax.cleanup_bucket(entry.get("revert_status")) != _tax.CLEANUP_BUCKET_KEPT:
+        return None
+    from adscan_core.reporting.cleanup_disclosures import (  # noqa: PLC0415
+        kept_reason_label,
+    )
+
+    return kept_reason_label(entry.get("kept_reason"), entry.get("method"))
+
+
+def _status_label_for(entry: dict[str, Any], status: str, bucket: str) -> str:
+    """The row's status label; a kept change says WHY it is in place."""
+    if bucket == _tax.CLEANUP_BUCKET_KEPT:
+        return _kept_reason(entry) or _tax.status_label(status)
+    return _tax.status_label(status)
 
 
 def _build_cleanup_report(
@@ -857,11 +1120,33 @@ def _build_cleanup_report(
         _tax.CLEANUP_BUCKET_KEPT: [],
         _tax.CLEANUP_BUCKET_IN_PROGRESS: [],
     }
+    normalized_all: list[dict[str, Any]] = []
     for entry in changes:
         if not isinstance(entry, dict):
             continue
         normalized = _normalize_change(entry)
         out[normalized["bucket"]].append(normalized)
+        normalized_all.append(normalized)
+    # Section-level sentences (cleanup account used, disabled-not-deleted
+    # computer accounts, the account kept by agreement, revoked certificates):
+    # the SAME copy module the web CTEM cleanup view calls.
+    from adscan_core.reporting.cleanup_disclosures import (  # noqa: PLC0415
+        cleanup_counters,
+        cleanup_disclosures,
+    )
+
+    out["disclosures"] = cleanup_disclosures(normalized_all)
+    # The headline figures and their split, worded by the same module the web
+    # CTEM calls, so no surface shows "0 to clean up" while changes remain.
+    # The rows go in too: the split names each outcome, so a change nobody
+    # tried to revert is never worded as one whose revert was not confirmed.
+    out["counters"] = cleanup_counters(out["summary"], normalized_all)
+    from adscan_core.reporting.cleanup_outcome import group_by_outcome  # noqa: PLC0415
+
+    # The same changes grouped by WHY they are where they are (kept by decision,
+    # needs an account with the rights, revert failed, not confirmed, no
+    # automatic undo, reverted), each group with its shared client copy.
+    out["outcome_groups"] = group_by_outcome(normalized_all)
     return out
 
 
@@ -893,6 +1178,9 @@ def build_cleanup_report_from_dict(env_changes: dict[str, Any] | None) -> dict[s
         recomputed = _compute_summary(changes)
         merged = dict(recomputed)
         merged.update({k: v for k, v in summary.items() if isinstance(v, int)})
+        # The derived figure follows the records, never a stale persisted value
+        # (an older ledger counted it without the unsettled changes).
+        merged["pending_manual"] = recomputed["pending_manual"]
         summary = merged
     return _build_cleanup_report(changes, summary)
 

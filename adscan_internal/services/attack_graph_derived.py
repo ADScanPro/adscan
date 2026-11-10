@@ -48,7 +48,10 @@ from adscan_core.rich_output import print_exception
 
 # Allow-list of relations callers may insert. Anything outside this set is
 # rejected so a typo in a future technique never silently produces an
-# UNKNOWN edge in the canonical graph.
+# UNKNOWN edge in the canonical graph. It is a SUBSET of
+# ``edge_kind._DERIVED_EDGES``, which is the authority on the edge KIND; this
+# list is the narrower question of what this writer accepts today, and a
+# relation that classifies as DERIVED can be added to it when a caller needs it.
 ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
     {
         "DumpedHashOf",
@@ -72,6 +75,9 @@ ALLOWED_DERIVED_RELATIONS: frozenset[str] = frozenset(
         "PrinterBugSurface",
         "WebDAVEnabled",
         "DropTheMIC",
+        "DropTheMIC2",
+        # Legacy: the CVE-2019-1040 check emitted this relation before it
+        # was renamed DropTheMIC; kept so existing graphs still classify.
         "NTLMReflection",
         # NTLMv1 relay surface marker (sub-project #3) — promoted by the
         # ntlmv1_relay_graph_builder when an NTLMv1 host is observed.
@@ -138,9 +144,22 @@ def insert_derived_edge(
         shell: The ADscan main shell — used to locate the workspace.
         domain: Target domain (graph file owner).
         source: Source principal label (e.g. ``"DC01.FOREST.LOCAL"``).
-        relation: One of the canonical derived relations
-            (``DumpedHashOf``, ``ForgedTicketFor``, ``ReadGMSAPasswordOf``,
-            ``OwnsCertificateFor``).
+        relation: Any relation in ``edge_kind._DERIVED_EDGES``, which is the
+            authority on what classifies as ``EdgeKind.DERIVED`` and holds about
+            twenty names, not the four below. ``DumpedHashOf``,
+            ``ForgedTicketFor``, ``ReadGMSAPasswordOf`` and
+            ``OwnsCertificateFor`` are the post-exploitation PROVENANCE
+            relations: they name the result, "we now hold this principal's
+            secret". A TECHNIQUE relation already in that set, such as a
+            credential dump's own name (``DumpLSA``, ``DumpSAM``, ...), is
+            equally valid and is usually preferable when the edge represents an
+            action the client can look up, because the attack-step catalog hangs
+            the narrative, the MITRE id, the detection guidance and the
+            remediation off the technique, while a consequence-named relation
+            renders generically and makes one executed action read as several
+            techniques. The precedent is in the engine, not only permitted in
+            theory: ``attack_graph_core._build_implicit_dumplsa_overlay`` already
+            mints a dump relation as a derived bridge edge.
         target: Target principal label (the principal whose credential
             material the technique recovered, e.g. ``"krbtgt@FOREST.LOCAL"``
             or ``"Administrator@FOREST.LOCAL"``).

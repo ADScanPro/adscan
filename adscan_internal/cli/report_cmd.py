@@ -52,7 +52,6 @@ def _build_workspace_shell(workspace: str | None) -> Any | None:
     from adscan import PentestShell, _resolve_license_mode  # noqa: PLC0415
 
     shell = PentestShell(license_mode=_resolve_license_mode(requested_pro=False))
-    shell.type = getattr(shell, "type", None) or "audit"
     shell.ensure_workspaces_dir()
     shell.current_workspace = ws_dir.name
     shell.current_workspace_dir = str(ws_dir)

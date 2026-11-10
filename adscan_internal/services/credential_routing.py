@@ -27,9 +27,22 @@ never the other way around. A value already in ``nt_hash`` is trusted as-is.
 
 from __future__ import annotations
 
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 _HEX_CHARS = frozenset("0123456789abcdef")
+
+
+class CredentialMaterialMissingError(ValueError):
+    """A transport config names a principal but carries no secret for it.
+
+    Raised by :func:`require_credential_material` from a config's
+    ``__post_init__``, i.e. before any packet is built. Reaching this means a
+    caller resolved WHO to authenticate as and then lost the secret on the way
+    (the classic ``password=None if is_hash else secret`` into a config that has
+    no ``nt_hash`` field). Sending that config would put an empty secret on the
+    wire as a real account: one failed logon per attempt, toward a lockout.
+    """
 
 
 def looks_like_ntlm_hash(value: object) -> bool:
@@ -87,8 +100,101 @@ def promote_credential_fields(
     return pwd, nt_hash, aes_key, ccache_path
 
 
+def require_credential_material(
+    *,
+    transport: str,
+    username: Optional[str],
+    password: Optional[str],
+    nt_hash: Optional[str] = None,
+    aes_key: Optional[str] = None,
+    ccache_path: Optional[str] = None,
+    extra_material: tuple[Any, ...] = (),
+    ambient_kerberos: Optional[Callable[[], bool]] = None,
+) -> None:
+    """Refuse a config that names a principal and holds no secret for it.
+
+    The single invariant every authenticating transport config enforces from
+    its ``__post_init__``: when ``username`` is set, at least one piece of
+    credential material travels with it. Material is a password (an EMPTY
+    string counts: it is the explicit blank-password credential the blank spray
+    and AS-REP paths send on purpose, distinct from ``None``), an NT hash, an
+    AES key, a ccache path, or any transport-specific material passed in
+    ``extra_material`` (a ``CredentialContext``, PFX path, in-memory ccache).
+
+    The ambient ``KRB5CCNAME`` is NOT material by itself: it holds whichever
+    principal last minted, which is how a bind "as alice" turns into a bind as
+    the Domain Admin, or into an empty-password AS-REQ. A Kerberos transport may
+    pass ``ambient_kerberos``, a check that the ambient cache holds a ticket for
+    THIS principal; only then does the ambient cache count.
+
+    A config without a username (anonymous bind, null session, a posture-only
+    carrier) is not checked: it authenticates as nobody.
+
+    Raises:
+        CredentialMaterialMissingError: ``username`` is set and no material is.
+    """
+    principal = str(username or "").strip()
+    if not principal:
+        return
+    if password is not None:
+        return
+    if any(str(value or "").strip() for value in (nt_hash, aes_key, ccache_path)):
+        return
+    if any(bool(value) for value in extra_material):
+        return
+    if ambient_kerberos is not None:
+        try:
+            if ambient_kerberos():
+                return
+        except Exception:  # noqa: BLE001 - an unreadable cache is not material
+            pass
+    raise CredentialMaterialMissingError(
+        f"{transport}: refusing to authenticate as a named principal with no "
+        "password, NT hash, AES key or ticket; the secret was lost before the "
+        "connection was built"
+    )
+
+
+def nt_hash_of_password(password: Optional[str]) -> str:
+    """Return the NT hash of a cleartext password, or ``""`` when undecidable.
+
+    NT hash = MD4(UTF-16LE(password)). Used to tell whether a stored cleartext
+    and an incoming NT hash are the SAME secret (two formats of one password)
+    or two DIFFERENT secrets for the same principal (one of them stale).
+    Best-effort: returns ``""`` when MD4 is unavailable, never raises.
+    """
+    if not isinstance(password, str):
+        return ""
+    try:
+        from Cryptodome.Hash import MD4  # noqa: PLC0415
+
+        digest = MD4.new()
+        digest.update(password.encode("utf-16-le"))
+        return digest.hexdigest().lower()
+    except Exception:  # noqa: BLE001 - undecidable, the caller keeps its default
+        return ""
+
+
+def same_secret(password: Optional[str], nt_hash: Optional[str]) -> Optional[bool]:
+    """Whether ``password`` and ``nt_hash`` are one secret in two formats.
+
+    Returns ``True`` / ``False`` when it can be decided, ``None`` when it cannot
+    (no hash, an unhashable password, MD4 unavailable).
+    """
+    if not looks_like_ntlm_hash(nt_hash or ""):
+        return None
+    computed = nt_hash_of_password(password)
+    if not computed:
+        return None
+    return computed == normalize_ntlm_hash(str(nt_hash))
+
+
 __all__ = [
+    "CredentialMaterialMissingError",
     "looks_like_ntlm_hash",
     "normalize_ntlm_hash",
+    "nt_hash_of_password",
     "promote_credential_fields",
+    "require_credential_material",
+    "same_secret",
 ]

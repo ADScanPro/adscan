@@ -11,9 +11,16 @@ from asysocks.unicomm.common.target import UniTarget, UniProto
 from urllib.parse import urlparse, parse_qs, unquote
 from asysocks.unicomm.utils.paramprocessor import str_one, int_one, bool_one
 
+def float_one(x):
+	# ADscan: the inter-page sleep (``rate``) is seconds as a FLOAT, so a pacing
+	# level can ask for 0.2 s between pages. ``int_one`` truncated it to whole
+	# seconds (0.2 -> ValueError, 1.5 -> ValueError). Locked by
+	# tests/unit/vendor/test_badldap_rate_float_url_param.py.
+	return float(x[0])
+
 msldaptarget_url_params = {
 	'pagesize' : int_one,
-	'rate' : int_one,
+	'rate' : float_one,
 }
 
 

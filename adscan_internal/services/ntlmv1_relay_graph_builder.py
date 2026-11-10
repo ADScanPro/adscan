@@ -425,6 +425,8 @@ def compute_host_feasibility(
     ntlmv1_observed: bool,
     adcs_pki_present: Optional[bool],
     machine_account_quota: Optional[int],
+    domain_machine_account_quota: Optional[int] = None,
+    controlled_computer_available: Optional[bool] = None,
 ) -> dict[str, Optional[str]]:
     """Return ``{"rbcd"|"shadow_credentials"|"crack": reason|None}``.
 
@@ -460,6 +462,8 @@ def compute_host_feasibility(
             ntlm_auth=ntlm_auth,
             adcs_pki_present=adcs_pki_present,
             machine_account_quota=machine_account_quota,
+            domain_machine_account_quota=domain_machine_account_quota,
+            controlled_computer_available=controlled_computer_available,
         )
         result = evaluate_relay_feasibility(inputs)
         if result.viable:
@@ -643,6 +647,30 @@ def _machine_account_quota_for(
     return None
 
 
+def _domain_quota_and_controlled_computer(
+    shell: object, *, domain: str
+) -> tuple[Optional[int], Optional[bool]]:
+    """(domain MAQ observed by the collector, non-ADscan controlled computer?).
+
+    Both read from persisted state (no network): the collector's domain policy
+    and the credential store. ADscan-provisioned computer accounts never count
+    as controlled (decision D3).
+    """
+    try:
+        from adscan_internal.services.machine_account_provisioning_service import (  # noqa: PLC0415
+            non_adscan_controlled_computer_accounts,
+            observed_domain_machine_account_quota,
+        )
+
+        domain_maq = observed_domain_machine_account_quota(shell, domain=domain)
+        controlled = bool(non_adscan_controlled_computer_accounts(shell, domain=domain))
+        return domain_maq, controlled
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None, None
+
+
 def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
     """Materialize the NTLMv1 attack steps into ``attack_graph.json`` (I/O wrapper).
 
@@ -725,6 +753,9 @@ def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
         maq_value = _machine_account_quota_for(
             shell, domain=domain, username=actor_username
         )
+        domain_maq, controlled_available = _domain_quota_and_controlled_computer(
+            shell, domain=domain
+        )
         nodes_by_id = _graph_nodes_as_mapping(graph)
 
         def _computer_label_for_ip(ip: str) -> str:
@@ -748,6 +779,8 @@ def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
                 ntlmv1_observed=observed,
                 adcs_pki_present=adcs_pki_present,
                 machine_account_quota=maq_value,
+                domain_machine_account_quota=domain_maq,
+                controlled_computer_available=controlled_available,
             )
 
         edges = plan_ntlmv1_relay_edges(

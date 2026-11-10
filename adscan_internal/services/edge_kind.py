@@ -223,6 +223,9 @@ _DERIVED_EDGES: Final[frozenset[str]] = frozenset(
         "PrinterBugSurface",
         "WebDAVEnabled",
         "DropTheMIC",
+        "DropTheMIC2",
+        # Legacy: the CVE-2019-1040 check emitted this relation before it
+        # was renamed DropTheMIC; kept so existing graphs still classify.
         "NTLMReflection",
         # NTLMv1 relay attack-step surface marker (sub-project #3). A discovered
         # NTLMv1-on-host misconfiguration is a finding on its own, materialized

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.artifact_manifest/1",
+  "title": "ADscan artifact manifest v1",
+  "description": "Every file a run left in its workspace, with its egress class from adscan_core/node_link/artifact_classes.py. 'unlisted' is a file no classification rule covers: it never leaves a scanner node under any data policy. Paths are workspace-relative and may name AD objects (a domain directory), so the manifest itself stays on the node unless the data policy allows findings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "generated_at_frame", "generated_at", "artifacts"],
+  "properties": {
+    "schema": {"const": "adscan.artifact_manifest/1"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "generated_at_frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Which clock generated_at came from (adscan_core/reporting/clock_frame.py): the host clock may be stepped to a domain controller mid-run.",
+      "required": ["frame", "stepped"],
+      "properties": {
+        "frame": {"enum": ["target_agreed", "unverified", "mixed"]},
+        "stepped": {"type": "boolean"}
+      }
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "class", "size", "hashed", "redaction_required"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "$comment": "Workspace-relative POSIX path; never absolute, never '..'.",
+            "pattern": "^(?!/)(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$))[^\\u0000-\\u001f]{1,1024}$"
+          },
+          "class": {"enum": ["summary", "finding", "evidence", "secret", "unlisted"]},
+          "size": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "hashed": {"type": "boolean"},
+          "redaction_required": {
+            "$comment": "The content can embed a secret: may leave only after the field-level redactor and the known-secret scanner (artifact_classes.may_leave). The sha256 is over the unredacted content.",
+            "type": "boolean"
+          },
+          "hash_skipped": {
+            "$comment": "Why no digest: never for a secret or unlisted file (a digest of a short secret or loot file is crackable), past the size cap or the time budget, or unreadable.",
+            "enum": ["secret", "unlisted", "size_cap", "time_budget", "unreadable"]
+          }
+        }
+      }
+    }
+  }
+}

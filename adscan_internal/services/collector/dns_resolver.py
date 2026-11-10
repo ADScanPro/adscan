@@ -39,6 +39,9 @@ import dns.exception
 import dns.resolver
 
 from adscan_core import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import active_runtime
 
 from adscan_internal import print_info_debug, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
@@ -71,8 +74,19 @@ _COLLECTOR_RAW_OUTPUT_FILENAME = "collector_massdns_output.jsonl"
 # default. It is only bounded to protect the local socket/FD budget, not to
 # throttle the DC (a single resolver answering cached A records is cheap; the
 # DC does the same lookups massdns issued). Overridable via
-# ``ADSCAN_DNS_RESOLVE_CONCURRENCY`` for a constrained host.
-_DNS_RESOLVE_CONCURRENCY = 1000
+# the deprecated ``ADSCAN_DNS_RESOLVE_CONCURRENCY`` for a constrained host. The
+# value lives in the scan-pacing SSOT (consumer ``dns.resolve``): 500 at the
+# default level, lower at the slow levels, where it is a deliberate choice of
+# the operator (dead hosts then cost wall time, never coverage).
+#
+# 500, not 1000, since 2026-11-04 (scan-pacing WP2b, measured against a GOAD
+# DC): with 500 names that take about 4 s each to fail among 4,300 queries, 500
+# in flight finished in the same wall time as 1000 (4.4 s against 4.7 s) with
+# full coverage, and the DC answered a second client faster during the burst
+# (p95 about 25 ms against 36 ms). 250 already cost 1.9x the wall time and 100
+# cost 4.4x, which is the serialisation the paragraph above warns about.
+_DNS_PACING = _pacing_consumer("dns.resolve")
+_DNS_RESOLVE_CONCURRENCY = _DNS_PACING.param("in_flight").default
 
 # Per-query budget. dnspython uses ``timeout`` as the per-ATTEMPT wait and
 # ``lifetime`` as the TOTAL budget for one name, retrying attempts until the
@@ -88,26 +102,22 @@ _DNS_RESOLVE_CONCURRENCY = 1000
 # truncated-result violation of the Exposure-Validation doctrine — unacceptable.
 # 2.0s per attempt x 6.0s total => ~3 attempts, and 500 dead hosts fully
 # overlapped still cost ~6s total (not N x 6s) thanks to the concurrency below.
-_DNS_QUERY_TIMEOUT_SECS = 2.0
-_DNS_QUERY_LIFETIME_SECS = 6.0
+_DNS_QUERY_TIMEOUT_SECS = _DNS_PACING.param("attempt_timeout_s").default  # 2.0
+_DNS_QUERY_LIFETIME_SECS = _DNS_PACING.param("lifetime_s").default  # 6.0, keeps >= 3x the attempt
+
+
+def _dns_pacing():
+    """The resolver's resolved pacing parameters."""
+    return component_pacing(active_pacing(), "dns.resolve")
 
 
 def _resolve_concurrency() -> int:
-    """Return the in-flight resolution limit (env override, floored high).
+    """Return the in-flight resolution limit from the scan pacing.
 
-    The floor exists because a conservative concurrency defeats the whole
-    migration (see ``_DNS_RESOLVE_CONCURRENCY``). An operator on a constrained
-    host may lower it via ``ADSCAN_DNS_RESOLVE_CONCURRENCY``, but a bogus/tiny
-    value is clamped up to a sane minimum.
+    500 at the default level (see ``_DNS_RESOLVE_CONCURRENCY``); the deprecated
+    ``ADSCAN_DNS_RESOLVE_CONCURRENCY`` still applies, floored at 1.
     """
-    raw = os.getenv("ADSCAN_DNS_RESOLVE_CONCURRENCY")
-    if not raw:
-        return _DNS_RESOLVE_CONCURRENCY
-    try:
-        value = int(raw)
-    except ValueError:
-        return _DNS_RESOLVE_CONCURRENCY
-    return max(value, 1)
+    return int(_dns_pacing()["in_flight"])
 
 
 def _is_ipv4(ip: str) -> bool:
@@ -154,8 +164,9 @@ def _build_async_resolver(resolver_ips: list[str]) -> "dns.asyncresolver.Resolve
             continue
         valid_nameservers.append(candidate)
     resolver.nameservers = valid_nameservers
-    resolver.timeout = _DNS_QUERY_TIMEOUT_SECS
-    resolver.lifetime = _DNS_QUERY_LIFETIME_SECS
+    pacing = _dns_pacing()
+    resolver.timeout = pacing["attempt_timeout_s"]
+    resolver.lifetime = pacing["lifetime_s"]
     return resolver
 
 
@@ -170,6 +181,8 @@ async def _resolve_one(
     empty IP list — never raises, so it can never stall or abort the batch.
     """
     async with sem:
+        # One token of the scan-wide request rate per query (no-op when unlimited).
+        await active_runtime().acquire()
         try:
             answer = await resolver.resolve(hostname, "A")
         except (

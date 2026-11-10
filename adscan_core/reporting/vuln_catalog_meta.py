@@ -50,13 +50,13 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
  'ldap_anonymous': {'severity': 'medium',
                     'title': 'LDAP Anonymous Bind Enabled',
                     'mitre': [{'id': 'T1087.002', 'name': 'Account Discovery: Domain Account'}]},
- 'ldap_security_posture': {'severity': 'high',
+ 'ldap_security_posture': {'severity': 'medium',
                            'title': 'LDAP Signing / Channel Binding Not Hardened',
                            'mitre': [{'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
                                      {'id': 'T1557.001',
                                       'name': 'Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and '
                                               'SMB Relay'}]},
- 'ntlmv1_enabled': {'severity': 'high',
+ 'ntlmv1_enabled': {'severity': 'medium',
                     'title': 'Domain Controller Accepts NTLMv1 Authentication',
                     'mitre': [{'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
                               {'id': 'T1078', 'name': 'Valid Accounts'}]},
@@ -101,7 +101,7 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
  'laps_readable': {'severity': 'high',
                    'title': 'LAPS Password Readable by Non-Admins',
                    'mitre': [{'id': 'T1555', 'name': 'Credentials from Password Stores'}]},
- 'obsolete_computers': {'severity': 'high', 'title': 'Obsolete Operating Systems', 'mitre': []},
+ 'obsolete_computers': {'severity': 'medium', 'title': 'Obsolete Operating Systems', 'mitre': []},
  'stale_enabled_computers': {'severity': 'low',
                              'title': 'Enabled Stale Computer Accounts Detected',
                              'mitre': []},
@@ -168,13 +168,16 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
  'adcs_esc11': {'severity': 'high',
                 'title': 'ADCS ESC11 - NTLM Relay to RPC Certificate Enrollment',
                 'mitre': [{'id': 'T1649', 'name': 'Steal or Forge Authentication Certificates'}]},
+ 'adcs_esc12': {'severity': 'high',
+                'title': 'ADCS ESC12 - CA Key in a YubiHSM with a Readable HSM Password',
+                'mitre': [{'id': 'T1649', 'name': 'Steal or Forge Authentication Certificates'}]},
  'adcs_esc13': {'severity': 'critical',
                 'title': 'ADCS ESC13 - Issuance Policy with Group Link Abuse',
                 'mitre': [{'id': 'T1649', 'name': 'Steal or Forge Authentication Certificates'}]},
  'adcs_esc14': {'severity': 'critical',
                 'title': 'ADCS ESC14 - Weak Explicit Certificate Mapping Abuse',
                 'mitre': [{'id': 'T1649', 'name': 'Steal or Forge Authentication Certificates'}]},
- 'certighost': {'severity': 'critical',
+ 'certighost': {'severity': 'high',
                 'title': 'Certighost - AD CS Chase-Fallback Domain Controller Impersonation',
                 'mitre': [{'id': 'T1649', 'name': 'Steal or Forge Authentication Certificates'}]},
  'adcs_orphaned_ca_ntauth': {'severity': 'high',
@@ -182,7 +185,7 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                                       'Authentication',
                              'mitre': [{'id': 'T1649',
                                         'name': 'Steal or Forge Authentication Certificates'}]},
- 'nopac': {'severity': 'critical',
+ 'nopac': {'severity': 'high',
            'title': 'noPac/sAMAccountName Spoofing (CVE-2021-42278 + CVE-2021-42287)',
            'mitre': [{'id': 'T1068', 'name': 'Exploitation for Privilege Escalation'},
                      {'id': 'T1558', 'name': 'Steal or Forge Kerberos Tickets'}]},
@@ -190,9 +193,9 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                'title': 'ZeroLogon (CVE-2020-1472)',
                'mitre': [{'id': 'T1210', 'name': 'Exploitation of Remote Services'}]},
  'printnightmare': {'severity': 'high',
-                    'title': 'PrintNightmare Vulnerable Hosts Detected',
+                    'title': 'PrintNightmare (CVE-2021-34527) Exposure in the Print Spooler',
                     'mitre': [{'id': 'T1068', 'name': 'Exploitation for Privilege Escalation'}]},
- 'ms17-010': {'severity': 'high',
+ 'ms17-010': {'severity': 'critical',
               'title': 'MS17-010 (EternalBlue) Vulnerable Hosts Detected',
               'mitre': [{'id': 'T1210', 'name': 'Exploitation of Remote Services'}]},
  'webdav': {'severity': 'medium',
@@ -202,7 +205,7 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                'title': 'DFSCoerce Authentication Coercion Primitive',
                'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'}]},
  'mseven': {'severity': 'medium',
-            'title': 'MS-EFSRPC Coercion Primitive (PetitPotam Variant)',
+            'title': 'MS-EVEN Coercion Primitive (EventLog Remoting)',
             'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'}]},
  'petitpotam': {'severity': 'medium',
                 'title': 'PetitPotam Authentication Coercion Primitive',
@@ -261,25 +264,25 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
  'machine_account_quota_risk': {'severity': 'low',
                                 'title': 'Machine Account Quota Allows Domain Join',
                                 'mitre': []},
- 'smb_v1_enabled': {'severity': 'high',
+ 'smb_v1_enabled': {'severity': 'medium',
                     'title': 'SMBv1 Protocol Enabled',
                     'mitre': [{'id': 'T1210', 'name': 'Exploitation of Remote Services'}]},
  'smb_signing_disabled': {'severity': 'medium',
                           'title': 'SMB Signing Not Required',
                           'mitre': [{'id': 'T1557.001',
                                      'name': 'LLMNR/NBT-NS Poisoning and SMB Relay'}]},
- 'reversible_encryption_enabled': {'severity': 'high',
+ 'reversible_encryption_enabled': {'severity': 'medium',
                                    'title': 'Passwords Stored With Reversible Encryption',
                                    'mitre': [{'id': 'T1003', 'name': 'OS Credential Dumping'}]},
- 'lsa_protection_disabled': {'severity': 'high',
+ 'lsa_protection_disabled': {'severity': 'medium',
                              'title': 'LSASS Not Running as a Protected Process (RunAsPPL Disabled)',
                              'mitre': [{'id': 'T1003.001',
                                         'name': 'OS Credential Dumping: LSASS Memory'}]},
- 'wdigest_enabled': {'severity': 'high',
+ 'wdigest_enabled': {'severity': 'medium',
                      'title': 'WDigest Cleartext Credential Caching Enabled',
                      'mitre': [{'id': 'T1003.001',
                                 'name': 'OS Credential Dumping: LSASS Memory'}]},
- 'lm_hash_storage_enabled': {'severity': 'high',
+ 'lm_hash_storage_enabled': {'severity': 'medium',
                              'title': 'LM Password Hash Storage Enabled',
                              'mitre': [{'id': 'T1003',
                                         'name': 'OS Credential Dumping'}]},
@@ -341,16 +344,16 @@ VULN_CATALOG_META: dict[str, dict[str, Any]] = {'kerberoast': {'severity': 'medi
                              'title': 'Domain Does Not Force AES Encryption for Kerberos',
                              'mitre': [{'id': 'T1558.003',
                                         'name': 'Steal or Forge Kerberos Tickets: Kerberoasting'}]},
- 'ntlmv1_crack': {'severity': 'critical',
+ 'ntlmv1_crack': {'severity': 'high',
                   'title': 'NTLMv1 Offline Crack to Machine Account Hash',
                   'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'},
                             {'id': 'T1110', 'name': 'Brute Force'}]},
- 'ntlmv1_relay_rbcd': {'severity': 'critical',
+ 'ntlmv1_relay_rbcd': {'severity': 'high',
                        'title': 'NTLMv1 Coerce-and-Relay to Resource-Based Constrained Delegation',
                        'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'},
                                  {'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
                                  {'id': 'T1134', 'name': 'Access Token Manipulation'}]},
- 'ntlmv1_relay_shadowcreds': {'severity': 'critical',
+ 'ntlmv1_relay_shadowcreds': {'severity': 'high',
                               'title': 'NTLMv1 Coerce-and-Relay to Shadow Credentials',
                               'mitre': [{'id': 'T1187', 'name': 'Forced Authentication'},
                                         {'id': 'T1557', 'name': 'Adversary-in-the-Middle'},
@@ -410,6 +413,7 @@ VULN_CATALOG_STEP_RELATIONS: dict[str, str] = {
     "adcs_esc9": "adcsesc9",
     "adcs_esc10": "adcsesc10",
     "adcs_esc11": "adcsesc11",
+    "adcs_esc12": "adcsesc12",
     "adcs_esc13": "adcsesc13",
     "adcs_esc14": "adcsesc14",
     "nopac": "nopac",
@@ -430,4 +434,153 @@ VULN_CATALOG_STEP_RELATIONS: dict[str, str] = {
     "shadow_credentials_present": "hasshadowcredentials",
 }
 
-__all__ = ("VULN_CATALOG_META", "VULN_CATALOG_STEP_RELATIONS")
+
+# ── Scan-policy declarations (docs/superpowers/specs/2026-11-04-scan-policy-
+# checks-by-family-design.md § 4.4.5 and § 5.5) ──────────────────────────────
+# Kept as SIBLING maps rather than new keys inside ``VULN_CATALOG_META`` entries,
+# so no consumer that iterates an entry's items sees a new field. Both maps must
+# cover the exact keyset (locked by tests/unit/scan_policy/test_family_total.py).
+
+#: Family of every finding key (closed taxonomy:
+#: ``adscan_core.scan_policy.families``).
+FINDING_FAMILY: dict[str, str] = {
+    _key: _fam
+    for _fam, _keys in (
+        ("kerberos_roasting", ("kerberoast", "asreproast", "timeroast")),
+        ("unauthenticated", ("smb_null_domain", "smb_guest_shares", "ldap_anonymous")),
+        (
+            "auth_hardening",
+            (
+                "ldap_security_posture", "ntlmv1_enabled", "smb_relay_targets",
+                "smbv1_enabled", "smb_v1_enabled", "smb_signing_disabled",
+                "ntlm_authentication_accepted", "ldaps_unavailable",
+                "kerberos_rc4_domain_accepted", "kerberos_aes_not_forced",
+                "rc4_only_accounts", "weak_lm_compatibility_level",
+                "ntlm_min_session_security_weak", "lsa_protection_disabled",
+                "wdigest_enabled", "lm_hash_storage_enabled", "lsass_custom_ssp_allowed",
+            ),
+        ),
+        (
+            "coercion_relay",
+            (
+                "ntlmv1_relay_rbcd", "ntlmv1_relay_shadowcreds", "ntlmv1_crack",
+                "http_spn_relay_surface", "webdav", "dfscoerce", "mseven",
+                "petitpotam", "printerbug",
+            ),
+        ),
+        (
+            "hygiene",
+            (
+                "stale_passwords", "stale_enabled_users", "password_not_req",
+                "password_not_required", "password_never_expires",
+                "weak_password_policy", "reversible_encryption_enabled",
+                "obsolete_computers", "stale_enabled_computers",
+                "duplicate_computer_dns", "machine_password_rotation_disabled",
+                "machine_password_rotation_relaxed", "laps",
+                "machine_account_quota_risk", "krbtgt_password_age",
+            ),
+        ),
+        ("privileged_groups", ("tier0_highvalue_sprawl", "tier0_access_exposure", "da_sessions")),
+        (
+            "credentials_exposed",
+            (
+                "smb_share_secrets", "gpp_autologin", "gpp_passwords",
+                "credential_in_ldap_attribute", "ldap_user_description_password_leak",
+                "user_description_credential_leak",
+            ),
+        ),
+        (
+            "credential_dumping",
+            (
+                "laps_readable", "gmsa_readable", "dcsync", "krbtgt_pass",
+                "shadow_credentials_present", "unauthorized_external_tenant_replication",
+            ),
+        ),
+        ("password_attacks", ("recovered_account_passwords",)),
+        (
+            "delegation_trusts",
+            (
+                "rbcd_configured", "constrained_delegation", "unconstrained_delegation",
+                "trust_tgt_delegation_enabled", "raise_child_forest_root",
+                "trust_sid_filtering_disabled",
+            ),
+        ),
+        ("acl_abuse", ("excessive_cross_tier_rights",)),
+        (
+            "adcs",
+            (
+                "adcs_esc1", "adcs_esc2", "adcs_esc3", "adcs_esc4", "adcs_esc5",
+                "adcs_orphaned_ca_ntauth", "adcs_esc6", "adcs_esc7", "adcs_esc8",
+                "certighost", "adcs_esc9", "adcs_esc10", "adcs_esc11", "adcs_esc12",
+                "adcs_esc13",
+                "adcs_esc14", "adcs_esc15", "adcs_esc16", "adcs_esc17",
+            ),
+        ),
+        ("cve", ("nopac", "zerologon", "printnightmare", "ms17-010")),
+        ("mssql", ("mssql_bulk_operations_overprivilege",)),
+    )
+    for _key in _keys
+}
+
+#: Mandatory evidence sources: always collected, so a finding that lists one is
+#: never dependency-excluded by a scan policy.
+EVIDENCE_MANDATORY_SOURCES: frozenset[str] = frozenset(
+    {"directory", "posture_probe", "host_collection", "technique_outcome"}
+)
+
+#: What produces each finding, ANY-OF semantics. A finding is excluded by
+#: dependency only when EVERY entry is a check id and every one is excluded, so a
+#: finding with a second producer is never wrongly silenced. Check ids follow the
+#: registry scheme (``step:`` / ``module:`` / ``probe:``). Where a producer could
+#: not be pinned from the code, a mandatory source is listed so the finding stays
+#: assessed (the conservative direction: no false "not assessed").
+FINDING_EVIDENCE: dict[str, tuple[str, ...]] = {
+    **{_key: ("directory",) for _key in FINDING_FAMILY},
+    # Posture probe verdicts (domain_posture / posture_findings_emitter).
+    **{
+        _key: ("posture_probe",)
+        for _key in (
+            "ldap_security_posture", "ntlm_authentication_accepted",
+            "ldaps_unavailable", "kerberos_rc4_domain_accepted",
+            "kerberos_aes_not_forced", "ntlmv1_enabled",
+        )
+    },
+    # Host collector: SMB negotiate and the admin-gated HKLM reads analysed by
+    # collector/audit_analyzer.py (the registry stage always runs).
+    **{
+        _key: ("host_collection",)
+        for _key in (
+            "smb_relay_targets", "smbv1_enabled", "smb_v1_enabled",
+            "smb_signing_disabled", "duplicate_computer_dns",
+            "lsa_protection_disabled", "wdigest_enabled", "lm_hash_storage_enabled",
+            "weak_lm_compatibility_level", "ntlm_min_session_security_weak",
+            "lsass_custom_ssp_allowed",
+        )
+    },
+    "recovered_account_passwords": ("technique_outcome",),
+    "krbtgt_pass": ("technique_outcome",),
+    "timeroast": ("step:timeroasting",),
+    "da_sessions": ("module:domain_collection.samr",),
+    "mssql_bulk_operations_overprivilege": ("module:domain_collection.mssql",),
+    "zerologon": ("probe:cve-2020-1472",),
+    "nopac": ("probe:cve-2021-42278",),
+    "printnightmare": ("probe:cve-2021-34527",),
+    "ms17-010": ("probe:cve-2017-0144",),
+    "webdav": ("probe:adscan-webdav-enabled",),
+    "petitpotam": ("probe:adscan-coercion-petitpotam", "module:domain_analysis.ntlm_auth_type_sweep"),
+    "printerbug": (
+        "probe:adscan-coercion-printerbug",
+        "probe:adscan-printerbug-surface",
+        "module:domain_analysis.ntlm_auth_type_sweep",
+    ),
+    "dfscoerce": ("probe:adscan-coercion-dfscoerce", "module:domain_analysis.ntlm_auth_type_sweep"),
+    "mseven": ("probe:adscan-coercion-msevencoerce", "module:domain_analysis.ntlm_auth_type_sweep"),
+}
+
+__all__ = (
+    "EVIDENCE_MANDATORY_SOURCES",
+    "FINDING_EVIDENCE",
+    "FINDING_FAMILY",
+    "VULN_CATALOG_META",
+    "VULN_CATALOG_STEP_RELATIONS",
+)

@@ -20,7 +20,11 @@ import shutil
 from adscan_internal.command_runner import CommandRunner, CommandSpec, default_runner
 from adscan_internal import print_info_debug
 from adscan_internal.services.base_service import BaseService
-from adscan_internal.services.llm.config import AIProvider, load_ai_config
+from adscan_internal.services.llm.config import (
+    AIProvider,
+    ai_offline_reason,
+    load_ai_config,
+)
 from adscan_internal.services.llm.codex_exec_service import CodexExecService
 
 
@@ -76,6 +80,9 @@ class ShareLootAIAnalysisService(BaseService):
     def is_available(self) -> tuple[bool, str]:
         """Return whether Codex exec is available for loot analysis."""
         config = load_ai_config()
+        offline_reason = ai_offline_reason()
+        if offline_reason is not None:
+            return False, offline_reason
         if not config.enabled:
             return False, "AI is disabled."
         if config.provider != AIProvider.CODEX_CLI:

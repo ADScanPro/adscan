@@ -184,31 +184,40 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
     # SMB
     # ------------------------------------------------------------------
     "smb_relay_targets": VulnCvssDefinition(
-        # Relay target posture. Adjacent + High complexity is reasonable in v3.1
-        # because exploitation generally needs MITM/coercion/on-path conditions.
+        # A configuration finding: the host accepts SMB sessions without
+        # signing, so relayed NTLM authentication can be used against it. What
+        # the scan PROVED is the setting, not a relay. Medium baseline, High
+        # when an affected host is a domain controller or Tier 0, Critical only
+        # when a relay against it was actually walked in this run. Graded in
+        # lockstep with ``smb_signing_disabled`` (same weakness, second producer).
         finding_type=FindingType.CHAIN_PREREQUISITE,
         cvss_vector="CVSS:3.1/AV:A/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
-                elevated_score=9.0,
+                elevated_score=8.0,
                 reason=(
-                    "DCs are relayable SMB targets. Relaying to a DC meaningfully "
-                    "raises privilege-escalation potential"
+                    "A domain controller does not require SMB signing. Relayed "
+                    "authentication accepted by a domain controller can reach "
+                    "privileged access, so the exposure is rated High"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
-                elevated_score=9.0,
+                elevated_score=8.0,
                 reason=(
-                    "Tier-0 assets are relayable SMB targets. "
-                    "Captured authentication can yield privileged access"
+                    "A Tier 0 host does not require SMB signing. Relayed "
+                    "authentication accepted by a Tier 0 host can reach "
+                    "privileged access, so the exposure is rated High"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="SMB relay confirmed: authenticated session obtained",
+                reason=(
+                    "A relay against an unsigned SMB host was carried out in "
+                    "this assessment and produced an authenticated session"
+                ),
             ),
         ],
     ),
@@ -250,25 +259,35 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
     "smbv1_enabled": VulnCvssDefinition(
         # SMBv1 enabled is posture, not the CVE itself. Do not pretend it is
         # equivalent to EternalBlue-class RCE unless you separately detected a
-        # concrete vulnerable build/CVE. Elevation stays in Medium territory
-        # because "protocol enabled" is not "host vulnerable".
+        # concrete vulnerable build/CVE (that is the ``ms17-010`` finding).
+        # Medium baseline, High when the affected host is Tier 0 or a DC.
+        # Mirrors the canonical ``smb_v1_enabled`` definition below (same
+        # weakness, second producer); keep the two in lockstep.
         finding_type=FindingType.CHAIN_PREREQUISITE,
         cvss_vector=None,
         elevation_rules=[
+            # DC first: on a tie the earlier rule wins, and "domain controller"
+            # is the more specific explanation when the finding carries it.
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
-                elevated_score=6.5,
+                elevated_score=7.5,
                 reason=(
-                    "SMBv1 enabled on DCs. Legacy protocol surface; not equivalent "
-                    "to a confirmed CVE such as EternalBlue (MS17-010)"
+                    "SMBv1 is enabled on a domain controller. A domain controller "
+                    "that still accepts SMBv1 is exposed to the SMBv1 exploit "
+                    "family if it is missing patches. Whether a host is actually "
+                    "vulnerable to MS17-010 is tested separately and reported as "
+                    "its own finding"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
-                elevated_score=6.5,
+                elevated_score=7.5,
                 reason=(
-                    "SMBv1 enabled on Tier-0 assets. Legacy protocol surface; "
-                    "confirm a concrete CVE before treating as critical"
+                    "SMBv1 is enabled on a Tier 0 host. A host in the identity "
+                    "control plane that still accepts SMBv1 is exposed to the "
+                    "SMBv1 exploit family if it is missing patches. Whether a "
+                    "host is actually vulnerable to MS17-010 is tested "
+                    "separately and reported as its own finding"
                 ),
             ),
         ],
@@ -317,24 +336,40 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         ],
     ),
     "ldap_security_posture": VulnCvssDefinition(
-        # Signing/channel binding not enforced -> relay posture. This is
-        # defensible as a standalone misconfiguration because the service itself
-        # lacks required integrity protections.
+        # A configuration finding: LDAP signing or channel binding is not
+        # enforced, so relayed NTLM authentication can be used against the
+        # directory. What the scan PROVED is the setting, not a relay. Medium
+        # baseline, High when the affected host is a domain controller or Tier 0
+        # (in practice always: the setting is answered by the DC), Critical only
+        # when a relay to LDAP was actually walked in this run.
         finding_type=FindingType.CHAIN_PREREQUISITE,
         cvss_vector="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N",
         elevation_rules=[
             CvssElevationRule(
                 condition=CONDITION_DC_TARGETS,
-                elevated_score=9.0,
+                elevated_score=8.0,
                 reason=(
-                    "LDAP protections not enforced on DCs. "
-                    "Relaying to LDAP can enable privileged directory operations"
+                    "A domain controller does not enforce LDAP signing or channel "
+                    "binding. Relayed authentication accepted by the directory can "
+                    "change privileged objects, so the exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=8.0,
+                reason=(
+                    "A Tier 0 host does not enforce LDAP signing or channel "
+                    "binding. Relayed authentication accepted by the directory can "
+                    "change privileged objects, so the exposure is rated High"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
-                reason="LDAP relay exploitation confirmed",
+                reason=(
+                    "A relay to LDAP was carried out in this assessment and "
+                    "changed the directory"
+                ),
             ),
         ],
     ),
@@ -529,49 +564,82 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         ],
     ),
     "smb_v1_enabled": VulnCvssDefinition(
-        # SMBv1 is deprecated with known critical CVEs (EternalBlue MS17-010).
-        # HIGH baseline regardless of patch status — the protocol itself is unsafe.
-        # Escalates to CRITICAL on DCs (Tier-0) or when exploitation is confirmed.
-        finding_type=FindingType.VULNERABILITY,
+        # A hardening finding: a legacy protocol left enabled. What the scan
+        # PROVED is that the host negotiates the SMBv1 dialect, not that it is
+        # exploitable. The severe outcome (unauthenticated SYSTEM code
+        # execution) needs a separate, specific defect, MS17-010, which the CVE
+        # scanner probes on its own and reports as its own ``ms17-010`` finding
+        # (graded Critical when the probe confirms the host vulnerable). Grading
+        # this finding at that outcome would double-count it and, on a patched
+        # host, overclaim it. So: Medium baseline, High when an affected host is
+        # Tier 0 (the stamped tier read by ``extract_context_from_details``) or
+        # a domain controller, and never Critical from this key alone. No
+        # exploitation rule either: ADscan never runs the SMBv1 exploit, and a
+        # confirmed vulnerability belongs to the MS17-010 finding.
+        # Mirrors the ``smbv1_enabled`` alias above (same weakness, second
+        # producer); keep the two in lockstep.
+        finding_type=FindingType.CHAIN_PREREQUISITE,
         cvss_vector=None,
         elevation_rules=[
+            # DC first: on a tie the earlier rule wins, and "domain controller"
+            # is the more specific explanation when the finding carries it.
             CvssElevationRule(
-                condition=CONDITION_TIER_ZERO,
-                elevated_score=9.0,
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=7.5,
                 reason=(
-                    "Domain Controller with SMBv1 enabled. EternalBlue on a DC "
-                    "yields direct OS-level access to the Kerberos trust root"
+                    "SMBv1 is enabled on a domain controller. A domain controller "
+                    "that still accepts SMBv1 is exposed to the SMBv1 exploit "
+                    "family if it is missing patches. Whether a host is actually "
+                    "vulnerable to MS17-010 is tested separately and reported as "
+                    "its own finding"
                 ),
             ),
             CvssElevationRule(
-                condition=CONDITION_EXPLOITATION,
-                elevated_score=9.8,
-                reason="SMBv1 exploit confirmed: remote code execution achieved",
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "SMBv1 is enabled on a Tier 0 host. A host in the identity "
+                    "control plane that still accepts SMBv1 is exposed to the "
+                    "SMBv1 exploit family if it is missing patches. Whether a "
+                    "host is actually vulnerable to MS17-010 is tested "
+                    "separately and reported as its own finding"
+                ),
             ),
         ],
     ),
     "smb_signing_disabled": VulnCvssDefinition(
-        # SMB signing not required — enables NTLM relay attacks.
-        # Severity escalates on DCs (Tier-0) because they are the highest-value
-        # relay target. Further escalates when relay exploitation is confirmed.
+        # A configuration finding: SMB signing is not required, so relayed NTLM
+        # authentication can be used against the host. Medium baseline, High
+        # when an affected host is a domain controller or Tier 0, Critical only
+        # when a relay against it was actually walked in this run. Graded in
+        # lockstep with ``smb_relay_targets`` (same weakness, second producer).
         finding_type=FindingType.POSTURE,
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=8.0,
+                reason=(
+                    "A domain controller does not require SMB signing. Relayed "
+                    "authentication accepted by a domain controller can reach "
+                    "privileged access, so the exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=8.0,
                 reason=(
-                    "Domain Controller with SMB signing not required. An ideal relay "
-                    "target; successful relay against a DC yields LDAP/SMB access "
-                    "as the DC machine account"
+                    "A Tier 0 host does not require SMB signing. Relayed "
+                    "authentication accepted by a Tier 0 host can reach "
+                    "privileged access, so the exposure is rated High"
                 ),
             ),
             CvssElevationRule(
                 condition=CONDITION_EXPLOITATION,
                 elevated_score=9.0,
                 reason=(
-                    "NTLM relay via unsigned SMB confirmed: credential relayed "
-                    "and used to authenticate to a target service"
+                    "A relay against an unsigned SMB host was carried out in "
+                    "this assessment and produced an authenticated session"
                 ),
             ),
         ],
@@ -1107,6 +1175,20 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
             ),
         ],
     ),
+    "adcs_esc12": VulnCvssDefinition(
+        finding_type=FindingType.VULNERABILITY,
+        # High privileges (administrator of the CA host) are the precondition;
+        # the scope changes because a certificate signed with the CA key is
+        # trusted domain-wide.
+        cvss_vector="CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:C/C:H/I:H/A:N",
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=9.0,
+                reason="ESC12 CA signing key usable to forge Tier-0 logon certificates",
+            ),
+        ],
+    ),
     "adcs_esc16": VulnCvssDefinition(
         finding_type=FindingType.VULNERABILITY,
         cvss_vector=None,
@@ -1268,18 +1350,38 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
         ],
     ),
     "ntlmv1_enabled": VulnCvssDefinition(
+        # A configuration finding: a host still answers with NTLMv1. Medium
+        # baseline, High when the host is a domain controller or Tier 0, Critical
+        # only when an NTLMv1 response was actually cracked or relayed in this
+        # run. The routes that walk it are their own findings
+        # (``ntlmv1_relay_rbcd`` / ``ntlmv1_relay_shadowcreds`` / ``ntlmv1_crack``).
         finding_type=FindingType.CHAIN_PREREQUISITE,
         cvss_vector=None,
         elevation_rules=[
             CvssElevationRule(
-                condition=CONDITION_EXPLOITATION,
-                elevated_score=9.0,
-                reason="NTLMv1 negotiation captured and credentials cracked or relayed",
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=8.0,
+                reason=(
+                    "A domain controller answers with NTLMv1. Its response can be "
+                    "cracked offline or relayed, and on a domain controller that "
+                    "reaches the whole domain, so the exposure is rated High"
+                ),
             ),
             CvssElevationRule(
-                condition=CONDITION_DC_TARGETS,
-                elevated_score=8.5,
-                reason="NTLMv1 accepted by Domain Controllers: challenge/response is trivially crackable",
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=8.0,
+                reason=(
+                    "A Tier 0 host answers with NTLMv1. Its response can be "
+                    "cracked offline or relayed, and on a Tier 0 host that reaches "
+                    "the whole domain, so the exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.0,
+                reason=(
+                    "An NTLMv1 response was cracked or relayed in this assessment"
+                ),
             ),
         ],
     ),
@@ -1299,6 +1401,193 @@ CVSS_RULES: dict[str, VulnCvssDefinition] = {
                 condition=CONDITION_TIER_ZERO,
                 elevated_score=9.5,
                 reason="Credential exposed in an LDAP attribute belongs to a Tier-0 principal",
+            ),
+        ],
+    ),
+
+    # ------------------------------------------------------------------
+    # Host and domain hardening conditions
+    # ------------------------------------------------------------------
+    # Configuration findings: what the scan PROVED is a setting, not an attack.
+    # Medium baseline (the catalog band), High when an affected asset is a
+    # domain controller or Tier 0 (the stamped tier read by
+    # ``extract_context_from_details``). No exploitation rule: no attack step a
+    # run executes is recorded against these findings, so nothing can lift one
+    # to Critical from a mapping alone.
+    "lsa_protection_disabled": VulnCvssDefinition(
+        # LSASS is not running as a protected process (RunAsPPL off).
+        finding_type=FindingType.POSTURE,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=7.5,
+                reason=(
+                    "LSA Protection is off on a domain controller. A local "
+                    "administrator there can read the credentials of the most "
+                    "privileged accounts from memory, so the exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "LSA Protection is off on a Tier 0 host. A local administrator "
+                    "there can read the credentials of privileged accounts from "
+                    "memory, so the exposure is rated High"
+                ),
+            ),
+        ],
+    ),
+    "wdigest_enabled": VulnCvssDefinition(
+        # WDigest caches the cleartext password of interactive logons.
+        finding_type=FindingType.POSTURE,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=7.5,
+                reason=(
+                    "WDigest cleartext caching is on on a domain controller. The "
+                    "plaintext passwords of privileged accounts that sign in there "
+                    "are kept in memory, so the exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "WDigest cleartext caching is on on a Tier 0 host. The "
+                    "plaintext passwords of privileged accounts that sign in there "
+                    "are kept in memory, so the exposure is rated High"
+                ),
+            ),
+        ],
+    ),
+    "lm_hash_storage_enabled": VulnCvssDefinition(
+        # The host still stores the weak LM hash of passwords.
+        finding_type=FindingType.POSTURE,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=7.5,
+                reason=(
+                    "A domain controller stores LM password hashes. They include "
+                    "those of privileged accounts and crack quickly, so the "
+                    "exposure is rated High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "A Tier 0 host stores LM password hashes. They include those of "
+                    "privileged accounts and crack quickly, so the exposure is "
+                    "rated High"
+                ),
+            ),
+        ],
+    ),
+    "obsolete_computers": VulnCvssDefinition(
+        # A host runs a Windows version past end of support. The finding
+        # records the version, never that a specific flaw was exploited.
+        finding_type=FindingType.POSTURE,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_DC_TARGETS,
+                elevated_score=7.5,
+                reason=(
+                    "A domain controller runs an unsupported Windows version. It no "
+                    "longer receives security fixes, and a flaw on a domain "
+                    "controller reaches the whole domain, so the exposure is rated "
+                    "High"
+                ),
+            ),
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "A Tier 0 host runs an unsupported Windows version. It no "
+                    "longer receives security fixes, and a flaw on a Tier 0 host "
+                    "reaches the whole domain, so the exposure is rated High"
+                ),
+            ),
+        ],
+    ),
+    "reversible_encryption_enabled": VulnCvssDefinition(
+        # A domain or fine-grained password policy stores passwords with
+        # reversible encryption. The finding is domain-wide, so its affected
+        # asset is the domain, which carries no tier; the Tier 0 signal comes
+        # from the policy scope instead (``_reversible_encryption_context`` in
+        # the calculator): the Default Domain Password Policy covers privileged
+        # accounts, a fine-grained policy alone is not shown to.
+        finding_type=FindingType.POSTURE,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_TIER_ZERO,
+                elevated_score=7.5,
+                reason=(
+                    "Reversible encryption is set on the Default Domain Password "
+                    "Policy, which covers privileged accounts unless a "
+                    "fine-grained policy overrides it, so the exposure is rated "
+                    "High"
+                ),
+            ),
+        ],
+    ),
+
+    # ------------------------------------------------------------------
+    # NTLMv1 routes (mapped by the relay graph builder)
+    # ------------------------------------------------------------------
+    # A route finding is emitted while the builder maps the avenue open (status
+    # theoretical / discovered / attempted / blocked); a configuration close or
+    # a data gap emits nothing. Mapped is High (the catalog band); Critical only
+    # when the route was walked in this run, i.e. an edge behind the finding
+    # carries ``status == "success"`` (stamped ``exploitation_confirmed`` by the
+    # attack-graph finding derivation). No tier rule: a mapped route landing on
+    # a domain controller is still a mapped route.
+    "ntlmv1_relay_rbcd": VulnCvssDefinition(
+        # Route finding: High when mapped, Critical only when walked.
+        finding_type=FindingType.VULNERABILITY,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.5,
+                reason=(
+                    "The NTLMv1 relay to resource-based constrained delegation was carried out in this assessment"
+                ),
+            ),
+        ],
+    ),
+    "ntlmv1_relay_shadowcreds": VulnCvssDefinition(
+        # Route finding: High when mapped, Critical only when walked.
+        finding_type=FindingType.VULNERABILITY,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.5,
+                reason=(
+                    "The NTLMv1 relay to shadow credentials was carried out in this assessment"
+                ),
+            ),
+        ],
+    ),
+    "ntlmv1_crack": VulnCvssDefinition(
+        # Route finding: High when mapped, Critical only when walked.
+        finding_type=FindingType.VULNERABILITY,
+        cvss_vector=None,
+        elevation_rules=[
+            CvssElevationRule(
+                condition=CONDITION_EXPLOITATION,
+                elevated_score=9.5,
+                reason=(
+                    "A captured NTLMv1 response was cracked to the machine account hash in this assessment"
+                ),
             ),
         ],
     ),

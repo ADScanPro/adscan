@@ -12,12 +12,15 @@ the second call for the same domain returns ``False`` and is a no-op.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import time
 from enum import StrEnum
 from typing import Any
 
 import rich.box
 
+from adscan_core import tier
 from adscan_core.outbound_links import cta_markup
 from adscan_internal import (
     print_info_debug,
@@ -147,8 +150,8 @@ def promote_to_pwned(
         compromise_summary: Optional pre-rendered Rich summary string
             for the "Domain Compromised" panel. When ``None`` a
             default summary is built.
-        ctf_actions: Optional set of CTF post-compromise actions to
-            queue when ``shell.type == "ctf"``. Defaults to
+        ctf_actions: Optional set of lab post-compromise actions (flag
+            collection) to queue when the scan policy is for a lab. Defaults to
             ``{"flags"}``. Pass e.g. ``{"flags", "dcsync"}`` for the
             full DA-membership flow.
 
@@ -306,7 +309,15 @@ def promote_to_pwned(
                     is_enterprise_lane,
                 )
 
-                if is_enterprise_lane():
+                if tier.is_pro():
+                    # A PRO user already owns the deliverable kit: no upsell.
+                    victory_message = (
+                        "[bold green]You've just proven full domain compromise."
+                        "[/bold green]\n\n"
+                        "Domain Admin access confirmed. Document it before the "
+                        "engagement window closes."
+                    )
+                elif is_enterprise_lane():
                     victory_message = (
                         "[bold green]You've just proven full domain compromise "
                         "in your own AD.[/bold green]\n\n"
@@ -384,7 +395,8 @@ def promote_to_pwned(
     # the NTDS (DA-group membership) and omitted by the secretsdump-driven paths
     # (krbtgt / Tier-0 hash already extracted) so neither mode replicates twice.
     post_compromise_actions = set(ctf_actions) if ctf_actions else {"flags"}
-    if getattr(shell, "type", None) == "ctf":
+    # Flag collection is a lab activity (genuinely environment).
+    if policy_settings.is_lab(shell):
         try:
             shell._ctf_queue_post_compromise_actions(
                 domain,
@@ -422,7 +434,7 @@ def promote_to_pwned(
         # audit pipeline re-runs the attack-path engine, which must not run
         # re-entrantly. A safe checkpoint drains the queue (graph re-collection
         # AS the obtained DA + host credential-harvesting campaign).
-        if getattr(shell, "type", None) == "audit":
+        if policy_settings.runs_full_assessment(shell):
             try:
                 # DCSync-"all" is decided STATE-driven inside the executor
                 # (is_full_ntds_replicated), not by the caller — so it runs once

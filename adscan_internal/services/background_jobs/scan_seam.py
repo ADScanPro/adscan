@@ -9,17 +9,26 @@ secondary subworkspaces but is not a primary scan entry).
 """
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import os
 from typing import Any, Optional
 
 from adscan_core import telemetry
+from adscan_core.poisoning_decision import resolve_poisoning
 from adscan_core.rich_output import (
     confirm_ask,
     print_info,
     print_instruction,
+    print_warning,
 )
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.services.background_jobs.poisoning_job import PoisoningJobRuntime
+from adscan_internal.services.background_jobs.poisoning_interface import (
+    choose_poisoning_interface,
+    choose_poisoning_interfaces,
+    warn_poisoning_skipped_no_interface,
+)
 from adscan_internal.services.background_jobs.registry import (
     BackgroundJob,
     get_or_create_registry,
@@ -39,6 +48,19 @@ _WRITESHARE_BAIT_KIND = "writeshare_bait"
 # Hard opt-out for the write-share NTLMv2-bait background job (parity with
 # ``ADSCAN_NO_POISONING`` — a monitored / out-of-scope engagement kill switch).
 _WRITESHARE_BAIT_OPT_OUT_ENV = "ADSCAN_NO_WRITESHARE_BAIT"
+
+
+def _scan_policy_allows_job(shell: Any, kind: str) -> bool:
+    """True unless the active scan policy excludes job ``kind`` (refuses once)."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        job_excluded,
+        refuse,
+    )
+
+    if not job_excluded(shell, kind):
+        return True
+    refuse(shell, f"module:{kind}", surface="job")
+    return False
 
 
 def _env_flag_set(name: str) -> bool:
@@ -101,9 +123,13 @@ def writeshare_bait_enabled(shell: Any) -> bool:
     except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
         pass
 
-    # (3) No explicit config → workspace-type default (ctf on, audit off).
+    # (3) No explicit config → the scan policy's writable-share bait setting
+    # (Lab / CTF: automatic; a real environment: ask, never unattended).
     try:
-        return str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        return (
+            policy_settings.policy_setting(shell, policy_settings.WRITESHARE_BAIT)
+            == policy_settings.WRITESHARE_BAIT_AUTOMATIC
+        )
     except Exception:  # noqa: BLE001 — a bad shell attr must never break the gate
         return False
 
@@ -155,6 +181,9 @@ def maybe_launch_writeshare_bait_job(
     try:
         if not target_host or not targets or not listener_ip:
             return None
+        # Scan policy (spec 2026-11-04 § 7.2 S6): an excluded job never plants.
+        if not _scan_policy_allows_job(shell, _WRITESHARE_BAIT_KIND):
+            return None
         scope = str(target_host)
         registry = get_or_create_registry(shell)
 
@@ -202,6 +231,11 @@ def maybe_launch_writeshare_bait_job(
         )
         if not runtime.start():
             registry.mark(job.id, state="failed")
+            failure = getattr(runtime, "start_failure", None)
+            if failure:
+                print_warning(
+                    f"Write-share NTLMv2 bait was not planted on {scope}: {failure}"
+                )
             return None
         registry.attach_runtime(job.id, runtime)
         print_info(
@@ -258,13 +292,17 @@ def _configured_poisoning_enabled(shell: Any) -> Optional[bool]:
         return None
 
 
-def _render_poisoning_consent_panel(scope: str) -> None:
+def _render_poisoning_consent_panel(
+    scope: Optional[str], *, segments: tuple[Any, ...] = ()
+) -> None:
     """Render the premium, didactic consent panel for the poisoning offer.
 
     Carries the value (why it matters), the L2 scope, the noise/OPSEC cost, and
     the background-job controls, so the confirm line below can stay a clean
-    one-liner. Best-effort: a rendering failure never blocks the offer. Rich
-    wraps the copy, so it stays readable down to an 80-column terminal.
+    one-liner. ``scope`` is the interface when one is already configured, else
+    ``None`` (the operator is asked which interface right after). Best-effort: a
+    rendering failure never blocks the offer. Rich wraps the copy, so it stays
+    readable down to an 80-column terminal.
     """
     try:
         from rich.console import Group  # noqa: PLC0415
@@ -291,8 +329,20 @@ def _render_poisoning_consent_panel(scope: str) -> None:
             row.append(value, style=value_style)
             return row
 
+        segment_names = [str(getattr(s, "interface", "") or "") for s in segments]
+        segment_names = [n for n in segment_names if n]
+        if scope:
+            where = f"Layer-2 segment on {scope} only — does not cross routers"
+        elif len(segment_names) >= 2:
+            where = (
+                f"The Layer-2 segment behind each of {', '.join(segment_names)} "
+                "(the interfaces with an AD asset routed through them) — does not "
+                "cross routers"
+            )
+        else:
+            where = "Layer-2 segment on the interface you choose only — does not cross routers"
         rows = Group(
-            _row("Scope", f"Layer-2 segment on {scope} only — does not cross routers"),
+            _row("Scope", where),
             _row("Runs", "Non-blocking — the scan continues while it captures"),
             _row("Noise", "Generates network traffic a monitored network may flag", "yellow"),
             _row("Control", "'jobs' for status · 'stop_poisoning' stops it anytime"),
@@ -306,7 +356,15 @@ def _render_poisoning_consent_panel(scope: str) -> None:
         print_panel(
             Group(lede, Text(""), rows, Text(""), footer),
             title="📡  Broadcast Poisoning",
-            subtitle=f"interface {scope}",
+            subtitle=(
+                f"interface {scope}"
+                if scope
+                else (
+                    f"{len(segment_names)} segment interfaces"
+                    if len(segment_names) >= 2
+                    else "choose an interface"
+                )
+            ),
             border_style=ADSCAN_PRIMARY,
             title_align="left",
         )
@@ -315,95 +373,216 @@ def _render_poisoning_consent_panel(scope: str) -> None:
         print_exception(exception=exc)
 
 
+def _active_poisoning_job(registry: Any, interface: Optional[str]) -> Optional[BackgroundJob]:
+    """Return the live poisoning job this launch would duplicate, if any.
+
+    Idempotency is keyed on ``(kind, scope)`` with scope ``poisoning@<iface>``
+    so a client given one interface per VLAN can run one job per interface: with
+    an interface resolved, only a job on THAT interface matches. Only when there
+    is no interface to key on (it is about to be asked for) does any live
+    poisoning job count, so a session that already runs one is not re-asked.
+    """
+    if interface:
+        return registry.find_active(_POISONING_KIND, interface)
+    for job in registry.active():
+        if job.kind == _POISONING_KIND:
+            return job
+    return None
+
+
 def maybe_launch_poisoning_job(
     shell: Any, domain: str, interface: Optional[str]
 ) -> Optional[BackgroundJob]:
     """Decide + launch a broadcast-poisoning background job. Best-effort.
 
-    Order: no-interface guard → idempotency guard → decision gate → launch.
-    The decision gate precedence, strongest first:
+    This is also where the network interface is asked for: poisoning is the only
+    technique that needs a named NIC (it binds one interface and that cannot be
+    inferred), so the question lives beside the decision that needs it instead of
+    at scan startup. Order: idempotency guard -> decision gate -> interface ->
+    launch. The decision precedence (SSOT:
+    :func:`adscan_core.poisoning_decision.resolve_poisoning`, shared with the web
+    form and the Celery command builder), strongest first:
 
     1. ``ADSCAN_NO_POISONING=1`` (hard opt-out) → skip, unconditionally.
     2. ``scan_config.poisoning.enabled`` set (not ``None``) → authoritative:
-       ``True`` launches, ``False`` skips — overriding the workspace-type
-       default, in BOTH interactive and non-interactive runs.
-    3. Otherwise → the workspace-type default: audit auto-launches (interactive
-       prompt pre-set to Yes), ctf does not (prompt pre-set to No).
+       ``True`` launches, ``False`` skips — overriding the policy's default,
+       in BOTH interactive and non-interactive runs.
+    3. Otherwise → the scan policy's ``poisoning`` setting: on auto-launches
+       (interactive prompt pre-set to Yes), off does not (prompt pre-set to No).
+
+    The interface, once poisoning resolves ON:
+
+    * **Interactive:** no interface set → the shared picker; one already set →
+      confirm or switch, the keep-current answer pre-selected. Declining skips
+      poisoning, announced.
+    * **Non-interactive:** never prompts. Keeps the interface that is set; with
+      none, poisoning is SKIPPED with a visible warning (never a crash, never
+      silence).
 
     Returns the job on launch (or the existing active job), else ``None``.
     Never raises.
     """
     try:
-        if not interface:
+        # Scan policy (spec 2026-11-04 § 7.2 S6): an excluded job never launches,
+        # ahead of every consent, interface or idempotency decision.
+        if not _scan_policy_allows_job(shell, _POISONING_KIND):
             return None
-        scope = str(interface)
         registry = get_or_create_registry(shell)
 
-        # Idempotency: already running on this interface → no re-prompt, no relaunch.
-        existing = registry.find_active(_POISONING_KIND, scope)
+        # Idempotency: a poisoning job is already running → no re-prompt, no
+        # relaunch (the trust-enum loop and both scan entry points converge here).
+        current_interface = str(interface or "").strip() or None
+        existing = _active_poisoning_job(registry, current_interface)
         if existing is not None:
             return existing
 
-        # (1) Hard env opt-out — strongest precedence, applies everywhere
-        # (out-of-scope / known-monitored engagements), even over an explicit
-        # scan_config enable.
-        if _ci_opt_out():
+        policy_default = policy_settings.policy_setting(shell, policy_settings.POISONING)
+        # The policy always answers the setting (its explicit value or its
+        # environment's default), so the environment is not read again here.
+        resolution = resolve_poisoning(
+            environment=None,
+            configured_enabled=_configured_poisoning_enabled(shell),
+            env_opt_out=_ci_opt_out(),
+            policy_default=policy_default,
+        )
+        if not resolution.enabled and not (
+            resolution.defaulted and not is_non_interactive(shell)
+        ):
+            # Off by env/config, or off by the ctf default in an unattended run.
+            # (A ctf default is still OFFERED interactively, pre-set to "skip".)
             return None
 
-        # Poisoning is an AUDIT technique (harvest a first credential from a real
-        # engagement), not a CTF one (CTF boxes rarely escalate via broadcast
-        # poisoning). So the workspace-type DEFAULT is: audit ON, ctf OFF.
-        is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        # Poisoning harvests a first credential on a real engagement; CTF boxes
+        # rarely escalate through it. The default-launch answer follows the scan
+        # policy's poisoning setting (Lab / CTF: off, offered; real: on).
+        is_ctf = policy_default != policy_settings.POISONING_ON
+        current = current_interface
+        # Interfaces with an AD segment behind them (callback-capable AND an
+        # in-scope asset routed through them). On an appliance with one NIC per
+        # client segment this is the list of segments the client cabled.
+        segments = () if current else _segment_interfaces(shell)
 
-        # (2) Explicit scan_config toggle is authoritative — it overrides the
-        # type default in both modes. ``None`` = defer to the type default (3).
-        configured = _configured_poisoning_enabled(shell)
-        if configured is False:
-            return None
-        if configured is None:
-            # (3) No explicit config → workspace-type default.
-            if is_non_interactive(shell):
-                # CI / non-interactive (adscan ci — the web/PoV worker path):
-                # audit auto-launches unattended (the money path); ctf never does.
-                if is_ctf:
-                    return None
-                # else (audit): fall through and launch unattended.
+        if is_non_interactive(shell):
+            # Unattended (adscan ci — the web/PoV worker path): audit auto-launches
+            # (the money path); an explicit enable launches too. Never prompt.
+            # A named interface is the operator's chosen noise footprint and is
+            # never widened; with none named, every segment interface is poisoned.
+            if current:
+                scopes: tuple[str, ...] = (current,)
+            elif segments:
+                scopes = tuple(s.interface for s in segments)
             else:
-                # Interactive: the didactic consent panel + prompt is unchanged.
-                _render_poisoning_consent_panel(scope)
-                consent = confirm_ask(
-                    f"Start background poisoning on {scope}?",
-                    default=not is_ctf,  # audit → Yes, CTF → No
+                warn_poisoning_skipped_no_interface(shell)
+                return None
+        else:
+            if not resolution.authoritative:
+                # No explicit config: the didactic consent panel, then the
+                # interface question that carries the yes/no (audit → launch,
+                # ctf → skip pre-selected).
+                _render_poisoning_consent_panel(current, segments=segments)
+            default_launch = resolution.authoritative or not is_ctf
+            if len(segments) >= 2:
+                scopes = choose_poisoning_interfaces(
+                    shell, default_launch=default_launch, segments=segments
                 )
-                if not consent:
-                    print_instruction(
-                        "Skipped. Start it anytime with the 'poisoning' command."
-                    )
-                    return None
-        # configured is True → authoritative launch (both modes, no prompt).
+            else:
+                chosen = choose_poisoning_interface(shell, default_launch=default_launch)
+                scopes = (chosen,) if chosen else ()
+            if not scopes:
+                print_instruction(
+                    "Skipped. Start it anytime with the 'poisoning' command."
+                )
+                return None
 
-        job = registry.create(kind=_POISONING_KIND, scope=scope)
-        sink = make_registry_result_sink(registry)
-        runtime = PoisoningJobRuntime(
-            shell,
-            interface=scope,
-            advertised_ip=getattr(shell, "myip", None),
-            sink=sink,
-            job_id=job.id,
-        )
-        if not runtime.start():
-            registry.mark(job.id, state="failed")
-            return None
-        registry.attach_runtime(job.id, runtime)
-        print_info(
-            f"Background poisoning started on {scope}. Results appear as they land; "
-            "'jobs' for status, 'stop_poisoning' to stop."
-        )
-        return job
+        first_job: Optional[BackgroundJob] = None
+        for scope in scopes:
+            job = _launch_poisoning_on(shell, registry, scope)
+            if first_job is None and job is not None:
+                first_job = job
+        _refresh_network_interface_usage(shell)
+        return first_job
     except Exception as exc:  # noqa: BLE001 — a launch failure must not abort the scan
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return None
+
+
+def _segment_interfaces(shell: Any) -> tuple[Any, ...]:
+    """Interfaces worth poisoning: callback-capable with an AD segment behind them.
+
+    Thin seam over the SSOT :mod:`adscan_internal.services.network_segments`.
+    Best-effort: a mapping failure returns no segment, which keeps the old
+    behaviour (ask, or skip with the visible warning when unattended).
+    """
+    try:
+        from adscan_internal.services.network_segments import (  # noqa: PLC0415
+            map_interface_segments,
+            poisoning_interfaces,
+        )
+
+        return poisoning_interfaces(map_interface_segments(shell))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return ()
+
+
+def _refresh_network_interface_usage(shell: Any) -> None:
+    """Rewrite the per-scan interface usage record (best-effort, never raises)."""
+    try:
+        from adscan_internal.services.network_segments import (  # noqa: PLC0415
+            write_network_interface_usage,
+        )
+
+        write_network_interface_usage(shell)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _launch_poisoning_on(shell: Any, registry: Any, scope: str) -> Optional[BackgroundJob]:
+    """Launch (or return the live) poisoning job on ONE interface."""
+    # Idempotency on the resolved interface (an operator switch may land on an
+    # interface that already has a job).
+    existing = registry.find_active(_POISONING_KIND, scope)
+    if existing is not None:
+        return existing
+
+    # Only an operator DECLARATION is announced on every interface (it wins for
+    # every target by design). An interface-derived myip belongs to one NIC, so
+    # announcing it on another segment would send victims to an address they
+    # cannot reach; without a declaration the poisoner answers each victim with
+    # its own interface's address on the victim's subnet.
+    from adscan_internal.services.listener_ip import myip_is_declared  # noqa: PLC0415
+    from adscan_internal.services.network_segments import (  # noqa: PLC0415
+        ROLE_POISONING,
+        record_interface_role,
+    )
+
+    advertised_ip = getattr(shell, "myip", None) if myip_is_declared(shell) else None
+    job = registry.create(kind=_POISONING_KIND, scope=scope)
+    sink = make_registry_result_sink(registry)
+    runtime = PoisoningJobRuntime(
+        shell,
+        interface=scope,
+        advertised_ip=advertised_ip,
+        sink=sink,
+        job_id=job.id,
+    )
+    if not runtime.start():
+        registry.mark(job.id, state="failed")
+        print_warning(
+            f"Background poisoning could not start on {scope}; the scan continues "
+            "without it on that interface."
+        )
+        return None
+    registry.attach_runtime(job.id, runtime)
+    record_interface_role(shell, scope, ROLE_POISONING)
+    print_info(
+        f"Background poisoning started on {scope}. Results appear as they land; "
+        "'jobs' for status, 'stop_poisoning' to stop."
+    )
+    return job
 
 
 # Job kinds that run to COMPLETION on their own (a finite crack) vs an
@@ -414,6 +593,60 @@ def maybe_launch_poisoning_job(
 # never offered for stop and never killed here (`jobs stop <id>` still works on
 # demand). They surface via the harvest review as they land.
 _FINITE_JOB_KINDS: frozenset[str] = frozenset({"cracking"})
+
+
+def _reconcile_unattributed_captures(shell: Any) -> None:
+    """Re-file reserved-bucket captures into the domains they now resolve to.
+
+    Reports what moved, because an operator who watched a hash land with no
+    domain needs to know it has one now. Never raises: a failed re-file leaves
+    the material exactly where it was, which is already honest.
+    """
+    try:
+        from adscan_internal.services.captured_credential_attribution import (  # noqa: PLC0415
+            reconcile_unattributed_captures,
+        )
+
+        refiled = reconcile_unattributed_captures(shell)
+        if not refiled:
+            return
+        domains = sorted({domain for _principal, domain in refiled})
+        count = len(refiled)
+        print_info(
+            f"Attributed {count} captured credential{'s' if count != 1 else ''} to "
+            f"{', '.join(domains)} — available for cracking under "
+            f"{'those domains' if len(domains) != 1 else 'that domain'}."
+        )
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _declare_network_interface_usage(shell: Any) -> None:
+    """Write the final interface usage record and tell the operator what it says.
+
+    Operator-facing only: which configured interfaces had no in-scope AD asset
+    behind them, and which AD segments broadcast poisoning did not cover when it
+    ran elsewhere. Client-facing wording is the host-reach coverage block's job,
+    whose ``vantage`` and ``idle_interfaces`` come from the same segment map. Never raises.
+    """
+    try:
+        from adscan_internal.services.network_segments import (  # noqa: PLC0415
+            unpoisoned_segment_lines,
+            unused_interface_lines,
+            write_network_interface_usage,
+        )
+
+        record = write_network_interface_usage(shell)
+        notes =unused_interface_lines(record) + unpoisoned_segment_lines(record)
+        if not notes:
+            return
+        print_info("Network interfaces this scan did not use for every segment:")
+        for line in notes:
+            print_info(f"  {line}", spacing="none")
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def reconcile_jobs_at_scan_end(shell: Any) -> None:
@@ -427,6 +660,19 @@ def reconcile_jobs_at_scan_end(shell: Any) -> None:
     * **Indefinite listeners** (broadcast poisoning) get the keep-or-stop prompt
       (default keep). Stopping them does NOT stop the cracks.
     """
+    # Deferred attribution, BEFORE the harvest summary so it reports the domains
+    # the material now belongs to. A capture that landed in the reserved bucket
+    # early in the scan — the poisoning job launches at the scan-entry seam, well
+    # before LDAP collection records a NetBIOS name or a DC — is attributable by
+    # now, and re-filing it is what puts the hash in front of the domain's
+    # cracking, relay and attack-path consumers instead of leaving it orphaned.
+    # Deliberately ahead of every early return below: it must run unattended too.
+    _reconcile_unattributed_captures(shell)
+    # Same placement, same reason: by scan end the collection has resolved the
+    # computers, so this is the complete answer to "which NIC reached which AD
+    # segment", and a configured NIC nothing used is declared, never silent.
+    _declare_network_interface_usage(shell)
+
     try:
         _render_scan_end_harvest_summary(shell)
         registry = get_or_create_registry(shell)

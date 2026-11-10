@@ -16,9 +16,11 @@ from adscan_internal.services.coercion.core import (
     CoercionRunResult,
     CoercionTarget,
     RpcTransport,
+    _coercion_method_delay,
 )
 from adscan_internal.services.coercion.display import print_coercion_summary
 from adscan_internal.services.coercion.registry import default_coercion_methods
+
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,9 @@ class NativeCoercionRunConfig:
     listener_auth_type: CoercionAuthType = "smb"
     listener_port: int | None = None
     timeout_seconds: float = 60.0
-    delay_seconds: float = 0.05
+    delay_seconds: float = field(
+        default_factory=lambda: _coercion_method_delay()
+    )  # pause between methods on one host; scan pacing ``coercion.methods`` (0.05 s default)
     protocols: tuple[str, ...] = ()
     transports: tuple[RpcTransport, ...] = ("ncan_np",)
     method_names: tuple[str, ...] = ()

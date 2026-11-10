@@ -822,7 +822,12 @@ def _build_smb_config_for_host(
             target_hostname=spn_host or target or pdc_ip,
             domain=domain,
             username=username,
-            password=None if (is_ccache or is_hash) else (cred_stripped or None),
+            # An explicit empty override is the deliberate guest / null-session
+            # credential: keep it as "" (the blank password the material guard
+            # accepts) instead of dropping it to None.
+            password=None
+            if (is_ccache or is_hash)
+            else (cred_stripped if credential_override is not None else (cred_stripped or None)),
             nt_hash=cred_stripped if is_hash else None,
             ccache_path=cred_stripped if is_ccache else None,
             auth_domain=domain,

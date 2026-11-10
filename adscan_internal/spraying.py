@@ -125,6 +125,11 @@ class SprayEligibilityResult:
     """Per-eligible-user lockout headroom (username + BadPwdCount + remaining), for
     the eligibility panel. Empty on legacy/no-policy paths; render falls back to the
     plain ``eligible_users`` list when so."""
+    attempt_cap: Optional[int] = None
+    """Hard ceiling on attempts per account for one spray flow, applied on top of
+    the headroom-derived budget. Set when the lockout counters were read from a
+    source that can under-count (a replica DC whose PDC is unreachable), so the
+    budget must not trust them fully. ``None`` = no extra ceiling."""
     owned_drop: Optional["OwnedPrincipalDrop"] = None
     """The already-owned principals removed BEFORE this result was computed, so the
     panel can render the full funnel (list -> owned -> safety -> sprayed) instead of
@@ -201,7 +206,7 @@ def compute_spray_eligibility(
     if no_lockout_enforced:
         notes.append(
             "Account lockout threshold is None (no lockout enforced). All users are "
-            "eligible; spraying cannot lock accounts, but use caution."
+            "eligible; failed sign-ins do not count toward a lockout, but use caution."
         )
         return SprayEligibilityResult(
             input_users=list(file_users),
@@ -218,7 +223,7 @@ def compute_spray_eligibility(
     if lockout_threshold == 0:
         notes.append(
             "Account lockout threshold is 0 (no lockout enforced). All users are "
-            "eligible; spraying cannot lock accounts."
+            "eligible; failed sign-ins do not count toward a lockout."
         )
         return SprayEligibilityResult(
             input_users=list(file_users),

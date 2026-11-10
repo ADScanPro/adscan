@@ -180,6 +180,9 @@ _PLACEMENTS: dict[str, _Placement] = {
     "demo_next_steps": _Placement("/docs"),
     # Telemetry disclosure row in the install summary.
     "telemetry_notice": _Placement("/docs/telemetry"),
+    # The guidance the retired workspace type (`ci --type`, `set type`) and a
+    # `ci` run with no policy print: the scan-policies guide.
+    "legacy_type_notice": _Placement("/docs/guides/scan-policies"),
     # `adscan ci --help`: where to report a wrong autonomous decision.
     "ci_help_debug": _Placement("/docs"),
     # Image pull failed after retries.

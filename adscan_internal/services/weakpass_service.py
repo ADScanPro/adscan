@@ -10,6 +10,8 @@ the free community/CTF value), every weakpass call MUST pass through
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
@@ -47,15 +49,16 @@ def weakpass_allowed(shell: object | None) -> bool:
     1. Global kill switch (highest priority): if ``ADSCAN_OFFLINE`` /
        ``ADSCAN_NO_EXTERNAL`` is truthy, weakpass is ALWAYS disabled, with no
        prompt, no matter what.
-    2. By ``shell.type``:
-       - ``ctf``  -> ON automatically (lab / public data; keeps the fast
-         lead-magnet UX).
-       - ``audit`` -> default OFF. In an interactive (TTY) session, show an
+    2. By the scan policy's ``online_hash_lookup`` setting:
+       - ``on``  -> ON automatically (Lab / CTF: lab / public data; keeps the
+         fast lead-magnet UX). Only a lab policy may set it.
+       - ``ask`` -> default OFF. In an interactive (TTY) session, show an
          explicit opt-in prompt (default ``False``) that spells out the egress.
-       - any other / unknown / unreadable type -> fail-safe OFF.
+       - ``off`` -> OFF, no prompt.
+       - no policy environment / unreadable shell -> fail-safe OFF.
     3. Non-interactive / CI (no TTY): never prompt and never auto-enable via a
-       prompt. Falls back to the type default, so the Enterprise platform (CI)
-       never uses weakpass by construction (only ``ctf`` stays ON in CI).
+       prompt, so the Enterprise platform (CI) never uses weakpass unless a lab
+       policy turned it on.
 
     Args:
         shell: The active shell. Read defensively; an unreadable shell -> OFF.
@@ -71,28 +74,27 @@ def weakpass_allowed(shell: object | None) -> bool:
         )
         return False
 
-    # 2) Decide by session type (fail-safe default OFF for anything unknown).
-    try:
-        shell_type = str(getattr(shell, "type", "") or "").strip().lower()
-    except Exception:  # noqa: BLE001 - unreadable shell must fail safe
-        print_info_debug("weakpass disabled: shell type unreadable (fail-safe).")
-        return False
-
-    if shell_type == "ctf":
-        return True
-
-    if shell_type != "audit":
-        # Unknown / ambiguous / unset session type -> never egress.
+    # 2) Decide by the scan policy (fail-safe default OFF for anything unknown).
+    if policy_settings.policy_environment(shell) is None:
+        # No policy environment (unset / unreadable session) -> never egress.
         print_info_debug(
-            f"weakpass disabled: session type '{shell_type or 'unset'}' "
-            "is not opt-in eligible (fail-safe)."
+            "weakpass disabled: the session has no scan policy environment "
+            "(fail-safe)."
+        )
+        return False
+    lookup = policy_settings.policy_setting(shell, policy_settings.ONLINE_HASH_LOOKUP)
+    if lookup == policy_settings.ONLINE_HASH_LOOKUP_ON:
+        return True
+    if lookup == policy_settings.ONLINE_HASH_LOOKUP_OFF:
+        print_info_verbose(
+            "weakpass disabled: the scan policy turns online hash lookups off."
         )
         return False
 
-    # 3) audit: default OFF; only an explicit interactive opt-in turns it ON.
+    # 3) ask: default OFF; only an explicit interactive opt-in turns it ON.
     if is_non_interactive(shell):
         print_info_verbose(
-            "weakpass disabled: non-interactive/CI audit session "
+            "weakpass disabled: non-interactive/CI session "
             "(default OFF, no external NT-hash lookup)."
         )
         return False

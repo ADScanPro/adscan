@@ -6,12 +6,15 @@ import asyncio
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 from adscan_core.rich_output import print_error, print_info, print_info_debug, print_info_verbose
 from adscan_internal.core.events import Event, EventBus, EventType
 from adscan_internal.services.cve_scanner.catalog import (
@@ -35,8 +38,14 @@ from adscan_core.rich_output import print_exception
 # (host, port) is ~50× cheaper than an auth handshake, so a higher fan-out
 # than the auth concurrency is safe — mirrors the SMB sweep's gate). Kept in
 # one place so a corporate-scale bump is a one-line change.
-_PREFLIGHT_PROBE_CONCURRENCY = 64
-_PREFLIGHT_PROBE_TIMEOUT_SECONDS = 3.0
+# The values live in the scan-pacing SSOT (consumer ``probe.cve_preflight``);
+# these names are the default-level values.
+_PREFLIGHT_PROBE_CONCURRENCY = _pacing_consumer("probe.cve_preflight").param("concurrency").default  # 64
+_PREFLIGHT_PROBE_TIMEOUT_SECONDS = _pacing_consumer("probe.cve_preflight").param("timeout_s").default  # 3.0
+
+
+class _PausedBySafeguard(Exception):
+    """The strain safeguard paused this host earlier in the assessment."""
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,15 @@ class ScanContext:
     domains_data: Mapping[str, Any] = field(default_factory=dict)
     ip_hostname_inventory: dict[str, list[str]] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
+    #: The scanning account's lockout headroom for checks whose negative outcome
+    #: is a failed sign-in (``failing_auth_budget.FailingAuthBudget``). ``None``
+    #: means unknown, and those checks then send nothing (fail closed).
+    failing_auth_budget: Any | None = None
+    #: The run's per-host patch-level cache (``host_patch_level.HostPatchLevelCache``):
+    #: one Remote Registry read per host serves every patch-level check, made
+    #: with an administrator of the host when ADscan holds one. ``None`` (tests,
+    #: ad-hoc callers) keeps each check reading with the scan credential.
+    patch_level: Any | None = None
 
 
 @dataclass
@@ -131,13 +149,20 @@ class CVEScanRunner:
     def __init__(
         self,
         *,
-        concurrency: int = 10,
-        per_host_concurrency: int = 3,
-        check_timeout_seconds: float = 120.0,
+        concurrency: int | None = None,
+        per_host_concurrency: int | None = None,
+        check_timeout_seconds: float | None = None,
     ) -> None:
-        self._concurrency = concurrency
-        self._per_host_concurrency = per_host_concurrency
-        self._check_timeout = check_timeout_seconds
+        # Unset values come from the scan pacing (``cve.runner``: 10, 3 and 120 s
+        # at the default level).
+        pacing = component_pacing(active_pacing(), "cve.runner")
+        self._concurrency = pacing["concurrency"] if concurrency is None else concurrency
+        self._per_host_concurrency = (
+            pacing["per_host_concurrency"] if per_host_concurrency is None else per_host_concurrency
+        )
+        self._check_timeout = (
+            pacing["check_timeout_s"] if check_timeout_seconds is None else check_timeout_seconds
+        )
 
     async def scan(
         self,
@@ -156,8 +181,16 @@ class CVEScanRunner:
         cves_t = tuple(cves)
         cred_auth_domains = _credential_auth_domains(creds)
         started_at = datetime.now(timezone.utc)
-        global_sem = asyncio.Semaphore(self._concurrency)
+        runtime = active_runtime()
+        global_sem = runtime.semaphore(self._concurrency)
         per_host_sems: dict[str, asyncio.Semaphore] = {}
+
+        async def _paced_run(check: Any, target: ScanTarget) -> Any:
+            # Per-host pause and request rate (no-op at the default level); a host
+            # the safeguard paused is not checked and reads as unreachable.
+            if not await runtime.before_op(target.host):
+                raise _PausedBySafeguard(target.host)
+            return await check.run(target, creds, ctx)
 
         # Partition CVE catalog entries: coercion entries share a single
         # engine call per host (the adapter emits one CVEResult per
@@ -266,11 +299,15 @@ class CVEScanRunner:
                 started = time.monotonic()
                 try:
                     raw = await asyncio.wait_for(
-                        check.run(target, creds, ctx),
+                        _paced_run(check, target),
                         timeout=self._check_timeout,
                     )
                     cve_results = list(raw) if isinstance(raw, list) else [raw]
+                    runtime.record(target.host, Outcome.OK, time.monotonic() - started)
+                except _PausedBySafeguard:
+                    cve_results = [_unreachable_result(cve, target)]
                 except asyncio.TimeoutError:
+                    runtime.record(target.host, Outcome.TIMEOUT)
                     # A host that passed the reachability preflight but then
                     # timed out mid-check is unreachable-at-depth, not a tool
                     # fault: render a concise unreachable line, NOT the generic
@@ -293,7 +330,9 @@ class CVEScanRunner:
 
                 async with results_lock:
                     for result in cve_results:
-                        annotated = _stamp_duration(result, duration)
+                        annotated = _stamp_duration(
+                            _stamp_catalog_severity(result, cve), duration
+                        )
                         results.append(annotated)
                         if on_result is not None:
                             on_result(annotated)
@@ -337,10 +376,14 @@ class CVEScanRunner:
                 timed_out = False
                 try:
                     technique_results = await asyncio.wait_for(
-                        check.run(target, creds, ctx),
+                        _paced_run(check, target),
                         timeout=self._check_timeout,
                     )
+                    runtime.record(target.host, Outcome.OK, time.monotonic() - started)
+                except _PausedBySafeguard:
+                    timed_out = True
                 except asyncio.TimeoutError:
+                    runtime.record(target.host, Outcome.TIMEOUT)
                     # Passed the 445 preflight but the sweep timed out
                     # mid-flight → unreachable-at-depth, a data gap. Concise
                     # line, not the generic support template.
@@ -475,8 +518,8 @@ class CVEScanRunner:
             probe_map = await tcp_probe_hosts(
                 sorted(hosts),
                 port,
-                timeout=_PREFLIGHT_PROBE_TIMEOUT_SECONDS,
-                max_concurrency=_PREFLIGHT_PROBE_CONCURRENCY,
+                timeout=component_pacing(active_pacing(), "probe.cve_preflight")["timeout_s"],
+                max_concurrency=component_pacing(active_pacing(), "probe.cve_preflight")["concurrency"],
             )
             for host, probe in probe_map.items():
                 if probe.status == "open":
@@ -659,6 +702,22 @@ def _error_result(cve: CVEDefinition, target: ScanTarget, message: str) -> CVERe
         technique=cve.technique,
         error=message,
     )
+
+
+def _stamp_catalog_severity(result: CVEResult, cve: CVEDefinition) -> CVEResult:
+    """Grade a VULNERABLE result by the catalog band, not the check's CVSS bucket.
+
+    Each check stamps ``Severity.from_cvss(CVSS_V3)``, which grades the CVE's
+    worst case. The catalog band follows how the verdict was reached
+    (``CVEDefinition.detection_basis``), so a probe confirmation and a
+    patch-level inference no longer read the same. Only CVE checks carry a
+    basis; every other result is returned unchanged.
+    """
+    if result.status is not CVEStatus.VULNERABLE or not cve.detection_basis:
+        return result
+    if result.severity is cve.severity:
+        return result
+    return replace(result, severity=cve.severity)
 
 
 def _stamp_duration(result: CVEResult, duration: float) -> CVEResult:

@@ -64,6 +64,7 @@ from adscan_internal.services.smb_transport import (
     smb_machine_with_fallback,
 )
 from adscan_core.rich_output import print_exception
+from adscan_core.scan_policy import settings as policy_settings
 
 FlagKind = Literal["user", "root", "system", "flag", "proof", "unknown"]
 FlagMethod = Literal["smb_read", "remote_exec"]
@@ -1057,10 +1058,10 @@ async def _remote_exec_fallback_strategy(
 
         host_intel_cache = getattr(shell, 'host_intel_cache', None)
         edr_intel = getattr(shell, 'edr_intel', None)
-        workspace_type = getattr(shell, 'type', None)
+        prefer_speed = policy_settings.prefers_fast_remote_execution(shell)
         adaptive = host_intel_cache is not None
         on_intel = (
-            _make_panel_callback(shell, host_intel_cache, workspace_type)
+            _make_panel_callback(shell, host_intel_cache, prefer_speed)
             if adaptive else None
         )
 
@@ -1077,7 +1078,7 @@ async def _remote_exec_fallback_strategy(
                     methods=None if adaptive else STDOUT_CASCADE,
                     intel_cache=host_intel_cache,
                     intel=edr_intel,
-                    workspace_type=workspace_type,
+                    prefer_speed=prefer_speed,
                     on_intel_resolved=on_intel,
                     timeout=timeout_seconds,
                 )
@@ -1160,7 +1161,7 @@ async def _remote_exec_fallback_strategy(
 # ---------------------------------------------------------------------------
 
 
-def _make_panel_callback(shell, host_intel_cache, workspace_type):
+def _make_panel_callback(shell, host_intel_cache, prefer_speed):
     """Return an on_intel_resolved callback that fires the host-intel panel once."""
     def _cb(fp, ranked):
         try:
@@ -1185,8 +1186,12 @@ def _make_panel_callback(shell, host_intel_cache, workspace_type):
                 console=get_console(),
                 fingerprint=fp,
                 cascade=ranked,
-                reason_lines=build_reason_lines(fp, workspace_type),
-                workspace_type=workspace_type,
+                reason_lines=build_reason_lines(fp, prefer_speed),
+                execution_preference=policy_settings.SETTINGS_BY_KEY[
+                    policy_settings.REMOTE_EXECUTION
+                ].value_label(
+                    policy_settings.policy_setting(shell, policy_settings.REMOTE_EXECUTION)
+                ),
                 cache_ttl_remaining_s=ttl_remaining,
             )
         except Exception as exc:  # noqa: BLE001

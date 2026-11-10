@@ -91,8 +91,14 @@ async def check_blank_password(
     except Exception:  # noqa: BLE001 — salt probe is best-effort
         pass
 
+    # The empty password IS the test here, so this is the one sign-in the
+    # lockout guard lets through with no secret. It is still judged: a
+    # principal at its failure budget or reported disabled is not tried.
+    from adscan_core.auth_attempt_guard import allow_empty_secret  # noqa: PLC0415
+
     try:
-        await client.with_clock_skew(client.get_TGT)
+        with allow_empty_secret():
+            await client.with_clock_skew(client.get_TGT)
         print_info_debug(f"blank-password: TGT minted for {username} (empty password)")
         return True
     except KerberosError:

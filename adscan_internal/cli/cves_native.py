@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-import socket
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,11 +215,37 @@ def _run_report(shell: Any) -> None:
         )
 
 
+def filter_cves_by_scan_policy(shell: Any, cves: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Return ``cves`` minus the probes the active scan policy excludes.
+
+    Each excluded probe is refused once through the enforcement SSOT. No policy:
+    ``cves`` is returned unchanged.
+    """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        cve_excluded,
+        policy_active,
+        refuse,
+    )
+
+    if not policy_active(shell):
+        return tuple(cves)
+    kept: list[Any] = []
+    for cve in cves:
+        cve_id = str(getattr(cve, "id", "") or "")
+        if cve_excluded(shell, cve_id):
+            refuse(shell, f"probe:{cve_id.lower()}", surface="cve_probe")
+            continue
+        kept.append(cve)
+    return tuple(kept)
+
+
 def _run_scan(shell: Any, argv: list[str]) -> None:
     targets_path: str | None = None
     cve_selectors: list[str] = []
     listener: str | None = None
-    concurrency = 10
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    concurrency = int(component_pacing(active_pacing(), "cve.runner")["concurrency"])
     audience = "technical"
     force_dc = False
     i = 0
@@ -273,18 +298,16 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
         print_error(str(exc))
         return
 
+    # Scan policy (spec 2026-11-04 § 7.2 S6): drop the probes the policy
+    # excludes before any target is touched. An unknown probe id fails closed.
+    cves = filter_cves_by_scan_policy(shell, cves)
+    if not cves:
+        print_info("CVE verification: every selected check is excluded by scan policy.")
+        return
+
     workspace_dir = _workspace_dir(shell) or Path.cwd()
     masked_creds = _masked_creds(shell, domain)
-
-    # Resolve credentials + DC IP once from the shell. These wire both the
-    # SMB factory used by the coercion adapter and the cred bundle that
-    # authenticated checks (PrintNightmare, BadSuccessor, WebDAV, …)
-    # consume via ``getattr(creds, …)``.
-    cred_info = _shell_credentials(shell, domain)
     dc_ip = _shell_dc_ip(shell, domain)
-
-    smb_factory = _build_smb_factory(cred_info=cred_info, dc_ip=dc_ip)
-    ldap_factory = async_connect_with_ldap_fallback
 
     # Allocate the scan_id eagerly so the persistent log + report all live
     # under the same directory before the runner emits its first event.
@@ -303,34 +326,21 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
     # there is no DC IP we leave ``listener_host`` unset; the runner
     # surfaces coercion entries as Error rather than producing fake
     # NotApplicable rows.
-    listener_host = listener or _resolve_listener_host(dc_ip)
+    listener_host = listener or _resolve_listener_host(shell, dc_ip)
     if listener_host is None:
         print_warning(
             "[cves] listener host could not be resolved (no DC IP); "
             "coercion checks will surface as errors. Pass --listener <ip>."
         )
 
-    # Workspace state the authenticated checks need to resolve a DC's FQDN
-    # through the canonical SSOTs (build_ldap_config_for_domain / resolve_dc_fqdn)
-    # instead of handing the transport a bare IP — which degrades the Kerberos
-    # SPN to ldap/<ip> or cifs/<ip> and draws SEC_E_LOGON_DENIED from the DC.
-    domains_data = dict(getattr(shell, "domains_data", {}) or {})
-    ip_hostname_inventory = _load_ip_hostname_inventory(shell, domain)
-
-    ctx = ScanContext(
-        workspace_dir=Path(workspace_dir),
+    ctx, creds_obj = build_scan_context(
+        shell,
         domain=domain,
+        cves=cves,
+        scan_id=scan_id,
+        workspace_dir=Path(workspace_dir),
         listener_host=listener_host,
-        smb_connection_factory=smb_factory,
-        ldap_factory=ldap_factory,
         event_bus=event_bus,
-        domains_data=domains_data,
-        ip_hostname_inventory=ip_hostname_inventory,
-        extras={"scan_id": scan_id, "dc_ip": dc_ip},
-    )
-
-    creds_obj = _build_creds_object(
-        cred_info=cred_info, dc_ip=dc_ip, target_domain=domain
     )
 
     state = build_state(
@@ -345,7 +355,7 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
     print_info_verbose(
         f"[cves] starting scan: targets={len(targets)} "
         f"cves={len(cves)} audience={audience} scan_id={scan_id} "
-        f"smb_factory={'wired' if smb_factory else 'absent'} "
+        f"smb_factory={'wired' if ctx.smb_connection_factory else 'absent'} "
         f"ldap_factory=wired"
     )
 
@@ -367,6 +377,82 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
                 scan_log=scan_log,
             )
         )
+
+
+def build_scan_context(
+    shell: Any,
+    *,
+    domain: str | None,
+    cves: tuple[Any, ...],
+    scan_id: str,
+    workspace_dir: Path,
+    listener_host: str | None = None,
+    event_bus: EventBus | None = None,
+) -> tuple[ScanContext, Any | None]:
+    """Build the ``ScanContext`` and the credential bundle one CVE scan runs with.
+
+    Shared by the CVE phase and the post-collection patch-level re-run, so both
+    resolve credentials, the DC, the host inventory and the patch-level cache
+    the same way.
+    """
+    # Resolve credentials + DC IP once from the shell. These wire both the
+    # SMB factory used by the coercion adapter and the cred bundle that
+    # authenticated checks (PrintNightmare, BadSuccessor, WebDAV, …)
+    # consume via ``getattr(creds, …)``.
+    cred_info = _shell_credentials(shell, domain)
+    dc_ip = _shell_dc_ip(shell, domain)
+
+    # Workspace state the authenticated checks need to resolve a DC's FQDN
+    # through the canonical SSOTs (build_ldap_config_for_domain / resolve_dc_fqdn)
+    # instead of handing the transport a bare IP — which degrades the Kerberos
+    # SPN to ldap/<ip> or cifs/<ip> and draws SEC_E_LOGON_DENIED from the DC.
+    domains_data = dict(getattr(shell, "domains_data", {}) or {})
+    ip_hostname_inventory = _load_ip_hostname_inventory(shell, domain)
+
+    ctx = ScanContext(
+        workspace_dir=Path(workspace_dir),
+        domain=domain,
+        listener_host=listener_host,
+        smb_connection_factory=_build_smb_factory(cred_info=cred_info, dc_ip=dc_ip),
+        ldap_factory=async_connect_with_ldap_fallback,
+        event_bus=event_bus,
+        domains_data=domains_data,
+        ip_hostname_inventory=ip_hostname_inventory,
+        extras={"scan_id": scan_id, "dc_ip": dc_ip},
+        failing_auth_budget=_failing_auth_budget_for(
+            shell, cves=cves, cred_info=cred_info, domain=domain, dc_ip=dc_ip
+        ),
+        patch_level=_patch_level_cache_for(shell, domain=domain, dc_ip=dc_ip),
+    )
+    creds_obj = _build_creds_object(
+        cred_info=cred_info, dc_ip=dc_ip, target_domain=domain
+    )
+    return ctx, creds_obj
+
+
+def _patch_level_cache_for(shell: Any, *, domain: str | None, dc_ip: str | None) -> Any | None:
+    """The run's patch-level cache, its administrator resolver refreshed.
+
+    Re-installing the resolver forgets earlier answers, so a credential gained
+    since the previous scan (a Domain Admin, a LAPS password) is used now.
+    """
+    if not domain:
+        return None
+    try:
+        from adscan_internal.services.cve_scanner.host_admin_access import (  # noqa: PLC0415
+            build_host_admin_access_resolver,
+        )
+        from adscan_internal.services.cve_scanner.host_patch_level import (  # noqa: PLC0415
+            get_host_patch_level_cache,
+        )
+
+        cache = get_host_patch_level_cache(shell, domain)
+        cache.set_access_resolver(build_host_admin_access_resolver(shell, domain=domain, dc_ip=dc_ip))
+        return cache
+    except Exception as exc:  # noqa: BLE001 - without it the checks read as before
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
 
 
 async def _run_async(
@@ -437,6 +523,22 @@ async def _run_async(
 
     persist_report(persist_target_dir, report)
     _emit_cve_positive_control_evidence(shell, report, targets, ctx)
+    _remember_scan(shell, report=report, targets=targets, ctx=ctx)
+
+
+def _remember_scan(shell: Any, *, report: Any, targets: tuple[ScanTarget, ...], ctx: ScanContext) -> None:
+    """Keep the scan for the post-collection re-run and write the host record."""
+    try:
+        if ctx.patch_level is not None:
+            ctx.patch_level.flush()
+        from adscan_internal.services.cve_scanner.patch_level_rerun import (  # noqa: PLC0415
+            remember_cve_scan,
+        )
+
+        remember_cve_scan(shell, report=report, targets=targets, domain=ctx.domain)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping never breaks the scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _emit_cve_positive_control_evidence(
@@ -457,6 +559,10 @@ def _emit_cve_positive_control_evidence(
             emit_cve_not_vulnerable_positives,
         )
 
+        from adscan_internal.services.engagement.observation_sources import (
+            observe_cve_results,
+        )
+
         host_to_domain: dict[str, str] = {}
         for target in targets or ():
             domain = str(getattr(target, "domain", "") or "").strip()
@@ -464,6 +570,16 @@ def _emit_cve_positive_control_evidence(
             if host and domain:
                 host_to_domain[host] = domain
 
+        default_domain = str(getattr(ctx, "domain", "") or "").strip() or None
+        # Every probe verdict (clear, vulnerable, errored, skipped) goes to the
+        # run's observation record first; the positives below are derived from
+        # the same record, so a probe that missed hosts cannot green its control.
+        observe_cve_results(
+            shell,
+            getattr(report, "results", ()),
+            host_to_domain=host_to_domain,
+            default_domain=default_domain,
+        )
         emit_cve_not_vulnerable_positives(
             shell,
             getattr(report, "results", ()),
@@ -474,6 +590,29 @@ def _emit_cve_positive_control_evidence(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[cves] positive control evidence emit failed: {exc}")
+
+
+def _findings_line(report: Any, rel: str) -> str:
+    """Return the "Findings:" line naming the evidence files this scan wrote.
+
+    One file is named by its real path; several are counted under the scan
+    directory; none says so, instead of printing a path template.
+    """
+    from adscan_internal.services.cve_scanner.ux.report import (  # noqa: PLC0415
+        evidence_relpath,
+        writes_evidence,
+    )
+
+    written = [r for r in getattr(report, "results", ()) or () if writes_evidence(r)]
+    if not written:
+        return "  Findings:  none (no host returned a finding, so no evidence file was written)"
+    if len(written) == 1:
+        path = f"{rel}/{evidence_relpath(written[0])}"
+        return f"  Findings:  {mark_sensitive(path, 'path')}"
+    return (
+        f"  Findings:  {len(written)} evidence files under {rel}/ "
+        "(one folder per CVE, one file per host)"
+    )
 
 
 def _print_persistent_summary(*, report: Any) -> None:
@@ -506,7 +645,7 @@ def _print_persistent_summary(*, report: Any) -> None:
             "Lab/host appears clean for the scanned CVEs."
         )
         print_info(f"  Report:    {rel}/report.md")
-        print_info(f"  Findings:  {rel}/<CVE-ID>/<host>.json")
+        print_info(_findings_line(report, rel))
         print_info(f"  Scan log:  {rel}/scan.log")
         return
 
@@ -551,7 +690,7 @@ def _print_persistent_summary(*, report: Any) -> None:
         )
 
     print_info(f"  Report:    {rel}/report.md")
-    print_info(f"  Findings:  {rel}/<CVE-ID>/<host>.json")
+    print_info(_findings_line(report, rel))
     print_info(f"  Scan log:  {rel}/scan.log")
 
 
@@ -561,19 +700,40 @@ def _insert_graph_edge(
     result: CVEResult,
     ctx: ScanContext,
 ) -> None:
+    record_cve_graph_edge(
+        shell,
+        cve,
+        result,
+        domain=ctx.domain,
+        scan_id=str(ctx.extras.get("scan_id", "latest")),
+    )
+
+
+def record_cve_graph_edge(
+    shell: Any,
+    cve: CVEDefinition,
+    result: CVEResult,
+    *,
+    domain: str | None,
+    scan_id: str,
+) -> None:
+    """Insert the attack-graph edge of one VULNERABLE CVE result. Never raises.
+
+    Shared by the CVE phase and the post-collection patch-level re-run; the
+    edge's evidence path points at the result file of the scan that holds it.
+    """
     relation = cve.graph_edge_relation
-    if not relation or not ctx.domain:
+    if not relation or not domain:
         return
     try:
         insert_derived_edge(
             shell=shell,
-            domain=ctx.domain,
+            domain=domain,
             source="ADscan",
             relation=relation,
             target=result.host,
             technique_id=cve.id,
-            evidence_path=f"cves/{ctx.extras.get('scan_id', 'latest')}/"
-            f"{cve.id}/{result.host}.json",
+            evidence_path=f"cves/{scan_id}/{cve.id}/{result.host}.json",
             extra={"aka": cve.aka, "cvss_v3": cve.cvss_v3},
         )
     except Exception as exc:  # noqa: BLE001
@@ -831,34 +991,72 @@ def _shell_credentials(shell: Any, domain: str | None) -> dict[str, Any]:
     }
 
 
-def _resolve_listener_host(dc_ip: str | None) -> str | None:
-    """Return the local IP that has a route to ``dc_ip``.
+def _failing_auth_budget_for(
+    shell: Any,
+    *,
+    cves: Any,
+    cred_info: dict[str, Any],
+    domain: str | None,
+    dc_ip: str | None,
+) -> Any | None:
+    """Return the scanning account's lockout budget when a selected probe needs it.
 
-    Uses a UDP socket ``connect`` to ask the kernel which interface
-    address would be used as the source for a packet to the DC. No
-    packets are sent — UDP ``connect`` only sets the socket's remote
-    binding so ``getsockname`` returns the chosen source IP. Returns
-    ``None`` when the DC IP is unknown or the lookup fails (loopback /
-    no-route environments).
+    Probes declared with the ``failing_auth_budget`` lockout guard (a patched
+    target records their tampered sign-in as a failure for the scanning account)
+    only run against this budget. ``None`` when no such probe is selected; the
+    probes treat a missing budget as no headroom, so nothing is sent blind.
+    """
+    from adscan_core.scan_policy.model import (  # noqa: PLC0415
+        LOCKOUT_GUARD_FAILING_AUTH_BUDGET,
+    )
+    from adscan_internal.services.cve_scanner.catalog import (  # noqa: PLC0415
+        CVE_POLICY_DECLARATIONS,
+    )
+
+    needs_budget = any(
+        CVE_POLICY_DECLARATIONS.get(str(getattr(cve, "id", "")), {}).get("lockout_guard")
+        == LOCKOUT_GUARD_FAILING_AUTH_BUDGET
+        for cve in (cves or ())
+    )
+    if not needs_budget:
+        return None
+    from adscan_internal.services.failing_auth_budget import (  # noqa: PLC0415
+        resolve_failing_auth_budget,
+    )
+
+    domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain or "", {}) or {}
+    return resolve_failing_auth_budget(
+        shell,
+        domain=str(domain or ""),
+        username=str(cred_info.get("username") or ""),
+        password=cred_info.get("password"),
+        dc_ip=dc_ip,
+        kerberos_target_hostname=(
+            domain_data.get("pdc_hostname_fqdn") or domain_data.get("pdc_hostname") or None
+        ),
+    )
+
+
+def _resolve_listener_host(shell: Any, dc_ip: str | None) -> str | None:
+    """Return the IP advertised to the coerced DC, or ``None`` when unknown.
+
+    Per-target through the listener-IP SSOT (declared ``myip``, kernel route
+    toward ``dc_ip``, interface ``myip``). ``None`` when the DC IP is unknown,
+    so the runner surfaces coercion entries as Error instead of advertising a
+    guess.
 
     Args:
-        dc_ip: The IPv4 address of the domain controller. ``None`` is
-            tolerated and short-circuits to ``None``.
-
-    Returns:
-        The local interface IP that routes to ``dc_ip``, or ``None``.
+        shell: Active shell (source of a declared ``myip``).
+        dc_ip: The IPv4 address of the domain controller being coerced.
     """
 
     if not dc_ip:
         return None
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect((dc_ip, 80))
-            return probe.getsockname()[0]
-    except OSError as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return None
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_listener_ip,
+    )
+
+    return resolve_listener_ip(shell, target=dc_ip).ip
 
 
 def _shell_dc_ip(shell: Any, domain: str | None) -> str | None:
@@ -953,4 +1151,4 @@ def status_label(status: CVEStatus) -> str:
     return status.value
 
 
-__all__ = ["dispatch"]
+__all__ = ["build_scan_context", "dispatch", "record_cve_graph_edge"]

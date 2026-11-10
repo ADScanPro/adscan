@@ -32,6 +32,14 @@ from adscan_internal.services.attack_graph_service import (
     infer_directory_object_enabled_state,
     resolve_netexec_target_for_node_label,
 )
+from adscan_internal.services.directory_change_consent import (
+    CHANGE_CLASS_ACCOUNT_ENABLED,
+    CHANGE_CLASS_OBJECT_RESTORED,
+    confirm_directory_change,
+)
+from adscan_internal.services.password_reset_target import (
+    relation_grants_password_reset,
+)
 from adscan_core.rich_output import print_exception
 
 
@@ -107,6 +115,50 @@ def _ace_step_failed(shell: Any, reason: str) -> bool:
     return False
 
 
+#: Branches that perform exactly the technique their relation names. They are
+#: gated on that relation at dispatch, because the dispatcher is also reached
+#: with a relation that is not the path step's own: AllExtendedRights remapped
+#: by target class, and the control-escalation ladder's writeowner / writedacl /
+#: addmember rungs. For a top-level step the path gate already allowed the same
+#: relation, so the check is a no-op there.
+_SINGLE_TECHNIQUE_RELATIONS: frozenset[str] = frozenset(
+    {
+        "dcsync",
+        "readgmsapassword",
+        "readlapspassword",
+        "addself",
+        "addmember",
+        "writedacl",
+        "writeowner",
+        "writespn",
+        "addkeycredentiallink",
+    }
+)
+
+
+def _chained_technique_refused(
+    shell: Any, technique: str, context: "AceStepContext"
+) -> bool:
+    """True when the scan policy excludes ``technique`` (refusal recorded once).
+
+    The caller returns ``None``: a technique the policy keeps from running is
+    neither a success nor a failure of the step.
+    """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_chained_technique,
+        mark_step_not_executed,
+    )
+
+    if gate_chained_technique(
+        shell, technique, via_relation=context.relation, target=context.to_label
+    ):
+        return False
+    # Every caller returns before performing anything, so the step ran nothing:
+    # the executor represents it as a step the policy excluded.
+    mark_step_not_executed(shell, technique)
+    return True
+
+
 def _normalize_account(value: str) -> str:
     name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
@@ -116,14 +168,6 @@ def _normalize_account(value: str) -> str:
     return name.strip().lower()
 
 
-def _is_audit_mode(shell: Any) -> bool:
-    """Return whether the current shell is running in audit mode."""
-    return str(getattr(shell, "type", "") or "").strip().lower() == "audit"
-
-
-def _is_ctf_mode(shell: Any) -> bool:
-    """Return whether the current shell is running in CTF mode."""
-    return str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
 
 
 def _sanitize_prompt_account(value: str) -> str:
@@ -359,17 +403,35 @@ def source_ownership_bucket(relation: str | None) -> str:
         controls the source principal by its ACTUAL type (own the user, own a real
         group member, or own the computer-account credential).
 
-    The discriminator is the RELATION's ``EdgeKind`` — NOT the source object type.
-    A COMPUTER source lands in ``own_source`` for ``AllowedToDelegate`` (own
-    ``SRV01$``) and in ``carry_forward`` for ``DumpLSA`` (carried session), decided
-    purely by the relation.
+    The discriminator is the RELATION — NOT the source object type. A COMPUTER
+    source lands in ``own_source`` for ``AllowedToDelegate`` (own ``SRV01$``) and
+    in ``carry_forward`` for ``DumpLSA`` (carried session), decided purely by the
+    relation. Two relation facts put a step in ``carry_forward``:
+
+    * its ``EdgeKind`` is ``DERIVED`` (a post-ex technique chained off an access
+      edge), or
+    * it runs inside a session on its SOURCE host
+      (:func:`relation_runs_in_source_host_session`: the dump family,
+      ``HasSession`` and ``PasswordInFile``). The rule: a step that acts on a host
+      reached through an access step runs as the principal holding that access in
+      the path, never as the host's computer account. ``HasSession`` is an
+      ``AUTH`` edge (the path engine chains it off a local-admin arrival), so
+      keying the bucket on ``EdgeKind`` alone put it in ``own_source`` and refused
+      the proven foothold (release gate 14.0.0).
     """
     from adscan_internal.services.edge_kind import (  # noqa: PLC0415
         EdgeKind,
         classify_edge_kind,
     )
+    from adscan_internal.services.execution_credential_scope import (  # noqa: PLC0415
+        relation_runs_in_source_host_session,
+    )
 
-    return "carry_forward" if classify_edge_kind(relation) is EdgeKind.DERIVED else "own_source"
+    if classify_edge_kind(relation) is EdgeKind.DERIVED:
+        return "carry_forward"
+    if relation_runs_in_source_host_session(str(relation or "")):
+        return "carry_forward"
+    return "own_source"
 
 
 def _group_member_sams(shell: Any, domain: str, from_label: str | None) -> set[str] | None:
@@ -421,12 +483,14 @@ def _group_member_sams(shell: Any, domain: str, from_label: str | None) -> set[s
 
 
 def resolve_source_node_kind(shell: Any, domain: str, from_label: str | None) -> str:
-    """Return the attack-graph node kind of a step's SOURCE label.
+    """Return the principal kind of a step's SOURCE label, lowercased.
 
-    The single implementation of "what kind of thing is this step sourced from"
-    (``User`` / ``Group`` / ``Computer`` / ...). Returns ``""`` when the label is
-    empty, the node is absent from the graph, or it carries no kind — callers
-    must read that as *indeterminate*, never as "not a group".
+    The executor's entry to the principal-kind SSOT
+    (:func:`adscan_internal.services.principal_kind.resolve_principal_kind`):
+    ``user`` / ``group`` / ``computer`` / another graph kind, from the attack-graph
+    node first and the membership snapshot second. Returns ``""`` when neither
+    knows the label; callers must read that as *indeterminate*, never as "not a
+    group" and never as "a user" because of what the name looks like.
 
     It exists as a named helper because the answer decides whether an owned
     principal may act for the step at all, and every consumer must reach the
@@ -434,17 +498,14 @@ def resolve_source_node_kind(shell: Any, domain: str, from_label: str | None) ->
     caller does not supply one, so the ownership gate and the executor cannot
     disagree about a step the gate already approved.
     """
-    label = str(from_label or "").strip()
-    if not label:
-        return ""
-    try:
-        node = get_node_by_label(shell, domain, label=label)
-    except Exception as exc:  # noqa: BLE001 — graph lookup is best-effort
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return ""
-    kind = _node_kind(node)
-    return "" if kind == "Unknown" else kind
+    from adscan_internal.services.principal_kind import (  # noqa: PLC0415
+        resolve_principal_kind,
+    )
+
+    # The principal-kind SSOT: graph node kind, then the membership snapshot,
+    # then unknown. Never the label's shape. This module's ``get_node_by_label``
+    # is passed so the executor and its tests share one lookup seam.
+    return resolve_principal_kind(shell, domain, from_label, get_node=get_node_by_label)
 
 
 def _label_matches_step_source(step: dict[str, Any], from_label: str) -> bool:
@@ -709,7 +770,80 @@ def rank_execution_candidates(
     return ordered
 
 
+#: Source tag returned when every source-faithful candidate is known unusable.
+UNUSABLE_PRINCIPALS_ONLY_TAG = "unusable_principals_only"
+
+
 def resolve_execution_candidates(
+    shell: Any,
+    *,
+    domain: str,
+    context_username: str | None,
+    summary: dict[str, Any],
+    from_label: str | None,
+    from_node_kind: str | None = None,
+    host: str | None = None,
+    strict_source: bool = False,
+    relation: str | None = None,
+) -> tuple[list[str], str]:
+    """The owned principals that could run a step, minus the ones that cannot sign in.
+
+    Wraps :func:`_resolve_execution_candidates_unfiltered` (the source-ownership
+    resolution, documented there) and removes every candidate the directory
+    marks disabled or the domain reported disabled / locked out in this session
+    (``account_usability.principal_unusable_reason``). An unusable principal is
+    never the actor: choosing it costs the account a failed sign-in and the step
+    its chance, which is what a disabled ``vagrant`` did six times in a GOAD run.
+    The order of the usable candidates is kept, so the ranking still decides.
+    When every candidate is unusable the step has no actor: the list is empty
+    and the tag is :data:`UNUSABLE_PRINCIPALS_ONLY_TAG`, which the executor
+    reports honestly instead of trying a principal it knows will be refused.
+    """
+    candidates, source_tag = _resolve_execution_candidates_unfiltered(
+        shell,
+        domain=domain,
+        context_username=context_username,
+        summary=summary,
+        from_label=from_label,
+        from_node_kind=from_node_kind,
+        host=host,
+        strict_source=strict_source,
+        relation=relation,
+    )
+    if not candidates:
+        return candidates, source_tag
+    from adscan_internal.services.account_usability import (  # noqa: PLC0415
+        partition_usable_principals,
+    )
+
+    usable, dropped = partition_usable_principals(shell, domain, candidates)
+    if not dropped:
+        return candidates, source_tag
+    from adscan_internal.services._annotation_log_dedup import (  # noqa: PLC0415
+        annotation_log_seen,
+    )
+
+    if not annotation_log_seen(
+        ("exec-user-unusable", str(from_label or ""), ",".join(sorted(dropped)))
+    ):
+        print_info_debug(
+            "[exec-user] Dropped candidate(s) that cannot sign in: "
+            + ", ".join(
+                f"{mark_sensitive(user, 'user')} ({reason})" for user, reason in dropped.items()
+            )
+        )
+    if usable:
+        return usable, source_tag
+    _UNUSABLE_CANDIDATES_BY_SOURCE[_exec_user_memo_key(domain, from_label)] = dict(dropped)
+    return [], UNUSABLE_PRINCIPALS_ONLY_TAG
+
+
+#: The unusable candidates behind the last empty resolution, per step source,
+#: so the executor can name them when it reports that the step has no actor.
+_UNUSABLE_CANDIDATES_BY_SOURCE: dict[tuple[str, str], dict[str, str]] = {}
+
+
+def _resolve_execution_candidates_unfiltered(
     shell: Any,
     *,
     domain: str,
@@ -1109,6 +1243,19 @@ def select_execution_user(
     gate reads it too.
     """
     if not candidates:
+        if source_tag == UNUSABLE_PRINCIPALS_ONLY_TAG:
+            dropped = _UNUSABLE_CANDIDATES_BY_SOURCE.get(
+                _exec_user_memo_key(domain, from_label), {}
+            )
+            names = ", ".join(
+                f"{mark_sensitive(user, 'user')} ({reason})" for user, reason in dropped.items()
+            )
+            print_warning(
+                "No account can run this step: every account that controls "
+                f"{mark_sensitive(from_label or '?', 'node')} is unable to sign in"
+                + (f": {names}." if names else ".")
+                + " The step is not attempted, so no account is sent a sign-in it would refuse."
+            )
         return None, source_tag
 
     if len(candidates) == 1:
@@ -1599,117 +1746,6 @@ def build_ace_step_context(
     )
 
 
-def _acl_cleanup_register(
-    shell: Any,
-    context: AceStepContext,
-    *,
-    kind: str,
-    detail: dict[str, Any] | None = None,
-) -> None:
-    """Register an ACL/attribute change with the ledger and acl_cleanup_actions.
-
-    No-op when neither environment_change_ledger nor acl_cleanup_actions is
-    present on the shell; backward compatible with test stubs and lite builds.
-    """
-    ledger = getattr(shell, "environment_change_ledger", None)
-    actions = getattr(shell, "acl_cleanup_actions", None)
-    if ledger is None and actions is None:
-        return
-
-    change_id: str | None = None
-    if ledger is not None:
-        try:
-            ledger_detail = {
-                "target_domain": context.target_domain,
-                "target_object": context.target_sam_or_label,
-                "exec_username": context.exec_username,
-                "executor_username": context.exec_username,
-                "executor_auth_domain": context.domain,
-                "credential_lookup_domain": context.domain,
-            }
-            if detail:
-                ledger_detail.update(detail)
-            change_id = ledger.register_change(
-                kind=kind,
-                domain=context.domain,
-                target=context.target_sam_or_label,
-                detail=ledger_detail,
-                method=(
-                    f"BloodHound ACE - {context.relation}"
-                    f" ({context.from_label} → {context.to_label})"
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-    if actions is not None:
-        action: dict[str, Any] = {
-            "kind": kind,
-            "domain": context.domain,
-            "target_domain": context.target_domain,
-            "target": context.target_sam_or_label,
-            "exec_username": context.exec_username,
-            "exec_password": context.exec_password,
-            "_ledger_change_id": change_id,
-        }
-        if detail:
-            action.update(detail)
-        try:
-            actions.append(action)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-
-def _capture_original_owner(shell: Any, context: AceStepContext) -> str | None:
-    """Query BloodyAD for the current owner SID of the target object before WriteOwner.
-
-    Returns the SID string (e.g. 'S-1-5-21-...') if parseable, else None.
-    None causes cleanup to fall back to operator_required with PS instructions.
-    """
-    import re
-
-    from adscan_internal.services.exploitation import ExploitationService
-
-    try:
-        domains_data = getattr(shell, "domains_data", {}) or {}
-        target_domain_data = (
-            domains_data.get(context.target_domain) or {}
-            if isinstance(domains_data, dict)
-            else {}
-        )
-        pdc_ip = str(target_domain_data.get("pdc") or "").strip() or None
-        pdc_hostname = str(target_domain_data.get("pdc_hostname") or "").strip() or None
-        pdc_host = pdc_hostname or pdc_ip
-        if not pdc_host:
-            return None
-
-        service = ExploitationService()
-        attr_result = service.acl.get_object_attributes(
-            pdc_host=pdc_host,
-            domain=context.domain,
-            username=context.exec_username,
-            password=context.exec_password,
-            target_object=context.target_sam_or_label,
-            attribute_names=("nTSecurityDescriptor",),
-            kerberos=True,
-            timeout=30,
-        )
-        if not attr_result.success:
-            return None
-
-        raw = str(attr_result.raw_output or "")
-        sid_match = re.search(r"(S-1-\d+-\d+(?:-\d+)+)", raw)
-        if sid_match:
-            return sid_match.group(1)
-        return None
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return None
-
-
 def _execute_genericall_domain_dcsync(
     shell: Any,
     context: AceStepContext,
@@ -1778,17 +1814,8 @@ def _execute_genericall_domain_dcsync(
         )
         return False
 
-    exec_sid = getattr(shell, "_last_exec_sid", context.exec_username)
-    _acl_cleanup_register(
-        shell,
-        context,
-        kind="dacl_ace_added",
-        detail={
-            "trustee": exec_sid or context.exec_username,
-            "rights_type": "dcsync",
-        },
-    )
-
+    # The replication ACEs are recorded by the DACL write seam itself
+    # (``run_exploit_write_dacl``), with the trustee SID the cleanup verifies.
     print_info(
         f"[{BRAND_COLORS['success']}]DCSync rights granted.[/{BRAND_COLORS['success']}]"
         " Triggering domain replication..."
@@ -1900,6 +1927,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             f"(target_kind={target_kind})"
         )
         relation = effective_relation
+
+    if relation in _SINGLE_TECHNIQUE_RELATIONS and _chained_technique_refused(
+        shell, relation, context
+    ):
+        return None
 
     if relation == "dcsync":
         # The acting principal + secret arrive PRE-RESOLVED from the step-execution
@@ -2013,24 +2045,31 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
 
     if relation == "forcechangepassword":
         from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
-            classify_destructive,
             is_machine_account_name,
+        )
+        from adscan_internal.services.password_reset_target import (  # noqa: PLC0415
+            password_reset_verdict,
         )
 
         # SAFETY HARD-BLOCK (defense-in-depth; the un-bypassable guard lives in
-        # ``run_exploit_force_change_password``). A ForceChangePassword against a
-        # computer/machine account resets that host's password and disrupts it,
-        # so ADscan refuses it in EVERY mode before any warning or prompt. A
-        # ``$``-suffixed sAMAccountName OR a computer/machine ``target_kind``
-        # triggers the block.
+        # ``run_exploit_force_change_password``). A ForceChangePassword against an
+        # account a running system depends on (a computer, krbtgt, a managed
+        # service account, an Entra ID sync account) cannot be undone, so ADscan
+        # refuses it in EVERY mode before any warning or prompt. The target is
+        # resolved to its graph node (by the step's own label first) so the
+        # classifier reads structural signals, not just the name.
         effective_target_kind = (
             "computer"
             if is_machine_account_name(context.target_sam_or_label)
             or is_machine_account_name(context.to_label)
             else target_kind
         )
-        destructive_verdict = classify_destructive(
-            "forcechangepassword", effective_target_kind
+        destructive_verdict = password_reset_verdict(
+            shell,
+            domain=context.target_domain,
+            account=context.target_sam_or_label,
+            target_kind=effective_target_kind,
+            label=context.to_label,
         )
         if destructive_verdict.hard_blocked:
             print_warning(
@@ -2049,31 +2088,61 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             return False
 
         marked_from = mark_sensitive(context.exec_username, "user")
+        # The scan policy decides: a policy that does not consent to this write
+        # by default is told why it matters (the consent seam's own answer).
+        from adscan_internal.services.directory_change_consent import (  # noqa: PLC0415
+            directory_change_consent_default,
+        )
+        from adscan_internal.services.password_reset_target import (  # noqa: PLC0415
+            held_secret_for_account,
+        )
+
+        # The credential is already held: the choke point skips the reset (the
+        # one gate every entry point shares), so the disruptive-change warning
+        # would describe a reset that is not going to happen.
+        reset_needed = (
+            held_secret_for_account(
+                shell,
+                domain=context.target_domain,
+                account=context.target_sam_or_label,
+            )
+            is None
+        )
+        # The policy gate lives at the choke point too; asking here first keeps
+        # a refused reset from being reported as a failed step, and keeps the
+        # disruptive-change warning from describing a reset that will not run.
+        if reset_needed and _chained_technique_refused(
+            shell, "forcechangepassword", context
+        ):
+            return None
         audit_context = (
-            " This is particularly disruptive in audit mode." if _is_audit_mode(shell) else ""
+            ""
+            if directory_change_consent_default(shell, check_id="step:forcechangepassword")
+            else " This is particularly disruptive on a real environment."
         )
-        print_system_change_warning(
-            title="[bold yellow]Disruptive Operation: ForceChangePassword[/bold yellow]",
-            summary=(
-                f"Execution user: {marked_from}\nTarget user: {marked_to}"
-                f"{audit_context}"
-            ),
-            planned_changes=[
-                "Reset the target user's domain password immediately.",
-                "Store the new credential in ADscan for follow-up path execution.",
-            ],
-            impact_notes=[
-                "This invalidates the target user's current password immediately.",
-                "Active sessions and services using this account will lose access.",
-                "Password reset is irreversible: the original password cannot be recovered.",
-            ],
-            cleanup_notes=[
-                "Coordinate with the client to reset the password to a known value after the engagement.",
-            ],
-            authorization_note=(
-                "Only continue if you are explicitly authorized to reset this credential during the engagement."
-            ),
-        )
+        if reset_needed:
+            print_system_change_warning(
+                title="[bold yellow]Disruptive Operation: ForceChangePassword[/bold yellow]",
+                summary=(
+                    f"Execution user: {marked_from}\nTarget user: {marked_to}"
+                    f"{audit_context}"
+                ),
+                planned_changes=[
+                    "Reset the target user's domain password immediately.",
+                    "Store the new credential in ADscan for follow-up path execution.",
+                ],
+                impact_notes=[
+                    "This invalidates the target user's current password immediately.",
+                    "Active sessions and services using this account will lose access.",
+                    "Password reset is irreversible: the original password cannot be recovered.",
+                ],
+                cleanup_notes=[
+                    "Coordinate with the client to reset the password to a known value after the engagement.",
+                ],
+                authorization_note=(
+                    "Only continue if you are explicitly authorized to reset this credential during the engagement."
+                ),
+            )
         # The consent gate lives in the ForceChangePassword choke point
         # (``run_exploit_force_change_password`` in ``exploits.py``), which every
         # entry point funnels through and which owns the mode-dependent default
@@ -2082,12 +2151,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         # second consent prompt here would be a redundant gate with its own drift
         # risk (it once auto-skipped in CTF and cancelled a reset the choke point
         # was about to auto-approve), so the decision is deferred to the SSOT.
-        # Ledger-ordering fix: do NOT register a cleanup obligation before the
-        # reset runs. A pre-registered "password_changed" entry left a FALSE
-        # operator-required obligation when the reset later failed (the operator
-        # was told to reset a password that was never changed). Register only
-        # AFTER the reset CONFIRMS success: a successful FCP leaves exactly one
-        # operator-required entry; a failed FCP leaves the ledger clean.
+        # The reset is disclosed by the choke point itself
+        # (``run_exploit_force_change_password`` records ``password_changed`` /
+        # ``manual_required`` only after the DC confirmed it), so a failed reset
+        # leaves the ledger clean and a successful one is recorded exactly once,
+        # whichever entry point reached it.
         fcp_success = shell.exploit_force_change_password(
             context.domain,
             context.exec_username,
@@ -2098,6 +2166,15 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             target_kind=effective_target_kind,
         )
         if not fcp_success:
+            held_outcome = getattr(shell, "_last_ace_execution_outcome", None)
+            if (
+                isinstance(held_outcome, dict)
+                and held_outcome.get("key") == "credential_already_held"
+            ):
+                # Not run because not needed: neither a success (no reset
+                # happened) nor a failure (the path continues with the held
+                # credential, which the executor carries forward).
+                return None
             print_warning(
                 "ForceChangePassword did not complete; the target password was not "
                 "changed. No cleanup obligation was recorded."
@@ -2108,32 +2185,6 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 "changed",
             )
 
-        _acl_cleanup_register(
-            shell,
-            context,
-            kind="password_changed",
-            detail={"target_user": context.target_sam_or_label},
-        )
-        ledger = getattr(shell, "environment_change_ledger", None)
-        if ledger is not None:
-            _cid = None
-            actions = getattr(shell, "acl_cleanup_actions", None)
-            if actions:
-                _cid = actions[-1].get("_ledger_change_id")
-            if _cid:
-                try:
-                    ledger.mark_operator_required(
-                        _cid,
-                        manual_cleanup_instructions=(
-                            f"Coordinate with the client to reset the password for "
-                            f"'{context.target_sam_or_label}' to a known value.\n"
-                            f"  Set-ADAccountPassword -Identity '{context.target_sam_or_label}'"
-                            f" -NewPassword (ConvertTo-SecureString 'NewPass' -AsPlainText -Force)"
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
         return True
 
     if relation == "addkeycredentiallink":
@@ -2207,8 +2258,9 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         if target_kind in {"user", "computer"}:
             if context.target_tombstoned and target_kind == "user":
                 print_warning(f"Target {marked_to} is a deleted (tombstoned) object.")
-                if Confirm.ask(
-                    "Restore it from the AD Recycle Bin first?", default=True
+                if confirm_directory_change(
+                    shell, "Restore it from the AD Recycle Bin first?",
+                    change_class=CHANGE_CLASS_OBJECT_RESTORED,
                 ):
                     # Pass the tombstone DN when known; otherwise the SID +
                     # sAMAccountName so the service resolves the real Deleted-Objects
@@ -2241,7 +2293,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     return False
             if context.target_enabled is False and target_kind == "user":
                 print_warning(f"Target {marked_to} is disabled.")
-                if Confirm.ask("Do you want to try to enable it first?", default=True):
+                if confirm_directory_change(
+                    shell, "Do you want to try to enable it first?",
+                    change_class=CHANGE_CLASS_ACCOUNT_ENABLED,
+                ):
                     if not shell.enable_user(
                         context.domain,
                         context.exec_username,
@@ -2263,7 +2318,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     return False
             if context.target_enabled is False and target_kind == "computer":
                 print_warning(f"Target {marked_to} is disabled.")
-                if Confirm.ask("Do you want to try to enable it first?", default=True):
+                if confirm_directory_change(
+                    shell, "Do you want to try to enable it first?",
+                    change_class=CHANGE_CLASS_ACCOUNT_ENABLED,
+                ):
                     if not shell.enable_computer(
                         context.domain,
                         context.exec_username,
@@ -2329,8 +2387,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         prompt_for_password_fallback=False,
                         prompt_for_user_privs_after=False,
                         prompt_for_method_choice=True,
-                        # ForceChangePassword needs GenericAll/Reset-Password — not GenericWrite.
-                        allow_force_change_password=(relation == "genericall"),
+                        # The reset right comes from the relation (never GenericWrite);
+                        # the policy and the account are decided inside the helper.
+                        allow_force_change_password=relation_grants_password_reset(
+                            relation
+                        ),
                     )
                 print_warning(
                     "Computer-object control exploitation helper is unavailable in this shell context."
@@ -2341,7 +2402,11 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "this shell context",
                 )
 
-            ok = shell.exploit_generic_all_user(
+            # The helper records each write it actually makes, at its own seam:
+            # the shadow credential (only when written), the targeted-Kerberoast
+            # SPN, or the password reset. Recording a fixed kind here once
+            # labelled an SPN or a reset as shadow credentials.
+            return shell.exploit_generic_all_user(
                 context.domain,
                 context.exec_username,
                 context.exec_password,
@@ -2350,17 +2415,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 prompt_for_password_fallback=False,
                 prompt_for_user_privs_after=False,
                 prompt_for_method_choice=True,
-                # ForceChangePassword needs GenericAll/Reset-Password — not GenericWrite.
-                allow_force_change_password=(relation == "genericall"),
+                # The reset right comes from the relation (never GenericWrite);
+                # the policy and the account are decided inside the helper.
+                allow_force_change_password=relation_grants_password_reset(relation),
             )
-            if ok:
-                _acl_cleanup_register(
-                    shell,
-                    context,
-                    kind="shadow_credentials_added",
-                    detail={"target_user": context.target_sam_or_label},
-                )
-            return ok
 
         if target_kind == "ou":
             return shell.exploit_generic_all_ou(
@@ -2385,9 +2443,17 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "GenericWrite on a Domain object does not grant DACL modification; "
                     "DCSync is not reachable through this edge",
                 )
+            # The replication grant exists only to serve DCSync: refused before
+            # the DACL is touched when the policy excludes DCSync.
+            if _chained_technique_refused(shell, "dcsync", context):
+                return None
             return _execute_genericall_domain_dcsync(shell, context)
 
         if target_kind == "group":
+            # AddMember is its own check: the GenericAll / Owns switch never adds
+            # a member when the policy excludes AddMember.
+            if _chained_technique_refused(shell, "addmember", context):
+                return None
             # RBCD coordination: a downstream AllowedToAct on this group needs an
             # owned SPN-bearing member (S4U requires an SPN). When the look-ahead
             # resolved one, default to it instead of the path-source executor — a
@@ -2438,6 +2504,9 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         "membership_already_present": bool(
                             membership_outcome.get("already_member")
                         ),
+                        "ledger_change_id": membership_outcome.get(
+                            "ledger_change_id"
+                        ),
                     },
                 )
             return result
@@ -2484,6 +2553,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "membership_already_present": bool(
                         membership_outcome.get("already_member")
                     ),
+                    "ledger_change_id": membership_outcome.get("ledger_change_id"),
                 },
             )
         return result
@@ -2537,11 +2607,18 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     "membership_already_present": bool(
                         membership_outcome.get("already_member")
                     ),
+                    "ledger_change_id": membership_outcome.get("ledger_change_id"),
                 },
             )
         return result
 
     if relation == "owns":
+        # The technique Phase 2 performs on a group / domain is its own check;
+        # ask before Phase 1 writes the FullControl ACE, so a chain the policy
+        # refuses leaves the directory untouched.
+        owns_chained = {"group": "addmember", "domain": "dcsync"}.get(target_kind)
+        if owns_chained and _chained_technique_refused(shell, owns_chained, context):
+            return None
         # Phase 1: leverage ownership to write FullControl DACL entry (no owneredit needed).
         owns_ok = shell.exploit_owns(
             context.domain,
@@ -2565,7 +2642,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         if target_kind in {"user", "computer"}:
             if context.target_enabled is False and target_kind == "user":
                 print_warning(f"Target {marked_to} is disabled.")
-                if Confirm.ask("Do you want to try to enable it first?", default=True):
+                if confirm_directory_change(
+                    shell, "Do you want to try to enable it first?",
+                    change_class=CHANGE_CLASS_ACCOUNT_ENABLED,
+                ):
                     if not shell.enable_user(
                         context.domain,
                         context.exec_username,
@@ -2599,7 +2679,12 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                     prompt_for_password_fallback=False,
                     prompt_for_user_privs_after=False,
                     prompt_for_method_choice=True,
+                    allow_force_change_password=relation_grants_password_reset(
+                        relation
+                    ),
                 )
+            # Ownership grants FullControl, so the reset right is there; the
+            # policy and the account are decided inside the helper.
             return shell.exploit_generic_all_user(
                 context.domain,
                 context.exec_username,
@@ -2609,6 +2694,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 prompt_for_password_fallback=False,
                 prompt_for_user_privs_after=False,
                 prompt_for_method_choice=True,
+                allow_force_change_password=relation_grants_password_reset(relation),
             )
 
         if target_kind == "ou":
@@ -2622,6 +2708,10 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             )
 
         if target_kind == "group":
+            # AddMember is its own check: the GenericAll / Owns switch never adds
+            # a member when the policy excludes AddMember.
+            if _chained_technique_refused(shell, "addmember", context):
+                return None
             # RBCD coordination: a downstream AllowedToAct on this group needs an
             # owned SPN-bearing member (S4U requires an SPN). When the look-ahead
             # resolved one, default to it instead of the path-source executor — a
@@ -2672,6 +2762,9 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                         "membership_already_present": bool(
                             membership_outcome.get("already_member")
                         ),
+                        "ledger_change_id": membership_outcome.get(
+                            "ledger_change_id"
+                        ),
                     },
                 )
             return result
@@ -2694,7 +2787,8 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         target_type = (
             target_kind if target_kind in {"user", "group", "domain"} else target_kind
         )
-        ok = shell.exploit_write_dacl(
+        # Recorded by the seam (``run_exploit_write_dacl``) once the ACE is written.
+        return shell.exploit_write_dacl(
             context.domain,
             context.exec_username,
             context.exec_password,
@@ -2703,19 +2797,6 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             target_type,
             followup_after=False,
         )
-        if ok:
-            is_domain = target_type == "domain"
-            exec_sid = getattr(shell, "_last_exec_sid", context.exec_username)
-            _acl_cleanup_register(
-                shell,
-                context,
-                kind="dacl_ace_added",
-                detail={
-                    "trustee": exec_sid or context.exec_username,
-                    "rights_type": "dcsync" if is_domain else "genericAll",
-                },
-            )
-        return ok
 
     if relation == "writeowner":
         if target_kind not in {"user", "group"}:
@@ -2723,8 +2804,9 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 f"WriteOwner exploitation is only implemented for User/Group targets (got {context.target_kind})."
             )
             return False
-        original_owner_sid = _capture_original_owner(shell, context)
-        ok = shell.exploit_write_owner(
+        # Recorded by the seam (``run_exploit_write_owner``), with the prior owner
+        # read from the security descriptor the write replaced.
+        return shell.exploit_write_owner(
             context.domain,
             context.exec_username,
             context.exec_password,
@@ -2733,14 +2815,6 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
             target_kind,
             followup_after=False,
         )
-        if ok:
-            _acl_cleanup_register(
-                shell,
-                context,
-                kind="owner_changed",
-                detail={"original_owner_sid": original_owner_sid},
-            )
-        return ok
 
     if relation == "writespn":
         if target_kind not in {"user", "computer"}:
@@ -2748,24 +2822,15 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
                 f"WriteSPN exploitation is only implemented for User/Computer targets (got {context.target_kind})."
             )
             return False
-        ok = shell.exploit_write_spn(
+        # Recorded by the seam (``run_exploit_write_spn``) only when it added the
+        # SPN; an SPN the account already held is never recorded, so never removed.
+        return shell.exploit_write_spn(
             context.domain,
             context.exec_username,
             context.exec_password,
             context.target_sam_or_label,
             context.target_domain,
         )
-        if ok:
-            from adscan_internal.cli.exploits import _build_targeted_kerberoast_spn  # noqa: PLC0415
-
-            spn = _build_targeted_kerberoast_spn(context.target_sam_or_label)
-            _acl_cleanup_register(
-                shell,
-                context,
-                kind="spn_added",
-                detail={"spn": spn},
-            )
-        return ok
 
     # Defensive: should not happen due to ACL_ACE_RELATIONS guard.
     try:

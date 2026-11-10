@@ -80,8 +80,14 @@ def query_ldap_attribute_values(
     allow_password_fallback_on_kerberos_failure: bool = True,
     auth_domain: str | None = None,
     auth_kdc: str | None = None,
+    search_scope: str = "SUBTREE",
 ) -> tuple[list[str], bool]:
-    """Execute one LDAP filter and return values for one requested attribute."""
+    """Execute one LDAP filter and return values for one requested attribute.
+
+    ``search_scope="BASE"`` with ``search_base`` set to an object's DN reads a
+    constructed attribute such as ``tokenGroups``, which a domain controller
+    computes only for a base-scope read.
+    """
     base_dn = str(search_base or "").strip() or domain_to_base_dn(target_domain)
     if not base_dn:
         raise ValueError(f"{operation_name} requires a search base or target domain.")
@@ -91,7 +97,7 @@ def query_ldap_attribute_values(
             search_base=base_dn,
             search_filter=ldap_filter,
             attributes=[attribute],
-            search_scope="SUBTREE",
+            search_scope=search_scope,
             paged_size=1000,
         )
         return _extract_attribute_values(connection.entries, attribute)
@@ -125,6 +131,8 @@ def query_shell_ldap_attribute_values(
     prefer_kerberos: bool = True,
     allow_ntlm_fallback: bool = True,
     operation_name: str = "LDAP query",
+    search_base: str | None = None,
+    search_scope: str = "SUBTREE",
 ) -> list[str] | None:
     """Resolve shell context and execute a native LDAP attribute query."""
     from adscan_internal.services.ldap_transport_service import (
@@ -138,8 +146,15 @@ def query_shell_ldap_attribute_values(
     if not isinstance(domain_data, dict):
         return None
 
-    username = str(auth_username or domain_data.get("username") or "").strip()
-    password = str(auth_password or domain_data.get("password") or "").strip()
+    # Username and secret from the SAME principal (pairing SSOT): an explicit
+    # auth_username never borrows the domain's active password.
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    username, password = resolve_principal_secret_pair(
+        domains_data, domain=domain, username=auth_username, secret=auth_password
+    )
     if not username or not password:
         # DIAG: this early-return (BEFORE any bind) is a distinct failure from a
         # transport/bind error — it means NO stored credential is available for
@@ -228,6 +243,8 @@ def query_shell_ldap_attribute_values(
             allow_password_fallback_on_kerberos_failure=allow_ntlm_fallback,
             auth_domain=auth_domain,
             auth_kdc=auth_kdc,
+            search_base=search_base,
+            search_scope=search_scope,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

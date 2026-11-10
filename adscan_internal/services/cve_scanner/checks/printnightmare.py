@@ -1,56 +1,74 @@
-# Parity with netexec is the contract here — inherits netexec's permissive fall-through.
-# Known FP on hosts where the spool API is reachable but the host is patched.
-# Source: reference/NetExec/nxc/modules/printnightmare.py:110-111.
-"""PrintNightmare (CVE-2021-34527) native check — netexec parity.
+"""PrintNightmare (CVE-2021-34527) native check, read-only.
 
-Bind to MS-RPRN over ``\\PIPE\\spoolss``, build a ``DRIVER_INFO_2`` with
-**all NULL fields** (cVersion=0, every name pointer NULL — exactly as
-netexec does at ``printnightmare.py:73-92``), then call
-``RpcAddPrinterDriverEx``.
+Founder decision 2026-11-06: the check must not change anything on the target,
+so it never calls ``RpcAddPrinterDriverEx`` or any other print-spooler add or
+install function (the previous probe called the driver-install RPC with an
+empty driver and read the error). It reads three facts instead, all over one
+authenticated SMB session and all non-state-changing:
 
-Decision tree (replicates ``printnightmare.py:93-111`` verbatim):
+1. **Exposure**: the ``spoolss`` named pipe is listed on ``IPC$``, so the Print
+   Spooler accepts remote RPC. Absent pipe → ``NOT_APPLICABLE``.
+2. **Point and Print policy** (Remote Registry,
+   ``HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers\\PointAndPrint``):
+   ``RestrictDriverInstallationToAdministrators`` explicitly 0 together with
+   ``NoWarningNoElevationOnInstall`` or ``UpdatePromptSettings`` set to 1 lets a
+   standard user install a driver without elevation, which Microsoft documents
+   as exploitable even on a patched host.
+3. **Patch level** (Remote Registry, ``CurrentVersion``): the build and UBR
+   against the first revision of each build that carries the July 2021 fix.
 
-* ``RPC_E_ACCESS_DENIED`` (0x8001011B) → ``NotVulnerable``
-* ``ERROR_INVALID_PARAMETER`` (0x57) → ``Vulnerable``
-* ``DCERPCException`` whose mapped status is ``rpc_s_access_denied`` →
-  ``NotVulnerable``
-* Anything else, including no exception → ``Vulnerable``
-  (netexec's permissive fall-through, ``return True`` at line 110-111)
+Verdict (``classify``):
 
-Restrictive-AD constraints (per ``adscan-ad-constraints``):
+* insecure Point and Print → ``VULNERABLE`` (inferred, whatever the build);
+* build below the fixed revision → ``VULNERABLE`` (inferred);
+* fixed build and Point and Print observed at its secure default → ``NOT_VULNERABLE``;
+* anything the session could not read (no registry access, a build outside
+  the table, a Point and Print key that answered access denied) → ``SKIPPED``,
+  NOT ASSESSED. An answer the check cannot interpret never becomes a verdict.
 
-* The SMB session is opened with the user's **auth_domain** (where the
-  account lives), not the target_domain. Cross-realm SMB to a foreign
-  DC without a trust path returns ``STATUS_LOGON_FAILURE`` — the runner
-  catches that and emits ``SKIPPED`` rather than a misleading
-  ``NotApplicable`` (which would suggest the spooler is filtered).
-* Kerberos is preferred when explicitly requested (``creds.use_kerberos``
-  or ``ctx`` provides a kdc_ip). The probe wires impacket's
-  ``set_kerberos(True, kdcHost=...)`` so cross-realm Kerberos referrals
-  work via the underlying impacket flow. NTLM is the fallback for
-  environments where Kerberos is unreachable.
-* Clock skew on Kerberos is handled by impacket's internal retry loop
-  on ``KRB_AP_ERR_SKEW``; ADscan's ``kerberos_transport`` wrapper is
-  the canonical path for code that issues TGTs/TGSes directly, but the
-  spooler bind path is owned by impacket so we let it negotiate.
+Every VULNERABLE verdict is an INFERENCE (patch level or policy, never an
+observed driver load), so the finding is graded High and confirmation-pending
+(``adscan_core/reporting/finding_confidence.py``); the runner stamps the band
+from the catalog's ``detection_basis``.
+
+Reading HKLM over Remote Registry normally needs local administrator rights on
+the target, so a non-admin credential gets "not assessed" on most hosts. That is
+the honest result: the patch state was not observed. When ADscan holds an
+administrator of the host (Domain Admin, or that host's own local administrator
+material), the session is opened with it instead (``ScanContext.patch_level``,
+:mod:`..host_patch_level`), and the OS build comes from the run's per-host cache,
+so the one read serves every patch-level check. A host first left not assessed
+is evaluated again once such a credential exists (``patch_level_rerun``).
 """
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from adscan_core import telemetry
-from adscan_core.rich_output import print_error, print_info_verbose
+from adscan_core.rich_output import print_error, print_exception, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.cve_scanner.checks._os_patch_level import (
+    ACCESS_ADMINISTRATIVE,
+    ACCESS_STANDARD,
+    READ_ABSENT,
+    READ_DENIED,
+    READ_FAILED,
+    READ_OK,
+    OSVersionRead,
+    classify_patch_level,
+    coerce_registry_int,
+    patch_level_basis,
+    read_os_version,
+    registry_reason_for,
+)
 from adscan_internal.services.cve_scanner.result import (
     CVEResult,
     CVEStatus,
     Evidence,
     Severity,
 )
-from adscan_core.rich_output import print_exception
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.cve_scanner.runner import ScanContext, ScanTarget
@@ -59,219 +77,309 @@ if TYPE_CHECKING:  # pragma: no cover
 CVE_ID = "CVE-2021-34527"
 AKA = "PrintNightmare"
 CVSS_V3 = 8.8
-CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
+# NVD (NIST) and MSRC both publish 8.8 at S:U (not S:C, which computes 9.9).
+CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
 
-# Win32/HRESULT codes — see netexec printnightmare.py:97-101,140.
-RPC_E_ACCESS_DENIED = 0x8001011B
-ERROR_INVALID_PARAMETER = 0x57
+SPOOLSS_PIPE = "spoolss"
 
-# MS-RPRN APD_* flags (printnightmare.py:132-134).
-APD_COPY_ALL_FILES = 0x00000004
-APD_COPY_FROM_DIRECTORY = 0x00000010
-APD_INSTALL_WARNED_DRIVER = 0x00008000
-_ADD_DRIVER_FLAGS = (
-    APD_COPY_ALL_FILES | APD_COPY_FROM_DIRECTORY | APD_INSTALL_WARNED_DRIVER
+POINT_AND_PRINT_PATH = (
+    "SOFTWARE\\Policies\\Microsoft\\Windows NT\\Printers\\PointAndPrint"
+)
+POINT_AND_PRINT_VALUES = (
+    "RestrictDriverInstallationToAdministrators",
+    "NoWarningNoElevationOnInstall",
+    "UpdatePromptSettings",
 )
 
+#: First UBR of each Windows build that carries the July 2021 PrintNightmare fix
+#: (the out-of-band updates of 2021-07-06: KB5004950 10240.18969, KB5004948
+#: 14393.4470, KB5004949 17134.2208, KB5004947 17763.2029, KB5004946 18363.1646,
+#: KB5004945 19041/19042/19043.1083). A build absent from the table is either
+#: released after the fix (``FIRST_BUILD_RELEASED_FIXED``) or unknown to the
+#: check, and then the patch state is not assessed (Server 2012 / 2012 R2 /
+#: 2008 R2 ship monthly rollups this table does not model).
+PRINTNIGHTMARE_FIXED_UBR_BY_BUILD: dict[int, int] = {
+    10240: 18969,
+    14393: 4470,
+    17134: 2208,
+    17763: 2029,
+    18363: 1646,
+    19041: 1083,
+    19042: 1083,
+    19043: 1083,
+}
+#: Windows 10 21H2 (19044, November 2021) and every later build, Server 2022
+#: (20348) included, shipped after the fix.
+FIRST_BUILD_RELEASED_FIXED = 19044
 
-# Substring markers indicating that an SMB bind-time auth failure is best
-# classified as a cross-realm credential failure (per the AD-constraints
-# checklist) rather than a "spooler not reachable" verdict.
-_AUTH_FAILURE_MARKERS = (
-    "STATUS_LOGON_FAILURE",
-    "STATUS_NO_LOGON_SERVERS",
-    "STATUS_ACCESS_DENIED",
-    "KDC_ERR_C_PRINCIPAL_UNKNOWN",
-    "KDC_ERR_S_PRINCIPAL_UNKNOWN",
-    "KDC_ERR_WRONG_REALM",
-    "KDC_ERR_PREAUTH_FAILED",
-    "logon failure",
-    "wrong password",
-)
+# Registry read outcomes (``RegistryRead.reason``), shared with every check
+# that reads the patch level (``_os_patch_level``). READ_ABSENT on a Point and
+# Print value means the policy default applies.
+
+
+@dataclass(frozen=True)
+class RegistryRead:
+    """One registry value read: its integer value, or why it is missing."""
+
+    value: int | None
+    reason: str = READ_OK
 
 
 @dataclass(frozen=True)
 class PrintNightmareProbeResult:
-    """Outcome of one PrintNightmare probe."""
+    """What the read-only probe observed on one host."""
 
-    spooler_reachable: bool
-    add_driver_error_code: int | None
-    add_driver_error_text: str | None
-    vulnerable: bool
-    notes: tuple[str, ...] = ()
-    auth_failure: bool = False
+    #: ``True``/``False`` once the pipe listing completed, ``None`` when it failed.
+    spooler_exposed: bool | None
+    os_build: int | None = None
+    os_ubr: int | None = None
+    #: Why the OS version could not be read (``READ_*``), empty when it was.
+    os_read_reason: str = READ_OK
+    point_and_print: dict[str, RegistryRead] = field(default_factory=dict)
+    error: str | None = None
+    #: Access of the session that read the Point and Print policy
+    #: (``ACCESS_ADMINISTRATIVE`` / ``ACCESS_STANDARD``; empty when unknown).
+    session_access: str = ""
+    #: Access of the read the OS build came from (it may be another check's).
+    os_access: str = ""
 
 
-def _probe_printnightmare_sync(
+ProbeFn = Callable[..., Awaitable[PrintNightmareProbeResult]]
+#: Wraps the in-session OS read so the run's cache can serve or record it.
+OSReadWrapper = Callable[[Callable[[], Awaitable[OSVersionRead]]], Awaitable[OSVersionRead]]
+
+
+def _read_basis(access: str) -> str:
+    """Evidence clause for a read made with ``access``."""
+    return patch_level_basis(OSVersionRead(None, None, access=access))
+
+
+def patch_status(build: int | None, ubr: int | None) -> str:
+    """Classify the host's patch state: ``patched`` / ``unpatched`` / ``unknown``."""
+    return classify_patch_level(
+        build,
+        ubr,
+        fixed_ubr_by_build=PRINTNIGHTMARE_FIXED_UBR_BY_BUILD,
+        first_build_released_fixed=FIRST_BUILD_RELEASED_FIXED,
+    )
+
+
+def point_and_print_state(values: dict[str, RegistryRead]) -> str:
+    """Classify the Point and Print policy: ``insecure`` / ``secure`` / ``unknown``.
+
+    ``insecure`` needs the restriction explicitly lifted (0) AND a prompt
+    suppressed (1); that is the configuration Microsoft documents as exploitable
+    on a patched host. A key or value that is absent leaves the secure default
+    in force. A read that was denied or failed leaves the state unknown.
+    """
+    if not values:
+        return "unknown"
+    restrict = values.get("RestrictDriverInstallationToAdministrators")
+    no_warning = values.get("NoWarningNoElevationOnInstall")
+    update_prompt = values.get("UpdatePromptSettings")
+    reads = [r for r in (restrict, no_warning, update_prompt) if r is not None]
+    if len(reads) != len(POINT_AND_PRINT_VALUES):
+        return "unknown"
+    prompt_suppressed = any(
+        r.reason == READ_OK and r.value == 1 for r in (no_warning, update_prompt)
+    )
+    if restrict.reason == READ_OK and restrict.value == 0 and prompt_suppressed:
+        return "insecure"
+    if any(r.reason in (READ_DENIED, READ_FAILED) for r in reads):
+        return "unknown"
+    return "secure"
+
+
+def classify(probe: PrintNightmareProbeResult) -> tuple[CVEStatus, str]:
+    """Pure-logic verdict from what the probe observed."""
+    if probe.spooler_exposed is None:
+        return CVEStatus.SKIPPED, (
+            "not assessed: the named pipes could not be listed"
+            + (f" ({probe.error})" if probe.error else "")
+        )
+    if not probe.spooler_exposed:
+        return CVEStatus.NOT_APPLICABLE, "Print Spooler not exposed (no spoolss pipe)"
+    pnp = point_and_print_state(probe.point_and_print)
+    if pnp == "insecure":
+        policy_basis = (
+            "; inferred from the Point and Print policy, read with administrative access"
+            if probe.session_access == ACCESS_ADMINISTRATIVE
+            else ""
+        )
+        return CVEStatus.VULNERABLE, (
+            "Print Spooler exposed and Point and Print lets standard users install "
+            f"drivers without elevation (exploitable even on a patched host){policy_basis}"
+        )
+    patch = patch_status(probe.os_build, probe.os_ubr)
+    if patch == "unpatched":
+        return CVEStatus.VULNERABLE, (
+            f"Print Spooler exposed on build {probe.os_build}.{probe.os_ubr}, "
+            f"below the July 2021 fix; {_read_basis(probe.os_access)}"
+        )
+    if patch == "patched" and pnp == "secure":
+        return CVEStatus.NOT_VULNERABLE, (
+            "Print Spooler exposed, build carries the July 2021 fix and Point and "
+            f"Print is at its secure default; {_read_basis(probe.os_access)}"
+        )
+    reason = probe.os_read_reason if patch == "unknown" else "point_and_print_unreadable"
+    return CVEStatus.SKIPPED, (
+        "not assessed: Print Spooler exposed but its patch state or Point and "
+        f"Print policy could not be read ({reason or 'build not in the fix table'})"
+    )
+
+
+async def _probe_printnightmare(
     *,
     host: str,
     username: str | None,
     password: str | None,
     domain: str | None,
+    auth_domain: str | None,
     nt_hash: str | None,
-    use_kerberos: bool = False,
-    kdc_host: str | None = None,
+    kdc_ip: str | None,
     target_hostname: str | None = None,
+    timeout: int = 30,
+    smb_config: Any | None = None,
+    os_read_wrapper: OSReadWrapper | None = None,
+    session_access: str = "",
 ) -> PrintNightmareProbeResult:
-    """Synchronous probe — call from a worker thread.
+    """Read-only probe: list pipes, then two registry reads, one SMB session.
 
-    Mirrors ``reference/NetExec/nxc/modules/printnightmare.py:39-111``.
-
-    Args:
-        host: Target IP / hostname (named-pipe binding host).
-        username: Authenticated user (no realm prefix).
-        password: Plaintext password (or empty when ``nt_hash`` is set).
-        domain: ``auth_domain`` — realm where the account lives.
-        nt_hash: NT hash for pass-the-hash / Kerberos RC4-key paths.
-        use_kerberos: Switch impacket's DCERPC transport into Kerberos
-            mode. Required when NTLM is GPO-disabled.
-        kdc_host: KDC IP/host for Kerberos auth (passed to impacket
-            ``set_kerberos(True, kdcHost=...)``).
-        target_hostname: SPN host for Kerberos (e.g. ``dc01.essos.local``).
-            When unset and Kerberos is in use, impacket may fail with
-            ``KDC_ERR_S_PRINCIPAL_UNKNOWN`` against an IP target.
+    The pipe listing and the registry reads run sequentially on the one
+    connection (one aiosmb connection is not safe for concurrent pipes).
+    ``smb_config`` (an administrator's session) replaces the scan credential
+    when given; ``os_read_wrapper`` lets the run's cache serve the OS build or
+    record the one this session reads.
     """
+    from adscan_internal.services.smb_transport import (  # noqa: PLC0415
+        SMBConfig,
+        SMBTransportError,
+        smb_machine_with_fallback,
+    )
+
+    config = smb_config or SMBConfig(
+        target_ip=host,
+        target_hostname=target_hostname,
+        domain=domain,
+        username=username,
+        password=password,
+        nt_hash=nt_hash,
+        auth_domain=auth_domain,
+        kdc_ip=kdc_ip,
+        timeout=timeout,
+    )
     try:
-        from impacket.dcerpc.v5 import rprn, transport
-        from impacket.dcerpc.v5.dtypes import NULL
-        from impacket.dcerpc.v5.rpcrt import DCERPCException, rpc_status_codes
-    except ImportError as exc:  # pragma: no cover
-        return PrintNightmareProbeResult(
-            spooler_reachable=False,
-            add_driver_error_code=None,
-            add_driver_error_text=f"impacket missing: {exc}",
-            vulnerable=False,
-        )
-
-    # Use the SPN-friendly hostname when running Kerberos; the IP host is
-    # required when running NTLM (named-pipe over SMB to the literal IP).
-    bind_host = target_hostname if (use_kerberos and target_hostname) else host
-    binding = rf"ncacn_np:{bind_host}[\PIPE\spoolss]"
-    rpc_transport = transport.DCERPCTransportFactory(binding)
-    rpc_transport.set_dport(445)
-    if hasattr(rpc_transport, "setRemoteHost"):
-        rpc_transport.setRemoteHost(host)
-    if hasattr(rpc_transport, "set_credentials"):
-        rpc_transport.set_credentials(
-            username or "",
-            password or "",
-            domain or "",
-            "",
-            nt_hash or "",
-        )
-    if use_kerberos and hasattr(rpc_transport, "set_kerberos"):
-        # impacket's set_kerberos(True, kdcHost=...) toggles GSSAPI/SPNEGO
-        # on the underlying SMB session; clock skew is handled internally.
-        rpc_transport.set_kerberos(True, kdcHost=kdc_host or host)
-
-    notes: list[str] = []
-    try:
-        dce = rpc_transport.get_dce_rpc()
-        dce.connect()
-        dce.bind(rprn.MSRPC_UUID_RPRN)
-    except Exception as exc:  # noqa: BLE001
-        err_text = f"bind error: {exc}"
-        upper = str(exc).upper()
-        is_auth_failure = any(m.upper() in upper for m in _AUTH_FAILURE_MARKERS)
-        return PrintNightmareProbeResult(
-            spooler_reachable=False,
-            add_driver_error_code=None,
-            add_driver_error_text=err_text,
-            vulnerable=False,
-            notes=("could not bind to MS-RPRN",),
-            auth_failure=is_auth_failure,
-        )
-
-    try:
-        # All-NULL DRIVER_INFO_2 — netexec printnightmare.py:75-84.
-        driver_container = rprn.DRIVER_CONTAINER()
-        driver_container["Level"] = 2
-        driver_container["DriverInfo"]["tag"] = 2
-        driver_container["DriverInfo"]["Level2"]["cVersion"] = 0
-        driver_container["DriverInfo"]["Level2"]["pName"] = NULL
-        driver_container["DriverInfo"]["Level2"]["pEnvironment"] = NULL
-        driver_container["DriverInfo"]["Level2"]["pDriverPath"] = NULL
-        driver_container["DriverInfo"]["Level2"]["pDataFile"] = NULL
-        driver_container["DriverInfo"]["Level2"]["pConfigFile"] = NULL
-
-        error_code: int | None = None
-        error_text: str | None = None
-        # Default verdict mirrors netexec's permissive fall-through
-        # (``return True`` at printnightmare.py:110-111).
-        vulnerable = True
-
-        try:
-            rprn.hRpcAddPrinterDriverEx(dce, NULL, driver_container, _ADD_DRIVER_FLAGS)
-            error_code = 0
-            error_text = "STATUS_SUCCESS — call accepted"
-            notes.append(
-                "AddPrinterDriverEx returned success — fall-through Vulnerable"
+        async with smb_machine_with_fallback(config) as machine:
+            pipes: list[str] = []
+            async for name, err in machine.list_pipes():
+                if err is None and name:
+                    pipes.append(str(name))
+            exposed = any(p.lower() == SPOOLSS_PIPE for p in pipes)
+            if not exposed:
+                return PrintNightmareProbeResult(spooler_exposed=False, session_access=session_access)
+            os_read, pnp = await _read_registry(
+                machine.connection, os_read_wrapper=os_read_wrapper, session_access=session_access
             )
-        except DCERPCException as exc:
-            error_text = str(exc)
-            code = getattr(exc, "error_code", None)
-            if isinstance(code, int):
-                error_code = code
-
-            if code == RPC_E_ACCESS_DENIED:
-                vulnerable = False
-                notes.append("RPC_E_ACCESS_DENIED (0x8001011B) — patched")
-            elif code == ERROR_INVALID_PARAMETER:
-                vulnerable = True
-                notes.append("ERROR_INVALID_PARAMETER (0x57) — Vulnerable")
-            else:
-                # Generic DCERPCException — check the rpc_status_codes mapping
-                # for ``rpc_s_access_denied`` (printnightmare.py:105-108).
-                mapped: str | None = None
-                try:
-                    mapped = (
-                        rpc_status_codes.get(code) if isinstance(code, int) else None
-                    )
-                except Exception:  # noqa: BLE001
-                    mapped = None
-                if mapped == "rpc_s_access_denied":
-                    vulnerable = False
-                    notes.append("rpc_s_access_denied — patched")
-                else:
-                    # Fall-through: netexec prints "Unexpected error" but
-                    # then unconditionally highlights Vulnerable.
-                    notes.append(
-                        f"unexpected DCERPC error {error_text!r} — fall-through Vulnerable"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            error_text = f"transport error: {exc}"
-            notes.append(f"transport error during AddPrinterDriverEx: {exc}")
-            # Non-DCERPC transport errors → still Vulnerable (parity).
-
+            return PrintNightmareProbeResult(
+                spooler_exposed=True,
+                os_build=os_read.build,
+                os_ubr=os_read.ubr,
+                os_read_reason=os_read.reason,
+                point_and_print=pnp,
+                session_access=session_access,
+                os_access=os_read.access,
+            )
+    except SMBTransportError as exc:
         return PrintNightmareProbeResult(
-            spooler_reachable=True,
-            add_driver_error_code=error_code,
-            add_driver_error_text=error_text,
-            vulnerable=vulnerable,
-            notes=tuple(notes),
+            spooler_exposed=None, error=f"smb error: {exc}", session_access=session_access
         )
+
+
+async def _read_registry(
+    connection: Any,
+    *,
+    os_read_wrapper: OSReadWrapper | None = None,
+    session_access: str = "",
+) -> tuple[OSVersionRead, dict[str, RegistryRead]]:
+    """Read the OS build/UBR and the Point and Print values, never writing."""
+    from aiosmb.dcerpc.v5.interfaces.remoteregistry import (  # noqa: PLC0415
+        HKEY,
+        rrprpc_from_smb,
+    )
+
+    try:
+        async with rrprpc_from_smb(connection) as rrp:
+            hklm, err = await rrp.ConnectRegistry(HKEY.LOCAL_MACHINE)
+            if err is not None:
+                reason = registry_reason_for(err)
+                os_read = OSVersionRead(None, None, reason, access=session_access)
+                if os_read_wrapper is not None:
+                    # Another check may already hold this host's build.
+                    os_read = await os_read_wrapper(_constant_read(os_read))
+                return os_read, {v: RegistryRead(None, reason) for v in POINT_AND_PRINT_VALUES}
+            try:
+
+                async def _in_session() -> OSVersionRead:
+                    build, ubr, os_reason = await read_os_version(rrp, hklm)
+                    return OSVersionRead(build, ubr, os_reason, access=session_access)
+
+                if os_read_wrapper is not None:
+                    os_read = await os_read_wrapper(_in_session)
+                else:
+                    os_read = await _in_session()
+                pnp = await _read_point_and_print(rrp, hklm)
+            finally:
+                await rrp.CloseKey(hklm)
+            return os_read, pnp
+    except Exception as exc:  # noqa: BLE001  (Remote Registry unavailable or denied)
+        reason = registry_reason_for(exc)
+        os_read = OSVersionRead(None, None, reason, access=session_access)
+        if os_read_wrapper is not None:
+            try:
+                os_read = await os_read_wrapper(_constant_read(os_read))
+            except Exception:  # noqa: BLE001 - the session failure stands
+                pass
+        return os_read, {v: RegistryRead(None, reason) for v in POINT_AND_PRINT_VALUES}
+
+
+def _constant_read(read: OSVersionRead) -> Callable[[], Awaitable[OSVersionRead]]:
+    async def _read() -> OSVersionRead:
+        return read
+
+    return _read
+
+
+async def _read_point_and_print(rrp: Any, hklm: Any) -> dict[str, RegistryRead]:
+    key, err = await rrp.OpenKey(hklm, POINT_AND_PRINT_PATH)
+    if err is not None or key is None:
+        reason = registry_reason_for(err)
+        return {v: RegistryRead(None, reason) for v in POINT_AND_PRINT_VALUES}
+    try:
+        out: dict[str, RegistryRead] = {}
+        for value in POINT_AND_PRINT_VALUES:
+            _vt, data, qerr = await rrp.QueryValue(key, value)
+            if qerr is not None:
+                out[value] = RegistryRead(None, registry_reason_for(qerr))
+            else:
+                parsed = coerce_registry_int(data)
+                out[value] = RegistryRead(parsed, READ_OK if parsed is not None else READ_ABSENT)
+        return out
     finally:
-        try:
-            dce.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        await rrp.CloseKey(key)
 
 
 class PrintNightmareCheck:
-    """Probe-only PrintNightmare detection — netexec parity.
-
-    Cross-realm policy: the SMB session uses the **auth_domain** (where
-    the user account lives) as the credential realm. When the resulting
-    bind fails with an authentication-class error and ``auth_domain``
-    differs from ``target_domain``, the verdict is ``SKIPPED`` — there
-    is genuinely no answer to "is this DC vulnerable?" without a
-    target-realm credential or a real cross-realm trust path.
-    """
+    """Read-only PrintNightmare exposure check (pipe listing + registry reads)."""
 
     cve_id: str = CVE_ID
+    #: Graded from the host's patch level (and the Point and Print policy): the
+    #: post-collection re-run (``patch_level_rerun``) re-evaluates it once
+    #: administrator access exists.
+    reads_patch_level: bool = True
 
-    def __init__(self, *, probe: Any | None = None) -> None:
-        self._probe = probe or _probe_printnightmare_sync
+    def __init__(self, *, probe: ProbeFn | None = None, timeout: int = 30) -> None:
+        self._probe = probe or _probe_printnightmare
+        self._timeout = timeout
 
     async def run(
         self,
@@ -279,136 +387,127 @@ class PrintNightmareCheck:
         creds: Any | None,
         ctx: "ScanContext",
     ) -> list[CVEResult]:
-        """Run the PrintNightmare probe against ``target``."""
-        del ctx
+        """Run the read-only probe against ``target``."""
         if creds is None:
-            return [_error(target.host, "PrintNightmare probe requires authentication")]
+            return [_result(target.host, CVEStatus.ERROR, "PrintNightmare probe requires authentication")]
 
-        username = getattr(creds, "username", None)
-        password = getattr(creds, "password", None)
-        # Auth-domain (creds.domain) is where the user lives. target_domain
-        # is informational; SMB credentials always resolve in auth_domain.
-        auth_domain = getattr(creds, "auth_domain", None) or getattr(
-            creds, "domain", None
-        )
-        target_domain = getattr(creds, "target_domain", None) or auth_domain
-        nt_hash = getattr(creds, "nt_hash", None)
-        use_kerberos = bool(getattr(creds, "use_kerberos", False))
-        kdc_host = getattr(creds, "kdc_ip", None) or getattr(creds, "auth_kdc_ip", None)
-        target_hostname = target.display_name
-
-        cross_realm = (
-            target_domain is not None
-            and auth_domain is not None
-            and target_domain.lower() != auth_domain.lower()
+        from adscan_internal.services.cve_scanner.checks.webdav import (  # noqa: PLC0415
+            _resolve_target_fqdn,
         )
 
-        print_info_verbose(
-            f"[printnightmare] probing {mark_sensitive(target.host, 'host')} "
-            f"(auth_realm={mark_sensitive(auth_domain or '?', 'domain')}, "
-            f"target_realm={mark_sensitive(target_domain or '?', 'domain')}, "
-            f"kerberos={use_kerberos})"
+        domain = (
+            target.domain
+            or getattr(creds, "target_domain", None)
+            or getattr(creds, "domain", None)
         )
+        print_info_verbose(f"[printnightmare] probing {mark_sensitive(target.host, 'host')}")
+        target_hostname = _resolve_target_fqdn(target=target, ctx=ctx, domain=domain)
+        base_kwargs: dict[str, Any] = {
+            "host": target.host,
+            "username": getattr(creds, "username", None),
+            "password": getattr(creds, "password", None),
+            "domain": domain,
+            "auth_domain": getattr(creds, "auth_domain", None) or domain,
+            "nt_hash": getattr(creds, "nt_hash", None),
+            "kdc_ip": getattr(creds, "kdc_ip", None),
+            "target_hostname": target_hostname,
+            "timeout": self._timeout,
+        }
         try:
-            result = await asyncio.to_thread(
-                self._probe,
-                host=target.host,
-                username=username,
-                password=password,
-                domain=auth_domain,
-                nt_hash=nt_hash,
-                use_kerberos=use_kerberos,
-                kdc_host=kdc_host,
-                target_hostname=target_hostname,
-            )
-        except TypeError:
-            # Backwards-compatible call for legacy probes (test injections)
-            # that only accept the original 5-argument signature.
-            result = await asyncio.to_thread(
-                self._probe,
-                host=target.host,
-                username=username,
-                password=password,
-                domain=auth_domain,
-                nt_hash=nt_hash,
-            )
+            cache = getattr(ctx, "patch_level", None)
+            if cache is None:
+                probe = await self._probe(**base_kwargs)
+            else:
+                probe = await self._probe_with_cache(
+                    cache,
+                    base_kwargs,
+                    host=target.host,
+                    target_hostname=target_hostname,
+                    standard_principal=str(getattr(creds, "username", "") or ""),
+                )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_error(f"[printnightmare] probe crashed against {target.host}: {exc}")
-            return [_error(target.host, str(exc))]
+            return [_result(target.host, CVEStatus.ERROR, str(exc))]
 
-        return [_result_from_probe(target.host, result, cross_realm=cross_realm)]
+        status, summary = classify(probe)
+        payload = {
+            "detection_basis": "patch_level",
+            "spooler_exposed": probe.spooler_exposed,
+            "os_build": probe.os_build,
+            "os_ubr": probe.os_ubr,
+            "os_read_reason": probe.os_read_reason,
+            "patch_status": patch_status(probe.os_build, probe.os_ubr),
+            "point_and_print": {
+                name: {"value": read.value, "reason": read.reason}
+                for name, read in probe.point_and_print.items()
+            },
+            "point_and_print_state": point_and_print_state(probe.point_and_print),
+            "read_access": probe.session_access,
+            "os_read_access": probe.os_access,
+            "error": probe.error,
+        }
+        return [_result(target.host, status, summary, payload=payload)]
+
+    async def _probe_with_cache(
+        self,
+        cache: Any,
+        base_kwargs: dict[str, Any],
+        *,
+        host: str,
+        target_hostname: str | None,
+        standard_principal: str,
+    ) -> PrintNightmareProbeResult:
+        """Probe with an administrator's session when one exists, else the scan credential.
+
+        The OS build goes through the run's cache, so a build another check
+        already read is reused and the one read here serves the others.
+        """
+        def _wrapper(access: str, principal: str) -> OSReadWrapper:
+            async def _wrap(reader: Callable[[], Awaitable[OSVersionRead]]) -> OSVersionRead:
+                return await cache.get_or_read(
+                    host, target_hostname, access=access, principal=principal, reader=reader
+                )
+
+            return _wrap
+
+        access = await cache.resolve_access(host, target_hostname)
+        if access is not None:
+            probe = await self._probe(
+                **base_kwargs,
+                smb_config=access.config,
+                session_access=ACCESS_ADMINISTRATIVE,
+                os_read_wrapper=_wrapper(ACCESS_ADMINISTRATIVE, access.principal),
+            )
+            if probe.spooler_exposed is not None:
+                return probe
+            # The administrator's session itself failed: the scan credential
+            # still gets its own attempt below.
+        return await self._probe(
+            **base_kwargs,
+            session_access=ACCESS_STANDARD,
+            os_read_wrapper=_wrapper(ACCESS_STANDARD, standard_principal),
+        )
 
 
-def _result_from_probe(
-    host: str, probe: PrintNightmareProbeResult, *, cross_realm: bool = False
+def _result(
+    host: str,
+    status: CVEStatus,
+    summary: str,
+    *,
+    payload: dict[str, Any] | None = None,
 ) -> CVEResult:
-    """Map a :class:`PrintNightmareProbeResult` to a :class:`CVEResult`.
-
-    Cross-realm authentication failures are surfaced as ``SKIPPED`` so
-    the lab harness counts them as a documented per-target outcome, not
-    a misleading ``NotApplicable`` (which would suggest the spooler is
-    filtered).
-    """
-    base = dict(
-        cve_id=CVE_ID,
-        aka=AKA,
-        host=host,
-        cvss_v3=CVSS_V3,
-        cvss_vector=CVSS_VECTOR,
-        severity=Severity.from_cvss(CVSS_V3),
-    )
-    payload = {
-        "spooler_reachable": probe.spooler_reachable,
-        "add_driver_error_code": probe.add_driver_error_code,
-        "add_driver_error_text": probe.add_driver_error_text,
-        "notes": list(probe.notes),
-        "auth_failure": probe.auth_failure,
-    }
-    if probe.auth_failure and cross_realm:
-        return CVEResult(
-            **base,
-            status=CVEStatus.SKIPPED,
-            evidence=Evidence(
-                summary=(
-                    "PrintNightmare bind rejected — cross-realm creds not "
-                    "authorized; no trust path tested"
-                ),
-                payload=payload,
-            ),
-        )
-    if not probe.spooler_reachable:
-        return CVEResult(
-            **base,
-            status=CVEStatus.NOT_APPLICABLE,
-            evidence=Evidence(
-                summary="MS-RPRN not reachable — spooler disabled or filtered",
-                payload=payload,
-            ),
-        )
-    status = CVEStatus.VULNERABLE if probe.vulnerable else CVEStatus.NOT_VULNERABLE
-    summary = (
-        "PrintNightmare surface confirmed via RpcAddPrinterDriverEx"
-        if probe.vulnerable
-        else "PrintNightmare not exploitable (ACCESS_DENIED)"
-    )
-    return CVEResult(
-        **base, status=status, evidence=Evidence(summary=summary, payload=payload)
-    )
-
-
-def _error(host: str, message: str) -> CVEResult:
     return CVEResult(
         cve_id=CVE_ID,
         aka=AKA,
         host=host,
-        status=CVEStatus.ERROR,
+        status=status,
         severity=Severity.from_cvss(CVSS_V3),
         cvss_v3=CVSS_V3,
         cvss_vector=CVSS_VECTOR,
-        error=message,
-        evidence=Evidence(summary=f"PrintNightmare error: {message}", payload={}),
+        error=summary if status in (CVEStatus.ERROR, CVEStatus.SKIPPED) else None,
+        evidence=Evidence(summary=summary, payload=payload or {}),
     )
 
 
@@ -417,8 +516,13 @@ __all__ = [
     "CVE_ID",
     "CVSS_V3",
     "CVSS_VECTOR",
-    "ERROR_INVALID_PARAMETER",
+    "FIRST_BUILD_RELEASED_FIXED",
+    "POINT_AND_PRINT_VALUES",
+    "PRINTNIGHTMARE_FIXED_UBR_BY_BUILD",
     "PrintNightmareCheck",
     "PrintNightmareProbeResult",
-    "RPC_E_ACCESS_DENIED",
+    "RegistryRead",
+    "classify",
+    "patch_status",
+    "point_and_print_state",
 ]

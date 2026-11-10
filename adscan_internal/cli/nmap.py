@@ -10,6 +10,8 @@ This module centralizes all functionality related to:
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import os
 import re
 import shlex
@@ -17,9 +19,9 @@ import shutil
 
 from adscan_core.pal.process import effective_user_is_root
 from adscan_core.pal.platform import is_windows
+from adscan_core.scan_pacing import active_pacing, component_pacing, nmap_timing_flags
 from adscan_internal.services.network_probe_service import (
     ScanPacing,
-    _env_int,
     connect_scan_open_ports_sync,
     expand_host_expression,
 )
@@ -72,6 +74,8 @@ from adscan_core.tui.stream_runner import (
     stream_command_lines,
 )
 
+#: Whole-scan budget at the default pace; the live value scales with pacing
+#: (``_important_port_scan_timeout_seconds``). Kept as the documented default.
 NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS = 7200
 NMAP_DC_DISCOVERY_LARGE_RANGE_THRESHOLD = 4096
 _MASSDNS_FULL_DETAIL_LIMIT = 25
@@ -82,55 +86,32 @@ MassdnsReportSort = Literal["hostname", "ip-count", "status"]
 _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD = 10
 _MEDIUM_IMPORTANT_PORT_SCAN_IP_THRESHOLD = 100
 
-# --- Nmap timing (SSOT) ------------------------------------------------------
-# Rate-neutral, polite-by-default timing shared by every Linux nmap command.
-# On a large AD domain a big fraction of the DNS-resolved ENABLED computer
-# objects are stale/offline, and nmap's default 10 retransmits per DEAD host
-# dominate wall-clock (measured ~37 min for 40% of ~1000 hosts). These flags
-# bound only the give-up COST on dead hosts (retransmits + per-host wall-clock);
-# they do NOT raise the send rate against live hosts. The default deliberately
-# carries NO -T4/-T5, NO --min-rate, NO --max-rate and NO --scan-delay — those
-# raise aggression and are rejected as a default by the AD OPSEC constraints
-# (adscan-ad-constraints § 11). Speed is strictly OPT-IN via env for an operator
-# who owns the network.
-_NMAP_DEFAULT_MAX_RETRIES = 3
-_NMAP_MAX_RETRIES_CEILING = 10
-_NMAP_DEFAULT_HOST_TIMEOUT = "15m"
-# nmap accepts a bare number (seconds) or <num>[smh]; validate that shape.
-_NMAP_HOST_TIMEOUT_RE = re.compile(r"^\d+(?:\.\d+)?[smh]?$")
-_NMAP_TIMING_TEMPLATE_RE = re.compile(r"^-T[0-5]$")
+# --- Nmap timing -------------------------------------------------------------
+# The timing flags come from the scan-pacing SSOT (adscan_core.scan_pacing). At
+# the ``normal`` level they are the rate-neutral defaults this module always
+# used: ``--max-retries 3 --host-timeout 15m`` and nothing else, because the
+# give-up cost on dead hosts (stale AD computer objects) dominates and a higher
+# send rate is rejected as a default by the AD OPSEC constraints
+# (adscan-ad-constraints § 11). Slower levels add ``--max-rate``,
+# ``--max-hostgroup``, ``--max-parallelism`` and ``--scan-delay``; ``fast`` adds
+# ``-T4`` with an 800 packets/s governor. Never ``-T5`` (the deprecated
+# ``ADSCAN_PORTSCAN_NMAP_TIMING=-T5`` is clamped to ``-T4``), never
+# ``--min-rate``. ``-Pn`` is decided per call site below, never by pacing.
 
 
 def _nmap_timing_flags() -> str:
-    """Return the shared Linux nmap timing flags (rate-neutral defaults + env opt-in).
-
-    Defaults are polite-by-default and rate-neutral: ``--max-retries 3`` (down
-    from nmap's 10) and ``--host-timeout 15m`` bound how long nmap wastes on a
-    DEAD host without changing the send rate against a live one. The optional
-    timing TEMPLATE is the ONLY thing that ever appends a ``-T<n>`` and it is the
-    sanctioned "operator owns the network" speed override — unset by default.
-
-    Env overrides (all safe-fallback on a missing/bad value):
-      - ``ADSCAN_PORTSCAN_NMAP_MAX_RETRIES`` — int, clamped to 1..10 (default 3).
-      - ``ADSCAN_PORTSCAN_NMAP_HOST_TIMEOUT`` — nmap ``<num>[smh]`` form (default "15m").
-      - ``ADSCAN_PORTSCAN_NMAP_TIMING`` — ``-T0``..``-T5``; unset => nothing added.
+    """Return the nmap timing flags for the session's scan pacing.
 
     Returns:
-        The timing flags as a single space-joined string (no leading/trailing
-        space), e.g. ``"--max-retries 3 --host-timeout 15m"``.
+        The flags as one space-joined string, e.g.
+        ``"--max-retries 3 --host-timeout 15m"`` at the default level.
     """
-    retries = min(
-        _env_int("ADSCAN_PORTSCAN_NMAP_MAX_RETRIES", _NMAP_DEFAULT_MAX_RETRIES, minimum=1),
-        _NMAP_MAX_RETRIES_CEILING,
-    )
-    host_timeout = os.environ.get("ADSCAN_PORTSCAN_NMAP_HOST_TIMEOUT", "").strip()
-    if not host_timeout or not _NMAP_HOST_TIMEOUT_RE.match(host_timeout):
-        host_timeout = _NMAP_DEFAULT_HOST_TIMEOUT
-    flags = f"--max-retries {retries} --host-timeout {host_timeout}"
-    timing = os.environ.get("ADSCAN_PORTSCAN_NMAP_TIMING", "").strip()
-    if timing and _NMAP_TIMING_TEMPLATE_RE.match(timing):
-        flags = f"{timing} {flags}"
-    return flags
+    return nmap_timing_flags(active_pacing())
+
+
+def _important_port_scan_timeout_seconds() -> int:
+    """Whole-scan wall budget for the important-port scan (scales with pacing)."""
+    return int(component_pacing(active_pacing(), "portscan.nmap")["whole_scan_timeout_s"])
 
 
 class NmapShell(Protocol):
@@ -2258,6 +2239,15 @@ def _write_network_reachability_report(
     return True
 
 
+def _stamp_host_reach_coverage(shell: NmapShell, domain: str) -> None:
+    """Persist the client-facing network-reach coverage block. Never raises."""
+    from adscan_internal.services.host_reach_coverage_stamp import (
+        stamp_host_reach_coverage,
+    )
+
+    stamp_host_reach_coverage(shell, domain)
+
+
 def _load_network_reachability_report(report_path: str) -> dict[str, object] | None:
     """Load a structured reachability report from disk."""
     if not report_path or not os.path.exists(report_path):
@@ -2957,8 +2947,7 @@ def convert_hostnames_to_ips_and_scan(
         important_ports_csv = ",".join(str(port) for port in important_ports)
         ip_count = len(unique_ips)
         marked_domain = mark_sensitive(domain, "domain")
-        workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-        is_ctf_workspace = workspace_type == "ctf"
+        is_ctf_workspace = policy_settings.reaches_wide(shell)
         is_small_scope = ip_count <= _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD
         is_medium_scope = (
             _SMALL_IMPORTANT_PORT_SCAN_IP_THRESHOLD
@@ -2968,7 +2957,7 @@ def convert_hostnames_to_ips_and_scan(
         auto_run_small_scope = is_ctf_workspace and is_small_scope
         if auto_run_small_scope:
             decision_lines = [
-                "Auto-running the important port scan because this is a small CTF scope.",
+                "Auto-running the important port scan because the scope is small and the scan policy reaches wide.",
                 f"Domain: {marked_domain}",
                 f"Resolved IPs queued: {ip_count}",
                 f"Important TCP ports: {important_ports_csv}",
@@ -2978,7 +2967,7 @@ def convert_hostnames_to_ips_and_scan(
                 "- service visibility is high-value immediately",
                 "- segmentation hints are useful early in CTF workflows",
                 "",
-                "This still generates active network traffic, but the tradeoff is acceptable in CTF mode at this size.",
+                "This still generates active network traffic, but the tradeoff is acceptable at this size.",
             ]
             panel_title = "Automatic Important Port Scan"
             prompt_text = ""
@@ -3147,7 +3136,7 @@ def convert_hostnames_to_ips_and_scan(
                         shell,
                         command=port_scan_command,
                         domain=domain,
-                        timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                        timeout_seconds=_important_port_scan_timeout_seconds(),
                         _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
                         _sudo_validate=_sudo_validate,
                         retry_debug_context="combined reachability/port scan",
@@ -3157,7 +3146,7 @@ def convert_hostnames_to_ips_and_scan(
                     shell,
                     command=port_scan_command,
                     domain=domain,
-                    timeout_seconds=NMAP_IMPORTANT_PORTS_SCAN_TIMEOUT_SECONDS,
+                    timeout_seconds=_important_port_scan_timeout_seconds(),
                     run_scan_fallback=_run_port_scan_buffered,
                     # Drive the platform's "X of Y hosts" port-scan bar off the
                     # queued IP count (enabled_computers_ips.txt line count).
@@ -3243,6 +3232,10 @@ def convert_hostnames_to_ips_and_scan(
                 reachability_report_file,
                 reachability_payload,
             )
+            # Declare the computers this vantage could not reach, from the
+            # measurement just written, so the gap reaches every deliverable
+            # and the web even when the scan ends before its scan-end pass.
+            _stamp_host_reach_coverage(shell, domain)
             # Produce always; render only when not deferred to Phase 3.
             if render:
                 _show_network_reachability_summary(
@@ -3275,6 +3268,9 @@ def convert_hostnames_to_ips_and_scan(
             _remove_file_if_exists(os.path.join(nmap_dir, "imp_ports_scan"))
             _remove_file_if_exists(os.path.join(nmap_dir, "imp_ports_scan.gnmap"))
             _remove_file_if_exists(os.path.join(nmap_dir, "imp_ports_discovery.gnmap"))
+            # Reachability was not measured: the deliverable must say so rather
+            # than let every computer's host-level sections read as clean.
+            _stamp_host_reach_coverage(shell, domain)
             print_info(
                 "Skipping Nmap by user choice. Reachability, service exposure, and segmentation inference were not computed."
             )

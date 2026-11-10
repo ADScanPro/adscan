@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from adscan_core import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_runtime import active_runtime
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
@@ -231,19 +233,86 @@ def _emit_rdp_failure_posture(
 # ---------------------------------------------------------------------------
 
 
+def _rdp_guard_target(factory: object, host: str) -> "tuple[str, str, str] | None":
+    """``(realm, principal, secret)`` when this RDP sign-in sends an NTLM secret.
+
+    A CredSSP+Kerberos sign-in proves its secret in a kerbad AS exchange, which
+    the Kerberos seam (``_kerberos_recovery``) already judges, so only NTLM is
+    handled here. A local account (no domain, or ``"."``) is keyed to the host.
+    """
+    credential = getattr(factory, "credential", None)
+    if credential is None:
+        return None
+    protocol = str(getattr(getattr(credential, "protocol", None), "name", "") or "")
+    if protocol.upper() != "NTLM":
+        return None
+    username = str(getattr(credential, "username", "") or "")
+    if not username:
+        return None
+    from adscan_core.auth_attempt_guard import local_realm  # noqa: PLC0415
+
+    realm = str(getattr(credential, "domain", "") or "").strip()
+    if realm in ("", "."):
+        realm = local_realm(host)
+    secret_value = getattr(credential, "secret", None)
+    secret = (
+        secret_value.hex()
+        if isinstance(secret_value, (bytes, bytearray))
+        else str(secret_value or "")
+    )
+    return realm, username, secret
+
+
+def _record_rdp_outcome(
+    target: "tuple[str, str, str]", err: "BaseException | None", *, nla: bool
+) -> None:
+    """Record a CredSSP outcome. Only an NLA exchange proves anything about the secret.
+
+    The verdict comes from the NTSTATUS the server put in the CredSSP
+    ``errorCode`` (``CredSSP - Server sent an error! Code: 0xc000006d``), read by
+    the shared NTLM classifier. A server that just closes the connection (older
+    CredSSP) gives no code and stays UNKNOWN. A connection without NLA never
+    authenticated, so its success is not a sign-in success.
+    """
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+    from adscan_core.auth_outcome import SUCCESS, classify_ntlm_status  # noqa: PLC0415
+
+    if err is None:
+        if nla:
+            auth_attempt_guard.record_verdict(*target, SUCCESS)
+        return
+    auth_attempt_guard.record_verdict(*target, classify_ntlm_status(_exception_chain_text(err)))
+
+
 async def _attempt_connection(
     factory: object, host: str, proto: object, timeout_s: float
 ) -> bool:
-    """Return True if the CredSSP handshake succeeds with the given protocol."""
-    from aardwolf.commons.factory import RDPConnectionFactory  # noqa: F401 type hint
+    """Return True if the CredSSP handshake succeeds with the given protocol.
 
+    The single aardwolf connect seam of this module: the sign-in lockout guard
+    (``adscan_core.auth_attempt_guard``) checks an NTLM secret before it is sent
+    and records the classified outcome after.
+    """
+    from aardwolf.commons.factory import RDPConnectionFactory  # noqa: F401 type hint
+    from adscan_core.auth_attempt_guard import check_attempt  # noqa: PLC0415
+
+    guard_target = _rdp_guard_target(factory, host)
+    if guard_target is not None:
+        check_attempt(*guard_target)
     ios = factory.get_settings()  # type: ignore[attr-defined]
     if proto is not None:
         ios.supported_protocols = proto
-    async with asyncio.timeout(timeout_s):
-        async with factory.create_connection_newtarget(host, ios) as conn:  # type: ignore[attr-defined]
-            _, err = await conn.connect()
-            return err is None
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with factory.create_connection_newtarget(host, ios) as conn:  # type: ignore[attr-defined]
+                _, err = await conn.connect()
+    except Exception as exc:
+        if guard_target is not None:
+            _record_rdp_outcome(guard_target, exc, nla=proto is not None)
+        raise
+    if guard_target is not None:
+        _record_rdp_outcome(guard_target, err, nla=proto is not None)
+    return err is None
 
 
 async def _probe_one(
@@ -440,8 +509,8 @@ async def scan_rdp_hosts(
     secret: str,
     is_hash: bool,
     dc_ip: str | None = None,
-    connect_timeout_s: float = 10.0,
-    max_workers: int = 10,
+    connect_timeout_s: float | None = None,
+    max_workers: int | None = None,
     posture_snapshot: Optional[DomainPosture] = None,
     posture_sink: Optional[PostureSink] = None,
     domain_for_posture: Optional[str] = None,
@@ -457,8 +526,9 @@ async def scan_rdp_hosts(
         dc_ip: DC/KDC IP for Kerberos ticket acquisition.  Required for the
                Kerberos fallback to work in environments without AD-aware DNS.
                Safe to omit — NTLM-only probe proceeds without it.
-        connect_timeout_s: Per-host handshake timeout in seconds.
-        max_workers: Maximum concurrent probes.
+        connect_timeout_s: Per-host handshake timeout in seconds (default from
+            the scan pacing, ``sweep.rdp_access``: 10 s at the default level).
+        max_workers: Maximum concurrent probes (default from the scan pacing: 10).
         posture_snapshot: Optional :class:`DomainPosture` for the target
             domain. When ``NTLM_AUTHENTICATION=DISABLED HIGH`` is recorded,
             each probe skips the doomed NTLM attempt and uses Kerberos directly.
@@ -487,10 +557,15 @@ async def scan_rdp_hosts(
         except Exception:  # noqa: BLE001 — never let the sync break the sweep
             pass
 
-    sem = asyncio.Semaphore(max_workers)
+    pacing = component_pacing(active_pacing(), "sweep.rdp_access")
+    if connect_timeout_s is None:
+        connect_timeout_s = float(pacing["connect_timeout_s"])
+    runtime = active_runtime()
+    sem = runtime.semaphore(int(pacing["max_workers"]) if max_workers is None else max_workers)
 
     async def _guarded(host: str) -> RDPLoginResult:
         async with sem:
+            await runtime.before_op(host)
             return await _probe_one(
                 host,
                 domain,

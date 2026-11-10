@@ -91,6 +91,18 @@ from jinja2 import Environment, select_autoescape
 from adscan_core import telemetry
 from adscan_core.offline import offline_mode_enabled
 from adscan_core.operator_role import CtaLane, resolve_cta_lane
+from adscan_core.reporting.cleanup_disclosures import (
+    STILL_IN_PLACE_LABEL,
+    cleanup_counters,
+    still_in_place_count,
+)
+from adscan_core.reporting.cleanup_outcome import (
+    OUTCOME_COPY,
+    OUTCOME_ORDER,
+    OUTCOME_REVERTED,
+    cleanup_outcome,
+)
+from adscan_core.reporting.cleanup_remediation import remediation_steps
 from adscan_core.outbound_links import (
     cta_display_url,
     cta_link_style,
@@ -120,8 +132,10 @@ from adscan_core.reporting.chokepoint_copy import (
     CHOKEPOINT_MAX_ROWS,
     REMEDIATION_ORDER_CLAUSE,
     STRUCTURAL_CHOKE_BADGE,
+    by_design_note_lead,
     chokepoint_headline,
     containment_block_note,
+    custody_actions_phrase,
     is_structural_choke,
     reach_uniform_note,
     remediation_chain_note,
@@ -131,15 +145,29 @@ from adscan_core.reporting.chokepoint_copy import (
     remediation_start_here_headline,
 )
 from adscan_core.reporting.endpoint_defense import merge_endpoint_defense
+from adscan_core.reporting.host_reach_coverage import merge_host_reach_coverage
+from adscan_core.reporting.scan_pacing_disclosure import merge_scan_pacing
+from adscan_core.scan_policy.annotate import NOTE_LABEL_KEY as POLICY_NOTE_LABEL_KEY
+from adscan_core.scan_policy.annotate import (
+    META_UNLOCK_LINE_KEY as POLICY_META_UNLOCK_LINE_KEY,
+)
+from adscan_core.scan_policy.coverage import merge_scan_policy_coverage
 from adscan_core.reporting.host_enrichment_coverage import (
     merge_host_enrichment_coverage,
 )
 from adscan_core.reporting.user_exposure_ranking import (
     build_user_exposure_ranking,
+    population_exclusions,
 )
 from adscan_core.reporting.domain_scope import (
     classify_report_domains,
     format_discovered_domains_note,
+)
+from adscan_core.reporting.engagement_scope import (
+    BEYOND_SCOPE_KPI_KEY,
+    beyond_scope_reach_view,
+    combine_beyond_scope_blocks,
+    load_engagement_scope,
 )
 from adscan_core.reporting.principal_display import (
     format_graph_node_label,
@@ -148,6 +176,12 @@ from adscan_core.reporting.principal_display import (
 )
 from adscan_core.reporting.finding_aliases import collapse_finding_aliases
 from adscan_core.reporting.finding_vuln_map import is_reportable_finding
+from adscan_core.reporting.compromise_verdict import (
+    UNEXECUTED_VERDICTS,
+    aggregate_awaiting_wait_seconds,
+    aggregate_reach_evidence,
+    verdict_from_report_entry,
+)
 from adscan_core.reporting.reach_claim import (
     full_compromise_reach_phrase,
     reaches_full_compromise_clause,
@@ -185,6 +219,7 @@ from adscan_internal.services.adcs_path_display import (
 )
 from adscan_internal.services.affected_assets import (
     build_affected_assets_pair_rows,
+    build_affected_assets_role_rows,
 )
 from adscan_internal.services.affected_asset_rules import Representation, rule_for
 from adscan_internal.services.affected_assets_struct import (
@@ -213,6 +248,7 @@ from adscan_internal.services.attack_surface_analysis import (
     top_remediation_targets,
 )
 from adscan_internal.services.remediation_start_here import (
+    compute_by_design_notes,
     containment_kind_for_technique,
     containment_sort_rank,
 )
@@ -250,7 +286,11 @@ from adscan_internal.services.exposure_score_service import (
     derive_posture_path_inputs,
     report_tier_for_record,
 )
-from adscan_internal.services.path_state import _PROVEN_STATUSES, client_status_label
+from adscan_internal.services.path_state import (
+    _PROVEN_STATUSES,
+    client_status_label,
+    client_status_tone,
+)
 from adscan_internal.services.post_compromise_obligations import (
     load_post_compromise_obligations,
     obligations_to_dicts,
@@ -323,23 +363,10 @@ REFERENCE_ENVIRONMENT_ASSURANCE = (
 #   closed_by_configuration | theoretical
 # (step statuses also include success / failed / error).
 #
-# The LABEL is the shared SSOT ``path_state.client_status_label`` (the paid
-# deliverable renders the same vocabulary, so the two tiers can never name a
-# status differently). Only the TONE — a CSS-class token this document's
-# stylesheet maps to a colour — is local.
-_STATUS_TONES: dict[str, str] = {
-    "partial": "partial",
-    "attempted": "attempted",
-    "failed": "attempted",
-    "error": "attempted",
-    "post_ex_failed": "attempted",
-    "unavailable": "gap",
-    "unsupported": "gap",
-    "blocked": "safety",
-    "safety_blocked": "safety",
-    "closed_by_configuration": "hardening",
-    "theoretical": "theoretical",
-}
+# The LABEL and the TONE are the shared SSOT ``path_state.client_status_label``
+# / ``client_status_tone`` (the paid deliverable and the web CTEM render the
+# same vocabulary, so no surface can name or colour a status differently). The
+# tone is a CSS-class token this document's stylesheet maps to a colour.
 
 
 def status_presentation(status: object) -> tuple[str, str]:
@@ -353,7 +380,7 @@ def status_presentation(status: object) -> tuple[str, str]:
     token = str(status or "").strip().lower()
     if token in _PROVEN_STATUSES:
         return ("Validated", "proven")
-    return (client_status_label(token), _STATUS_TONES.get(token, "theoretical"))
+    return (client_status_label(token), client_status_tone(token))
 
 
 def _score_tone(score: int) -> str:
@@ -375,7 +402,7 @@ class AssetLabel:
     """One affected-asset label for a LITE finding row, with its tier + role.
 
     ``text`` is the humanized object name (for a PAIRING finding, the composed
-    pair ``logged-on-user @ host (IP)``); ``tier`` is the compact privilege-tier
+    pair ``logged-on-user signed in to host (IP)``); ``tier`` is the compact privilege-tier
     badge (``Tier 0`` / ``Tier 1`` / ``Tier 2``) or ``""``; ``role`` is the
     finding-specific client role (``holder``, ``roastable-target`` …) or ``""``.
     """
@@ -396,12 +423,25 @@ class AssetLabel:
     #: per-account outcome — ``cracked`` / ``attempted`` / ``exposed``, from the
     #: stamped entity's ``crack_status``. ``""`` for every other finding.
     crack_status: str = ""
+    #: For a DIRECTORY-ATTRIBUTE SECRET row whose finding carries BOTH states:
+    #: ``authenticated`` when the leaked value opened this object,
+    #: ``unproven`` when the directory refused it for the account holding it,
+    #: from the stamped entity's ``secret_status``. ``""`` elsewhere.
+    secret_status: str = ""
     #: For a PAIRING row, the per-endpoint tiers so the client sees BOTH tiers of
     #: the ESAE violation (a Tier-0 user on a Tier-1 host), ordered as ``text``
     #: reads: ``({"text","tier","tier_basis"}, ...)``. Empty for a non-pair row.
     pair_endpoints: tuple[dict[str, str], ...] = ()
-    #: The connector between the two endpoints (`` @ `` / `` → ``). ``""`` otherwise.
+    #: The connector between the two endpoints (`` signed in to `` / `` → ``). ``""`` otherwise.
     pair_connector: str = ""
+    #: A broad built-in identity's reach (``Any account that can sign in to the
+    #: domain``). ``""`` otherwise.
+    scope_note: str = ""
+    #: On an attack-step finding, the role group this label sits in and its
+    #: heading (``Who can exploit it`` …), from the shared role SSOT. Labels
+    #: arrive ordered by group. ``""`` on any other finding.
+    role_group: str = ""
+    role_group_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -452,6 +492,9 @@ class PathStepRow:
     narrative: str
     status_label: str
     status_tone: str
+    #: "Not executed, excluded by the scan policy" when the policy kept this
+    #: step from running (shared annotation, adscan_core.scan_policy.annotate).
+    not_executed_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -492,6 +535,14 @@ class AttackPathRow:
     #: single-origin route. SSOT:
     #: ``report_attack_paths.build_origin_footholds_summary``.
     origin_footholds_summary: str = ""
+    #: The sentence naming the other domains the route's Tier-0 asset also
+    #: leads to. Empty for a single-domain route.
+    #: SSOT: ``adscan_core.reporting.cross_domain_reach.also_reaches_domains_line``.
+    also_reaches_summary: str = ""
+    #: "Enabling <check> in the scan policy would let ADscan prove this route."
+    #: Empty unless the policy kept the route from being walked end to end.
+    #: SSOT: ``adscan_core.scan_policy.annotate.policy_unlock_line``.
+    policy_unlock_line: str = ""
 
 
 @dataclass(frozen=True)
@@ -656,7 +707,7 @@ class LiteRemediationStartHere:
     #: that promises "the single fix that removes the most paths is flagged below",
     #: so that promise is never printed when no row is flagged.
     has_largest_reduction: bool = False
-    #: How many leading rows are containment actions, and the one-line note that
+    #: How many leading rows are containment fixes, and the one-line note that
     #: introduces them. ``0`` / ``""`` on a clean engagement, which prints no
     #: containment copy at all.
     containment_count: int = 0
@@ -674,6 +725,27 @@ class LiteRemediationStartHere:
     #: The legend defined that badge unconditionally, so a table where nothing
     #: earned it still explained a mark the reader could not find in it.
     has_structural_badge: bool = False
+    #: Techniques the ranking leaves out because no change is needed for their
+    #: holder (how Active Directory works), each ``{"label", "why_not"}``, and the
+    #: sentence that introduces them. Same derivation as the paid report
+    #: (``remediation_start_here.compute_by_design_notes``), so the two documents
+    #: skip the same techniques for the same reason.
+    by_design: tuple[dict[str, Any], ...] = ()
+    by_design_note: str = ""
+
+
+def _lite_by_design_notes(raw_paths: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """The by-design techniques of these paths, through the shared derivation.
+
+    Best-effort: a failure leaves the note out rather than the whole section.
+    """
+    try:
+        notes = compute_by_design_notes([{"name": "", "attack_paths": list(raw_paths or [])}])
+    except Exception as exc:  # noqa: BLE001 - the note never blocks the report
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return ()
+    return tuple({"label": n["label"], "why_not": n["why_not"]} for n in notes)
 
 
 @dataclass(frozen=True)
@@ -688,6 +760,30 @@ class EnvironmentChangeRow:
     status_tone: str
     detail: str
     performed_at: str
+    #: Cleanup instruction as ordered steps in the shared command shape
+    #: (``intro``, ``command``, ``platform``, ``caption``, ``outro``): prose shown
+    #: above each command, the command block holding only the command.
+    steps: tuple[dict[str, str], ...] = ()
+    #: Why the change is where it is (``cleanup_outcome`` key) and its chip.
+    outcome: str = ""
+    chip: str = ""
+    #: A revert that failed with the rights to do it: the reason it recorded
+    #: and the accounts it tried (``role_label``, ``account``, ``outcome_label``).
+    revert_error: str = ""
+    attempts: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ChangeOutcomeGroup:
+    """Changes still in place that share one outcome, with its shared copy."""
+
+    key: str
+    title: str
+    explanation: str
+    next_step: str
+    cta_where: str
+    tone: str
+    rows: tuple[EnvironmentChangeRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -715,11 +811,49 @@ class ChangeDisclosure:
     other_rows: tuple[EnvironmentChangeRow, ...] = ()
     #: False when no write ledger could be read for this scan.
     determined: bool = True
+    #: Every change still in place, grouped by why (``cleanup_outcome``).
+    outcome_groups: tuple[ChangeOutcomeGroup, ...] = ()
 
     @property
     def needs_action(self) -> bool:
-        """True when something is left for the client's administrator to undo."""
+        """True when a change could not be undone (or is still being undone)."""
         return bool(self.manual_required or self.in_progress)
+
+    @property
+    def awaiting_client(self) -> int:
+        """Every change still in place for the client to remove or accept.
+
+        Includes the changes left in place on purpose: not a failure, but not
+        done either, so they are never counted as nothing outstanding. The
+        definition is shared with the paid report and the web
+        (``cleanup_disclosures.still_in_place_count``).
+        """
+        return still_in_place_count(
+            manual_required=self.manual_required,
+            kept=self.kept,
+            in_progress=self.in_progress,
+        )
+
+    @property
+    def awaiting_label(self) -> str:
+        """Headline of the figure, worded once for every surface."""
+        return STILL_IN_PLACE_LABEL
+
+    @property
+    def awaiting_split(self) -> str:
+        """The split under the figure, naming each outcome and its count."""
+        rows = self.manual_rows + self.other_rows
+        return str(
+            cleanup_counters(
+                {
+                    "manual_required": self.manual_required,
+                    "kept": self.kept,
+                    "in_progress": self.in_progress,
+                    "reverted_confirmed": self.reverted,
+                },
+                [{"outcome": r.outcome} for r in rows],
+            )["split"]
+        )
 
     @property
     def clean_run(self) -> bool:
@@ -934,10 +1068,28 @@ class LiteReportModel:
     #: section is then omitted. Withholding a safety-critical instruction is
     #: not a tier boundary, which is why the free report carries it too.
     obligations: tuple[dict[str, Any], ...] = ()
+    #: The client-facing NAME of the obligations count, from the copy SSOT
+    #: (:func:`~adscan_core.reporting.chokepoint_copy.custody_actions_phrase`):
+    #: "2 credential custody actions", never "2 containment actions". The ranked
+    #: "Start here" list has a containment block of its own with a different
+    #: count, and while both carried the same label this document stated two
+    #: different numbers of first things to do.
+    obligations_phrase: str = ""
     #: How many paths carry a validated segment without being proven end to end.
     #: Not rendered as its own figure today; carried so the document's own
     #: proof mix can be measured (see :func:`derive_report_content_metrics`).
     partial_paths: int = 0
+    #: Why the unexecuted routes to full domain compromise did not run, one
+    #: sentence per domain, from the verdict SSOT
+    #: (:meth:`CompromiseVerdict.sentence`): the operator's refusal, the scan
+    #: policy's exclusion and a missing approval each keep their own words.
+    #: Empty when every route ran or none was found.
+    verdict_not_executed: str = ""
+    #: "Reach beyond your scope": one entry per in-scope domain and the domain
+    #: outside the engagement scope its routes continue into (sentence, gravity,
+    #: mapped route count), from the shared ``engagement_scope`` view. Counted in
+    #: none of the figures above. Empty when no route leaves the scope.
+    beyond_scope_reach: tuple[dict[str, Any], ...] = ()
     #: Affected-asset coverage of the findings above. The rows themselves carry
     #: the assets; this is the roll-up of how many name something the reader can
     #: act on, which is what the content telemetry reports.
@@ -980,6 +1132,18 @@ class LiteReportModel:
     #: boundary so it never reads as exhaustive; the identity graph is always 100%.
     #: SSOT: :mod:`adscan_core.reporting.host_enrichment_coverage`.
     host_enrichment_coverage_statement: str = ""
+    #: Network reach of the assessment over the enabled computers: the report-wide
+    #: view from the tier-shared SSOT, with ``scope_statement`` (always, when a
+    #: block was recorded), ``has_gap`` and the per-segment rows. Empty mapping
+    #: when the scan recorded no block (the document then reads as before). A
+    #: computer the assessment could not reach is absent from every host-level
+    #: section, so it is declared here rather than left to read as clean.
+    #: SSOT: :mod:`adscan_core.reporting.host_reach_coverage`.
+    host_reach_coverage: Mapping[str, Any] = field(default_factory=dict)
+    #: Scope and method: the scan policy and the assessment pace, as the shared
+    #: views (adscan_core.scan_policy.coverage / scan_pacing_disclosure).
+    scan_policy: Mapping[str, Any] = field(default_factory=dict)
+    scan_pacing: Mapping[str, Any] = field(default_factory=dict)
     #: The "attack surface already reduced" positive callout: avenues this
     #: environment's configuration closed with certainty. Present only when the
     #: run closed at least one; count is the shared cross-tier cardinality.
@@ -1190,7 +1354,7 @@ def _finding_asset_labels(finding: Any) -> tuple[tuple[AssetLabel, ...], int]:
 
     A PAIRING finding (HasSession, ForceChangePassword, shadow-creds, LAPS, gMSA,
     RBCD, NTLMv1-relay) renders its per-edge pairs as a pair
-    (``logged-on-user @ host (IP)``) via the shared affected-assets SSOT, so the
+    (``logged-on-user signed in to host (IP)``) via the shared affected-assets SSOT, so the
     reader sees who-can-do-what-to-whom rather than two unrelated flat lists.
 
     Otherwise, locators come first — an account, host, share, certificate template
@@ -1227,6 +1391,36 @@ def _finding_asset_labels(finding: Any) -> tuple[tuple[AssetLabel, ...], int]:
             )
             return shown, max(0, len(pair_rows) - len(shown))
 
+    # Attack-step findings: the SAME role-grouped rows the PDF report prints
+    # (who can exploit it / what it exposes / where the weakness lives), capped
+    # per group so a long exposed list never hides who can exploit it.
+    if key:
+        role_rows = build_affected_assets_role_rows(key, details or {})
+        if role_rows:
+            shown_rows: list[AssetLabel] = []
+            per_group: dict[str, int] = {}
+            for row in role_rows:
+                group = row.role_group or ""
+                if per_group.get(group, 0) >= _INLINE_ASSET_CAP:
+                    continue
+                per_group[group] = per_group.get(group, 0) + 1
+                shown_rows.append(
+                    AssetLabel(
+                        text=row.text,
+                        tier=row.tier_badge or "",
+                        tier_basis=row.tier_basis or "",
+                        tier_confidence=row.tier_confidence or "",
+                        role=row.role_label or "",
+                        metric=row.metric or "",
+                        crack_status=row.crack_status or "",
+                        secret_status=row.secret_status or "",
+                        scope_note=row.scope_note or "",
+                        role_group=group,
+                        role_group_label=row.role_group_label or "",
+                    )
+                )
+            return tuple(shown_rows), max(0, len(role_rows) - len(shown_rows))
+
     locators: list[AssetLabel] = []
     fallback: list[AssetLabel] = []
     for entity in _finding_asset_entities(finding):
@@ -1241,6 +1435,7 @@ def _finding_asset_labels(finding: Any) -> tuple[tuple[AssetLabel, ...], int]:
             role=str(entity.get("role_label") or "").strip(),
             metric=str(entity.get("metric") or "").strip(),
             crack_status=str(entity.get("crack_status") or "").strip(),
+            secret_status=str(entity.get("secret_status") or "").strip(),
         )
         bucket = (
             fallback
@@ -1309,6 +1504,18 @@ def reportable_finding_keys(domains: Any) -> list[str]:
         str(finding.get("key") or "")
         for _domain, finding in iter_reportable_findings(domains)
     ]
+
+
+def reportable_finding_severity_counts(domains: Any) -> dict[str, int]:
+    """Return the report's finding count per severity band.
+
+    The exact figures the document's severity strip prints, derived by the same
+    function that builds the document (:func:`_collect_findings`), so a consumer
+    that quotes them (the run summary) cannot count differently.
+    """
+    if not isinstance(domains, dict):
+        return {sev: 0 for sev in _SEVERITY_ORDER}
+    return dict(_collect_findings(domains, multi_domain=len(domains) > 1)[1])
 
 
 def _collect_findings(
@@ -1484,23 +1691,6 @@ def _step_affected_object(step: dict[str, Any]) -> str:
     return ""
 
 
-def _strip_relation_prefix(text: str, relation: str) -> str:
-    """Drop the leading ``"<EdgeToken>: "`` the CLI narrative templates carry.
-
-    The catalog's short templates open with the raw BloodHound token because
-    the CLI reads them as a technical log line. In a client document the token
-    is the wrong register and it is already carried by the step's technique
-    headline, so the sentence starts at the sentence.
-    """
-    body = text.strip()
-    candidates = {format_relation_label(relation).lower(), relation.strip().lower()}
-    for candidate in candidates:
-        if candidate and body.lower().startswith(candidate + ":"):
-            body = body[len(candidate) + 1 :].lstrip()
-            return body[:1].upper() + body[1:] if body else body
-    return body
-
-
 def _with_source_verification(narrative: str, step: dict[str, Any]) -> str:
     """Append the share-credential source verification level, when the step has one.
 
@@ -1550,7 +1740,7 @@ def _step_narrative_base(step: dict[str, Any]) -> str:
     relation = str(step.get("action") or step.get("relation") or "").strip()
     text = render_step_narrative(step, short=True) or render_step_narrative(step)
     if text:
-        return _strip_relation_prefix(text, relation)
+        return text.strip()
 
     entry = get_attack_step_entry(relation)
     description = (
@@ -1625,6 +1815,11 @@ def _build_path_steps(
                 narrative=_step_narrative(step),
                 status_label=label,
                 status_tone=tone,
+                not_executed_label=str(
+                    (step.get("details") or {}).get(POLICY_NOTE_LABEL_KEY) or ""
+                )
+                if isinstance(step.get("details"), dict)
+                else "",
             )
         )
     extra = 0
@@ -1671,6 +1866,7 @@ def _build_path_rows(
     the rendered rows — the tail is disclosed as an honest "N more" note rather
     than dropped, so the counts have to match it.
     """
+    from adscan_core.reporting.cross_domain_reach import also_reaches_domains_line
     from adscan_internal.services.attack_graph_core import fold_origin_stories
     from adscan_internal.services.report_attack_paths import (
         build_origin_footholds_summary,
@@ -1751,6 +1947,15 @@ def _build_path_rows(
                 via_accounts_note=_format_via_accounts_note(path, path_domain),
                 origin_route_count=origin_route_count,
                 origin_footholds_summary=origin_footholds_summary,
+                also_reaches_summary=also_reaches_domains_line(
+                    path.get("also_reaches_domains")
+                ),
+                policy_unlock_line=str(
+                    (path.get("meta") if isinstance(path.get("meta"), dict) else {}).get(
+                        POLICY_META_UNLOCK_LINE_KEY
+                    )
+                    or ""
+                ),
             )
         )
     return rows, len(ordered), proven, partial, rendered_routes
@@ -1987,44 +2192,12 @@ _PROVEN_TECHNIQUE_BADGE = "PROVEN"
 
 
 def _proven_step_technique_keys(raw_paths: Sequence[Mapping[str, Any]]) -> set[str]:
-    """Return the technique keys ADscan proved AT LEAST ONE STEP of.
+    """Delegate to the shared derivation (``remediation_start_here``)."""
+    from adscan_internal.services.remediation_start_here import (  # noqa: PLC0415
+        proven_step_technique_keys,
+    )
 
-    A technique is "proven" here when any path carries a step exercising it whose
-    own status is a proven token (``success`` / ``exploited`` / ``domain_compromised``,
-    the SSOT :data:`~adscan_internal.services.path_state._PROVEN_STATUSES`). This is
-    the SAME step-status signal the attack-path listing uses to badge a step
-    "Validated", so the remediation ranking and the path evidence agree.
-
-    Crucially it is per-STEP, not per-path: a technique proven only as a step inside
-    a PARTIAL route (the full chain not walked end to end) still counts, which is
-    what the end-to-end ``exploited_paths`` counter misses — the reason a validated
-    step (e.g. DCSync proven on a partial path) otherwise reads "not yet executed".
-    A step whose own status is theoretical (``discovered`` / ``structural``) never
-    counts, so a technique that was mapped-only on those partial routes is not
-    credited (honest per-technique proof).
-
-    Keys are the lower-cased edge tokens ``compute_technique_priorities`` uses, so a
-    caller can test ``entry.technique in <this set>`` directly.
-    """
-    proven: set[str] = set()
-    for path in raw_paths:
-        if not isinstance(path, Mapping):
-            continue
-        steps = path.get("steps")
-        if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
-            continue
-        for step in steps:
-            if not isinstance(step, Mapping):
-                continue
-            status = str(step.get("status") or "").strip().lower()
-            if status not in _PROVEN_STATUSES:
-                continue
-            for key in ("action", "relation", "type"):
-                value = step.get(key)
-                if isinstance(value, str) and value.strip():
-                    proven.add(value.strip().lower())
-                    break
-    return proven
+    return proven_step_technique_keys(raw_paths)
 
 
 def _step_technique_key(step: Mapping[str, Any]) -> str:
@@ -2379,6 +2552,7 @@ def build_lite_remediation_start_here(
         else:
             break
     chain_note = remediation_chain_note(tie_size) if tie_size > 1 else ""
+    by_design = _lite_by_design_notes(raw_paths)
     return LiteRemediationStartHere(
         present=True,
         headline=headline,
@@ -2394,10 +2568,20 @@ def build_lite_remediation_start_here(
         # affected-user population + share), so the buyer's number leads instead of
         # sitting in a quiet aside while the rows show only path counts.
         reach_uniform_note=(
-            reach_uniform_note(uniform_reach_pct, reach_total=reach_total)
+            reach_uniform_note(
+                uniform_reach_pct,
+                reach_total=reach_total,
+                containment_count=containment_count,
+                # Derived from the rows shown, so the note never claims "every fix
+                # below" over rows that each say no ordinary account runs through.
+                reach_fixes=_reach_bearing,
+                foothold_fixes=sum(1 for row in rows if int(row.reach_users) <= 0),
+            )
             if reach_is_uniform
             else ""
         ),
+        by_design=by_design,
+        by_design_note=by_design_note_lead(len(by_design)),
         has_largest_reduction=has_largest_reduction,
         containment_count=containment_count,
         containment_note=containment_block_note(containment_count),
@@ -2578,9 +2762,46 @@ def _change_rows(
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        detail = str(
-            entry.get("manual_reason_label") or entry.get("remediation_command") or ""
-        ).strip()
+        label = str(entry.get("manual_reason_label") or "").strip()
+        # A change still in place shows WHY (the reason label) AND HOW to remove
+        # it (the instruction, prose above commands): the free report is the
+        # copy that gets forwarded to the domain owner, so it carries both.
+        steps: tuple[dict[str, str], ...] = ()
+        if bucket in ("manual", "kept", "in_progress"):
+            raw_steps = entry.get("remediation_steps")
+            if not isinstance(raw_steps, list):
+                raw_steps = remediation_steps(str(entry.get("remediation_command") or ""))
+            steps = tuple(
+                {
+                    "intro": str(s.get("intro") or ""),
+                    "command": str(s.get("command") or ""),
+                    "platform": str(s.get("platform") or "windows"),
+                    "caption": str(s.get("caption") or ""),
+                    "outro": str(s.get("outro") or ""),
+                }
+                for s in raw_steps
+                if isinstance(s, dict)
+            )
+        outcome = str(
+            entry.get("outcome")
+            or cleanup_outcome({"bucket": bucket, "manual_reason": entry.get("manual_reason")})
+        )
+        copy = OUTCOME_COPY.get(outcome)
+        chip = (
+            str(entry.get("status_label") or "")
+            if bucket == "kept"
+            else (copy.chip if copy else str(entry.get("status_label") or ""))
+        )
+        attempts = tuple(
+            {
+                "role_label": str(a.get("role_label") or ""),
+                "account": str(a.get("account") or ""),
+                "outcome_label": str(a.get("outcome_label") or ""),
+            }
+            for a in (entry.get("revert_attempts") or [])
+            if isinstance(a, dict)
+        )
+        detail = label
         performed_at = _display_timestamp(
             entry.get("verified_at")
             or entry.get("reverted_at")
@@ -2596,9 +2817,57 @@ def _change_rows(
                 status_tone=tone,
                 detail=detail,
                 performed_at=performed_at,
+                steps=steps,
+                outcome=outcome,
+                chip=chip,
+                revert_error=str(entry.get("revert_error") or ""),
+                attempts=attempts,
             )
         )
     return tuple(rows)
+
+
+#: Chip tones for each outcome, on the design system's chip vocabulary. The four
+#: a client must tell apart (kept, needs rights, failed, not confirmed) never
+#: share a tone.
+_OUTCOME_CHIP_TONE: dict[str, str] = {
+    "error": "critical",
+    "access": "low",
+    "check": "partial",
+    "action": "attempted",
+    "neutral": "info",
+    "pending": "theoretical",
+    "good": "hardening",
+}
+
+
+def _outcome_groups(
+    rows: tuple[EnvironmentChangeRow, ...],
+) -> tuple[ChangeOutcomeGroup, ...]:
+    """Rows still in place grouped by outcome, in the shared display order."""
+    groups: list[ChangeOutcomeGroup] = []
+    for key in OUTCOME_ORDER:
+        if key == OUTCOME_REVERTED:
+            continue
+        members = tuple(r for r in rows if r.outcome == key)
+        if not members:
+            continue
+        copy = OUTCOME_COPY[key]
+        tone = _OUTCOME_CHIP_TONE.get(copy.tone, "gap")
+        groups.append(
+            ChangeOutcomeGroup(
+                key=key,
+                title=copy.title,
+                explanation=copy.explanation,
+                next_step=copy.next_step,
+                cta_where=copy.cta_where,
+                tone=tone,
+                rows=tuple(
+                    replace(r, status_tone=tone) for r in members
+                ),
+            )
+        )
+    return tuple(groups)
 
 
 def build_change_disclosure(
@@ -2669,6 +2938,11 @@ def build_change_disclosure(
         other_rows=_change_rows(kept, "kept")
         + _change_rows(in_progress, "in_progress"),
         determined=True,
+        outcome_groups=_outcome_groups(
+            _change_rows(manual, "manual")
+            + _change_rows(kept, "kept")
+            + _change_rows(in_progress, "in_progress")
+        ),
     )
 
 
@@ -2856,6 +3130,11 @@ def build_verdict(
     paths_total: int,
     end_to_end_proven: bool = False,
     headline: PathHeadline | None = None,
+    reach_evidence: str | None = None,
+    reach_reason: str = "",
+    reach_awaiting_wait: int = 0,
+    entry_proven_routes: int = 0,
+    mapped_routes: int = 0,
 ) -> tuple[str, str, str]:
     """Compose the one-sentence verdict the report opens with.
 
@@ -2915,7 +3194,13 @@ def build_verdict(
         )
     plural = "" if paths_total == 1 else "s"
     clause = reaches_full_compromise_clause(
-        end_to_end_proven, plural=paths_to_da != 1
+        end_to_end_proven,
+        plural=paths_to_da != 1,
+        evidence=reach_evidence,
+        reason=reach_reason,
+        awaiting_wait_seconds=reach_awaiting_wait,
+        entry_proven_routes=entry_proven_routes,
+        mapped_routes=mapped_routes,
     )
     return (
         str(paths_to_da),
@@ -2929,6 +3214,9 @@ def _build_sprawl_lead(
     reach: DomainUserReach,
     *,
     end_to_end_proven: bool = False,
+    reach_evidence: str | None = None,
+    reach_reason: str = "",
+    reach_awaiting_wait: int = 0,
 ) -> str:
     """Compose the SPRAWL headline, with path exposure demoted to its tail.
 
@@ -2980,12 +3268,31 @@ def _build_sprawl_lead(
         return (
             f"{lead} {affected} of the remaining {ordinary_total} ordinary "
             f"(non-administrative) {remaining} also {also} "
-            f"{full_compromise_reach_phrase(end_to_end_proven)}."
+            f"{full_compromise_reach_phrase(end_to_end_proven, evidence=reach_evidence, reason=reach_reason, awaiting_wait_seconds=reach_awaiting_wait)}."
+            f"{_tier1_remainder(sprawl)}"
         )
     return (
         f"{lead} Tier separation is the finding here; path exposure is measured "
         f"against what remains of it."
     )
+
+
+def _tier1_remainder(sprawl: Mapping[str, Any]) -> str:
+    """Name the Tier 1 accounts the sprawl sentence's arithmetic leaves out.
+
+    "Ordinary" is the Tier 2 population (the same people ``tier2_exposure``, the
+    remediation reach and the paid report count), so "5 already hold Tier 0 ...
+    of the remaining 9 ordinary" only reconciles with a population of 15 when
+    the one Tier 1 server administrator is named. Empty when there is none.
+    """
+    from adscan_core.reporting.privilege_tier_labels import (  # noqa: PLC0415
+        tier1_remainder_sentence,
+    )
+
+    sentence = str(sprawl.get("tier1_sentence") or "") or tier1_remainder_sentence(
+        sprawl.get("tier1_count", 0), sprawl.get("tier1_accounts") or ()
+    )
+    return f" {sentence}" if sentence else ""
 
 
 def _build_sprawl_tail(sprawl: Mapping[str, Any] | None) -> str:
@@ -3022,6 +3329,9 @@ def build_verdict_reach(
     sprawl: Mapping[str, Any] | None = None,
     *,
     end_to_end_proven: bool = False,
+    reach_evidence: str | None = None,
+    reach_reason: str = "",
+    reach_awaiting_wait: int = 0,
 ) -> str:
     """Compose the account-population line that sits under the verdict.
 
@@ -3058,7 +3368,14 @@ def build_verdict_reach(
     """
     sprawl_leads = bool(sprawl and sprawl.get("available") and sprawl.get("leads"))
     if sprawl_leads and sprawl is not None:
-        return _build_sprawl_lead(sprawl, reach, end_to_end_proven=end_to_end_proven)
+        return _build_sprawl_lead(
+            sprawl,
+            reach,
+            end_to_end_proven=end_to_end_proven,
+            reach_evidence=reach_evidence,
+            reach_reason=reach_reason,
+            reach_awaiting_wait=reach_awaiting_wait,
+        )
     if not reach.available or reach.affected <= 0 or reach.total <= 0:
         return ""
     if reach.ordinary_available and reach.ordinary_affected > 0:
@@ -3067,7 +3384,7 @@ def build_verdict_reach(
         lead = (
             f"{reach.ordinary_affected} of {reach.ordinary_total} ordinary "
             f"(non-administrative) domain user {accounts} {has_or_have} "
-            f"{full_compromise_reach_phrase(end_to_end_proven)}"
+            f"{full_compromise_reach_phrase(end_to_end_proven, evidence=reach_evidence, reason=reach_reason, awaiting_wait_seconds=reach_awaiting_wait)}"
         )
         if reach.ordinary_affected >= reach.ordinary_total:
             sentence = f"{lead}."
@@ -3104,7 +3421,12 @@ class ExposureFigure:
 
 
 def build_exposure_figure(
-    reach: DomainUserReach, *, end_to_end_proven: bool = False
+    reach: DomainUserReach,
+    *,
+    end_to_end_proven: bool = False,
+    reach_evidence: str | None = None,
+    reach_reason: str = "",
+    reach_awaiting_wait: int = 0,
 ) -> ExposureFigure:
     """Resolve the ledger's headline exposure figure from the shared reach SSOT.
 
@@ -3130,7 +3452,10 @@ def build_exposure_figure(
             available=True,
             pct=reach.ordinary_pct,
             label="Ordinary accounts exposed",
-            sub=f"{tier0_reach_sub_phrase(end_to_end_proven)} · higher is worse",
+            sub=(
+                f"{tier0_reach_sub_phrase(end_to_end_proven, evidence=reach_evidence, reason=reach_reason, awaiting_wait_seconds=reach_awaiting_wait)}"
+                " · higher is worse"
+            ),
         )
     return ExposureFigure(
         available=True,
@@ -3352,6 +3677,21 @@ def _now_display() -> str:
     return datetime.now(timezone.utc).strftime("%B %d, %Y · %H:%M UTC")
 
 
+def _with_runbook_steps(obligation: dict[str, Any]) -> dict[str, Any]:
+    """An obligation carrying its procedure as command steps.
+
+    The document prints a procedure through ``client_command``, one block per
+    command with its prose outside, so an obligation that arrives with only the
+    flat ``runbook`` lines is split the same way the ledger splits it.
+    """
+    if not isinstance(obligation, dict) or obligation.get("runbook_steps"):
+        return obligation
+    lines = [str(line) for line in (obligation.get("runbook") or [])]
+    if not any(line.strip() for line in lines):
+        return obligation
+    return {**obligation, "runbook_steps": remediation_steps("\n".join(lines))}
+
+
 def build_report_model(
     *,
     workspace_name: str,
@@ -3363,6 +3703,7 @@ def build_report_model(
     obligations: Sequence[dict[str, Any]] = (),
     reference_environment: str = "",
     scan_summary: Optional[Mapping[str, Any]] = None,
+    engagement_scope: Optional[Mapping[str, Any]] = None,
 ) -> LiteReportModel:
     """Build the fully-resolved, client-safe report model from loaded data.
 
@@ -3461,11 +3802,47 @@ def build_report_model(
     # the PRO ``reach_end_to_end_proven`` gate so the two tiers cannot word the
     # same partial-only workspace differently.
     reach_end_to_end_proven = reach_walked_end_to_end(raw_paths)
+    # How far the unproven routes were executed, and why the rest did not run:
+    # the verdict SSOT over every domain's stamped blocks, so a route nobody
+    # executed is never described as having its entry step proven, and the
+    # three not-executed reasons keep their own words.
+    domain_verdicts = [
+        verdict_from_report_entry(entry)
+        for entry in domains.values()
+        if isinstance(entry, dict)
+    ]
+    reach_evidence, reach_reason = aggregate_reach_evidence(domain_verdicts)
+    reach_awaiting_wait = aggregate_awaiting_wait_seconds(domain_verdicts)
     verdict_figure, verdict_text, verdict_tone = build_verdict(
         paths_to_da=inputs.paths_to_da,
         paths_total=paths_total,
         end_to_end_proven=reach_end_to_end_proven,
         headline=path_headline,
+        reach_evidence=reach_evidence,
+        reach_reason=reach_reason,
+        reach_awaiting_wait=reach_awaiting_wait,
+        entry_proven_routes=sum(v.entry_proven for v in domain_verdicts),
+        mapped_routes=sum(v.not_executed for v in domain_verdicts),
+    )
+    # Why the routes did not run, in the shared not-executed vocabulary (the
+    # operator's "no", the policy's exclusion, the missing approval), the same
+    # sentence the paid report states beside its headline.
+    verdict_not_executed = " ".join(
+        v.sentence() for v in domain_verdicts if v.kind in UNEXECUTED_VERDICTS
+    )
+    # Reach beyond the engagement scope, from each domain's stamped KPI block
+    # (the same view the paid report and the web read).
+    beyond_scope_view = beyond_scope_reach_view(
+        combine_beyond_scope_blocks(
+            *[
+                entry["exposure_kpis"].get(BEYOND_SCOPE_KPI_KEY)
+                for entry in domains.values()
+                if isinstance(entry, dict) and isinstance(entry.get("exposure_kpis"), dict)
+            ]
+        )
+    )
+    beyond_scope_reach: list[dict[str, Any]] = (
+        list(beyond_scope_view["entries"]) if beyond_scope_view else []
     )
     # Zero-credential LEAD: set only when the engine proved a path to full domain
     # compromise that began from an unauthenticated foothold. It leads the verdict
@@ -3513,6 +3890,9 @@ def build_report_model(
         domain_user_reach,
         aggregate_tier0_population(domains),
         end_to_end_proven=reach_end_to_end_proven,
+        reach_evidence=reach_evidence,
+        reach_reason=reach_reason,
+        reach_awaiting_wait=reach_awaiting_wait,
     )
     # The headline exposure figure, LABELLED distinctly from the posture score.
     # Resolved from the SAME shared DomainUserReach SSOT and the SAME branch the
@@ -3522,7 +3902,11 @@ def build_report_model(
     # whenever the prose states a reach, not only on the subset of artifacts
     # whose Tier split happens to reconcile.
     exposure_figure = build_exposure_figure(
-        domain_user_reach, end_to_end_proven=reach_end_to_end_proven
+        domain_user_reach,
+        end_to_end_proven=reach_end_to_end_proven,
+        reach_evidence=reach_evidence,
+        reach_reason=reach_reason,
+        reach_awaiting_wait=reach_awaiting_wait,
     )
 
     # Bridge the three exposure-population figures a SAMPLED coverage note leaves
@@ -3551,13 +3935,17 @@ def build_report_model(
         domain_label=domain_label,
         domain_count=len(domain_names),
         discovered_domains=domain_scope.discovered,
-        discovered_domains_note=format_discovered_domains_note(domain_scope),
+        discovered_domains_note=format_discovered_domains_note(
+            domain_scope, engagement_scope=engagement_scope
+        ),
         generated_at=generated_at or _now_display(),
         verdict_figure=verdict_figure,
         verdict_text=verdict_text,
         verdict_tone=verdict_tone,
         verdict_unauthenticated_lead=verdict_unauthenticated_lead,
         verdict_reach=verdict_reach,
+        verdict_not_executed=verdict_not_executed,
+        beyond_scope_reach=tuple(beyond_scope_reach),
         priority_findings=counts.get("critical", 0) + counts.get("high", 0),
         paths_to_domain_compromise=inputs.paths_to_da,
         tier0_exposed=inputs.tier0_exposed,
@@ -3613,13 +4001,17 @@ def build_report_model(
         partial_paths=partial,
         finding_assets=finding_assets,
         client_logo_uri=client_logo_uri,
-        obligations=tuple(obligations),
+        obligations=tuple(_with_runbook_steps(ob) for ob in obligations),
+        obligations_phrase=custody_actions_phrase(len(tuple(obligations))),
         reference_environment=str(reference_environment or "").strip(),
         attack_path_coverage_statement=(_lite_coverage_view.get("statement") or ""),
         attack_path_coverage_reconciliation=attack_path_coverage_reconciliation,
         host_enrichment_coverage_statement=(
             merge_host_enrichment_coverage(domains.values()).get("statement") or ""
         ),
+        host_reach_coverage=merge_host_reach_coverage(domains.values()),
+        scan_policy=merge_scan_policy_coverage(domains.values()),
+        scan_pacing=merge_scan_pacing(domains.values()),
         hardening=build_hardening_observed(domains, raw_paths),
         exposure_reach_pct=exposure_figure.pct,
         exposure_reach_available=exposure_figure.available,
@@ -3631,7 +4023,9 @@ def build_report_model(
         # sub-block when ``top_users`` is empty (no path carries an affected user).
         time_to_compromise=time_to_compromise,
         assessment_duration=assessment_duration,
-        user_exposure=build_user_exposure_ranking(raw_paths),
+        user_exposure=build_user_exposure_ranking(
+            raw_paths, excluded_users=population_exclusions(domains)
+        ),
         tier_glossary=build_tier_glossary_rows(),
         severity_methodology=severity_methodology_view(),
         # Endpoint defense, merged across domains by the shared SSOT. The free
@@ -3920,26 +4314,13 @@ def _stamp_domain_assessments(
     Returns:
         ``True`` when the technical report was rewritten.
     """
-    from types import SimpleNamespace
+    from adscan_internal.services.report_attack_paths import stamp_domain_assessment
 
-    from adscan_core.reporting.technical_report import record_domain_assessment
-    from adscan_internal.services.report_attack_paths import (
-        resolve_domain_assessment,
-    )
-
-    shell = SimpleNamespace(current_workspace_dir=str(workspace_dir))
     entries = raw_domains if isinstance(raw_domains, dict) else {}
     changed = False
     for domain in domains:
-        try:
-            enumerated, basis = resolve_domain_assessment(
-                workspace_dir, domain, entries.get(domain)
-            )
-            record_domain_assessment(shell, domain, enumerated=enumerated, basis=basis)
+        if stamp_domain_assessment(workspace_dir, domain, entries.get(domain)):
             changed = True
-        except Exception as exc:  # noqa: BLE001 - a report never fails on this
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
     return changed
 
 
@@ -3973,12 +4354,13 @@ def _stamp_chokepoints(
     were the ones losing them. The seed is in-memory only: the stamp persists
     just its own block, so ``attack_paths: []`` stays on disk as designed.
 
-    Idempotent: the shared predicate
-    (:func:`~adscan_internal.services.chokepoint_cardinality.chokepoint_block_is_derived`)
-    skips a domain whose block is ranked AND already carries the path-derivation
-    marker, so a prior PRO stamp is never recomputed or overwritten. A ranked
-    block written before the paths reached the seam lacks that marker and is
-    re-stamped once.
+    Always re-derives (``no_cache=True``), exactly like ``_stamp_exposure_kpis``:
+    the render recomputes ``raw_paths`` fresh from the reconciled graph, and a
+    block persisted in ``technical_report.json`` (by the scan-end seam, a PRO
+    run, or a previous LITE render) may describe an EARLIER graph. The old
+    skip-if-derived pre-check saved one graph load per domain and cost nothing
+    else (every stamp derives from the same canonical listing), but it let a
+    stale ranking outlive the graph it was computed from.
 
     Best-effort by construction: every domain is guarded, so a missing/unreadable
     attack graph leaves that domain's choke block absent and the document simply
@@ -3990,7 +4372,6 @@ def _stamp_chokepoints(
     from types import SimpleNamespace
 
     from adscan_internal.services.chokepoint_cardinality import (
-        chokepoint_block_is_derived,
         resolve_choke_bounded,
         stamp_chokepoint_cardinality_for_domain,
     )
@@ -4003,12 +4384,6 @@ def _stamp_chokepoints(
             domain_data = entries.get(domain)
             if not isinstance(domain_data, dict):
                 domain_data = {}
-            # Idempotency: when the block is already complete, skip the graph
-            # load entirely. Same predicate the stamp itself guards on, so the
-            # cheap pre-check and the stamp can never disagree.
-            if chokepoint_block_is_derived(domain_data.get("chokepoint_cardinality")):
-                continue
-
             # The paths this domain's "Start Here" and "Most Exposed Accounts"
             # sub-blocks are derived from. Already computed once for this render
             # by the shared report SSOT (``_compute_report_paths``), so this is a
@@ -4061,6 +4436,7 @@ def _stamp_chokepoints(
                 value_terminals=value_terminal_ids,
                 bounded=bounded,
                 domain_data=domain_data,
+                no_cache=True,
             )
             changed = True
         except Exception as exc:  # noqa: BLE001 - a report never fails on this
@@ -4338,6 +4714,7 @@ def generate_lite_report_artifacts(
             workspace_name=workspace_name,
             technical_report=technical_report,
             raw_paths=raw_paths,
+            engagement_scope=load_engagement_scope(workspace_dir),
             environment_changes=changes_resolution,
             client_logo_uri=resolve_client_logo_data_uri(),
             # What the proven compromise obliges. Same SSOT the paid kit reads,
@@ -4774,6 +5151,14 @@ _TEMPLATE = r"""<!DOCTYPE html>
   content: "·"; color: var(--text-4); margin: 0 1.2mm;
 }
 .finding-assets-more { color: var(--text-4); margin-left: 1.2mm; }
+/* Attack-step role group (who can exploit it / what it exposes / where the
+   weakness lives): starts its own line, in the sans eyebrow style. */
+.finding-asset-group {
+  display: block; margin-top: 0.8mm; font-family: var(--font-sans);
+  font-size: 5.8pt; font-weight: 700; letter-spacing: 0.6px;
+  text-transform: uppercase; color: var(--text-4);
+}
+.finding-asset-group:first-child { margin-top: 0; }
 .asset-tier {
   display: inline-block; font-family: var(--font-sans); font-weight: 700;
   font-size: 5.6pt; letter-spacing: 0.3px; text-transform: uppercase;
@@ -4795,6 +5180,17 @@ _TEMPLATE = r"""<!DOCTYPE html>
 }
 .crack-badge.crack-cracked { background: var(--critical-bg); color: var(--critical); border-color: var(--critical-bd); }
 .crack-badge.crack-attempted { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-bd); }
+/* Directory-attribute secret, per row: AUTHENTICATED is the working credential;
+   UNPROVEN is the value the directory refused for the account holding it. Shown
+   only when one finding carries both. */
+.secret-badge {
+  display: inline-block; font-family: var(--font-sans); font-weight: 700;
+  font-size: 5.6pt; letter-spacing: 0.3px; text-transform: uppercase;
+  padding: 0 1mm; border-radius: 1.4px; margin-left: 1mm; vertical-align: 0.5px;
+  background: rgba(148,163,184,0.14); color: var(--text-4);
+  border: 1px solid var(--line-2);
+}
+.secret-badge.secret-authenticated { background: var(--critical-bg); color: var(--critical); border-color: var(--critical-bd); }
 .attck {
   display: inline-block; font-family: var(--font-mono); font-size: 6.5pt;
   color: var(--accent); border: 1px solid rgba(14,110,120,0.28);
@@ -5007,6 +5403,8 @@ ol.oblig-steps > li {
   font-size: 8.5pt; color: var(--text-2); line-height: 1.5; margin: 0 0 2.5mm;
   page-break-inside: avoid; break-inside: avoid;
 }
+/* Where and as whom a step's commands run: prose above them. */
+.oblig-where { font-size: 7.6pt; color: var(--text-3); line-height: 1.45; margin-top: 1.4mm; }
 .oblig-cmd {
   font-family: var(--font-mono); font-size: 6.8pt; color: var(--text);
   background: var(--bg-1); border: 1px solid var(--line);
@@ -5022,6 +5420,36 @@ ol.oblig-steps > li {
   white-space: pre-wrap; overflow-wrap: break-word; word-break: normal;
   hyphens: none; tab-size: 2; line-height: 1.5;
 }
+/* The document's client command block (rule: CLAUDE.md, "Every command a
+   client is shown renders through the shared terminal block"): prose before
+   the block, the shell it runs in, the command alone in the runbook box, then
+   the caption. Cleanup and custody commands both go through client_command. */
+.ccmd-item { margin-top: 1.4mm; page-break-inside: avoid; break-inside: avoid; }
+.ccmd-intro { font-size: 7.6pt; color: var(--text-2); line-height: 1.45; margin: 1.4mm 0 0; }
+.ccmd-shell {
+  display: block; font-family: var(--font-mono); font-size: 5.8pt; letter-spacing: 0.06em;
+  color: var(--text-4); margin-top: 1mm;
+}
+.ccmd-item .oblig-cmd { margin-top: 0.4mm; }
+.ccmd-note { font-size: 7pt; color: var(--text-3); line-height: 1.45; margin: 0.8mm 0 0; }
+/* One change still in place, grouped by why (shared outcome copy). */
+.change-group { margin-top: 6mm; }
+.change-group-t { font-size: 10pt; font-weight: 700; color: var(--text); display: flex; gap: 2mm; align-items: baseline; }
+.change-group-n { font-family: var(--font-mono); font-size: 8pt; color: var(--text-3); font-weight: 400; }
+.change-group-d { font-size: 8pt; color: var(--text-2); line-height: 1.5; margin: 1mm 0 0; }
+.change-group-next { font-size: 8pt; color: var(--text); line-height: 1.5; margin: 1mm 0 0; }
+.change-card {
+  border: 1px solid var(--line); border-radius: 1.5mm; padding: 2.5mm 3mm; margin-top: 2.5mm;
+  page-break-inside: avoid; break-inside: avoid;
+}
+.change-card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2mm; }
+.change-fail {
+  margin-top: 1.6mm; padding: 1.6mm 2.2mm; border: 1px solid var(--critical-bd);
+  background: var(--critical-bg); border-radius: 1mm; font-size: 7.5pt; line-height: 1.45;
+  color: var(--text-2);
+}
+.change-fail b { color: var(--text); }
+.change-fail ol { margin: 0.6mm 0 0 4mm; padding: 0; }
 .oblig-runbook-k {
   font-size: 6.5pt; font-weight: 700; letter-spacing: 0.2em;
   text-transform: uppercase; color: var(--text-4); margin-top: 3mm;
@@ -5051,6 +5479,7 @@ ol.oblig-steps > li {
   margin-top: 0.8mm; word-break: break-all; line-height: 1.35;
 }
 .change-detail { font-size: 7.5pt; color: var(--text-3); margin-top: 1mm; line-height: 1.4; }
+.change-cmd { font-family: var(--font-mono, monospace); font-size: 7pt; margin: 0.8mm 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── Closing call to action ───────────────────────────────────────────────
    The report's highest-intent moment: the reader has just seen the domain fall.
@@ -5117,6 +5546,20 @@ ol.oblig-steps > li {
 </style>
 </head>
 <body class="ds-doc">
+{# THE document's client command block. ``step`` is the shared command shape
+   (adscan_core.reporting.cleanup_remediation): intro, command, platform,
+   caption, outro. A prose-only step prints its intro alone. #}
+{% macro client_command(step) %}
+<div class="ccmd-item">
+  {% if step.intro %}<p class="ccmd-intro">{{ step.intro }}</p>{% endif %}
+  {% if step.command %}
+  <span class="ccmd-shell">{{ 'SQL Server query' if step.platform == 'sql' else ('Linux shell' if step.platform == 'linux' else 'PowerShell') }}</span>
+  <div class="oblig-cmd">{{ step.command }}</div>
+  {% if step.caption %}<p class="ccmd-note">{{ step.caption }}</p>{% endif %}
+  {% if step.outro %}<p class="ccmd-note">{{ step.outro }}</p>{% endif %}
+  {% endif %}
+</div>
+{% endmacro %}
 <div class="sheet">
 
   <header class="masthead">
@@ -5206,6 +5649,7 @@ ol.oblig-steps > li {
       {{ m.verdict_text }}
     </p>
     {% if m.verdict_reach %}<p class="ds-verdict-sub">{{ m.verdict_reach }}</p>{% endif %}
+    {% if m.verdict_not_executed %}<p class="ds-verdict-sub">{{ m.verdict_not_executed }}</p>{% endif %}
 
     <div class="ds-cols">
       {# The exposure figure, LABELLED so it can never read as the posture score
@@ -5321,10 +5765,10 @@ ol.oblig-steps > li {
        totals can differ by a small margin. Stated so the reader does not read the
        gap as a rounding error. #}
     <div class="ds-fineprint">
-      &ldquo;Accounts a compromise path can reach&rdquo; counts only the accounts on
-      at least one compromise path, which is a distinct measure from the total
-      population assessed elsewhere in this report; a small difference between the
-      two figures is expected, not a discrepancy.
+      &ldquo;Accounts a compromise path can reach&rdquo; counts the ordinary
+      (non-administrative) accounts on at least one compromise route of any kind.
+      The exposure figure at the top of this report counts the same accounts, but
+      only those whose route reaches full domain compromise.
     </div>
   </section>
   {% endif %}
@@ -5348,9 +5792,76 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
+  {# SCOPE AND METHOD: the scan policy and the assessment pace, the same
+     sentences the paid kit prints (tier-shared SSOT views). One line each at the
+     defaults; the full statement, and the excluded families, when a policy
+     narrowed the run or the pace differed. #}
+  {% if m.scan_policy and m.scan_policy.present %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Scan policy</div>
+      <div class="ds-note-t">{% if m.scan_policy.prominent %}{{ m.scan_policy.statement }}{% if m.scan_policy.cleared_line %} {{ m.scan_policy.cleared_line }}{% endif %}{% if m.scan_policy.families %} The families it narrowed are {% for f in m.scan_policy.families %}{{ f.label }} ({{ f.excluded }} of {{ f.total }}){{ ', ' if not loop.last else '.' }}{% endfor %}{% endif %}{% if m.scan_policy.routes_line %} {{ m.scan_policy.routes_line }}{% endif %}{% if m.scan_policy.execution_line and not m.scan_policy.map_only %} {{ m.scan_policy.execution_line }}{% endif %}{% else %}{{ m.scan_policy.headline }}{% endif %}{% if m.scan_policy.new_checks_line %} {{ m.scan_policy.new_checks_line }}{% endif %}{% if m.scan_policy.password_attempts_line %} {{ m.scan_policy.password_attempts_line }}{% endif %}{% if m.scan_policy.settings_line %} {{ m.scan_policy.settings_line }}{% endif %}{% if m.scan_policy.revert_permission_line %} {{ m.scan_policy.revert_permission_line }}{% endif %}</div>
+    </div>
+    {# The excluded checks, one row each, from the same shared view the paid
+       report renders, so both reports name the same excluded steps. #}
+    {% if m.scan_policy.prominent and m.scan_policy.excluded %}
+    <table class="adscan-table excluded-checks-table">
+      <thead>
+        <tr><th>Excluded check</th><th>Family</th><th>Group</th><th>What it means</th></tr>
+      </thead>
+      <tbody>
+        {% for row in m.scan_policy.excluded %}
+        <tr><td>{{ row.title }}</td><td>{{ row.family }}</td><td>{{ row.group or row.kind }}</td><td>{{ row.reason }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if m.scan_policy.excluded_omitted %}
+    <p class="ds-note-t">{{ m.scan_policy.excluded_omitted }} further excluded check{{ '' if m.scan_policy.excluded_omitted == 1 else 's' }} {{ 'is' if m.scan_policy.excluded_omitted == 1 else 'are' }} counted in the family table and not listed one by one.</p>
+    {% endif %}
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if m.scan_pacing and m.scan_pacing.present %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Assessment pace</div>
+      <div class="ds-note-t">{{ m.scan_pacing.headline }}</div>
+    </div>
+  </section>
+  {% endif %}
+
+  {# NETWORK REACH: which enabled computers answered over the network from where
+     the assessment ran, and which segments produced no answer at all. A
+     computer the assessment could not reach is absent from every host-level
+     section, so without this note it would read as checked and clean. Lighter
+     than the paid kit (sentence plus vantage, no per-segment table); the
+     sentence is the SAME one, from the tier-shared SSOT. #}
+  {% if m.host_reach_coverage and m.host_reach_coverage.scope_statement %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Network reach</div>
+      <div class="ds-note-t">{{ m.host_reach_coverage.scope_statement }}{% if m.host_reach_coverage.vantage_label %} {{ m.host_reach_coverage.vantage_label }}{% endif %}{% if m.host_reach_coverage.idle_interfaces_label %} {{ m.host_reach_coverage.idle_interfaces_label }}{% endif %}</div>
+    </div>
+  </section>
+  {% endif %}
+
   {# A domain reached over a trust but never enumerated contributes to nothing
      above, so it is stated separately rather than counted as scope. Naming it
      is the useful part: it is the surface this engagement did not measure. #}
+  {# Reach beyond the engagement scope: a route that compromised an in-scope
+     domain continues into a domain the client excluded. Counted in none of the
+     figures above; mapped, never executed, never hidden. #}
+  {% if m.beyond_scope_reach %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Reach beyond your scope</div>
+      {% for bs in m.beyond_scope_reach %}
+      <div class="ds-note-t">{{ bs.sentence }} {{ bs.gravity }} ({{ bs.routes_label }}.)</div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   {% if m.discovered_domains_note %}
   <section class="ds-section">
     <div class="ds-note">
@@ -5621,6 +6132,44 @@ ol.oblig-steps > li {
         {% endif %}
       </tbody>
     </table>
+    {# The capability class: which KINDS of product were active, counted from
+       active products only. Lighter than the paid section (counts, no host
+       rows) and never a protection grade. The Tier 0 recommendation is the
+       same authored sentence the paid report prints; it names no host here.
+       SSOT: adscan_core.reporting.endpoint_capability. #}
+    {% if m.endpoint_defense.has_capability %}
+    <table class="adscan-table tier-table">
+      <thead>
+        <tr>
+          <th class="col-tier">Active on the host</th>
+          <th class="col-tier-groups">Hosts</th>
+          <th class="col-tier-meaning">What that means</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in m.endpoint_defense.capability_rows %}
+        <tr>
+          <td><div class="tier-label">{{ row.label }}</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(row.hosts) }}</td>
+          <td class="tier-meaning">{{ row.meaning }}</td>
+        </tr>
+        {% endfor %}
+        {% for idle in m.endpoint_defense.inactive_rows %}
+        <tr>
+          <td><div class="tier-label">{{ idle.label }}</div></td>
+          <td class="tier-groups">{{ '{:,}'.format(idle.hosts) }}</td>
+          <td class="tier-meaning">{{ idle.meaning }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="ds-fineprint">{{ m.endpoint_defense.capability_scope_note }}</div>
+    {% endif %}
+    {% if m.endpoint_defense.tier0_edr_recommendation.text %}
+    <div class="ds-note">
+      <p style="margin:0"><b>Recommendation.</b> {{ m.endpoint_defense.tier0_edr_recommendation.text }}</p>
+    </div>
+    {% endif %}
     {% if m.endpoint_defense.has_efficacy %}
     <div class="ds-fineprint">
       <b>What the active products did.</b> {{ m.endpoint_defense.efficacy_statement }}
@@ -5656,19 +6205,27 @@ ol.oblig-steps > li {
     <div class="ds-section-head">
       <div class="ds-eyebrow">Do this first</div>
       <h2 class="ds-section-title">What the proof obliges</h2>
+      {# NAMED "credential custody", never "containment": the "Fixes to apply
+         first" section below has a containment block of its own with a
+         different count, and while both carried one label this page stated two
+         different numbers of first things to do. Count from the copy SSOT
+         (``m.obligations_phrase``). #}
       <p class="ds-section-lead">
-        The {{ 'action' if _one else (m.obligations | length) ~ ' actions' }} below
+        The {{ m.obligations_phrase }} below
         {{ 'is' if _one else 'are' }} not {{ 'a finding' if _one else 'findings' }}.
         {{ 'It exists' if _one else 'They exist' }} because the assessment succeeded:
         material that authenticates against your directory is now outside your control,
         and only your team can take it back. Nothing else in this report is effective
         while {{ 'it is' if _one else 'they are' }} outstanding.
+        {{ 'This one is' if _one else 'These are' }} separate from the ranked fixes later
+        in this report: a fix closes the route the material came out through, and
+        {{ 'this one takes' if _one else 'these take' }} the material itself back.
       </p>
     </div>
 
     {% for ob in m.obligations %}
     <div class="oblig">
-      <div class="oblig-k">Containment {{ loop.index }} of {{ m.obligations | length }}</div>
+      <div class="oblig-k">Custody action {{ loop.index }} of {{ m.obligations | length }}</div>
       <div class="oblig-t">{{ ob.title }}</div>
       <p class="oblig-proof">{{ ob.proof }}</p>
       {% if ob.rationale %}<p>{{ ob.rationale }}</p>{% endif %}
@@ -5677,7 +6234,8 @@ ol.oblig-steps > li {
         {% for step in ob.steps %}
         <li>
           {{ step.text }}
-          {% for cmd in step.commands %}<div class="oblig-cmd">{{ cmd }}</div>{% endfor %}
+          {% if step.where and step.commands %}<div class="oblig-where">{{ step.where }}</div>{% endif %}
+          {% for cmd in step.commands %}{{ client_command({'command': cmd, 'platform': 'windows'}) }}{% endfor %}
         </li>
         {% endfor %}
       </ol>
@@ -5685,10 +6243,9 @@ ol.oblig-steps > li {
       {# The procedure the change ledger already rendered for this obligation.
          The paid kit prints it in full in its own section and points at it
          from here; this document has no such section, so it carries it. #}
-      {% if ob.runbook %}
+      {% if ob.runbook_steps %}
       <div class="oblig-runbook-k">The procedure, with this engagement's values</div>
-      <div class="oblig-cmd">{% for line in ob.runbook %}{{ line }}
-{% endfor %}</div>
+      {% for rs in ob.runbook_steps %}{{ client_command(rs) }}{% endfor %}
       {% endif %}
       {% if ob.caveat %}
       <p class="oblig-caveat"><b>What stays true afterwards</b>{{ ob.caveat }}</p>
@@ -5769,10 +6326,11 @@ ol.oblig-steps > li {
       </tbody>
     </table>
     <div class="ds-fineprint">
-      <b>How to read this.</b>{% if m.remediation_start_here.containment_count %} The
-      first {{ m.remediation_start_here.containment_count }} row{{ '' if m.remediation_start_here.containment_count == 1 else 's' }}
-      contain key material that left your control during this assessment, and they come
-      first because nothing else here is effective while they are outstanding. The rest
+      {# The containment clause comes from the copy SSOT (``containment_note``),
+         not from a sentence written here: this note used to say the leading rows
+         "contain key material", the same words the custody-actions section uses
+         for a DIFFERENT count, so the page named two first things to do. #}
+      <b>How to read this.</b>{% if m.remediation_start_here.containment_count %} {{ m.remediation_start_here.containment_note }} The rest
       are{% else %} The fixes are{% endif %} ordered by
       {{ m.remediation_start_here.order_rule_clause }}, so the one at the top is the one
       to fund first. Each fix eliminates the
@@ -5784,6 +6342,12 @@ ol.oblig-steps > li {
       directory changes.{% endif %} The step-by-step remediation for each one, written for the
       administrator who has to apply it, is part of <a href="{{ m.pro_url }}">ADscan PRO</a>.
     </div>
+    {% if m.remediation_start_here.by_design %}
+    <div class="ds-fineprint">
+      {{ m.remediation_start_here.by_design_note }}
+      {% for note in m.remediation_start_here.by_design %}<br><b>{{ note.label }}.</b> {{ note.why_not }}{% endfor %}
+    </div>
+    {% endif %}
   </section>
   {% endif %}
 
@@ -5831,7 +6395,7 @@ ol.oblig-steps > li {
             <div class="finding-cat">{{ f.category }}</div>
             {% if f.assets %}
             <div class="finding-assets">
-              {%- for a in f.assets %}<span class="finding-asset">{% if a.pair_endpoints and a.pair_endpoints|length == 2 %}{% for ep in a.pair_endpoints %}{% if ep.tier %}<span class="asset-tier {% if ep.tier == 'Tier 0' %}t0{% elif ep.tier == 'Tier 1' %}t1{% endif %}"{% if ep.tier_basis %} title="{{ ep.tier_basis }}"{% endif %}>{{ ep.tier }}</span>{% endif %}{{ ep.text }}{% if not loop.last %}{{ a.pair_connector }}{% endif %}{% endfor %}{% else %}{% if a.tier %}<span class="asset-tier {% if a.tier == 'Tier 0' %}t0{% elif a.tier == 'Tier 1' %}t1{% endif %}"{% if a.tier_basis %} title="{{ a.tier_basis }}"{% endif %}>{{ a.tier }}</span>{% endif %}{{ a.text }}{% endif %}{% if a.metric %}<span class="asset-metric">&middot; {{ a.metric }}</span>{% endif %}{% if a.crack_status %}<span class="crack-badge crack-{{ a.crack_status }}">{{ a.crack_status }}</span>{% endif %}{% if a.role %}<span class="asset-role">{{ a.role }}</span>{% endif %}</span>{% endfor -%}
+              {%- for a in f.assets %}{% if a.role_group_label and (loop.first or a.role_group != loop.previtem.role_group) %}<span class="finding-asset-group">{{ a.role_group_label }}</span>{% endif %}<span class="finding-asset">{% if a.pair_endpoints and a.pair_endpoints|length == 2 %}{% for ep in a.pair_endpoints %}{% if ep.tier %}<span class="asset-tier {% if ep.tier == 'Tier 0' %}t0{% elif ep.tier == 'Tier 1' %}t1{% endif %}"{% if ep.tier_basis %} title="{{ ep.tier_basis }}"{% endif %}>{{ ep.tier }}</span>{% endif %}{{ ep.text }}{% if not loop.last %}{{ a.pair_connector }}{% endif %}{% endfor %}{% else %}{% if a.tier %}<span class="asset-tier {% if a.tier == 'Tier 0' %}t0{% elif a.tier == 'Tier 1' %}t1{% endif %}"{% if a.tier_basis %} title="{{ a.tier_basis }}"{% endif %}>{{ a.tier }}</span>{% endif %}{{ a.text }}{% endif %}{% if a.scope_note %}<span class="asset-metric">&middot; {{ a.scope_note }}</span>{% endif %}{% if a.metric %}<span class="asset-metric">&middot; {{ a.metric }}</span>{% endif %}{% if a.crack_status %}<span class="crack-badge crack-{{ a.crack_status }}">{{ a.crack_status }}</span>{% endif %}{% if a.secret_status %}<span class="secret-badge secret-{{ a.secret_status }}">{{ a.secret_status }}</span>{% endif %}{% if a.role %}<span class="asset-role">{{ a.role }}</span>{% endif %}</span>{% endfor -%}
               {%- if f.assets_overflow %}<span class="finding-assets-more">and {{ f.assets_overflow }} more</span>{% endif -%}
             </div>
             {% endif %}
@@ -5919,6 +6483,8 @@ ol.oblig-steps > li {
           <div class="ds-reach">{{ p.reach_label_short }}{% if p.domain %} &middot; {{ p.domain }}{% endif %}</div>
           {% if p.via_accounts_note %}<div class="path-accounts">{{ p.via_accounts_note }}</div>{% endif %}
           {% if p.origin_footholds_summary %}<div class="path-accounts">{{ p.origin_footholds_summary }}</div>{% endif %}
+          {% if p.also_reaches_summary %}<div class="path-accounts">{{ p.also_reaches_summary }}</div>{% endif %}
+          {% if p.policy_unlock_line %}<div class="path-accounts">{{ p.policy_unlock_line }}</div>{% endif %}
         </div>
         <span class="chip {{ p.status_tone }}">{{ p.status_label }}</span>
       </div>
@@ -5928,6 +6494,7 @@ ol.oblig-steps > li {
         <li>
           <span class="ds-step-txt">{% if s.technique %}<span class="step-tech">{{ s.technique }}.</span> {% endif %}{{ s.narrative }}</span>
           <span class="chip {{ s.status_tone }} ds-step-status">{{ s.status_label }}</span>
+          {% if s.not_executed_label %}<span class="chip ds-step-status">{{ s.not_executed_label }}</span>{% endif %}
         </li>
         {% endfor %}
       </ol>
@@ -6004,42 +6571,45 @@ ol.oblig-steps > li {
         <div class="ds-figure-sub">re-read afterwards to verify</div>
       </div>
       <div class="ds-col">
-        <div class="ds-figure-v{% if m.changes.needs_action %} critical{% endif %}">{{ m.changes.manual_required + m.changes.in_progress }}</div>
-        <div class="ds-figure-k">Awaiting your action</div>
-        <div class="ds-figure-sub">{% if m.changes.needs_action %}listed below with the object{% else %}nothing outstanding{% endif %}</div>
+        <div class="ds-figure-v{% if m.changes.needs_action %} critical{% endif %}">{{ m.changes.awaiting_client }}</div>
+        <div class="ds-figure-k">{{ m.changes.awaiting_label }}</div>
+        <div class="ds-figure-sub">{% if m.changes.awaiting_client %}{{ m.changes.awaiting_split }}{% else %}nothing outstanding{% endif %}</div>
       </div>
     </div>
 
-    {% if m.changes.manual_rows or m.changes.other_rows %}
-    <div class="changes-caption">Still in place</div>
-    <table class="adscan-table changes-table">
-      <thead>
-        <tr>
-          <th class="col-change">Change</th>
-          <th class="col-object">Object</th>
-          <th class="col-state">State</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for c in m.changes.manual_rows + m.changes.other_rows %}
-        <tr>
-          <td>
-            <div class="finding-name">{{ c.kind }}</div>
-            {% if c.domain %}<div class="finding-cat">{{ c.domain }}</div>{% endif %}
-          </td>
-          <td>
-            <div class="finding-name">{{ c.target }}</div>
-            {% if c.object_dn %}<div class="change-obj">{{ c.object_dn }}</div>{% endif %}
-          </td>
-          <td>
-            <span class="chip {{ c.status_tone }}">{{ c.status_label }}</span>
-            {% if c.detail %}<div class="change-detail">{{ c.detail }}</div>{% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% endif %}
+    {# Every change still in place, grouped by WHY, with the shared outcome
+       copy (adscan_core.reporting.cleanup_outcome; the paid report and the
+       platform use the same groups). Each command goes through
+       client_command. #}
+    {% for g in m.changes.outcome_groups %}
+    <div class="change-group">
+      <div class="change-group-t"><span class="chip {{ g.tone }}">{{ g.title }}</span><span class="change-group-n">{{ g.rows | length }}</span></div>
+      <p class="change-group-d">{{ g.explanation }}</p>
+      {% if g.next_step %}<p class="change-group-next">{{ g.next_step }}</p>{% endif %}
+      {% if g.cta_where %}<p class="change-group-d">{{ g.cta_where }}</p>{% endif %}
+      {% for c in g.rows %}
+      <div class="change-card">
+        <div class="change-card-head">
+          <span class="finding-name">{{ c.kind }}</span>
+          {% if c.chip %}<span class="chip {{ c.status_tone }}">{{ c.chip }}</span>{% endif %}
+          {% if c.domain %}<span class="finding-cat">{{ c.domain }}</span>{% endif %}
+        </div>
+        <div class="change-obj">{{ c.object_dn or c.target }}</div>
+        {% if c.outcome == 'revert_failed' %}
+        <div class="change-fail">
+          <b>{{ c.detail or 'The revert did not complete' }}.</b>
+          {% if c.revert_error %}<br><b>Recorded reason.</b> {{ c.revert_error }}{% endif %}
+          {% if c.attempts %}<br><b>Accounts ADscan tried</b>
+          <ol>{% for a in c.attempts %}<li>{{ a.role_label }}{% if a.account %} ({{ a.account }}){% endif %}, {{ a.outcome_label }}</li>{% endfor %}</ol>{% endif %}
+        </div>
+        {% elif c.detail and c.outcome != 'kept_by_decision' %}
+        <div class="change-detail">{{ c.detail }}.</div>
+        {% endif %}
+        {% for step in c.steps %}{{ client_command(step) }}{% endfor %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
 
     {% if m.changes.reverted_rows %}
     <div class="changes-caption">Undone</div>
@@ -6079,9 +6649,13 @@ ol.oblig-steps > li {
       could not be read for this scan. Absence of a record is not evidence that the directory was
       left untouched.
       {% elif m.changes.needs_action %}
-      <b>Action required.</b> The changes above could not be undone automatically. Each one names
-      the exact object, so an administrator can reverse it directly. Until that is done, the
-      change is still in place.
+      <b>Action required.</b> Some changes above could not be undone automatically. Each one names
+      the exact object and the command that reverses it. Until that is done, the change is still
+      in place.
+      {% elif m.changes.kept %}
+      <b>Action required.</b> Nothing failed to revert, but the changes above were left in place on
+      purpose and are still in your directory. Remove each one with the command shown, or record
+      that your team accepts it.
       {% elif m.changes.total %}
       <b>Nothing is outstanding.</b> Every change was reversed and then re-read to confirm the
       object was back to its original state.

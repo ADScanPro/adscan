@@ -45,7 +45,6 @@ from adscan_internal.services.domain_posture import (
     ConstraintCategory,
     DomainPosture,
     PasswordPolicySnapshot,
-    SignalConfidence,
     TriState,
     get_posture,
 )
@@ -74,10 +73,7 @@ def _is_hardened_high(posture: DomainPosture, category: ConstraintCategory, hard
     UNKNOWN and never emits — the "observe, never infer" boundary.
     """
     state = posture.get(category)
-    return (
-        state.effective_state is hardened
-        and state.confidence is SignalConfidence.HIGH
-    )
+    return state.is_observed and state.effective_state is hardened
 
 
 # Each row: (posture category, hardened TriState, positive key, title, evidence-note).
@@ -130,6 +126,29 @@ _POSTURE_POSITIVES: tuple[
         "only AES etypes are accepted.",
     ),
 )
+
+
+def observed_posture_controls(shell: Any, domain: str) -> list[dict[str, str]]:
+    """Return the OBSERVED-GOOD posture controls of *domain* WITHOUT recording them.
+
+    Read-only counterpart of :func:`emit_posture_positives` (same rows, same
+    "observed, never inferred" test). A recheck uses it to state what it saw in
+    its own run record instead of rewriting the scan's ``technical_report.json``.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return []
+    try:
+        posture = get_posture(getattr(shell, "domains_data", None), domain=domain_name)
+        return [
+            {"key": key, "title": title, "observed_state": hardened.value}
+            for category, hardened, key, title, _note in _POSTURE_POSITIVES
+            if _is_hardened_high(posture, category, hardened)
+        ]
+    except Exception as exc:  # noqa: BLE001 - best effort, never breaks a recheck
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
 
 
 def emit_posture_positives(shell: Any, domain: str) -> None:
@@ -411,6 +430,33 @@ def emit_cve_not_vulnerable_positives(
             if not domain_name:
                 continue
             key, title = key_title
+            details = {
+                "cve_id": str(getattr(result, "cve_id", "")),
+                "host": host,
+                "verdict": "not_vulnerable",
+                "source": "cve_probe",
+                "evidence": (
+                    f"Active vulnerability check ran against {host} and returned "
+                    "a definitive not-vulnerable verdict."
+                ),
+            }
+            # A statistical probe the scan pace ran with a smaller attempt budget
+            # (Zerologon at the Fragile pace) still observed a negative, but with a
+            # stated chance of a miss: say so instead of calling it definitive.
+            payload = getattr(getattr(result, "evidence", None), "payload", None) or {}
+            if isinstance(payload, dict) and payload.get("reduced_by_pace"):
+                from adscan_core.reporting.scan_pacing_disclosure import format_chance  # noqa: PLC0415
+
+                miss = float(payload.get("miss_probability") or 0.0)
+                details["confidence_reduced_by_pace"] = True
+                details["miss_probability"] = miss
+                details["evidence"] = (
+                    f"Active vulnerability check ran against {host} and returned a "
+                    f"not-vulnerable verdict after {payload.get('max_attempts')} of the "
+                    f"standard {payload.get('standard_max_attempts')} attempts the "
+                    f"assessment pace allowed, so about a {format_chance(miss)} chance "
+                    "remains that the host is vulnerable."
+                )
             recorder(
                 shell,
                 domain_name,
@@ -418,16 +464,7 @@ def emit_cve_not_vulnerable_positives(
                 title=title,
                 category="Patch State",
                 status="observed",
-                details={
-                    "cve_id": str(getattr(result, "cve_id", "")),
-                    "host": host,
-                    "verdict": "not_vulnerable",
-                    "source": "cve_probe",
-                    "evidence": (
-                        f"Active vulnerability check ran against {host} and returned "
-                        "a definitive not-vulnerable verdict."
-                    ),
-                },
+                details=details,
             )
     except Exception as exc:  # pragma: no cover - best effort sync
         telemetry.capture_exception(exc)
@@ -614,28 +651,89 @@ def emit_smbv1_positive(shell: Any, domain: str, nodes: Any) -> None:
 # (see ``adscan_internal/services/collector/host_collector.py``
 # ``_do_endpoint_protection_inventory``) that stamps ``endpoint_products`` /
 # ``edr_active`` / ``av_active`` / ``endpoint_posture_assessed`` on each
-# admin-assessed Computer node. This is inventory, not a finding: a host where
-# no product was detected is NOT_ASSESSED-for-absence (never a "missing
-# protection" finding — see the hard boundary in the module docstring), so only
-# the PRESENT case emits, exactly mirroring ``emit_registry_positives`` above.
+# admin-assessed Computer node. A host where no product was detected is
+# NOT_ASSESSED-for-absence (never a "missing protection" finding — see the hard
+# boundary in the module docstring). A host where a product is installed and
+# NOT running is different: that was observed, so the record says so and the
+# compliance engine reads it as contrary evidence, never as a pass.
+
+
+def _anti_malware_host_rows(shell: Any, domain: str, nodes: Any) -> tuple[list[dict], int]:
+    """Return ``(per-host rows, computers in the directory)`` for the reading.
+
+    Prefers the domain's MERGED defensive-posture inventory, which holds every
+    host any run examined, so a collection that reached only part of the estate
+    this time cannot erase a host an earlier run examined (the Audit-8 case:
+    castelblack examined with its antivirus off, then overwritten by a run that
+    reached only winterfell). Falls back to this run's Computer nodes when no
+    inventory exists. Each row is ``{"host", "products", "posture_assessed"}``.
+    """
+    from adscan_internal.services.endpoint_defense_attempts import (  # noqa: PLC0415
+        _count_computers,
+        _read_posture_hosts,
+    )
+
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+    domain_key = str(domain or "").strip().rstrip(".").lower()
+    computer_nodes = [
+        n
+        for n in (nodes or [])
+        if getattr(n, "properties", None) is not None
+        and str(getattr(n, "kind", "Computer") or "Computer") == "Computer"
+    ]
+    estate = _count_computers(workspace_dir, domain_key) if workspace_dir else 0
+    estate = estate or len(computer_nodes)
+    inventory = _read_posture_hosts(workspace_dir, domain_key) if workspace_dir else []
+    if inventory:
+        rows = [
+            {
+                "host": str(h.get("dns_name") or h.get("host_object_id") or "").strip(),
+                "products": h.get("products") or [],
+                "posture_assessed": h.get("posture_assessed"),
+            }
+            for h in inventory
+        ]
+        return [r for r in rows if r["host"]], estate
+    rows = []
+    for n in computer_nodes:
+        props = n.properties
+        if props.get("endpoint_posture_assessed") is not True:
+            continue
+        name = str(getattr(n, "samaccountname", "") or getattr(n, "name", "") or "").strip()
+        if name:
+            rows.append(
+                {
+                    "host": name,
+                    "products": props.get("endpoint_products") or [],
+                    "posture_assessed": True,
+                }
+            )
+    return rows, estate
 
 
 def emit_endpoint_protection_positive(shell: Any, domain: str, nodes: Any) -> None:
-    """Emit ``endpoint_protection_present`` from the collected hosts.
+    """Record the anti-malware control reading for the domain.
 
     Args:
         shell: The pentest shell (holds the technical report).
         domain: The domain the hosts belong to.
-        nodes: An iterable of collected host nodes carrying
-            ``endpoint_posture_assessed`` / ``edr_active`` / ``av_active`` /
-            ``endpoint_products`` (only admin-assessed hosts carry the flag;
-            others were NOT assessed and are excluded from both counts).
+        nodes: This run's collected nodes; used only when the domain has no
+            defensive-posture inventory yet.
 
-    A control is emitted GREEN only listing the hosts where an ACTIVE
-    endpoint-protection product was actually observed; the coverage
-    denominator (assessed hosts) is recorded so the client sees "M of N
-    assessed", never a claim about un-assessed hosts. Best-effort — a
-    detection failure never breaks collection persistence.
+    Each examined host is classified by the endpoint-defense SSOT
+    (:func:`adscan_core.reporting.endpoint_defense.classify_host_posture`), the
+    same classifier the report's Endpoint Defense section prints, over the
+    domain's MERGED inventory, and the record's status follows it:
+
+    * ``observed``: every computer in the directory was examined and has a
+      product observed active. The only status that can green a control.
+    * ``contradicted``: at least one host has a product installed and not
+      running. The record names those hosts; the compliance engine reads it as
+      a non-conformity.
+    * ``incomplete``: anything else (a computer not examined, nothing detected,
+      a protection state that could not be read). Never green, never a gap.
+
+    Best-effort: a failure never breaks collection persistence.
     """
     recorder = _resolve_recorder()
     if recorder is None:
@@ -644,52 +742,90 @@ def emit_endpoint_protection_positive(shell: Any, domain: str, nodes: Any) -> No
     if not domain_name:
         return
     try:
-        assessed_nodes = [
-            n for n in (nodes or [])
-            if getattr(n, "properties", None)
-            and n.properties.get("endpoint_posture_assessed") is True
-        ]
-        if not assessed_nodes:
-            return  # no host was assessed → nothing observed, nothing green
-        assessed_total = len(assessed_nodes)
+        from adscan_core.reporting.control_evidence_verdict import (  # noqa: PLC0415
+            STATUS_CONTRADICTED,
+            STATUS_INCOMPLETE,
+            STATUS_OBSERVED,
+            display_host,
+        )
+        from adscan_core.reporting.endpoint_capability import (  # noqa: PLC0415
+            active_products,
+        )
+        from adscan_core.reporting.endpoint_defense import (  # noqa: PLC0415
+            POSTURE_ACTIVE,
+            POSTURE_INSTALLED_INACTIVE,
+            classify_host_posture,
+        )
+
+        rows, estate = _anti_malware_host_rows(shell, domain_name, nodes)
+        if not rows:
+            return  # no host was examined → nothing observed, nothing recorded
+        assessed_total = len(rows)
+        not_examined = max(0, estate - assessed_total)
         good_hosts: list[dict[str, Any]] = []
-        for n in assessed_nodes:
-            props = n.properties
-            if not (bool(props.get("edr_active")) or bool(props.get("av_active"))):
-                continue
-            name = str(getattr(n, "samaccountname", "") or getattr(n, "name", "") or "").strip()
-            if not name:
-                continue
-            products = props.get("endpoint_products") or []
-            product_names = sorted(
-                {
-                    str(p.get("name") or "").strip()
-                    for p in products
-                    if isinstance(p, dict) and p.get("active") and p.get("name")
-                }
+        inactive_hosts: list[dict[str, Any]] = []
+        unconfirmed_hosts: list[str] = []
+        for row in rows:
+            products = [p for p in row["products"] if isinstance(p, dict)]
+            posture = classify_host_posture(products, row["posture_assessed"])
+            names = sorted(
+                {str(p.get("name") or "").strip() for p in products if p.get("name")}
             )
-            good_hosts.append({"host": name, "products": product_names})
-        if not good_hosts:
-            return  # observed, but no active protection found on any assessed host
+            if posture == POSTURE_ACTIVE:
+                good_hosts.append(
+                    {
+                        "host": row["host"],
+                        "products": sorted(
+                            {
+                                str(p.get("name") or "").strip()
+                                for p in active_products(products)
+                                if p.get("name")
+                            }
+                        ),
+                    }
+                )
+            elif posture == POSTURE_INSTALLED_INACTIVE:
+                inactive_hosts.append({"host": row["host"], "products": names})
+            else:
+                unconfirmed_hosts.append(row["host"])
+
+        if inactive_hosts:
+            status = STATUS_CONTRADICTED
+            named = ", ".join(display_host(h["host"]) for h in inactive_hosts[:6])
+            evidence_text = (
+                f"An antivirus product is installed and not running on {named}, "
+                "and no other active protection product was detected there."
+            )
+        elif unconfirmed_hosts or not_examined:
+            status = STATUS_INCOMPLETE
+            evidence_text = (
+                f"Active endpoint protection observed on {len(good_hosts)} of "
+                f"{assessed_total} examined computer(s); not confirmed on "
+                f"{len(unconfirmed_hosts)}, and {not_examined} computer(s) in the "
+                "directory were not examined. A control is credited only when "
+                "every host it covers was observed protected."
+            )
+        else:
+            status = STATUS_OBSERVED
+            evidence_text = (
+                "Active endpoint protection (antivirus or EDR) observed on every "
+                f"one of the {assessed_total} computer(s) in the directory."
+            )
         recorder(
             shell,
             domain_name,
             key="endpoint_protection_present",
             title="Endpoint Protection Software Deployed",
             category="Endpoint Hardening",
-            status="observed",
+            status=status,
             details={
                 "hosts_conformant": len(good_hosts),
                 "hosts_assessed": assessed_total,
+                "hosts_not_examined": not_examined,
+                "hosts_contrary": inactive_hosts[:64],
+                "hosts_unconfirmed": unconfirmed_hosts[:64],
                 "source": "endpoint_protection_inventory",
-                "evidence": (
-                    f"Active endpoint-protection software (AV/EDR) observed on "
-                    f"{len(good_hosts)} of {assessed_total} host(s) where the "
-                    "inventory could be read (local admin). Hosts that could not "
-                    "be assessed are not counted, and a host with no detected "
-                    "product is treated as not assessed for this purpose, never "
-                    "as a finding."
-                ),
+                "evidence": evidence_text,
             },
             evidence=good_hosts[:64],
         )
@@ -1560,9 +1696,67 @@ def emit_esc9_hardened_positive(
         print_info_debug(f"[positive-control] ESC9 hardened positive emit failed: {exc}")
 
 
+def emit_enumerated_surface_positives(
+    shell: Any, domain: str, census: Optional[Mapping[str, Any]]
+) -> None:
+    """Record the enumerated-surface outcome for each declared catalogue surface.
+
+    The technique-layer counterpart to the configuration positives above. The
+    collector counted what it ENUMERATED (how many accounts it read the Kerberos
+    attributes of, how many security descriptors it parsed, how many principals
+    it evaluated the replication right for); this records the outcome of each
+    count.
+
+    Every decision lives in the shared SSOT
+    (:func:`adscan_core.reporting.enumerated_surface_evidence.build_surface_evidence`),
+    including the one that matters: ``observed`` is unreachable without a
+    non-zero examined count, so no key here can be greened off an empty finding
+    list. A surface that was enumerated and DID find abusable objects records
+    nothing, because that is a finding and the findings channel owns it.
+
+    Best-effort and idempotent (``record_control_evidence`` updates by key).
+    Client-safe: the sentence names the method and the count, never a tool.
+    """
+    domain_name = str(domain or "").strip()
+    if not domain_name or not isinstance(census, Mapping) or not census:
+        return
+    try:
+        from adscan_core.reporting.enumerated_surface_evidence import (
+            build_surface_evidence,
+        )
+
+        recorder = _resolve_recorder()
+        if recorder is None:
+            return
+        for surface in sorted(census):
+            entry = census.get(surface)
+            if not isinstance(entry, Mapping):
+                continue
+            evidence = build_surface_evidence(entry)
+            if evidence is None:
+                continue
+            recorder(
+                shell,
+                domain_name,
+                key=evidence.key,
+                title=evidence.title,
+                category=evidence.category,
+                status=evidence.status,
+                details=dict(evidence.details),
+            )
+    except Exception as exc:  # pragma: no cover - best effort sync
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(
+            f"[positive-control] enumerated surface positives emit failed: {exc}"
+        )
+
+
 __all__ = [
+    "emit_enumerated_surface_positives",
     "emit_posture_positives",
     "emit_password_policy_positive",
+    "observed_posture_controls",
     "emit_cve_not_vulnerable_positives",
     "emit_registry_positives",
     "emit_endpoint_protection_positive",

@@ -385,7 +385,6 @@ _MACHINE_DOMAIN_FINGERPRINTS: dict[str, tuple[str, str]] = {
     "essos.local": ("goad", "goad"),
 }
 
-
 _AD_LABS_LOWER_BY_PROVIDER: dict[str, set[str]] = {
     provider: {entry.lower() for entry in entries}
     for provider, entries in _AD_LABS_BY_PROVIDER.items()
@@ -436,3 +435,22 @@ def is_lab_whitelisted(provider: str | None, lab_name: str | None) -> bool:
     return str(lab_name).strip().lower() in _AD_LABS_LOWER_BY_PROVIDER.get(
         canonical, set()
     )
+
+
+#: Providers whose labs publish no capture flags. GOAD is a full Active
+#: Directory range for practising attacks: there is no ``user.txt`` /
+#: ``root.txt`` to find, so a missing flag there says nothing about how the run
+#: went. Every other provider (and an unknown one) keeps the flag check, because
+#: on a flag-bearing box a missing ``root.txt`` is the signal that the machine
+#: was not fully compromised.
+_FLAGLESS_LAB_PROVIDERS: frozenset[str] = frozenset({"goad"})
+
+
+def lab_publishes_capture_flags(provider: str | None) -> bool:
+    """Whether a lab from ``provider`` has capture flags to collect and validate.
+
+    Unknown or missing providers answer True: the flag check stays on unless the
+    lab is known to have no flags.
+    """
+    canonical = provider_display_to_canonical(provider)
+    return canonical not in _FLAGLESS_LAB_PROVIDERS

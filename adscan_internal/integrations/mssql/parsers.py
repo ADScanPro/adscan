@@ -190,6 +190,10 @@ class LinkedServer:
     # (a bulkadmin/explicitly-granted login can have this without being
     # sysadmin). None = not probed / unknown (no capability claim).
     remote_bulk_admin: bool | None = None
+    # Why the far side of the link was NOT probed ("" when it was): a link whose
+    # host belongs to another domain, is outside the engagement scope, or has no
+    # determinable domain stays mapped, and its remote facts read unknown.
+    remote_probe_skip_reason: str = ""
 
 
 def parse_linked_servers_detail(rows: list[dict[str, Any]] | None) -> list[LinkedServer]:

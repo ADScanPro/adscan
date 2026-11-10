@@ -21,15 +21,35 @@ Tier = Literal["LITE", "PRO"]
 # Commands that require PRO. Matches the dispatch gate in ``adscan.py``
 # and the post-exit-42 upsell in ``adscan_launcher/cli.py``.
 #
-# PRO-gated commands: ``deliver`` (the full Client Deliverable Kit) and
-# ``ci`` (autonomous/non-interactive mode — automation is a PRO capability;
-# the LITE user drives ``adscan start`` interactively). ``ci`` is gated by
-# module absence like every PRO surface: LITE lacks ``adscan_internal.pro``
-# so ``is_pro()`` is False and the dispatch gate returns exit-42.
+# PRO-gated commands: ``deliver`` (the full Client Deliverable Kit), and every
+# NON-INTERACTIVE entry point: ``ci`` (a whole assessment unattended) and
+# ``execute`` (one REPL action from a shell or a script). LITE is
+# interactive-only: the LITE user drives ``adscan start``, where every
+# ``execute`` verb exists as a REPL command. Gated by module absence like every
+# PRO surface: LITE lacks ``adscan_internal.pro`` so ``is_pro()`` is False and
+# the dispatch gate returns exit-42.
 PRO_ONLY_COMMANDS: frozenset[str] = frozenset({
     "ci",
     "deliver",
+    "execute",
+    # The engagement ledger (history across runs) is PRO and Enterprise only
+    # (engagement-state spec, decision D12a).
+    "engagement",
+    # Re-verification of findings, attack steps and paths from the ledger is
+    # PRO (on demand) and Enterprise (on demand and scheduled), decision D12b.
+    "recheck",
 })
+
+# Commands the container dispatcher runs NON-INTERACTIVELY (it sets
+# ``ADSCAN_NONINTERACTIVE`` for them). Every one of them is PRO-only unless it
+# is listed in ``NON_INTERACTIVE_EXEMPT`` with the reason; a structural test
+# (``tests/unit/launcher/test_non_interactive_commands_are_pro.py``) fails CI
+# otherwise, so a new unattended entry point cannot ship in LITE by accident.
+NON_INTERACTIVE_COMMANDS: tuple[str, ...] = ("ci", "run", "execute", "doctor")
+NON_INTERACTIVE_EXEMPT: dict[str, str] = {
+    "doctor": "a read-only health check of the install and the lab connection",
+    "run": "a plan wrapper whose planned command (ci, deliver, doctor) is gated on its own",
+}
 
 # Commands that ship in LITE (operator-facing desk references and the
 # free entry points). Used purely for help-listing classification.
@@ -65,6 +85,8 @@ def is_pro_only(command: str) -> bool:
 __all__ = (
     "Tier",
     "PRO_ONLY_COMMANDS",
+    "NON_INTERACTIVE_COMMANDS",
+    "NON_INTERACTIVE_EXEMPT",
     "LITE_DELIVERABLE_COMMANDS",
     "DELIVERABLE_COMMAND_ORDER",
     "tier_for_command",

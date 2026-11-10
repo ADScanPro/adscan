@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.events/1",
+  "title": "ADscan event stream v1",
+  "description": "One event per JSON line. The first line of a stream is a stream_header; every event carries seq, contiguous from 1 (the header is 1). The stream-control events are closed objects; every other event type is an open envelope because readers ignore unknown fields within a major (additive changes only), and a consumer that must restrict what it forwards filters by type.",
+  "type": "object",
+  "required": ["type", "seq", "timestamp"],
+  "properties": {
+    "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+    "seq": {"type": "integer", "minimum": 1},
+    "timestamp": {"$ref": "#/$defs/timestamp"}
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/stream_header"},
+    {"$ref": "#/$defs/run_started"},
+    {"$ref": "#/$defs/run_completed"},
+    {"$ref": "#/$defs/engine_event"}
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+    "stream_header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "seq", "timestamp", "schema", "run_id"],
+      "properties": {
+        "type": {"const": "stream_header"},
+        "seq": {"const": 1},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "schema": {"const": "adscan.events/1"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "kind": {"enum": ["scan", "recheck", "postprocess", "doctor", "deliver"]},
+        "engine_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$"}
+      }
+    },
+    "run_started": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "seq", "timestamp", "run_id", "kind"],
+      "properties": {
+        "type": {"const": "run_started"},
+        "seq": {"type": "integer", "minimum": 1},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "kind": {"enum": ["scan", "recheck", "postprocess", "doctor", "deliver"]}
+      }
+    },
+    "run_completed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "seq", "timestamp", "run_id", "kind", "status", "exit_code"],
+      "properties": {
+        "type": {"const": "run_completed"},
+        "seq": {"type": "integer", "minimum": 1},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "kind": {"enum": ["scan", "recheck", "postprocess", "doctor", "deliver"]},
+        "status": {"enum": ["completed", "failed", "cancelled", "interrupted"]},
+        "exit_code": {"type": "integer"},
+        "result_path": {
+          "type": "string",
+          "$comment": "Workspace-relative path of run_summary.json.",
+          "pattern": "^(?!\\.\\.(/|$))(?!.*/\\.\\.(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+        }
+      }
+    },
+    "engine_event": {
+      "type": "object",
+      "required": ["type", "seq", "timestamp"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "not": {"enum": ["stream_header", "run_started", "run_completed"]}
+        },
+        "seq": {"type": "integer", "minimum": 2},
+        "timestamp": {"$ref": "#/$defs/timestamp"}
+      }
+    }
+  }
+}

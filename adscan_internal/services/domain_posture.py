@@ -232,6 +232,21 @@ class ConstraintState:
         """
         return TriState.UNKNOWN if self.is_stale else self.state
 
+    @property
+    def is_observed(self) -> bool:
+        """True when the DC gave a definitive, current, HIGH-confidence answer.
+
+        The single "observe, never infer" bar: a timeout, an inferred-by-absence
+        UNKNOWN, a LOW/MEDIUM signal or a stale record are all NOT observed. The
+        positive-evidence channel greens a control only past this bar (at the
+        hardened value) and the run-coverage record counts a posture category as
+        re-checked only past it, so the two can never disagree about what was seen.
+        """
+        return (
+            self.effective_state is not TriState.UNKNOWN
+            and self.confidence is SignalConfidence.HIGH
+        )
+
 
 _PASSWORD_POLICY_TTL: timedelta = timedelta(seconds=60)
 """Cache TTL for :class:`PasswordPolicySnapshot`.

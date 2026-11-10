@@ -10,11 +10,26 @@ from typing import TypeVar
 T = TypeVar("T")
 
 
-def run_async_sync(awaitable: Awaitable[T]) -> T:
-    """Run an awaitable from sync code, even if the caller already owns a loop."""
+def _loop_is_running() -> bool:
+    """Whether the calling thread is inside a running event loop.
+
+    The ``RuntimeError`` from ``get_running_loop`` is consumed HERE, and the
+    work runs after the ``except`` block has closed. Running it inside the
+    ``except`` (the previous shape) made every exception the awaited code
+    raised carry ``During handling of the above exception ... RuntimeError: no
+    running event loop`` in its traceback: a false lead in every debug log,
+    which read as an event-loop bug on paths that had none.
+    """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        return False
+    return True
+
+
+def run_async_sync(awaitable: Awaitable[T]) -> T:
+    """Run an awaitable from sync code, even if the caller already owns a loop."""
+    if not _loop_is_running():
         return asyncio.run(awaitable)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -51,9 +66,7 @@ def run_sync_off_loop(fn: Callable[..., T], *args: object, **kwargs: object) -> 
     Returns:
         The return value of ``fn(*args, **kwargs)``.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
+    if not _loop_is_running():
         return fn(*args, **kwargs)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

@@ -74,9 +74,23 @@ class EdrIntelligence:
     # ------------------------------------------------------------------ reads
 
     def was_caught(self, *, method: str, product: str) -> bool:
-        """Return True if *method* was ever caught by *product* on any host."""
+        """Return True if *method* was ever caught by *product* on any host.
+
+        Product names are compared through the catalog's
+        ``product_names_match``, so a catch recorded under a name the catalog
+        later split (the merged "Windows Defender") still counts against the
+        products it covered. Without it the split silently erased every OPSEC
+        lesson a workspace had learned against Defender.
+        """
+        # Lazy: host_intelligence/__init__ re-exports this module, so a
+        # module-level import of the catalog would be circular.
+        from adscan_internal.services.host_intelligence.product_catalog import (
+            product_names_match,
+        )
+
         return any(
-            e["method"] == method and e["product"] == product
+            e.get("method") == method
+            and product_names_match(str(e.get("product") or ""), product)
             for e in self._data.get("catches", [])
         )
 

@@ -6,6 +6,11 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from adscan_core.kerberos_roasting import (
+    AccountSignals,
+    is_asrep_roastable,
+    is_kerberoastable,
+)
 from adscan_internal.services.attack_graph_service import load_attack_graph
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
 from adscan_internal.services.graph_queries import (
@@ -254,27 +259,47 @@ class LocalGraphService:
         ``object_id`` — ``_find_node`` indexes the objectId/SID candidate set,
         so a name-less enrichment (SID only) still resolves.
         """
-        kind = (
+        matched = self.get_principal_node_with_kind(
+            domain,
+            principal_name,
+            principal_type=principal_type,
+            object_id=object_id,
+            lookup_name=lookup_name,
+        )
+        return matched[1] if matched else None
+
+    def get_principal_node_with_kind(
+        self,
+        domain: str,
+        principal_name: str,
+        *,
+        principal_type: str | None = None,
+        object_id: str | None = None,
+        lookup_name: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Like :meth:`get_principal_node`, also returning the kind that matched.
+
+        The kind is the inventory / graph collection the record was found in
+        (``User`` / ``Group`` / ``Computer``): directory evidence, so a caller
+        building a node never has to guess the kind from the name.
+        """
+        requested = (
             principal_type[:1].upper() + principal_type[1:] if principal_type else None
         )
-
-        def _lookup(name: str | None) -> dict[str, Any] | None:
+        kinds = (
+            (requested,)
+            if requested in {"User", "Group", "Computer"}
+            else ("User", "Group", "Computer")
+        )
+        for name in (principal_name, lookup_name, object_id):
             candidate = str(name or "").strip()
             if not candidate:
-                return None
-            if kind in {"User", "Group", "Computer"}:
-                return self._find_node(domain, candidate, kind=kind)
-            return (
-                self.get_user_node_by_samaccountname(domain, candidate)
-                or self.get_group_node_by_samaccountname(domain, candidate)
-                or self.get_computer_node_by_name(domain, candidate)
-            )
-
-        return (
-            _lookup(principal_name)
-            or _lookup(lookup_name)
-            or _lookup(object_id)
-        )
+                continue
+            for kind in kinds:
+                found = self._find_node(domain, candidate, kind=kind)
+                if found:
+                    return kind, found
+        return None
 
     def get_users(
         self,
@@ -444,11 +469,22 @@ class LocalGraphService:
         ]
 
     def get_kerberoastable_users(self, domain: str) -> list[str]:
-        """Return Kerberoastable users from the local attack graph."""
+        """Return Kerberoastable users from the local attack graph.
+
+        The inventory and the graph fallback apply the SAME cross-tier
+        predicate, so an account the collector refused to derive a Kerberoasting
+        edge for cannot reappear here. A managed service account publishes
+        service principal names and holds a directory-generated password, so it
+        is excluded from both.
+        """
         records = [
             record
             for record in self._inventory_records(domain, "users.json")
-            if is_active(record) and bool(record.get("hasspn"))
+            if is_active(record)
+            and is_kerberoastable(
+                AccountSignals.from_properties(record),
+                has_spn=bool(record.get("hasspn")),
+            )
         ]
         if records:
             return [
@@ -463,11 +499,18 @@ class LocalGraphService:
         ]
 
     def get_asreproastable_users(self, domain: str) -> list[str]:
-        """Return AS-REP-roastable users from the local attack graph."""
+        """Return AS-REP-roastable users from the local attack graph.
+
+        Same predicate split as :meth:`get_kerberoastable_users`.
+        """
         records = [
             record
             for record in self._inventory_records(domain, "users.json")
-            if is_active(record) and bool(record.get("dontreqpreauth"))
+            if is_active(record)
+            and is_asrep_roastable(
+                AccountSignals.from_properties(record),
+                preauth_required=not record.get("dontreqpreauth"),
+            )
         ]
         if records:
             return [

@@ -45,6 +45,39 @@ The schema (all keys optional)::
       enabled: true           # allow ADscan to pivot (ligolo tunnels via MSSQL, WinRM, etc.) into newly-reachable networks (absent = workspace-type default: ctf on, audit off)
     writeshare_bait:
       enabled: true           # drop NTLMv2-bait files on writable shares (absent = workspace-type default: ctf on, audit off)
+    durable_changes:
+      auto_revert: true       # automatic reversion of ADscan's directory changes (absent = workspace-type
+                              # default: on for audit and Enterprise, off for ctf). The single switch the
+                              # REPL `set auto_revert` and the web toggle drive.
+      keep: false             # legacy inverse of auto_revert for the durable AD objects at exit
+                              # (both set and contradictory = error)
+      machine_account_policy: revert_each_run  # retain_one = keep ONE ADscan computer account
+                              # between runs (consented continuous engagement); absent = revert_each_run
+      allow_ca_key_backup: false  # allow the CA private-key backup step of an executed path
+                              # (absent = off in non-interactive audit runs, on interactively and in ctf)
+    cleanup_credential:       # optional client account used ONLY to revert ADscan's changes
+      username: svc_cleanup
+      domain: corp.example    # optional; absent = every domain the run touches
+      secret_env: ADSCAN_CLEANUP_SECRET  # the ADSCAN_* variable holding the secret (never inline)
+    checks:                   # scan policy: which checks may run (absent = every check)
+      base: safe_for_production            # full_validation (default) | detection_only | safe_for_production
+      disabled: [step:kerberoasting, family:delegation_trusts]
+      enabled: [step:readgmsapassword]
+      new_checks: disabled                 # follow_base (default) | disabled
+      saved_at_registry_version: 12
+      pacing: {level: polite}              # the policy's pace: a CEILING for this scan
+      policy: {id: 7c0e-example, name: "Corp example", revision: 3}
+    pacing:                   # scan speed (absent = normal, today's behaviour)
+      level: polite                        # fragile | polite | normal (default) | fast
+      overrides: {max_parallel_hosts: 4}   # any knob of adscan_core.scan_pacing
+      ceiling: {level: polite}             # written by the web from a saved policy
+
+The ``checks`` section is validated for shape and selector syntax by
+:func:`adscan_core.scan_policy.policy.parse_policy_definition`; registry-aware
+validation (unknown ids, locked checks) happens when ``adscan ci`` resolves it.
+The ``pacing`` section is validated by
+:func:`adscan_core.scan_pacing.parse_pacing_block`, the validator the web and
+the policy layer share.
 
 Unknown keys raise :class:`ScanConfigError` — a typo must fail loud, never be
 silently ignored. The web mirrors this same valid-set so both sides validate
@@ -56,6 +89,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from adscan_core.scan_pacing import PacingBlock, PacingConfigError, parse_pacing_block
+from adscan_internal.services.cleanup_credential_reference import (
+    CleanupCredentialError,
+    CleanupCredentialReference,
+    parse_cleanup_reference,
+)
+from adscan_core.scan_policy.policy import (
+    ScanPolicyDefinition,
+    ScanPolicyError,
+    parse_policy_definition,
+)
 
 # ---------------------------------------------------------------------------
 # Valid sets — the web form MUST mirror these exactly (contract).
@@ -150,6 +195,10 @@ _TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "poisoning",
         "pivoting",
         "writeshare_bait",
+        "durable_changes",
+        "checks",
+        "pacing",
+        "cleanup_credential",
     }
 )
 _PHASES_KEYS: frozenset[str] = frozenset({"disabled", "steps"})
@@ -161,6 +210,9 @@ _CRACKING_KEYS: frozenset[str] = frozenset({"effort", "wordlist"})
 _POISONING_KEYS: frozenset[str] = frozenset({"enabled"})
 _PIVOTING_KEYS: frozenset[str] = frozenset({"enabled"})
 _WRITESHARE_BAIT_KEYS: frozenset[str] = frozenset({"enabled"})
+_DURABLE_CHANGES_KEYS: frozenset[str] = frozenset(
+    {"keep", "allow_ca_key_backup", "auto_revert", "machine_account_policy"}
+)
 
 
 class ScanConfigError(ValueError):
@@ -369,6 +421,64 @@ class WriteShareBaitConfig:
 
 
 @dataclass(frozen=True)
+class DurableChangesConfig:
+    """What happens to changes that outlive a step (decided once, per run).
+
+    Both fields are tri-state; ``None`` defers to the deployment default that
+    :mod:`adscan_internal.services.durable_change_policy` owns (the single place
+    that decides, so no service re-derives it):
+
+    * ``keep`` — the durable ``operator_confirmed`` AD objects (machine account,
+      RBCD delegation, KeyCredentialLink) at workspace exit. ``None``: reverted
+      in a non-interactive run (``adscan ci``, the appliance worker), asked with
+      "Revert all" preset interactively. ``True``: kept (the operator's explicit
+      choice). ``False``: reverted without asking.
+    * ``allow_ca_key_backup`` — whether an executed path may run the step that
+      copies the CA private key. A copy of that key cannot be withdrawn (only a
+      CA key rotation invalidates it), so ``None`` means OFF in a non-interactive
+      ``audit`` run and unchanged elsewhere. ``True``: allowed. ``False``: never.
+
+    Attributes:
+        keep: Keep durable AD objects at exit (``None`` = deployment default).
+        allow_ca_key_backup: Allow the CA key backup step (``None`` = default).
+    """
+
+    keep: Optional[bool] = None
+    allow_ca_key_backup: Optional[bool] = None
+    #: Automatic reversion of ADscan's directory changes, the ONE switch
+    #: (``None`` = workspace-type default: on for audit and Enterprise, off for
+    #: ctf). ``keep`` is its legacy inverse for the durable objects at exit.
+    auto_revert: Optional[bool] = None
+    #: ``retain_one`` keeps ONE named ADscan computer account between runs (a
+    #: consented continuous engagement); ``revert_each_run`` (default, ``None``)
+    #: leaves nothing behind. See machine_account_provisioning_service.
+    machine_account_policy: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ChecksConfig:
+    """The ``checks`` section: the scan policy this run is held to.
+
+    Attributes:
+        definition: The parsed policy definition (shape and syntax validated;
+            the registry-aware resolution runs in ``adscan ci``).
+    """
+
+    definition: ScanPolicyDefinition = field(default_factory=ScanPolicyDefinition)
+
+    @property
+    def is_default(self) -> bool:
+        """True when no policy was given: no restriction AND no named policy.
+
+        A named policy whose rules happen to equal full validation (the web's
+        "Full validation" built-in, a saved policy that excludes nothing) is
+        still a policy the run must disclose, so it is not the default.
+        """
+        identity = self.definition.identity
+        return self.definition.is_default and not identity.policy_id and not identity.name
+
+
+@dataclass(frozen=True)
 class ScanConfig:
     """A fully-resolved scan configuration.
 
@@ -402,6 +512,20 @@ class ScanConfig:
     writeshare_bait: WriteShareBaitConfig = field(
         default_factory=WriteShareBaitConfig
     )
+    # Durable-change decisions (exit revert/keep, CA key backup step). Both
+    # tri-state; an absent section defers to durable_change_policy defaults.
+    durable_changes: DurableChangesConfig = field(
+        default_factory=DurableChangesConfig
+    )
+    # Scan policy (which checks may run). An absent section is no policy.
+    checks: ChecksConfig = field(default_factory=ChecksConfig)
+    # Scan speed: the request (level + knob overrides) and, when a saved policy
+    # applies, its ceiling. An absent section is ``normal`` = today's behaviour.
+    pacing: PacingBlock = field(default_factory=PacingBlock)
+    # The client's cleanup-only account, by REFERENCE (principal + the ADSCAN_*
+    # variable holding its secret). Never the secret itself: this file is
+    # written to the run workspace. ``None`` = no cleanup account.
+    cleanup_credential: Optional[CleanupCredentialReference] = None
 
     # -- convenience predicates used by the gated decision points -----------
 
@@ -420,6 +544,13 @@ class ScanConfig:
             and self.poisoning.enabled is None
             and self.pivoting.enabled is None
             and self.writeshare_bait.enabled is None
+            and self.durable_changes.keep is None
+            and self.durable_changes.allow_ca_key_backup is None
+            and self.durable_changes.auto_revert is None
+            and self.durable_changes.machine_account_policy is None
+            and self.cleanup_credential is None
+            and self.checks.is_default
+            and self.pacing.is_default
         )
 
     def disabled_phase_ids(self) -> frozenset[str]:
@@ -642,6 +773,87 @@ def _parse_writeshare_bait(raw: Any) -> WriteShareBaitConfig:
     return WriteShareBaitConfig(enabled=enabled)
 
 
+def _parse_durable_changes(raw: Any) -> DurableChangesConfig:
+    mapping = _require_mapping(raw, where="durable_changes")
+    _reject_unknown_keys(mapping, _DURABLE_CHANGES_KEYS, where="durable_changes")
+    policy = mapping.get("machine_account_policy")
+    if policy is not None and policy not in ("retain_one", "revert_each_run"):
+        raise ScanConfigError(
+            "'durable_changes.machine_account_policy' must be 'retain_one' or "
+            f"'revert_each_run', got {policy!r}."
+        )
+    values: dict[str, Optional[bool]] = {}
+    for key in ("keep", "allow_ca_key_backup", "auto_revert"):
+        value = mapping.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise ScanConfigError(
+                f"'durable_changes.{key}' must be a boolean or absent, "
+                f"got {type(value).__name__}."
+            )
+        values[key] = value
+    keep, auto_revert = values.get("keep"), values.get("auto_revert")
+    if keep is not None and auto_revert is not None and keep == auto_revert:
+        raise ScanConfigError(
+            "'durable_changes.keep' and 'durable_changes.auto_revert' contradict each "
+            "other; set only 'auto_revert'."
+        )
+    return DurableChangesConfig(**values, machine_account_policy=policy)
+
+
+def _parse_cleanup_credential(raw: Any) -> Optional[CleanupCredentialReference]:
+    try:
+        return parse_cleanup_reference(raw)
+    except CleanupCredentialError as exc:
+        raise ScanConfigError(str(exc)) from exc
+
+
+def _parse_checks(raw: Any) -> ChecksConfig:
+    """Parse the ``checks`` section through the scan-policy SSOT validator."""
+    if raw is None:
+        return ChecksConfig()
+    try:
+        return ChecksConfig(definition=parse_policy_definition(raw))
+    except ScanPolicyError as exc:
+        raise ScanConfigError(str(exc)) from exc
+
+
+def _parse_pacing(raw: Any) -> PacingBlock:
+    """Parse the ``pacing`` section through the pacing SSOT validator."""
+    try:
+        return parse_pacing_block(raw, source="scan_config")
+    except PacingConfigError as exc:
+        raise ScanConfigError(str(exc)) from exc
+
+
+def pacing_section(block: PacingBlock) -> dict[str, Any]:
+    """Canonical, non-default form of a parsed ``pacing`` section.
+
+    ``level`` is emitted only when the section named one, so a section carrying
+    only a policy ceiling round-trips without turning into an explicit
+    ``normal`` request (which would then outrank the workspace's own setting).
+    """
+    out: dict[str, Any] = {}
+    request = block.request
+    if request.level_source != "default":
+        out["level"] = request.level.value
+    if request.overrides:
+        out["overrides"] = dict(request.overrides)
+    if request.profile is not None:
+        out["profile"] = request.profile.to_dict()
+    if block.ceiling is not None:
+        out["ceiling"] = block.ceiling.to_dict()
+    return out
+
+
+def pacing_request_is_explicit(block: PacingBlock) -> bool:
+    """True when the section asked for a level, a knob or a saved profile (not just a ceiling)."""
+    return (
+        block.request.level_source != "default"
+        or bool(block.request.overrides)
+        or block.request.profile is not None
+    )
+
+
 def _parse_host_cap(raw: Any) -> int:
     """Parse the top-level ``host_cap`` scalar (a non-negative integer).
 
@@ -691,6 +903,10 @@ def parse_scan_config(data: Any) -> ScanConfig:
         poisoning=_parse_poisoning(mapping.get("poisoning")),
         pivoting=_parse_pivoting(mapping.get("pivoting")),
         writeshare_bait=_parse_writeshare_bait(mapping.get("writeshare_bait")),
+        durable_changes=_parse_durable_changes(mapping.get("durable_changes")),
+        checks=_parse_checks(mapping.get("checks")),
+        pacing=_parse_pacing(mapping.get("pacing")),
+        cleanup_credential=_parse_cleanup_credential(mapping.get("cleanup_credential")),
     )
 
 

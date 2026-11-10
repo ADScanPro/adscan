@@ -20,6 +20,8 @@ and returns the existing entry. Snapshots are GC'd to a maximum of
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -204,12 +206,11 @@ def _report_path(shell: Any, *, domain: str) -> str:
 def is_timeline_enabled(shell: Any) -> bool:
     """Return whether inventory timeline is enabled for the active workspace.
 
-    CTF workspaces opt out: the snapshot churn there is not useful and the
-    extra files clutter the per-domain directory.
+    A policy whose objective is domain compromise opts out: the snapshot churn
+    there is not useful and the extra files clutter the per-domain directory.
     """
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    return workspace_type != "ctf"
+    return policy_settings.runs_full_assessment(shell)
 
 
 # ---------------------------------------------------------------------------

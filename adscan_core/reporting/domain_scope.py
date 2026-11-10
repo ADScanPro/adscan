@@ -47,8 +47,12 @@ coverage.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
+
+from adscan_core.workspace_domain_buckets import is_reserved_domain_bucket
 
 #: Top-level keys in the renderer ``report_data`` mapping (and in
 #: ``technical_report.json`` ``domains``) that are NOT domains. The mapping is
@@ -183,6 +187,119 @@ def classify_report_domains(domains: Mapping[str, Any] | None) -> DomainScope:
     return DomainScope(assessed=tuple(assessed), discovered=tuple(discovered))
 
 
+#: Workspace layout the collector writes: ``<workspace>/domains/<domain>/attack_graph.json``.
+WORKSPACE_DOMAINS_DIR = "domains"
+ATTACK_GRAPH_FILENAME = "attack_graph.json"
+TECHNICAL_REPORT_FILENAME = "technical_report.json"
+
+
+def domain_collection_verdict(
+    *, graph_present: bool, report_entry: Any = None
+) -> tuple[bool, str]:
+    """Return ``(enumerated, basis)`` from what the workspace holds for one domain.
+
+    The one rule for "did this engagement enumerate the domain" when no marker
+    has been recorded yet. The collector's own attack graph is decisive and is
+    checked first, because a perfectly clean assessed domain carries no
+    findings and would otherwise read as untested. Collected report evidence is
+    the secondary signal. Shared by the engine resolver that WRITES the marker
+    (``report_attack_paths.resolve_domain_assessment``) and by the workspace
+    reader below, so the verdict a surface reads cannot differ from the one the
+    report recorded.
+    """
+    if graph_present:
+        return True, "attack_graph"
+    if has_collection_evidence(report_entry):
+        return True, "report_evidence"
+    return False, "no_collection_evidence"
+
+
+def workspace_domain_graph_present(workspace_dir: str | os.PathLike[str], domain: str) -> bool:
+    """Return True when the collector wrote an attack graph for *domain*.
+
+    Domain names are case-insensitive while the filesystem is not, and the
+    collector writes the directory in lower case, so both spellings are tried.
+    """
+    label = str(domain or "").strip().rstrip(".")
+    if not label:
+        return False
+    root = os.path.join(os.fspath(workspace_dir), WORKSPACE_DOMAINS_DIR)
+    return any(
+        os.path.isfile(os.path.join(root, candidate, ATTACK_GRAPH_FILENAME))
+        for candidate in dict.fromkeys((label, label.lower()))
+    )
+
+
+def _load_report_domains(workspace_dir: str | os.PathLike[str]) -> Mapping[str, Any]:
+    path = os.path.join(os.fspath(workspace_dir), TECHNICAL_REPORT_FILENAME)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    domains = report.get("domains") if isinstance(report, Mapping) else None
+    return domains if isinstance(domains, Mapping) else {}
+
+
+def resolve_workspace_domain_scope(
+    workspace_dir: str | os.PathLike[str],
+    domain_names: Iterable[str] = (),
+    *,
+    report_domains: Mapping[str, Any] | None = None,
+) -> DomainScope:
+    """Split every domain a workspace knows into assessed and discovered.
+
+    The workspace-backed form of :func:`classify_report_domains`, for a reader
+    that holds a list of domain NAMES from somewhere other than the report (the
+    web's domain list, its trust partners, its persisted domain rows) and must
+    not count one the engagement only learned of across a trust. Each name is
+    classified by the same ladder the report uses: the recorded
+    ``assessment.enumerated`` marker in ``technical_report.json`` wins, then
+    :func:`domain_collection_verdict` over the collector's own output. Domains
+    the report names are classified too, so a caller passing no names gets the
+    report's own split.
+
+    Reserved storage buckets are never domains and are dropped. Names compare
+    case-insensitively; the first spelling seen is kept. As in
+    :func:`classify_report_domains`, inference never reports zero coverage: with
+    no recorded marker and nothing that looks assessed, every name is assessed.
+    """
+    if report_domains is None:
+        report_domains = _load_report_domains(workspace_dir)
+    entries = {
+        str(name).strip().lower(): entry
+        for name, entry in report_domains.items()
+        if is_report_domain_key(name, entry)
+    }
+
+    ordered: dict[str, str] = {}
+    for name in [*domain_names, *report_domains.keys()]:
+        label = str(name or "").strip().rstrip(".")
+        if not label or is_reserved_domain_bucket(label) or label in RESERVED_REPORT_DATA_KEYS:
+            continue
+        ordered.setdefault(label.lower(), label)
+
+    assessed: list[str] = []
+    discovered: list[str] = []
+    any_recorded = False
+    for key, label in ordered.items():
+        entry = entries.get(key)
+        marker = entry.get(ASSESSMENT_KEY) if isinstance(entry, Mapping) else None
+        if isinstance(marker, Mapping) and isinstance(marker.get("enumerated"), bool):
+            any_recorded = True
+            enumerated = bool(marker["enumerated"])
+        else:
+            enumerated, _basis = domain_collection_verdict(
+                graph_present=workspace_domain_graph_present(workspace_dir, label),
+                report_entry=entry,
+            )
+        (assessed if enumerated else discovered).append(label)
+
+    if not assessed and not any_recorded:
+        return DomainScope(assessed=tuple(discovered))
+    return DomainScope(assessed=tuple(assessed), discovered=tuple(discovered))
+
+
 def format_domain_scope_label(scope: DomainScope) -> str:
     """Return the cover/footer label for a scope, e.g. ``"1 assessed · 2 discovered"``.
 
@@ -196,14 +313,32 @@ def format_domain_scope_label(scope: DomainScope) -> str:
     return label
 
 
-def format_discovered_domains_note(scope: DomainScope) -> str:
+def format_discovered_domains_note(
+    scope: DomainScope, *, engagement_scope: Mapping[str, Any] | None = None
+) -> str:
     """Return a client-facing sentence naming the unenumerated trusted domains.
 
-    Empty when every known domain was assessed. The wording states the fact and
-    its consequence — untested surface — without dressing it up as a finding.
+    Empty when every known domain was assessed and the scope record withheld
+    nothing. The wording states the fact and its consequence — untested
+    surface — without dressing it up as a finding. With the workspace scope
+    record (``engagement_scope``, the engine's ``scope.json``) it also states
+    how the engagement scope was decided and which cross-domain routes it kept
+    from running (``adscan_core.reporting.engagement_scope``).
     """
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        format_engagement_scope_note,
+    )
+
+    scope_note = format_engagement_scope_note(engagement_scope)
     if not scope.discovered:
-        return ""
+        return scope_note
+    return " ".join(
+        part for part in (_discovered_sentence(scope), scope_note) if part
+    )
+
+
+def _discovered_sentence(scope: DomainScope) -> str:
+    """The sentence naming the trusted domains reached but not enumerated."""
     names = ", ".join(scope.discovered)
     if scope.discovered_count == 1:
         return (

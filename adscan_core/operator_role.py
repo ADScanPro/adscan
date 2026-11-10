@@ -19,8 +19,9 @@ from the container runtime during a later value moment / didactic render. It has
 to survive the ephemeral container, so it lives in the bind-mounted ADscan
 **state** directory (``~/.adscan/state/`` on the host ↔ ``/opt/adscan/state/``
 in the container) — the same store used by ``first_run_notices`` and the
-show-once survey flag, for the same reason. ``config.json`` sits above the mount
-and would be discarded when the container exits.
+show-once survey flag, for the same reason. ``config.json`` is the operator
+preferences and entitlements file (mounted as a single file); small cross-run
+markers belong in the state dir.
 
 Robustness contract
 -------------------

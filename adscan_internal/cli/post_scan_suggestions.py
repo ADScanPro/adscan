@@ -156,7 +156,15 @@ def _mark_recap_node(name: str) -> str:
 
 
 def _build_headline_path(shell: Any, domain: str) -> "Any | None":
-    """Fetch the single highest-value validated path, non-interactively.
+    """Fetch the first route of the canonical domain listing, non-interactively.
+
+    The recap headline is the route the report ranks first, so it asks for the
+    canonical listing's own parameters (the report's depth, ``highvalue`` /
+    ``object``, ``display_friendly`` + ``keep_longest``) and keeps its first row:
+    ``max_paths=1`` is the top route of the FINAL, post-processed listing, never a
+    bound on discovery. It reuses the canonical listing's cached result when the
+    scan already computed it, and it never writes the coverage block (a capped
+    request is not the canonical listing).
 
     ``engine_override="local"`` is mandatory — it skips the dev engine selector
     that would otherwise prompt/hang at scan-end. ``render_debug_tables=False``
@@ -166,12 +174,20 @@ def _build_headline_path(shell: Any, domain: str) -> "Any | None":
     from adscan_internal.services.attack_graph_service import (
         get_attack_path_summaries,
     )
+    from adscan_internal.services.report_attack_paths import (
+        REPORT_ATTACK_PATH_MAX_DEPTH,
+    )
 
     summaries = get_attack_path_summaries(
         shell,
         domain,
-        max_depth=10,
+        scope="domain",
+        max_depth=REPORT_ATTACK_PATH_MAX_DEPTH,
         max_paths=1,
+        target="highvalue",
+        target_mode="object",
+        display_friendly=True,
+        keep_longest=True,
         engine_override="local",
         render_debug_tables=False,
     )
@@ -311,6 +327,44 @@ def _recap_try_next(outcome: str) -> tuple[tuple[str, str], ...]:
     )
 
 
+def _authenticated_assessment_gap(
+    shell: Any, domain: str, *, verb: str
+) -> tuple[str, ...]:
+    """Delegate to the ``scan_progress`` SSOT (the same answer ``ci`` exits on)."""
+    from adscan_internal.services.scan_progress import authenticated_assessment_gap
+
+    return authenticated_assessment_gap(shell, domain, verb=verb)
+
+
+def _domain_verdict(shell: Any, domain: str, *, compromised: bool) -> Any:
+    """The domain verdict (``compromise_verdict`` SSOT) from the stamped report.
+
+    The same derivation the reports and the web read, from the same
+    ``technical_report.json`` blocks. ``None`` when the report cannot be read,
+    and the headline then claims nothing beyond "no full compromise proven".
+    """
+    try:
+        from adscan_core.reporting.compromise_verdict import verdict_from_report_entry
+        from adscan_core.reporting.technical_report import _get_technical_report_path
+        from adscan_internal.workspaces import read_json_file
+
+        report = read_json_file(str(_get_technical_report_path(shell)))
+        domains = report.get("domains") if isinstance(report, dict) else None
+        entry = domains.get(domain) if isinstance(domains, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        return verdict_from_report_entry(entry, domain_compromised=compromised)
+    except Exception:  # noqa: BLE001 - never break the scan success path
+        return None
+
+
+def _phase_titles(phase_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Chapter-strip titles for ``phase_ids`` (``scan_progress`` SSOT)."""
+    from adscan_internal.services.scan_progress import phase_titles
+
+    return phase_titles(phase_ids)
+
+
 def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     """Resolve the end-of-scan recap model from live scan artifacts.
 
@@ -351,9 +405,25 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     except Exception:  # noqa: BLE001
         findings = FindingsSummary()
 
+    # Proof of compromise needs no further evidence. Anything short of it does:
+    # "this domain held" and "no findings surfaced" are only claims an
+    # authenticated assessment can make once collection and attack-path
+    # discovery actually ran for the domain.
+    missing_phases = (
+        ()
+        if scope.domain_compromised
+        else _authenticated_assessment_gap(shell, domain, verb=verb)
+    )
+    verdict = _domain_verdict(shell, domain, compromised=scope.domain_compromised)
+    if verdict is not None and verdict.kind == "domain_compromised" and not scope.domain_compromised:
+        # The proof marker is the outcome's SSOT here; a KPI block alone does
+        # not promote the headline, and it must not word the domain otherwise.
+        verdict = None
     if scope.domain_compromised:
         outcome = "domain_compromised"
-    elif findings.total > 0:
+    elif missing_phases:
+        outcome = "incomplete"
+    elif findings.total > 0 or (verdict is not None and verdict.routes > 0):
         outcome = "findings"
     else:
         outcome = "clean"
@@ -420,6 +490,14 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
         report_path=report_path,
         try_next=_recap_try_next(outcome),
         fanout=fanout,
+        missing_phases=_phase_titles(missing_phases),
+        verdict_kind=verdict.kind if verdict is not None and outcome == "findings" else "",
+        verdict_phrase=(
+            verdict.recap_phrase() if verdict is not None and outcome == "findings" else ""
+        ),
+        verdict_sentence=(
+            verdict.sentence() if verdict is not None and outcome == "findings" else ""
+        ),
     )
 
 

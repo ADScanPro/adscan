@@ -186,7 +186,16 @@ def record_attempt(
             {
                 "name": str(getattr(product, "name", "") or ""),
                 "category": str(getattr(product, "category", "") or ""),
-                "active": bool(getattr(product, "active", False)),
+                # Observed active only; an assumed real-time-protection state
+                # is recorded as unconfirmed, never as active.
+                "active": bool(
+                    getattr(product, "observed_active")
+                    if hasattr(product, "observed_active")
+                    else getattr(product, "active", False)
+                ),
+                "activity_unconfirmed": bool(
+                    getattr(product, "activity_unconfirmed", False)
+                ),
             }
             for product in (getattr(fp, "products", None) or ())
         ]
@@ -273,7 +282,9 @@ def record_endpoint_defense_for_domain(shell: Any, domain: str) -> None:
         if not workspace_dir or not domain:
             return
 
-        posture_hosts = _read_posture_hosts(workspace_dir, domain)
+        posture_hosts = _annotate_edr_visibility(
+            _read_posture_hosts(workspace_dir, domain)
+        )
         attempts, recorded = read_attempts(workspace_dir)
         domain_key = str(domain).strip().rstrip(".").lower()
         scoped = [
@@ -292,6 +303,7 @@ def record_endpoint_defense_for_domain(shell: Any, domain: str) -> None:
                 shell, workspace_dir, domain, posture_hosts, scoped
             ),
             host_names=_resolve_host_names(shell, workspace_dir, domain, scoped),
+            clock_sync=_clock_sync_record(shell, domain),
         )
         if not block.get("present"):
             return
@@ -303,6 +315,23 @@ def record_endpoint_defense_for_domain(shell: Any, domain: str) -> None:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"endpoint-defense block not recorded for {domain}: {exc}")
+
+
+def _clock_sync_record(shell: Any, domain: str) -> dict[str, Any] | None:
+    """The domain's persisted clock-sync record, or ``None``.
+
+    Injected into the block builder so every attempt stamp is placed in its
+    clock HERE, while the record is still in reach. The block is read back in a
+    later process with no ``variables.json`` available, and the per-host
+    appendix CSV asserted UTC for stamps from two clocks because of it.
+
+    Best-effort: an absent record leaves every stamp honestly unplaced.
+    """
+    from adscan_core.reporting.clock_frame import CLOCK_SYNC_KEY  # noqa: PLC0415
+
+    store = (getattr(shell, "domains_data", None) or {}).get(domain)
+    record = store.get(CLOCK_SYNC_KEY) if isinstance(store, dict) else None
+    return record if isinstance(record, dict) else None
 
 
 def _install_tier_label_provider() -> None:
@@ -523,6 +552,35 @@ def _ip_hostname_aliases(
         for ip, names in (inventory or {}).items()
         if str(ip).strip().lower() in wanted
     }
+
+
+def _annotate_edr_visibility(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp each product with whether its EDR component is visible to the check.
+
+    The inventory writer stamps this on new records; a posture file written
+    before it carries no flag, and one written by the old catalog carries the
+    merged "Windows Defender" name that may have matched the EDR sensor. Both
+    are resolved here, where the catalog is importable, so the dependency-light
+    block never reads an antivirus suite as antivirus-only when it cannot
+    tell. An explicit flag already on the record is kept.
+    """
+    try:
+        from adscan_internal.services.host_intelligence.product_catalog import (
+            product_edr_module_indistinguishable,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unflagged record still renders
+        print_info_debug(f"edr visibility not annotated: {exc}")
+        return hosts
+    for host in hosts:
+        products = host.get("products")
+        if not isinstance(products, list):
+            continue
+        for product in products:
+            if isinstance(product, dict) and "edr_module_indistinguishable" not in product:
+                product["edr_module_indistinguishable"] = (
+                    product_edr_module_indistinguishable(str(product.get("name") or ""))
+                )
+    return hosts
 
 
 def _read_posture_hosts(workspace_dir: str, domain: str) -> list[dict[str, Any]]:

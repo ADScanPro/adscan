@@ -140,13 +140,17 @@ def run_capture_ntlm_share_drop(shell: Any, args: str) -> None:
         )
         return
 
-    listener_ip = str(getattr(shell, "myip", "") or "").strip()
-    if not listener_ip:
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_untargeted_listener_ip,
+    )
+
+    listener_selection = resolve_untargeted_listener_ip(shell)
+    if not listener_selection.resolved:
         print_error(
-            "This capability requires a listener IP. Ensure 'myip' is set (the address the "
-            "target will route NTLM back to)."
+            listener_selection.failure_message(subject="whoever opens the bait file")
         )
         return
+    listener_ip = str(listener_selection.ip)
 
     target_host = _resolve_target_host(shell, domain, parsed["host"])
     if not target_host:
@@ -208,6 +212,7 @@ def run_capture_ntlm_share_drop(shell: Any, args: str) -> None:
             target_share=share,
             target_host=target_host,
             listener_ip=listener_ip,
+            listener_bind_ip=listener_selection.bind_ip,
             file_type=file_type,
             filename=filename,
             directory_path=parsed["directory_path"],

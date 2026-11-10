@@ -24,6 +24,10 @@ questions:
   stamp taken once the host agreed with the DC is in the frame the DC's own
   Security log is written in, which is the frame a log search has to be in. A
   stamp with no record behind it is :data:`FRAME_UNVERIFIED`, never assumed.
+  Agreement is a BOUNDARY only on a run that physically stepped the clock: when
+  nothing moved it, one clock produced every instant in the run and the recorded
+  agreement is just the moment it was measured. See
+  :func:`resolve_frame_from_record`.
 * **Whether the stamp may be compared with the document's generation time.**
   Only when both are in the same clock. A DC-frame instant that post-dates a
   host-frame generation stamp is not a timestamp from the future, it is two
@@ -44,16 +48,24 @@ from typing import Any, Mapping
 __all__ = [
     "CLOCK_SYNC_KEY",
     "CLOCK_SYNC_SCHEMA_VERSION",
+    "FRAME_LABELS",
+    "FRAME_SUMMARY_LABELS",
     "FRAME_TARGET_AGREED",
+    "FRAME_MIXED",
     "FRAME_UNVERIFIED",
     "StampFrame",
     "build_clock_sync_record",
     "clock_offset_phrase",
+    "combine_window_frame",
     "format_instant_for_client",
+    "frame_label",
     "merge_clock_sync_record",
     "parse_iso8601",
+    "resolve_frame_from_record",
     "resolve_stamp_frame",
     "stamp_post_dates",
+    "summarize_stamp_frame",
+    "summary_frame_label",
 ]
 
 #: Key the sync guard writes its per-domain record under, inside
@@ -69,6 +81,69 @@ FRAME_TARGET_AGREED = "target_agreed"
 
 #: No record places this stamp in any clock. Nothing is claimed about it.
 FRAME_UNVERIFIED = "unverified"
+
+#: A run-level stamp that agrees with some assessed domains' controllers and not
+#: others (see :func:`summarize_stamp_frame`), or a WINDOW whose two boundaries
+#: disagree (see :func:`combine_window_frame`). Never a single instant: a stamp
+#: came from exactly one clock.
+FRAME_MIXED = "mixed"
+
+#: Client-facing name for each clock a SINGLE instant can have come from. The
+#: unverified label names the clock AND says the agreement is unconfirmed, so a
+#: reader never has to guess which log to search by.
+#:
+#: Lives here rather than beside any one renderer because every surface that
+#: prints an instant needs it: the engagement timeline, the containment
+#: instruction, the per-host endpoint-defense export. A second copy is how two
+#: renders of one instant end up naming different clocks.
+FRAME_LABELS: dict[str, str] = {
+    FRAME_TARGET_AGREED: "target domain controller clock",
+    FRAME_UNVERIFIED: "assessment host clock, agreement with the target unconfirmed",
+}
+
+#: Client-facing name for the frame of a SPAN: a window, or one run across
+#: several domains. Adds :data:`FRAME_MIXED`, which a single instant can never
+#: be, so a renderer cannot label one stamp with a frame no stamp can have.
+FRAME_SUMMARY_LABELS: dict[str, str] = {
+    **FRAME_LABELS,
+    FRAME_MIXED: "two clocks, so treat the day rather than the second as the boundary",
+}
+
+
+def frame_label(frame: Any) -> str:
+    """Client-facing name for the clock one instant came from, or ``""``.
+
+    ``""`` for anything that is not a frame a single instant can have, including
+    :data:`FRAME_MIXED`: an unnamed clock prints nothing rather than a guess.
+    """
+    return FRAME_LABELS.get(str(frame or ""), "")
+
+
+def summary_frame_label(frame: Any) -> str:
+    """Client-facing name for the frame of a window or a whole run, or ``""``."""
+    return FRAME_SUMMARY_LABELS.get(str(frame or ""), "")
+
+
+def combine_window_frame(first: Any, second: Any) -> str:
+    """Return the frame of a span whose two boundaries carry their own frames.
+
+    A span is in one clock only when both of its boundaries are, so two frames
+    that disagree make it :data:`FRAME_MIXED` rather than silently inheriting
+    either one. A boundary with no frame contributes nothing: one placed
+    boundary describes the span, and neither placed leaves it
+    :data:`FRAME_UNVERIFIED`.
+
+    This is what a tabular surface needs. A column and a ``min()`` have nowhere
+    to put a caveat, so the frame has to be a value they can carry.
+    """
+    frames = [
+        str(value or "")
+        for value in (first, second)
+        if str(value or "") in FRAME_LABELS
+    ]
+    if not frames:
+        return FRAME_UNVERIFIED
+    return frames[0] if len(set(frames)) == 1 else FRAME_MIXED
 
 
 def parse_iso8601(value: Any) -> datetime | None:
@@ -166,13 +241,19 @@ def merge_clock_sync_record(
     merged = dict(fresh)
     if not isinstance(existing, Mapping):
         return merged
+    # ``stepped`` answers "did the wall clock move during this run", which is a
+    # fact about the RUN and not about any one agreement, so it is sticky in
+    # either direction. Keeping only the first agreement's value loses a later
+    # step, and both the frame boundary below and the run-level guard in
+    # :func:`summarize_stamp_frame` rest on this field: a lost step would place
+    # a stamp in a clock it never came from.
+    if existing.get("stepped") or fresh.get("stepped"):
+        merged["stepped"] = True
     first = str(existing.get("agreed_since") or "").strip()
     if first:
         merged["agreed_since"] = first
-        # The offset and the step belong to the agreement that is still being
-        # described, which is the first one.
-        if "stepped" in existing:
-            merged["stepped"] = bool(existing.get("stepped"))
+        # The offset belongs to the agreement that is still being described,
+        # which is the first one.
         if existing.get("offset_seconds") is not None:
             merged["offset_seconds"] = existing.get("offset_seconds")
     return merged
@@ -186,25 +267,65 @@ def resolve_stamp_frame(domain_store: Any, observed_at: Any) -> StampFrame:
         observed_at: The persisted stamp to place.
 
     Returns:
-        :data:`FRAME_TARGET_AGREED` only when the record proves the host clock
-        already agreed with that domain's controller when the stamp was taken.
-        Anything else, including a missing record and an unparseable stamp, is
-        :data:`FRAME_UNVERIFIED`.
+        See :func:`resolve_frame_from_record`. A store carrying no record places
+        nothing: :data:`FRAME_UNVERIFIED`, never assumed.
     """
-    stamp = parse_iso8601(observed_at)
-    if stamp is None or not isinstance(domain_store, Mapping):
+    if not isinstance(domain_store, Mapping):
         return StampFrame()
-    record = domain_store.get(CLOCK_SYNC_KEY)
+    return resolve_frame_from_record(domain_store.get(CLOCK_SYNC_KEY), observed_at)
+
+
+def resolve_frame_from_record(record: Any, observed_at: Any) -> StampFrame:
+    """Return which clock ``observed_at`` came from, for one sync record.
+
+    The store-free half of :func:`resolve_stamp_frame`, so a caller holding the
+    record alone (a report block baked in an earlier process, which has no
+    ``domains_data`` in reach) resolves the frame through the same rule instead
+    of its own.
+
+    ``agreed_since`` records when agreement was CONFIRMED, and whether it is
+    also a FRAME BOUNDARY depends entirely on ``stepped``:
+
+    * ``stepped`` is True: the wall clock was physically moved to reach that
+      agreement, so an instant taken before it genuinely came from a different
+      clock and no record places it.
+    * ``stepped`` is False: nothing moved the clock and host NTP is held off for
+      the rest of the run, so ONE clock produced every instant in it. A pre-sync
+      stamp sits in the same frame as a post-sync one, and ``agreed_since`` is
+      only the moment the agreement was measured.
+
+    Reading the boundary without consulting ``stepped`` marked a stamp
+    unverified on every run against a healthy domain, because the change
+    ledger's ``scan_started_at`` is written before the first DC contact and is
+    therefore structurally earlier than the first sync.
+
+    Returns:
+        :data:`FRAME_TARGET_AGREED` when the record places the stamp in that
+        domain's controller's clock. Anything else, including a missing record,
+        a record with no agreement instant and an unparseable stamp, is
+        :data:`FRAME_UNVERIFIED`. ``stepped`` and ``offset_seconds`` describe
+        the RUN and are carried either way, because an unplaced stamp on a run
+        that moved the clock is a different thing from one on a run that did
+        not, and a caller deciding what to print needs to tell them apart.
+    """
     if not isinstance(record, Mapping):
         return StampFrame()
-    agreed_since = parse_iso8601(record.get("agreed_since"))
-    if agreed_since is None or stamp < agreed_since:
-        return StampFrame()
     offset = record.get("offset_seconds")
-    return StampFrame(
-        frame=FRAME_TARGET_AGREED,
+    run = StampFrame(
+        frame=FRAME_UNVERIFIED,
         stepped=bool(record.get("stepped")),
         offset_seconds=float(offset) if isinstance(offset, (int, float)) else None,
+    )
+    stamp = parse_iso8601(observed_at)
+    agreed_since = parse_iso8601(record.get("agreed_since"))
+    if stamp is None or agreed_since is None:
+        return run
+    if run.stepped and stamp < agreed_since:
+        return run
+    return StampFrame(
+        frame=FRAME_TARGET_AGREED,
+        stepped=run.stepped,
+        offset_seconds=run.offset_seconds,
     )
 
 
@@ -259,3 +380,34 @@ def clock_offset_phrase(offset_seconds: float | None) -> str:
     if hours:
         return f"{hours} {'hour' if hours == 1 else 'hours'}"
     return f"{minutes} {'minute' if minutes == 1 else 'minutes'}"
+
+
+def summarize_stamp_frame(
+    domain_stores: Any, observed_at: Any, *, clock_released: bool
+) -> dict[str, Any]:
+    """Place one RUN-level stamp (a run summary, a manifest) across every domain.
+
+    A run-level document names no domain, so it states one frame for all of
+    them: :data:`FRAME_TARGET_AGREED` when the stamp agrees with every assessed
+    domain's controller, :data:`FRAME_MIXED` when with some, otherwise
+    :data:`FRAME_UNVERIFIED`.
+
+    ``clock_released`` says the run has already handed the host clock back (NTP
+    restored at exit). A stamp taken then, on a run that STEPPED the clock, may
+    read either clock, so it is :data:`FRAME_UNVERIFIED` whatever the records say;
+    a run that agreed without stepping kept one clock throughout.
+
+    Returns:
+        ``{"frame": <frame>, "stepped": <any domain's agreement needed a step>}``.
+    """
+    stores = [store for store in (domain_stores or ()) if isinstance(store, Mapping)]
+    frames = [resolve_stamp_frame(store, observed_at) for store in stores]
+    stepped = any(frame.stepped for frame in frames)
+    agreed = [frame.agrees_with_target for frame in frames]
+    if not frames or (clock_released and stepped) or not any(agreed):
+        frame_name = FRAME_UNVERIFIED
+    elif all(agreed):
+        frame_name = FRAME_TARGET_AGREED
+    else:
+        frame_name = FRAME_MIXED
+    return {"frame": frame_name, "stepped": stepped}

@@ -61,13 +61,13 @@ workspace's persisted ``variables.json`` ``type``.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 
 from adscan_core.interaction import env_truthy
 from adscan_core.lab_context import normalize_workspace_type
+from adscan_core.reporting.client_secret_redaction import mask_secret_to_shape
 from adscan_internal.services.compliance_scope import (
     AUDIT_ENGAGEMENT,
     CTF_ENGAGEMENT,
@@ -105,8 +105,6 @@ CREDENTIAL_STORE_RELPATH = "variables.json"
 #: left as a ``<domain>`` token: an unfilled placeholder in a document is the
 #: defect this module exists to stop, in miniature.
 CREDENTIAL_STORE_KEYS_TEMPLATE = "domains_data.{domain}.credentials"
-
-_HEX_ONLY = re.compile(r"^[0-9a-fA-F]+$")
 
 _KRBTGT = "krbtgt"
 
@@ -191,22 +189,8 @@ def resolve_writeup_engagement_type(
 # ── Masking ──────────────────────────────────────────────────────────────────
 
 
-def mask_secret_to_shape(value: Any) -> str:
-    """Return the SHAPE of a secret: its length and whether it is hex.
-
-    Deliberately not a prefix (the flag masker shows four characters so an
-    author recognises their own capture; four characters of an employee
-    password is four characters of an employee password). The shape is what a
-    reader needs to read the row as evidence: a 32-hex value is a hash pulled
-    from the directory, a 12-character value is a login credential.
-    """
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    noun = "character" if len(text) == 1 else "characters"
-    if _HEX_ONLY.match(text):
-        return f"{len(text)} hex {noun}"
-    return f"{len(text)} {noun}"
+# ``mask_secret_to_shape`` is owned by ``adscan_core.reporting.client_secret_redaction``
+# (imported above) so the writeup, the report kit and the web share one shape.
 
 
 def select_exemplars(

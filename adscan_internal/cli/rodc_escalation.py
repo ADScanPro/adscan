@@ -7,6 +7,8 @@ privileged account on that RODC using ``bloodyAD``.
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1330,53 +1332,90 @@ def _load_rodc_attribute_state(
     return rodc_dn, reveal_values, never_reveal_values
 
 
-def _restore_rodc_attribute_state(
-    service: ExploitationService,
+def _rodc_restore_snapshot(
     *,
-    pdc_host: str,
-    domain: str,
-    username: str,
-    password: str,
-    target_object: str,
     reveal_values: tuple[str, ...] | None,
     never_reveal_values: tuple[str, ...] | None,
-) -> bool:
-    """Restore the RODC password-replication attributes to their original state.
+) -> dict[str, tuple[str, ...]]:
+    """The password-replication attributes to put back, and their original values.
 
     Each ``*_values`` parameter accepts ``None`` to mean "the modify path did
-    not touch this attribute, so do not write to it during cleanup".  This is
+    not touch this attribute, so do not write to it during cleanup". This is
     critical: blindly writing an empty tuple here would clear an attribute we
     never modified (e.g. when the original snapshot read failed, or when
     ``msDS-NeverRevealGroup`` was deliberately left untouched because it was
-    already empty).  An empty ``()`` is a legitimate restore target and means
-    "the original state was empty — clear the attribute".
+    already empty). An empty ``()`` is a legitimate restore target and means
+    "the original state was empty, clear the attribute".
     """
-    successes: list[bool] = []
+    snapshot: dict[str, tuple[str, ...]] = {}
     if reveal_values is not None:
-        reveal_restore = service.acl.set_object_attribute_values(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=username,
-            password=password,
-            target_object=target_object,
-            attribute_name="msDS-RevealOnDemandGroup",
-            attribute_values=reveal_values,
-            kerberos=True,
-        )
-        successes.append(bool(reveal_restore.success))
+        snapshot["msDS-RevealOnDemandGroup"] = tuple(reveal_values)
     if never_reveal_values is not None:
-        never_reveal_restore = service.acl.set_object_attribute_values(
-            pdc_host=pdc_host,
-            domain=domain,
-            username=username,
-            password=password,
-            target_object=target_object,
-            attribute_name="msDS-NeverRevealGroup",
-            attribute_values=never_reveal_values,
-            kerberos=True,
-        )
-        successes.append(bool(never_reveal_restore.success))
-    return all(successes) if successes else True
+        snapshot["msDS-NeverRevealGroup"] = tuple(never_reveal_values)
+    return snapshot
+
+
+def _revert_rodc_prp_changes(
+    shell: Any,
+    *,
+    domain: str,
+    target_object: str,
+    change_id: str | None,
+    reveal_values: tuple[str, ...] | None,
+    never_reveal_values: tuple[str, ...] | None,
+    creator_username: str,
+    creator_secret: str,
+    reveal_principal: str,
+) -> bool:
+    """Put the RODC password-replication attributes back, through the shared precedence.
+
+    The client cleanup account, then a verified privileged credential, then the
+    account that made the change, each attempt recorded on the ledger entry.
+    ``reverted_confirmed`` only when a re-read shows every attribute the step
+    wrote holding its original values again; otherwise ``manual_required``
+    with the native command naming the RODC object. Returns True when confirmed
+    (or when nothing was written).
+    """
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        VERIFY_ATTRIBUTE,
+    )
+    from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+        resolve_domain_dc,
+    )
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        run_ldap_attribute_restore,
+    )
+
+    snapshot = _rodc_restore_snapshot(
+        reveal_values=reveal_values, never_reveal_values=never_reveal_values
+    )
+    if not snapshot:
+        return True
+    dc_ip, dc_fqdn = resolve_domain_dc(shell, domain)
+    if not dc_ip:
+        return False
+    ledger = ledger_or_warn(shell) if change_id else None
+    result = run_ldap_attribute_restore(
+        shell,
+        ledger=ledger,
+        change_id=change_id,
+        domain=domain,
+        purpose="rodc_prp_modified",
+        dc_ip=dc_ip,
+        dc_fqdn=dc_fqdn or None,
+        target=target_object,
+        snapshot=snapshot,
+        verification_method=VERIFY_ATTRIBUTE,
+        manual_instructions=_tax.MANUAL_RODC_PRP.replace("TARGET", target_object).replace(
+            "REVEAL_PRINCIPAL", reveal_principal
+        ),
+        object_dn=target_object,
+        creator_username=creator_username,
+        creator_secret=creator_secret,
+        creator_domain=domain,
+        description="RODC password-replication policy restore",
+    )
+    return result.confirmed
 
 
 def _format_rodc_restore_values(values: tuple[str, ...] | None) -> str:
@@ -2311,7 +2350,7 @@ def offer_rodc_escalation(
             # directory write. The confirming re-read + settle happens in the
             # finally; a session that dies before cleanup leaves a
             # manual_required record naming the RODC object (ledger.finalize).
-            _prp_ledger = getattr(shell, "environment_change_ledger", None)
+            _prp_ledger = ledger_or_warn(shell)
             if _prp_ledger is not None:
                 try:
                     _prp_change_id = _prp_ledger.register_change(
@@ -2525,69 +2564,20 @@ def offer_rodc_escalation(
             never_reveal_restore_values: tuple[str, ...] | None = (
                 original_never_reveal_values if cleared_never_reveal else None
             )
-            cleanup_completed = _restore_rodc_attribute_state(
-                service,
-                pdc_host=pdc_host,
+            # Restore through the shared revert precedence: the ledger record
+            # settles reverted_confirmed only when a re-read shows the original
+            # values back, else manual_required naming the RODC object.
+            cleanup_completed = _revert_rodc_prp_changes(
+                shell,
                 domain=domain,
-                username=policy_username,
-                password=policy_password,
-                target_object=normalized_machine,
+                target_object=rodc_dn or normalized_machine,
+                change_id=_prp_change_id,
                 reveal_values=reveal_restore_values,
                 never_reveal_values=never_reveal_restore_values,
+                creator_username=policy_username,
+                creator_secret=policy_password or "",
+                reveal_principal=target_user_dn or target_user,
             )
-
-            # Settle the ledger record for the password-replication-policy
-            # modify. ``reverted_confirmed`` is fail-closed: it requires a
-            # confirming re-read proving the principal we added is gone from
-            # msDS-RevealOnDemandGroup. Anything less is manual_required with
-            # the native remediation naming the RODC object.
-            if _prp_change_id is not None:
-                _prp_ledger = getattr(shell, "environment_change_ledger", None)
-                if _prp_ledger is not None:
-                    _reveal_gone = False
-                    if cleanup_completed:
-                        try:
-                            _rb_dn, _rb_reveal, _rb_never = _load_rodc_attribute_state(
-                                service,
-                                pdc_host=pdc_host,
-                                domain=domain,
-                                username=policy_username,
-                                password=policy_password,
-                                target_object=normalized_machine,
-                            )
-                            _added = str(target_user_dn or "").strip().casefold()
-                            _reveal_gone = bool(_added) and not any(
-                                str(v or "").strip().casefold() == _added
-                                for v in _rb_reveal
-                            )
-                        except Exception as _vexc:  # noqa: BLE001
-                            telemetry.capture_exception(_vexc)
-                            _reveal_gone = False
-                    try:
-                        if _reveal_gone:
-                            _prp_ledger.mark_reverted_confirmed(
-                                _prp_change_id,
-                                verification_method="rodc_prp_reveal_reread",
-                                min_credential_principal=policy_username,
-                            )
-                        else:
-                            _prp_ledger.mark_manual_required(
-                                _prp_change_id,
-                                reason=_tax.MANUAL_REASON_REVERT_FAILED,
-                                remediation_command=_tax.MANUAL_RODC_PRP.replace(
-                                    "TARGET", rodc_dn or normalized_machine
-                                ).replace(
-                                    "REVEAL_PRINCIPAL", target_user_dn or target_user
-                                ),
-                                remediation_object_dn=rodc_dn or normalized_machine,
-                                error=(
-                                    "RODC password-replication policy restore could not "
-                                    "be confirmed by re-read."
-                                ),
-                            )
-                    except Exception as _sexc:  # noqa: BLE001
-                        telemetry.capture_exception(_sexc)
-                        print_exception(exception=_sexc)
             marked_rodc = mark_sensitive(normalized_machine, "user")
             marked_domain = mark_sensitive(domain, "domain")
             if cleanup_completed:

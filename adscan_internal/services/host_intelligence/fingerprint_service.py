@@ -47,11 +47,58 @@ from adscan_internal.services.host_intelligence.product_catalog import (
     DEFENDER_RTP_VAL,
     PRODUCT_CATALOG,
     SERVICES_BASE,
+    ProductSignature,
 )
 from adscan_internal.services.smb_transport import SMBConfig, smb_machine_with_fallback
 from adscan_core.rich_output import print_exception
 
 T = TypeVar("T")
+
+#: What the Defender real-time-protection read returned. Only ``on`` and
+#: ``off`` were observed; ``unknown`` is "could not read".
+RTP_ON = "on"
+RTP_OFF = "off"
+RTP_UNKNOWN = "unknown"
+
+
+def _rtp_summary(state: str) -> str:
+    """The debug token: ``unread`` says plainly that nothing was observed."""
+    return {RTP_ON: "on", RTP_OFF: "off"}.get(state, "unread (assumed on for technique selection)")
+
+
+def detected_product_for(
+    product: ProductSignature,
+    *,
+    inst: bool,
+    run: bool,
+    svc_start: int,
+    defender_rtp: bool,
+    defender_rtp_confirmed: bool = True,
+) -> DetectedProduct | None:
+    """The product observed on a host for one signature, or ``None``.
+
+    ``None`` when nothing matched, and also when the signature is an inbox
+    component (a service Windows registers whether or not the product was
+    deployed) that is neither running nor set to start automatically: its
+    presence is a fact about Windows, not about the client's deployment, and
+    reporting it would put an idle product on every host. Pure, so the rule is
+    unit-testable without a host.
+    """
+    if not (inst or run):
+        return None
+    if product.inbox_component and not (run or svc_start in (0, 1, 2)):
+        return None
+    return DetectedProduct(
+        name=product.name,
+        category=product.category,
+        installed=inst,
+        running=run,
+        svc_start=svc_start,
+        realtime_protection=defender_rtp if product.realtime_toggle else True,
+        realtime_protection_confirmed=(
+            defender_rtp_confirmed if product.realtime_toggle else True
+        ),
+    )
 
 
 class HostFingerprintService:
@@ -108,41 +155,38 @@ class HostFingerprintService:
                     config,
                     "Defender RTP",
                     self._read_defender_rtp,
-                    True,
+                    RTP_UNKNOWN,
                 )
             )
 
             lsarpc_map = await lsarpc_task
             service_map = await services_task
             running_map = await pipes_task
-            fp.defender_rtp = await rtp_task
+            fp.defender_rtp_state = await rtp_task
+            # The conservative boolean the technique selectors read: only a
+            # READ "off" turns it off. The state above is the observation.
+            fp.defender_rtp = fp.defender_rtp_state != RTP_OFF
             print_info_debug(
                 "[host_intel] probe summary: "
                 f"lsarpc_matches={len(lsarpc_map)} "
                 f"service_matches={sum(1 for found, _start in service_map.values() if found)} "
                 f"pipe_running={sum(1 for running in running_map.values() if running)} "
-                f"defender_rtp={'on-or-assumed' if fp.defender_rtp else 'off'}"
+                f"defender_rtp={_rtp_summary(fp.defender_rtp_state)}"
             )
 
             for product in PRODUCT_CATALOG:
                 reg_inst, svc_start = service_map.get(product.name, (False, -1))
                 lsa_inst = product.name in lsarpc_map
-                inst = reg_inst or lsa_inst
-                run = running_map.get(product.name, False)
-                if inst or run:
-                    rtp = (
-                        fp.defender_rtp if product.name == "Windows Defender" else True
-                    )
-                    fp.products.append(
-                        DetectedProduct(
-                            name=product.name,
-                            category=product.category,
-                            installed=inst,
-                            running=run,
-                            svc_start=svc_start,
-                            realtime_protection=rtp,
-                        )
-                    )
+                detected = detected_product_for(
+                    product,
+                    inst=reg_inst or lsa_inst,
+                    run=running_map.get(product.name, False),
+                    svc_start=svc_start,
+                    defender_rtp=fp.defender_rtp,
+                    defender_rtp_confirmed=fp.defender_rtp_state != RTP_UNKNOWN,
+                )
+                if detected is not None:
+                    fp.products.append(detected)
             if fp.detected_products:
                 print_info_debug(
                     "[host_intel] detected products: "
@@ -202,30 +246,38 @@ class HostFingerprintService:
             print_info_debug(f"[host_intel] {probe_name} probe failed: {exc}")
             return fallback
 
-    async def _read_defender_rtp(self, machine) -> bool:
-        """Return True iff Defender real-time protection is enabled.
+    async def _read_defender_rtp(self, machine) -> str:
+        """Read Defender real-time protection: ``on``, ``off`` or ``unknown``.
 
-        Reads ``DisableRealtimeMonitoring`` (DWORD). 0 / absent => RTP on,
-        1 => RTP off. Errors degrade to "enabled" so we never under-rate
-        the host.
+        Reads ``DisableRealtimeMonitoring`` (DWORD): 0 is a READ "on", 1 is a
+        READ "off". Anything else (no registry API, key or value absent, an
+        error) is ``unknown``: the state was not read. The probe used to
+        return True ("on") for all of those, so a host whose state nobody read
+        was reported as protected. A technique selector still treats unknown
+        as on (``HostFingerprint.defender_rtp``); reporting does not.
         """
         try:
             rpc, err = await machine.get_regapi()
             if err is not None or rpc is None:
-                return True
+                print_info_debug(f"[host_intel] Defender RTP unread: no registry API ({err})")
+                return RTP_UNKNOWN
             async with rpc:
                 key, err = await rpc.OpenRegPath(DEFENDER_RTP_KEY)
                 if err is not None or key is None:
-                    return True
+                    print_info_debug(f"[host_intel] Defender RTP unread: key not opened ({err})")
+                    return RTP_UNKNOWN
                 _vtype, val, err = await rpc.QueryValue(key, DEFENDER_RTP_VAL)
                 if err is not None or val is None:
-                    return True
-                return int(val) == 0
+                    print_info_debug(
+                        f"[host_intel] Defender RTP unread: value not present ({err})"
+                    )
+                    return RTP_UNKNOWN
+                return RTP_ON if int(val) == 0 else RTP_OFF
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             print_info_debug(f"[host_intel] Defender RTP read error: {exc}")
-            return True
+            return RTP_UNKNOWN
 
     async def _detect_via_lsarpc(self, machine) -> dict[str, set[str]]:
         """Detect installed services via LSARPC ``LsarLookupNames``.

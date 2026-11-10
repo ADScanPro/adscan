@@ -19,7 +19,18 @@ def resolve_domains_root(workspace_dir: str, domains_dir_name: str) -> str:
 
 
 def list_domains(workspace_dir: str, domains_dir_name: str) -> list[str]:
-    """List domain directory names under `workspace/<domains_dir_name>/`."""
+    """List the DOMAIN directory names under `workspace/<domains_dir_name>/`.
+
+    Reserved, non-domain buckets are excluded: that directory also holds
+    credential material captured off the network that is not yet attributed to
+    any domain, and a caller asking for "the workspace's domains" must never be
+    handed one of those as if it were one. See
+    :mod:`adscan_core.workspace_domain_buckets`.
+    """
+    from adscan_core.workspace_domain_buckets import (  # noqa: PLC0415
+        is_reserved_domain_bucket,
+    )
+
     domains_root = resolve_domains_root(workspace_dir, domains_dir_name)
     if not os.path.exists(domains_root):
         return []
@@ -28,6 +39,7 @@ def list_domains(workspace_dir: str, domains_dir_name: str) -> list[str]:
             entry
             for entry in os.listdir(domains_root)
             if os.path.isdir(os.path.join(domains_root, entry))
+            and not is_reserved_domain_bucket(entry)
         ]
     )
 

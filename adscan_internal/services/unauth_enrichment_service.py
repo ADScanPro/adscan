@@ -75,6 +75,10 @@ TaskStatus = Literal["skipped", "running", "done", "error", "denied"]
 
 # UF_DONT_REQUIRE_PREAUTH — AS-REP roastable accounts.
 UF_DONT_REQUIRE_PREAUTH = 0x400000
+# The same property as SAMR reports it (MS-SAMR 2.2.1.12,
+# ``USER_DONT_REQUIRE_PREAUTH``). SAMR's ``UserAccountControl`` is its own flag
+# set, not the LDAP ``userAccountControl`` value, so the two bits differ.
+SAMR_USER_DONT_REQUIRE_PREAUTH = 0x00010000
 
 
 @dataclass
@@ -160,9 +164,39 @@ class UnauthEnrichmentResults:
 
     @property
     def asreproast_eligible_users(self) -> list[str]:
-        return [
+        """Accounts with Kerberos pre-authentication disabled, from every source read.
+
+        Anonymous LDAP and a SAMR null session both return the account-control
+        flags; a DC that refuses one often answers the other. Reading only LDAP
+        printed "0" on a DC that denied the anonymous bind while SAMR had
+        returned the flag, and the authenticated collection then reported the
+        account (release gate 14.0.0).
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        for name in [
             u.samaccountname for u in self.ldap_active_users if u.asreproast_eligible
-        ]
+        ] + [
+            s.username
+            for s in self.samr_users
+            if int(getattr(s, "user_flags", 0) or 0) & SAMR_USER_DONT_REQUIRE_PREAUTH
+        ]:
+            key = str(name or "").strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                names.append(str(name).strip())
+        return names
+
+    @property
+    def asreproast_flags_read(self) -> bool:
+        """True when a source that carries the account-control flags answered.
+
+        Without one, a count of zero would read as "no account is roastable"
+        when nothing was read.
+        """
+        return self.ldap_active_users_status == "done" or (
+            self.samr_descriptions_status == "done" and bool(self.samr_users)
+        )
 
     @property
     def sensitive_descriptions(self) -> list[tuple[str, str]]:
@@ -856,7 +890,11 @@ def _render_intel_sheet(
     # thing (and miss a password stored in ``userPassword``, where the word
     # "password" never appears in the value).
     flag_lines = [
-        Text.from_markup(f"  AS-REP roastable accounts : [bold]{len(asrep)}[/bold]"),
+        Text.from_markup(
+            f"  AS-REP roastable accounts : [bold]{len(asrep)}[/bold]"
+            if asrep or results.asreproast_flags_read
+            else "  AS-REP roastable accounts : [dim]not readable without credentials[/dim]"
+        ),
         Text.from_markup(
             f"  Descriptions disclosing a credential : [bold]{len(sens)}[/bold]"
         ),

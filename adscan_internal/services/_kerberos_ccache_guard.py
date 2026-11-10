@@ -14,9 +14,9 @@ collection and its sessions to the wrong principal.
 
 This module is the durable, centralized net. It is **read-only**: it parses the
 ccache's primary principal and compares it (alias-aware) against the principal
-the caller asked for. On mismatch it WARNS loudly and emits a structured
-telemetry event so the operator can see the hijack in the recording. It never
-mints, refreshes, or repairs anything — that is ``ensure_user_ccache``'s job,
+the caller asked for. On mismatch it WARNS loudly, emits a structured
+telemetry event so the operator can see the hijack in the recording, and then
+refuses the bind. It never mints, refreshes, or repairs anything — that is ``ensure_user_ccache``'s job,
 and importing it here would invert the layering (transport -> service).
 
 Call contract (enforced by the call sites, not by this module):
@@ -35,8 +35,9 @@ Call contract (enforced by the call sites, not by this module):
 
 from __future__ import annotations
 
+import functools
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from adscan_internal import print_warning, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
@@ -50,25 +51,26 @@ from adscan_core.rich_output import print_exception
 # Escalation toggle
 # ---------------------------------------------------------------------------
 #
-# This release is CONSERVATIVE: a principal mismatch WARNS + records telemetry,
-# but the bind proceeds. We do not hard-refuse yet because a false positive
-# (an alias we failed to normalize, a legitimate cross-realm UPN form) would
-# block a real operation, and the re-ordered URL builders + the per-caller
-# ``ensure_user_ccache`` migrations already remove the hijack at the source.
+# A confirmed mismatch REFUSES the bind (raises). Binding through the ambient
+# cache as a principal other than the one the caller named is the
+# wrong-principal defect this guard exists for: it acts with somebody else's
+# rights and attributes the result to the wrong account. Every authenticating
+# transport config now carries its own principal's material
+# (``credential_routing.require_credential_material``), so this ambient branch
+# is reached only by a config that explicitly passed an empty password with
+# Kerberos; refusing there is the correct outcome, never a regression.
 #
-# TODO: escalate to refuse once validated — flip this to ``True`` (or wire it
-# to an env var / config) in a future release. When ``True``,
-# ``assert_ccache_principal_matches`` raises ``CcachePrincipalMismatchError``
-# on a confirmed mismatch so the caller falls back to NTLM / surfaces a blocked
-# reason instead of binding as the wrong principal.
-_REFUSE_ON_MISMATCH = False
+# An unreadable cache still degrades to a no-op (the transport surfaces the real
+# error), and an explicitly passed ``ccache_path`` never reaches this guard, so
+# ESC13 capability-bearing TGTs and S4U/RBCD/silver tickets are unaffected.
+_REFUSE_ON_MISMATCH = True
 
 
 class CcachePrincipalMismatchError(RuntimeError):
     """Raised when the ambient ccache principal does not match the expected one.
 
-    Only raised when ``_REFUSE_ON_MISMATCH`` is enabled. In the default
-    (conservative) configuration the guard warns and returns without raising.
+    Raised on a confirmed mismatch while ``_REFUSE_ON_MISMATCH`` is enabled
+    (the default).
     """
 
 
@@ -179,12 +181,11 @@ def assert_ccache_principal_matches(
 
     Returns:
         ``True`` when the principal matches (or could not be determined — we do
-        not block on an unreadable cache). ``False`` on a confirmed mismatch in
-        the conservative (warn-only) configuration.
+        not block on an unreadable cache). ``False`` on a confirmed mismatch
+        only when ``_REFUSE_ON_MISMATCH`` has been switched off.
 
     Raises:
-        CcachePrincipalMismatchError: On a confirmed mismatch ONLY when
-            ``_REFUSE_ON_MISMATCH`` is enabled (off by default this release).
+        CcachePrincipalMismatchError: On a confirmed mismatch (the default).
     """
     expected_user_norm = _normalize_principal_name(expected_username)
     if not expected_user_norm:
@@ -250,7 +251,53 @@ def assert_ccache_principal_matches(
     return False
 
 
+@functools.lru_cache(maxsize=64)
+def _cached_principal(path: str, mtime_ns: int, size: int) -> Optional[tuple[str, str]]:
+    del mtime_ns, size  # cache key only: a rewritten cache is re-read
+    return read_ccache_primary_principal(path)
+
+
+def ambient_ccache_holds_principal(expected_username: str) -> bool:
+    """True when ``$KRB5CCNAME`` holds a TGT for ``expected_username``.
+
+    The one case in which the ambient cache may stand in for a config's own
+    material: it is THIS principal's ticket (``ensure_user_ccache`` points the
+    environment at the per-user cache it minted). Alias-aware, read-only,
+    memoized per cache file version; ``False`` when unset or unreadable.
+    """
+    expected = _normalize_principal_name(expected_username)
+    path = str(os.environ.get("KRB5CCNAME") or "").strip()
+    if path.startswith("FILE:"):
+        path = path[5:]
+    if not expected or not path:
+        return False
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return False
+    principal = _cached_principal(path, stat.st_mtime_ns, stat.st_size)
+    if principal is None:
+        return False
+    return _normalize_principal_name(principal[0]) == expected
+
+
+def ambient_ccache_check(use_kerberos: bool, username: Optional[str]) -> Any:
+    """The ambient-ccache check a Kerberos transport config may stand on.
+
+    Returns ``None`` for a non-Kerberos config (the ambient cache is never its
+    material), else a zero-argument callable for
+    ``credential_routing.require_credential_material``: the transports' last
+    slot binds through ``$KRB5CCNAME``, which is the named principal's own
+    material only when the cache holds THAT principal's ticket.
+    """
+    if not use_kerberos:
+        return None
+    return lambda: ambient_ccache_holds_principal(str(username or ""))
+
+
 __all__ = [
+    "ambient_ccache_check",
+    "ambient_ccache_holds_principal",
     "CcachePrincipalMismatchError",
     "assert_ccache_principal_matches",
     "read_ccache_primary_principal",

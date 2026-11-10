@@ -29,6 +29,11 @@ absence / unreachable read / opt-out / no credential, and a clock-skew
 ``KDC_ERR_CLIENT_NOT_TRUSTED`` from the canary, all stay confirmation-pending —
 never removed, never a flat critical.
 
+The canary's enrollment is its own scan-policy check
+(``module:adcs_esc9_confirmation``: off in Audit and Production-sensitive) and
+passes :func:`authorize_detection_change` before any certificate is requested.
+The registry read in step 1 changes nothing and always runs.
+
 Opt-out: ``ADSCAN_NO_ESC9_CONFIRM=1`` skips the active probe entirely; the edges
 then fall to confirmation-pending (honest data gap), never a flat critical, never
 silently dropped.
@@ -60,6 +65,11 @@ from adscan_internal.services.adcs.esc9_confirmation import (
 from adscan_internal.services.adcs.scbe_observation import (
     observe_domain_scbe,
     resolve_reading_credential,
+)
+from adscan_internal.services.detection_change_gate import (
+    ESC9_CONFIRMATION_CHECK_ID,
+    DetectionChangeAuthorization,
+    authorize_detection_change,
 )
 
 _ESC9_RELATIONS = ("ADCSESC9", "ADCSESC10")
@@ -193,13 +203,33 @@ def _run_behavioral_canary(
     the edges confirmation-pending). Best-effort: any failure returns ``None``.
     """
     try:
-        username, secret = resolve_reading_credential(shell, domain, credential)
+        username, secret = resolve_reading_credential(
+            shell, domain, credential, auth_domain=auth_domain
+        )
         if not username or not secret:
             return None  # no enrolling credential: stay pending (data gap)
 
         template_cns = _collect_esc9_template_cns(graph)
         if not template_cns:
             return None  # template name unresolved: stay pending
+
+        # The canary enrolls a certificate on the client's CA: its own policy
+        # check, decided apart from the detection. Declined, the edges stay
+        # confirmation-pending at the confidence the registry read gave them.
+        authorization = authorize_detection_change(
+            shell,
+            ESC9_CONFIRMATION_CHECK_ID,
+            domain=domain,
+            prompt=(
+                "Confirm ESC9 / ESC10 on "
+                f"{mark_sensitive(domain, 'domain')} by enrolling one certificate as "
+                "the scan account and signing in with it? ADscan revokes it "
+                "afterwards when it holds an account allowed to, and otherwise the "
+                "report lists it for revocation."
+            ),
+        )
+        if authorization is None:
+            return None  # not allowed or declined: stay pending
 
         # Clock-sync guard BEFORE the PKINIT canary. PKINIT validates the signed
         # authenticator against the DC's REAL time, so a drifted host clock would
@@ -211,6 +241,7 @@ def _run_behavioral_canary(
         for template_cn in template_cns:
             verdict = _confirm_one_canary(
                 shell,
+                authorization,
                 domain=domain,
                 template_cn=template_cn,
                 username=username,
@@ -269,6 +300,7 @@ def _collect_esc9_template_cns(graph: dict[str, Any]) -> list[str]:
 
 def _confirm_one_canary(
     shell: Any,
+    authorization: DetectionChangeAuthorization,
     *,
     domain: str,
     template_cn: str,
@@ -282,8 +314,10 @@ def _confirm_one_canary(
 
     Returns a behavioral :class:`ScbeVerdict` for a definite outcome, or ``None`` for
     an indeterminate one (CA unreachable, request denied/pending, or a non-66 PKINIT
-    failure). Never raises.
+    failure). Never raises. ``authorization`` is the gate's approval of the
+    enrollment (:func:`authorize_detection_change`); only the gate builds one.
     """
+    del authorization  # held as the capability; the enrollment needs no field of it
     from adscan_internal.services.adcs.esc_enrollment import confirm_esc9_vulnerable
     from adscan_internal.services.adcs.esc_types import (
         EscConfig,

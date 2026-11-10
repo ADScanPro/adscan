@@ -23,6 +23,8 @@ re-asserting the lockout against every remaining host across both steps.
 """
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from typing import TYPE_CHECKING, Any, Callable
 
 from adscan_core import telemetry
@@ -171,8 +173,7 @@ def _select_shares_for_hunt(
     if _non_interactive is None:
         from adscan_internal.interaction import is_non_interactive as _non_interactive  # noqa: PLC0415
     if _non_interactive(shell):
-        is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-        if is_ctf:
+        if policy_settings.reaches_wide(shell):
             return rows
         # Audit CI: bound to the top-N highest-risk readable shares (rows are
         # already risk-ranked). Not a silent cap; log what was bounded.
@@ -190,10 +191,9 @@ def _select_shares_for_hunt(
     options = [_hunt_option_label(r) for r in rows]
     # Audit pre-selects only the top-N highest-risk shares as the default (rows
     # are already risk-ranked) while still listing every share so the operator
-    # can widen the selection. CTF pre-selects all. The cap is a function of the
-    # engagement type, not of CI mode.
-    is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-    if not is_ctf and len(options) > _AUDIT_HUNT_SHARE_LIMIT:
+    # can widen the selection. A wide default reach pre-selects all. The cap is a
+    # function of the scan policy's default reach, not of CI mode.
+    if not policy_settings.reaches_wide(shell) and len(options) > _AUDIT_HUNT_SHARE_LIMIT:
         default_values = options[:_AUDIT_HUNT_SHARE_LIMIT]
         print_info(
             f"Audit: pre-selected the top {_AUDIT_HUNT_SHARE_LIMIT} of "
@@ -318,8 +318,15 @@ def _run_writable_capture_substep(
             f"{guard.abort_reason or 'the credential was locked out / rejected earlier in this sweep.'}"
         )
         return
-    username = str(username or domain_data.get("username") or "").strip()
-    credential = str(credential or domain_data.get("password") or "").strip()
+    # Username and secret from the SAME principal (pairing SSOT): an explicit
+    # username never borrows the domain's active password.
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    username, credential = resolve_principal_secret_pair(
+        {domain: domain_data}, domain=domain, username=username, secret=credential
+    )
     if not username or not credential:
         print_info_verbose("No domain credentials — skipping Step 1/2 (writable-share capture).")
         return
@@ -414,8 +421,11 @@ def _run_writable_capture_substep(
             writeshare_bait_enabled,
         )
 
-        is_ctf = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
-        if not is_ctf:
+        bait_automatic = (
+            policy_settings.policy_setting(shell, policy_settings.WRITESHARE_BAIT)
+            == policy_settings.WRITESHARE_BAIT_AUTOMATIC
+        )
+        if not bait_automatic:
             # Respect a pre-tripped lockout guard: if the SAME credential was
             # already locked out / rejected earlier in this sweep, do not keep
             # planting bait (each plant authenticates) host after host.
@@ -437,12 +447,30 @@ def _run_writable_capture_substep(
             # A ``direct`` vantage yields exactly that (kernel-chosen src toward
             # the host).
             vantage = resolve_egress_for_target(shell, connect_host)
-            listener_ip = str(getattr(shell, "myip", "") or "")
+            listener_ip = ""
             listener_bind_ip: str | None = None
             pivot_plan = None
 
-            if vantage.is_direct:
-                listener_ip = vantage.callback_ip
+            if vantage.vantage != "pivot":
+                # Direct or undetermined vantage: the SSOT ladder chooses the
+                # advertised address (a declared ``myip`` wins) and says which
+                # local address can be bound for it, so a declared tunnel
+                # address on no local NIC no longer breaks the :445 bind.
+                from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+                    resolve_listener_ip,
+                )
+
+                selection = resolve_listener_ip(shell, target=connect_host)
+                if not selection.resolved:
+                    print_warning(
+                        "Write-share bait skipped: "
+                        + selection.failure_message(
+                            subject="whoever opens the bait file"
+                        )
+                    )
+                    continue
+                listener_ip = str(selection.ip)
+                listener_bind_ip = selection.bind_ip
             elif vantage.vantage == "pivot":
                 # A pivot (Ligolo TUN) vantage cannot bind the remote redirector
                 # locally — it needs the agent-listener reverse channel. Plan it
@@ -469,6 +497,12 @@ def _run_writable_capture_substep(
                         f"(reason={pivot_plan.skip_reason or 'unknown'})."
                     )
                     continue
+                if not pivot_plan.callback_ip:
+                    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+                        resolve_untargeted_listener_ip,
+                    )
+
+                    listener_ip = str(resolve_untargeted_listener_ip(shell).ip or "")
                 listener_ip = pivot_plan.callback_ip or listener_ip
                 listener_bind_ip = pivot_plan.bind_ip
 
@@ -580,7 +614,9 @@ def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
     from adscan_internal.services.scan_phases import phase_is_enabled  # noqa: PLC0415
 
     if not phase_is_enabled(shell, "share_credential_hunt"):
-        print_info("SMB Share Exposure skipped (disabled in scan configuration).")
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip  # noqa: PLC0415
+
+        announce_phase_skip(shell, "share_credential_hunt", label="SMB Share Exposure")
         return
     if getattr(shell, "_is_ctf_domain_pwned", lambda _d: False)(domain):
         return

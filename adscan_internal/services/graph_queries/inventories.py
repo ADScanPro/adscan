@@ -2,6 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from adscan_core.kerberos_roasting import (
+    AccountSignals,
+    is_asrep_roastable,
+    is_kerberoastable,
+)
+from adscan_core.kerberos_roasting import (
+    MANAGED_SERVICE_ACCOUNT_OBJECT_CLASSES as _MSA_OBJECT_CLASSES,
+)
+from adscan_core.kerberos_roasting import (
+    is_managed_service_account as _is_managed_service_account,
+)
 from adscan_internal.services.graph_queries.filters import (
     STALE_DAYS_DEFAULT,
     domain_matches,
@@ -25,43 +36,23 @@ def _nodes_props(graph: dict[str, Any], kind: str, domain: str) -> list[dict[str
 def is_managed_service_account(props: dict[str, Any]) -> bool:
     """Return True when a node is a (group) managed service account.
 
-    The single source of truth for "is this principal a gMSA/sMSA", consumed by
-    the enabled inventories here and by the account-population resolver behind
-    the account KPIs (``services/account_population.py``).
+    The graph-shaped adapter over the cross-tier predicate
+    ``adscan_core.kerberos_roasting.is_managed_service_account``, which is where
+    "is this principal a gMSA/sMSA" is decided for the engine, the deliverable
+    and the web product alike. This wrapper exists so the inventory callers here
+    and the account-population resolver behind the account KPIs
+    (``services/account_population.py``) keep passing flat graph properties.
 
-    Detects gMSAs/sMSAs across the two shapes the data can take:
-
-    * Native graph nodes — the LDAP collector sets ``is_gmsa=True`` /
-      ``account_type="gmsa"`` and a ``distinguishedname`` under
-      ``CN=Managed Service Accounts``.  ``objectClass`` is NOT carried into the
-      graph properties, so the ``is_gmsa`` / DN signals are what fire here.
-    * Raw LDAP-shaped props — an ``objectClass`` list still carrying
-      ``msDS-GroupManagedServiceAccount`` / ``msDS-ManagedServiceAccount``.
-
-    Four signals rather than one because no single field is present in every
-    artifact: a graph written before ``account_type`` existed still carries the
-    DN, and raw LDAP props carry only ``objectClass``.  The trailing ``$`` on
-    the sAMAccountName is deliberately NOT one of them — every MSA has it, but
-    so does every inter-domain trust account, which is a different class handled
-    by :func:`_is_machine_or_trust_user`.
+    The core predicate reads four signals rather than one because no single
+    field is present in every artifact: a native graph node carries ``is_gmsa``
+    / ``account_type``, a graph written before those existed carries only the
+    ``CN=Managed Service Accounts`` distinguished name, and raw LDAP-shaped
+    props carry only ``objectClass``. The trailing ``$`` on the sAMAccountName
+    is deliberately not among them — every MSA has it, but so does every
+    inter-domain trust account, which is a different class handled by
+    :func:`_is_machine_or_trust_user`.
     """
-    if bool(props.get("is_gmsa")):
-        return True
-    if str(props.get("account_type") or "").strip().casefold() in {"gmsa", "smsa"}:
-        return True
-
-    distinguished_name = str(props.get("distinguishedname") or "").casefold()
-    if "cn=managed service accounts," in distinguished_name:
-        return True
-
-    object_classes = props.get("objectclasses") or props.get("objectClass") or []
-    if isinstance(object_classes, str):
-        object_classes = [object_classes]
-    return any(
-        str(value).casefold()
-        in {"msds-managedserviceaccount", "msds-groupmanagedserviceaccount"}
-        for value in object_classes
-    )
+    return _is_managed_service_account(AccountSignals.from_properties(props))
 
 
 def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
@@ -76,8 +67,11 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
     ``get_enabled_users``' ``kind="User"`` filter), so among User nodes a
     ``$``-suffixed principal is either an inter-domain TRUST account or a group
     managed service account (gMSA).  A gMSA IS a real service-account user
-    (a user-like, attack-relevant principal — kerberoastable, ACL-bearing), so
-    it must stay IN the user inventory.  We therefore exclude ``$``-suffixed
+    (a user-like, attack-relevant principal — ACL-bearing, and whoever may
+    retrieve its managed password holds it), so it must stay IN the user
+    inventory.  It is NOT exposed to offline ticket cracking, which is a
+    separate question answered by ``adscan_core.kerberos_roasting`` and not by
+    membership of this inventory.  We therefore exclude ``$``-suffixed
     principals ONLY when they are not a managed service account — that carve-out
     is the distinguisher between a trust account (excluded) and a gMSA (kept),
     since the graph carries no explicit trust marker beyond the ``$`` suffix.
@@ -86,6 +80,18 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
     if not samaccountname.endswith("$"):
         return False
     return not is_managed_service_account(props)
+
+
+def is_machine_or_trust_user(props: dict[str, Any]) -> bool:
+    """Public name of :func:`_is_machine_or_trust_user` for other population counts.
+
+    Any figure that counts the domain's people (the exposure KPI's standard-user
+    denominator included) must drop inter-domain trust accounts exactly as the
+    user inventory does. A second definition counted the parent-trust account
+    ``SEVENKINGDOMS$`` as an ordinary user and printed "11 of 11" beside a
+    population of 10.
+    """
+    return _is_machine_or_trust_user(props)
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +113,9 @@ def _is_machine_or_trust_user(props: dict[str, Any]) -> bool:
 #   enabled       = ACCOUNTDISABLE (0x2) NOT set on userAccountControl.
 #   real user     = a normal user (objectCategory=person + objectClass=user)
 #                   OR a (group) managed service account — a gMSA/sMSA is a real
-#                   service-account user (kerberoastable, ACL-bearing), so it
-#                   stays IN the user inventory.  EXCLUDES only inter-domain TRUST
+#                   service-account user (ACL-bearing, and held by whoever may
+#                   retrieve its managed password), so it stays IN the user
+#                   inventory.  EXCLUDES only inter-domain TRUST
 #                   accounts (sAMAccountType=805306370).  Machine accounts are
 #                   objectClass=computer and never match the user branch.  This
 #                   mirrors _is_machine_or_trust_user, whose `$`-suffix exclusion
@@ -126,8 +133,8 @@ ENABLED_NOT_DISABLED_LDAP = "(!(userAccountControl:1.2.840.113556.1.4.803:=2))"
 # sAMAccountType for an INTERDOMAIN_TRUST_ACCOUNT (0x30000002 = 805306370).
 _SAM_ACCOUNT_TYPE_TRUST = "805306370"
 NOT_TRUST_ACCOUNT_LDAP = f"(!(sAMAccountType={_SAM_ACCOUNT_TYPE_TRUST}))"
-# gMSA/sMSA objectClass tokens, kept in lockstep with is_managed_service_account.
-_MSA_OBJECT_CLASSES = ("msDS-GroupManagedServiceAccount", "msDS-ManagedServiceAccount")
+# gMSA/sMSA objectClass tokens, read from the cross-tier SSOT
+# (adscan_core.kerberos_roasting) so no form can drift from another.
 _MSA_OBJECTCLASS_LDAP = "".join(f"(objectClass={oc})" for oc in _MSA_OBJECT_CLASSES)
 # Normal users OR managed service accounts (gMSA/sMSA).
 _USER_OR_MSA_LDAP = f"(|(&(objectCategory=person)(objectClass=user)){_MSA_OBJECTCLASS_LDAP})"
@@ -198,13 +205,41 @@ def get_high_value_users(graph: dict[str, Any], domain: str) -> list[dict[str, A
 def get_kerberoastable_users(
     graph: dict[str, Any], domain: str
 ) -> list[dict[str, Any]]:
-    return [p for p in get_enabled_users(graph, domain) if p.get("hasspn")]
+    """Return the enabled accounts whose service ticket is worth cracking.
+
+    A published service principal name is the entry condition, but it is not
+    sufficient: a managed service account publishes SPNs and holds a
+    directory-generated password, so its ticket is not crackable and listing it
+    here would be a false positive in the client's "exploitable today" view. The
+    exclusion is the cross-tier predicate, shared with the collector's edge
+    derivation and the web product, so all three agree on the same population.
+    """
+    return [
+        p
+        for p in get_enabled_users(graph, domain)
+        if is_kerberoastable(
+            AccountSignals.from_properties(p), has_spn=bool(p.get("hasspn"))
+        )
+    ]
 
 
 def get_asreproastable_users(
     graph: dict[str, Any], domain: str
 ) -> list[dict[str, Any]]:
-    return [p for p in get_enabled_users(graph, domain) if p.get("dontreqpreauth")]
+    """Return the enabled accounts whose AS-REP is worth cracking.
+
+    Same shape as :func:`get_kerberoastable_users`: pre-authentication disabled
+    is the entry condition, and an account whose password the directory
+    generates is excluded whatever that flag says.
+    """
+    return [
+        p
+        for p in get_enabled_users(graph, domain)
+        if is_asrep_roastable(
+            AccountSignals.from_properties(p),
+            preauth_required=not p.get("dontreqpreauth"),
+        )
+    ]
 
 
 def get_stale_users(

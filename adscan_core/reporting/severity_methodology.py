@@ -22,6 +22,8 @@ if either model grows or loses an input this annex does not mention.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from adscan_core.cvss.severity_mapper import severity_bands
 
 #: The inputs to the attack-step grade, in the order the engine consumes them.
@@ -111,6 +113,114 @@ FINDING_RULES: tuple[str, ...] = (
 #: ``adscan_core.cvss.disclosure`` for the opt-in.
 NO_CVSS_COLUMN_HEADING = "Why no CVSS column appears"
 
+#: One verified sentence per framework a report can map, keyed by the canonical
+#: framework key. Only the frameworks the report actually maps are cited, so a
+#: client under ISO 27001 and PCI DSS never reads a European regime that does
+#: not apply to them. PCI DSS is absent on purpose: it is the one framework that
+#: does mandate a CVSS, so it gets its own sentence in the builder below.
+_NO_CVSS_FRAMEWORK_SENTENCES: dict[str, str] = {
+    "dora": (
+        "DORA (Reg. (EU) 2022/2554, Art. 24(5)) and its ICT risk-management "
+        "technical standard (Reg. (EU) 2024/1774, Art. 10(2)(f)) require "
+        "findings to be prioritised and classified by criticality and name no "
+        "instrument for it."
+    ),
+    "nis2": (
+        "NIS2 (Dir. (EU) 2022/2555) is qualitative throughout, as is the "
+        "implementing regulation that details its risk-management measures for "
+        "the entity types that regulation covers (Reg. (EU) 2024/2690)."
+    ),
+    "ens": (
+        "The ENS (RD 311/2022) and the Instrucci\u00f3n T\u00e9cnica de "
+        "Seguridad de Auditor\u00eda that governs its audits (BOE-A-2018-4573) "
+        "name no scoring instrument either."
+    ),
+    "iso27001": (
+        "ISO/IEC 27001:2022 (Annex A, control 8.8) asks the organisation to "
+        "evaluate its exposure to technical vulnerabilities and act on it, and "
+        "prescribes no scoring method."
+    ),
+    "cis": (
+        "The CIS benchmark is a configuration baseline rather than a "
+        "vulnerability rating scheme, so it does not call for CVSS either."
+    ),
+}
+
+_NO_CVSS_PCI_SCOPE = (
+    "scopes it to external scanning by an approved vendor and routes internal "
+    "assessment to the entity's own risk ranking"
+)
+
+#: Display order of the cited frameworks (regulations first, baselines last).
+_NO_CVSS_CITE_ORDER: tuple[str, ...] = ("dora", "nis2", "ens", "iso27001", "cis")
+
+
+def _no_cvss_regime_paragraph(frameworks: Sequence[str] | None) -> str:
+    """Build the "does anyone require CVSS" paragraph for the mapped frameworks.
+
+    Args:
+        frameworks: Canonical framework keys the report maps. ``None`` or empty
+            means none were selected, and no regime is cited.
+
+    Returns:
+        One paragraph that names only the selected frameworks.
+    """
+    selected = {str(f).strip().lower() for f in (frameworks or []) if str(f).strip()}
+    cited = [k for k in _NO_CVSS_CITE_ORDER if k in selected]
+    pci = "pci_dss" in selected
+    if not cited and not pci:
+        return (
+            "No compliance framework was selected for this report, so it cites "
+            "no regime. Severity here is reported on the model above, which "
+            "does not depend on any framework."
+        )
+    parts: list[str] = []
+    if cited:
+        if pci:
+            parts.append(
+                "Of the frameworks mapped in this report, none except PCI DSS "
+                "asks for one, on the text of the instruments themselves."
+            )
+        elif len(cited) == 1:
+            parts.append(
+                "The framework mapped in this report does not ask for one, on "
+                "the text of the instrument itself."
+            )
+        else:
+            parts.append(
+                "None of the frameworks mapped in this report asks for one, on "
+                "the text of the instruments themselves."
+            )
+        parts.extend(_NO_CVSS_FRAMEWORK_SENTENCES[k] for k in cited)
+        if len(cited) > 1:
+            parts.append("The scale is left to the assessor in each case.")
+    if pci:
+        if cited:
+            parts.append(
+                f"The one standard here that does mandate a CVSS, PCI DSS, {_NO_CVSS_PCI_SCOPE}."
+            )
+        else:
+            parts.append(
+                "PCI DSS, the framework mapped in this report, does mandate a "
+                f"CVSS, but it {_NO_CVSS_PCI_SCOPE}, which is the basis this "
+                "report grades on."
+            )
+    return " ".join(parts)
+
+
+def no_cvss_column_body(frameworks: Sequence[str] | None = None) -> list[str]:
+    """Return the "why no CVSS column" paragraphs for the mapped frameworks.
+
+    Args:
+        frameworks: Canonical framework keys the report maps.
+
+    Returns:
+        The paragraphs in order, with the regime paragraph tailored.
+    """
+    first, _regimes, *rest = NO_CVSS_COLUMN_BODY
+    return [first, _no_cvss_regime_paragraph(frameworks), *rest]
+
+
 NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
     "A CVSS Base score means something because the reader can recompute it from "
     "the vector behind it. Most Active Directory exposures have no published "
@@ -118,20 +228,7 @@ NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
     "attribute any account can read, a control nobody turned on. A decimal "
     "printed without its vector cannot be verified by the reader, and an "
     "unverifiable figure is the one an auditor queries.",
-    "No regime in this report asks for one, on the text of the instruments "
-    "themselves. DORA (Reg. (EU) 2022/2554, Art. 24(5)) and its ICT "
-    "risk-management technical standard (Reg. (EU) 2024/1774, Art. 10(2)(f)) "
-    "require findings to be prioritised and classified by criticality and name "
-    "no instrument for it. NIS2 (Dir. (EU) 2022/2555) is qualitative "
-    "throughout, as is the implementing regulation that details its "
-    "risk-management measures for the entity types that regulation covers "
-    "(Reg. (EU) 2024/2690). The ENS (RD 311/2022) and the Instrucción Técnica "
-    "de Seguridad de Auditoría that governs its audits (BOE-A-2018-4573) "
-    "name "
-    "no scoring instrument either. All of them leave the scale to the "
-    "assessor. The one standard that does mandate a CVSS, PCI DSS, scopes it "
-    "to external scanning by an approved vendor and routes internal assessment "
-    "to the entity's own risk ranking.",
+    _no_cvss_regime_paragraph(("dora", "nis2", "ens", "pci_dss")),
     "17 of the 93 finding types ADscan catalogues map to a published Base "
     "vector. Printing a CVSS column would therefore fill 17 rows and leave 76 "
     "blank, so every finding here is graded by the model set out above, with "
@@ -145,8 +242,14 @@ NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
 )
 
 
-def severity_methodology_view() -> dict[str, object]:
+def severity_methodology_view(
+    frameworks: Sequence[str] | None = None,
+) -> dict[str, object]:
     """Return the annex as the render context both tiers consume.
+
+    Args:
+        frameworks: Canonical keys of the frameworks the report maps. Only
+            these are cited as regimes; ``None`` cites none.
 
     Returns:
         A mapping with the two graded models and the CVSS note, ready to loop
@@ -162,7 +265,9 @@ def severity_methodology_view() -> dict[str, object]:
                 "bands, so a number anywhere in this report can be placed "
                 "without looking it up."
             ),
-            "rows": [{"label": label, "range": span} for label, span in severity_bands()],
+            "rows": [
+                {"label": label, "range": span} for label, span in severity_bands()
+            ],
         },
         "attack_step": {
             "heading": "How an attack step is graded",
@@ -173,7 +278,9 @@ def severity_methodology_view() -> dict[str, object]:
                 "baseline figures behind them are available to your auditor "
                 "on request."
             ),
-            "inputs": [{"name": name, "body": body} for name, body in ATTACK_STEP_INPUTS],
+            "inputs": [
+                {"name": name, "body": body} for name, body in ATTACK_STEP_INPUTS
+            ],
             "rules": list(ATTACK_STEP_RULES),
         },
         "finding": {
@@ -187,7 +294,7 @@ def severity_methodology_view() -> dict[str, object]:
         },
         "no_cvss": {
             "heading": NO_CVSS_COLUMN_HEADING,
-            "body": list(NO_CVSS_COLUMN_BODY),
+            "body": no_cvss_column_body(frameworks),
         },
     }
 
@@ -199,5 +306,6 @@ __all__ = [
     "FINDING_RULES",
     "NO_CVSS_COLUMN_BODY",
     "NO_CVSS_COLUMN_HEADING",
+    "no_cvss_column_body",
     "severity_methodology_view",
 ]

@@ -26,6 +26,8 @@ MSSQL/CLR escalation session that produced the account).
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import active_ledger, ledger_or_warn
+
 from typing import Any
 
 from adscan_core.output import confirm_ask
@@ -135,7 +137,7 @@ def _resolve_pending_actions(shell: Any) -> list[dict[str, Any]]:
         for a in actions
         if str(a.get("_ledger_change_id") or "")
     }
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = active_ledger(shell)
     get_changes = getattr(ledger, "get_changes", None)
     if not callable(get_changes):
         return actions
@@ -214,106 +216,6 @@ def _resolve_minted_account_secret(
     return credentials.get(username) or credentials.get(username.lower())
 
 
-def _resolve_account_dn(
-    shell: Any, *, domain: str, username: str, secret: str
-) -> str | None:
-    """Resolve ``username``'s distinguishedName in ``domain`` via native LDAP.
-
-    Sync, best-effort — reuses the same query helper the RID-512 membership
-    check already uses for this exact account
-    (``native_group_membership.is_principal_member_of_rid_native``), so no new
-    LDAP-query mechanism is introduced. Authenticates as ``username`` itself
-    (its own stored secret), not the domain's currently-active credential.
-    """
-    from adscan_internal.services.ldap_query_service import (  # noqa: PLC0415
-        query_shell_ldap_attribute_values,
-    )
-
-    domain_data = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
-    if not isinstance(domain_data, dict):
-        return None
-
-    try:
-        from adscan_internal.services.native_group_membership import (  # noqa: PLC0415
-            escape_ldap_filter_value,
-        )
-
-        escaped = escape_ldap_filter_value(username)
-    except Exception:  # noqa: BLE001
-        escaped = username.replace("(", "").replace(")", "").replace("\\", "")
-
-    values = query_shell_ldap_attribute_values(
-        shell,
-        domain=domain,
-        ldap_filter=f"(&(objectClass=user)(sAMAccountName={escaped}))",
-        attribute="distinguishedName",
-        auth_username=username,
-        auth_password=secret,
-        pdc=str(domain_data.get("pdc") or ""),
-        prefer_kerberos=True,
-        allow_ntlm_fallback=True,
-        operation_name="deferred MSSQL admin-account revert DN lookup",
-    )
-    if not values:
-        return None
-    return str(values[0]).strip() or None
-
-
-def _delete_via_ldap(
-    shell: Any, *, domain: str, username: str, secret: str, user_dn: str
-) -> tuple[bool, str | None]:
-    """Delete ``user_dn`` over native LDAP, authenticated as the minted account.
-
-    The account genuinely holds Domain Admins by the time this runs (verified
-    at mint time — see ``_verify_admin_membership`` /
-    ``MssqlSeImpersonateSession.verification_domain``), so it has rights to
-    delete its own object. Returns ``(success, error)``.
-    """
-    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
-    from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
-        ADscanLDAPConfig,
-        async_connect_with_ldap_fallback,
-    )
-    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
-
-    domain_data = (getattr(shell, "domains_data", None) or {}).get(domain) or {}
-    dc_ip = resolve_dc_ip(domain_data)
-    if not dc_ip:
-        return False, f"no DC IP known for {domain}"
-
-    config = ADscanLDAPConfig(
-        domain=domain,
-        dc_ip=dc_ip,
-        use_ldaps=True,
-        use_kerberos=False,
-        username=username,
-        password=secret,
-    )
-
-    async def _run() -> tuple[bool, str | None]:
-        try:
-            result = await async_connect_with_ldap_fallback(config)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            return False, str(exc)
-        client = result.client
-        try:
-            ok, err = await client.delete_user(user_dn)
-            return bool(ok), (str(err) if err else None)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            return False, str(exc)
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
-
-    return run_async_sync(_run())
-
-
 def execute_deferred_mssql_admin_account_reverts(shell: Any) -> None:
     """Revert every pending MSSQL-escalation minted account. Called from ``do_exit``.
 
@@ -329,7 +231,7 @@ def execute_deferred_mssql_admin_account_reverts(shell: Any) -> None:
     if not actions:
         return
 
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
 
     for action in actions:
         domain = str(action.get("domain") or "").strip()
@@ -373,64 +275,69 @@ def execute_deferred_mssql_admin_account_reverts(shell: Any) -> None:
             continue
 
         secret = _resolve_minted_account_secret(shell, domain=domain, username=username)
-        if not secret:
-            print_warning(
-                f"Minted account credential for {marked_user}@{marked_domain} is no "
-                "longer available in the workspace — routing its revert to manual cleanup."
-            )
-            _settle_manual(
-                ledger,
-                change_id,
-                remediation_command=remediation_command,
-                remediation_object=username,
-                error="the minted account's stored credential is no longer available",
-            )
-            continue
+        is_dc_action = bool(action.get("is_dc"))
+        action_target_host = str(action.get("target_host") or "").strip()
+        scope = "domain" if is_dc_action else "local"
 
-        try:
-            user_dn = _resolve_account_dn(
-                shell, domain=domain, username=username, secret=secret
+        def _delete_and_confirm(
+            candidate: Any,
+            _domain: str = domain,
+            _username: str = username,
+            _scope: str = scope,
+            _host: str = action_target_host or str(action.get("target_hostname") or ""),
+        ) -> tuple[bool, str | None]:
+            from adscan_internal.services.native_account_cleanup import (  # noqa: PLC0415
+                delete_minted_account_as,
             )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            user_dn = None
 
-        if not user_dn:
-            print_warning(
-                f"Could not resolve DN for minted account {marked_user}@{marked_domain} "
-                "— routing its revert to manual cleanup."
+            if _scope != "domain" and not _host:
+                return False, "the host the local account lives on is not known"
+            return delete_minted_account_as(
+                getattr(shell, "domains_data", None) or {},
+                candidate,
+                domain=_domain,
+                host=_host,
+                username=_username,
+                scope=_scope,
             )
-            _settle_manual(
-                ledger,
-                change_id,
-                remediation_command=remediation_command,
-                remediation_object=username,
-                error="could not resolve the minted account's distinguishedName",
-            )
-            continue
 
-        try:
-            ok, err = _delete_via_ldap(
-                shell, domain=domain, username=username, secret=secret, user_dn=user_dn
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            ok, err = False, str(exc)
+        from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+            VERIFY_ACCOUNT_DELETED,
+        )
+        from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+            KIND_CCACHE,
+            KIND_NT_HASH,
+            KIND_PASSWORD,
+            run_revert_with_precedence,
+        )
+
+        # The shared revert precedence: the client cleanup account, a verified
+        # privileged credential, then the minted account itself (its own stored
+        # secret, never the domain's currently active credential). Every attempt
+        # is recorded and only a re-read that no longer finds the account settles
+        # ``reverted_confirmed``; otherwise the entry is ``manual_required``.
+        result = run_revert_with_precedence(
+            shell,
+            ledger=ledger if change_id else None,
+            change_id=change_id,
+            domain=domain,
+            purpose=_ACTION_KIND,
+            revert_and_confirm=_delete_and_confirm,
+            verification_method=VERIFY_ACCOUNT_DELETED,
+            manual_instructions=remediation_command,
+            object_dn=username,
+            creator_username=username,
+            creator_secret=secret or "",
+            creator_domain=domain,
+            supported_kinds=(KIND_PASSWORD, KIND_NT_HASH, KIND_CCACHE),
+            description="Minted MSSQL-escalation account deletion",
+        )
+        ok = result.confirmed
 
         if ok:
             print_success(
                 f"Reverted: minted MSSQL-escalation account {marked_user}@{marked_domain} deleted."
             )
-            if ledger is not None and change_id:
-                try:
-                    ledger.mark_reverted_confirmed(
-                        change_id, verification_method="mssql_deferred_ldap_delete"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
             # Mirror the account deletion into the runtime membership
             # snapshot — the account no longer exists, so its effective
             # membership (recorded by the mssql.py follow-up when the group
@@ -447,8 +354,6 @@ def execute_deferred_mssql_admin_account_reverts(shell: Any) -> None:
             # memberships.json; the graph model is status-transition, not
             # delete (same idiom as every other cleanup step in this
             # codebase), so annotate it as reverted rather than removing it.
-            is_dc_action = bool(action.get("is_dc"))
-            action_target_host = str(action.get("target_host") or "").strip()
             try:
                 if is_dc_action:
                     from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
@@ -490,15 +395,8 @@ def execute_deferred_mssql_admin_account_reverts(shell: Any) -> None:
                 )
         else:
             print_warning(
-                f"Deferred revert of {marked_user}@{marked_domain} failed: {err}. "
-                "Routing to manual cleanup."
-            )
-            _settle_manual(
-                ledger,
-                change_id,
-                remediation_command=remediation_command,
-                remediation_object=user_dn,
-                error=err or "LDAP delete failed",
+                f"Deferred revert of {marked_user}@{marked_domain} was not confirmed. "
+                "It is disclosed in the environment-change ledger for manual cleanup."
             )
 
 

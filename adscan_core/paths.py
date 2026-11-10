@@ -51,6 +51,25 @@ def get_locks_dir() -> Path:
     return get_run_dir() / "locks"
 
 
+def normalize_workspace_lock_name(name: str) -> str:
+    """Canonical key used for workspace lock paths."""
+    return str(name or "").strip().lower()
+
+
+def get_workspace_lock_path(workspace_name: str) -> Path:
+    """Path of the per-workspace single-instance lock (SSOT for launcher + runtime).
+
+    The file name carries the workspace name, so the lock is removed on release
+    and when the workspace is deleted: it must not outlive the engagement.
+    """
+    safe = normalize_workspace_lock_name(workspace_name)
+    if not safe:
+        raise ValueError("workspace_name must be non-empty")
+    # Restrict to a path-safe subset; the lock path is operator-visible.
+    sanitized = "".join(c if c.isalnum() or c in "-._" else "_" for c in safe)
+    return get_locks_dir() / f"workspace-{sanitized}.lock"
+
+
 def get_resolver_locks_dir() -> Path:
     """Lock directory for atomic loopback-IP claims (in-container Unbound)."""
     return get_locks_dir() / "resolvers"

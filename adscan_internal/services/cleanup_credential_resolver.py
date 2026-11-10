@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from adscan_core import telemetry
+from adscan_core.rich_output import print_exception
 from adscan_internal.principal_utils import normalize_machine_account
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
 
@@ -45,6 +47,10 @@ class CleanupCredential:
     principal_label: str = ""
     can_escalate_to_da: bool = False
     is_escalated: bool = False
+    #: The domain this credential authenticates to (empty = the change's domain).
+    domain: str = ""
+    #: ``revert_credentials.ROLE_*`` when built from the shared revert precedence.
+    role: str = ""
 
     @property
     def usable(self) -> bool:
@@ -89,23 +95,42 @@ def _lookup_domain_credential(shell: Any, domain: str, username: str) -> str:
 
 
 def resolve_da_escalation_credential(shell: Any, domain: str) -> tuple[str, str] | None:
-    """Return a conservative stored admin-looking credential for lazy escalation.
+    """Return the stored credential PROVEN to hold domain-wide admin rights.
 
-    Only used AFTER a real ACCESS_DENIED on the minimal-principal attempt. Returns
-    ``(username, secret)`` or ``None`` when no privileged-looking credential is
-    stored for the domain.
+    Only used AFTER a real ACCESS_DENIED on the minimal-principal attempt.
+    Delegates to the privilege SSOT
+    (:func:`~adscan_internal.services.credentials.privilege_role.pick_credential_for_local_admin`):
+    the account is a Domain Admin, Enterprise Admin, BUILTIN\\Administrators
+    member or the RID 500 account according to the collected graph, enabled,
+    and ranked by role then secret kind. A credential is never chosen because
+    of its NAME: "administrator" may be a renamed decoy, a disabled account,
+    or held only as a stale secret, and binding as it is how a cleanup locked
+    the domain Administrator.
+
+    Returns:
+        ``(username, secret)``, or ``None`` when no stored credential is graded
+        as a domain-wide administrator.
     """
-    creds = _domain_creds(shell, domain)
-    if not creds:
+    if not domain:
         return None
-    priority_names = ("administrator", "admin", "domain.admin", "da")
-    for wanted in priority_names:
-        for stored_user, stored_secret in creds.items():
-            if _normalize_credential_username(str(stored_user)) == wanted:
-                secret = str(stored_secret or "").strip()
-                if secret:
-                    return str(stored_user), secret
-    return None
+    try:
+        from adscan_internal.services.credentials.privilege_role import (  # noqa: PLC0415
+            pick_credential_for_local_admin,
+        )
+
+        picked = pick_credential_for_local_admin(shell, domain=domain)
+    except Exception as exc:  # noqa: BLE001 - an ungraded graph means "no escalation"
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+    if not picked:
+        return None
+    username, secret, _kind = picked
+    username = str(username or "").strip()
+    secret = str(secret or "").strip()
+    if not username or not secret:
+        return None
+    return username, secret
 
 
 def resolve_minimal_revert_credential(

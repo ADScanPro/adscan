@@ -41,6 +41,48 @@ def _path_is_proven(path: Mapping[str, Any]) -> bool:
     return str(path.get("status", "")).strip().lower() in _PROVEN_STATUSES
 
 
+def _account_key(name: str) -> str:
+    """Case-folded, realm-stripped comparison key (``user@realm`` -> ``user``).
+
+    Matches the exposure KPI's own user key, so an exclusion persisted as a
+    bare sAMAccountName also removes the UPN form of the same account.
+    """
+    key = name.strip().lower()
+    if "@" in key:
+        local = key.split("@", 1)[0]
+        if local:
+            key = local
+    return key
+
+
+def population_exclusions(domain_entries: Any) -> frozenset[str]:
+    """The accounts the exposure KPIs left OUT of their population, per domain.
+
+    Reads ``exposure_kpis.excluded_service_accounts`` (the machine-managed
+    service accounts, a gMSA among them, that the engine removes from the
+    measured population: SSOT ``services/account_population``) from each
+    domain entry of ``technical_report["domains"]`` (a mapping) or a sequence
+    of domain dicts. A caller that already resolved the population passes its
+    exclusions straight to :func:`build_user_exposure_ranking` instead.
+    """
+    entries = (
+        list(domain_entries.values())
+        if isinstance(domain_entries, Mapping)
+        else list(domain_entries or ())
+    )
+    found: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        kpis = entry.get("exposure_kpis")
+        if not isinstance(kpis, Mapping):
+            continue
+        for name in kpis.get("excluded_service_accounts") or ():
+            if isinstance(name, str) and name.strip():
+                found.add(_account_key(name))
+    return frozenset(found)
+
+
 def _clean_display_name(name: str) -> str:
     """Strip stray leading/trailing underscores from a service-account name.
 
@@ -89,7 +131,9 @@ def _build_domain_tier2_set(paths: Iterable[Mapping[str, Any]]) -> set[str] | No
 
 
 def _affected_users(
-    path: Mapping[str, Any], tier2_set: set[str] | None = None
+    path: Mapping[str, Any],
+    tier2_set: set[str] | None = None,
+    excluded: frozenset[str] = frozenset(),
 ) -> set[str]:
     """Extract the lowercased ordinary **Tier-2** affected users from ``meta``.
 
@@ -113,6 +157,8 @@ def _affected_users(
     if not isinstance(raw, (list, tuple, set)):
         return set()
     names = {e.strip().lower() for e in raw if isinstance(e, str) and e.strip()}
+    if excluded:
+        names = {n for n in names if _account_key(n) not in excluded}
     if tier2_set is not None:
         return names & tier2_set
     return names
@@ -123,10 +169,21 @@ def build_user_exposure_ranking(
     *,
     top_n: int = 15,
     name_bucket_max: int = 5,
+    excluded_users: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Rank accounts by how many distinct compromise paths can reach them.
 
+    The ranking counts the SAME population as the exposure-KPI headline: the
+    ordinary Tier-2 accounts, minus the accounts the KPI excluded from its
+    population (``excluded_users``, the machine-managed service accounts; read
+    them with :func:`population_exclusions`). Without the exclusion a gMSA
+    graded Tier 2 stayed in the ranking, which then read "Of 7 accounts a route
+    can reach" beside a headline counting 6.
+
     Args:
+        excluded_users: Accounts outside the measured population, as the KPI
+            persisted them (``exposure_kpis.excluded_service_accounts``).
+            Compared case-folded and realm-stripped. ``None`` keeps everyone.
         paths: The attack-path records. Each is a mapping that may carry
             ``meta.affected_users`` (a list of principal names) and a
             ``status`` string. Records without affected users contribute
@@ -177,9 +234,14 @@ def build_user_exposure_ranking(
     # Materialize the iterable because we pass over it twice.
     materialized = [p for p in paths if isinstance(p, Mapping)]
     tier2_set = _build_domain_tier2_set(materialized)
+    excluded = frozenset(
+        _account_key(name)
+        for name in (excluded_users or ())
+        if isinstance(name, str) and name.strip()
+    )
 
     for path in materialized:
-        users = _affected_users(path, tier2_set)
+        users = _affected_users(path, tier2_set, excluded)
         if not users:
             continue
         is_proven = _path_is_proven(path)

@@ -44,6 +44,8 @@ because a bookkeeping failure must not break a dump that is working.
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 import contextlib
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -107,7 +109,9 @@ def register_artifact_disclosure_for_shell(shell: Any) -> None:
 
 def _ledger() -> Any:
     """The live environment-change ledger, or None when there is no session."""
-    return getattr(_ACTIVE_DISCLOSURE_SHELL, "environment_change_ledger", None)
+    if _ACTIVE_DISCLOSURE_SHELL is None:
+        return None  # no session: nothing was written, so nothing is unrecorded
+    return ledger_or_warn(_ACTIVE_DISCLOSURE_SHELL)
 
 
 @contextlib.contextmanager

@@ -14,9 +14,12 @@ identity (``confirm_esc15_vulnerable``). The issued canary cert is a durable
 credential in the client PKI, so revocation + the environment-change ledger are
 inherited from ``request_certificate_native`` via ``EscConfig.shell``.
 
-Opt-out: ``ADSCAN_NO_ESC15_CONFIRM=1`` skips the active issuance entirely; the
-edge then falls to confirmation-pending (honest data gap), never a flat
-critical, never silently dropped.
+The enrollment is its own scan-policy check
+(``module:adcs_esc15_confirmation``: off in Audit and Production-sensitive) and
+passes :func:`authorize_detection_change` before any certificate is requested.
+Refused by the policy, declined by the operator, or opted out with
+``ADSCAN_NO_ESC15_CONFIRM=1``, the edge falls to confirmation-pending (honest
+data gap), never a flat critical, never silently dropped.
 """
 
 from __future__ import annotations
@@ -39,6 +42,11 @@ from adscan_internal.services.adcs.esc15_confirmation import (
     collect_esc15_template_refs,
     esc15_confirmation_disabled,
     esc15_edge_notes_update,
+)
+from adscan_internal.services.detection_change_gate import (
+    ESC15_CONFIRMATION_CHECK_ID,
+    DetectionChangeAuthorization,
+    authorize_detection_change,
 )
 
 
@@ -71,7 +79,9 @@ def run_esc15_confirmation_phase(
             return  # no ESC15 candidate in this domain
 
         marked_domain = mark_sensitive(domain, "domain")
-        username, secret = _resolve_enrolling_credential(shell, domain, credential)
+        username, secret = _resolve_enrolling_credential(
+            shell, domain, credential, auth_domain=auth_domain
+        )
 
         # Opt-out or no usable enrolling credential (e.g. a Kerberos-only /
         # ccache-only scan the native cert request cannot use): never issue a
@@ -95,12 +105,39 @@ def run_esc15_confirmation_phase(
             )
             return
 
+        # The confirmation enrolls a certificate on the client's CA: its own
+        # policy check, decided apart from the detection. Declined, every
+        # candidate stays confirmation-pending at the confidence it has.
+        authorization = authorize_detection_change(
+            shell,
+            ESC15_CONFIRMATION_CHECK_ID,
+            domain=domain,
+            prompt=(
+                f"Confirm ESC15 on {marked_domain} by enrolling one certificate as "
+                "the scan account? ADscan revokes it afterwards when it holds an "
+                "account allowed to, and otherwise the report lists it for revocation."
+            ),
+        )
+        if authorization is None:
+            reason = (
+                "the certificate enrollment that confirms ESC15 is not allowed by "
+                "the scan policy or was declined"
+            )
+            _apply_all_pending(graph, refs, reason)
+            save_attack_graph(shell, domain, graph)
+            print_info_verbose(
+                f"ESC15 confirmation not run for {marked_domain}; "
+                f"{len(refs)} candidate(s) left confirmation-pending."
+            )
+            return
+
         verdicts: dict[str, Esc15CollectionAction] = {}
         notes_by_template: dict[str, dict[str, Any]] = {}
         hardened_templates: list[str] = []
         for ref in refs:
             action, notes, hardened_cn = _confirm_one_template(
                 shell,
+                authorization,
                 domain=domain,
                 ref=ref,
                 username=username,
@@ -154,31 +191,33 @@ def _apply_all_pending(
 
 
 def _resolve_enrolling_credential(
-    shell: Any, domain: str, credential: Any
+    shell: Any,
+    domain: str,
+    credential: Any,
+    *,
+    auth_domain: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Return ``(username, secret)`` for the enrolling principal.
 
     ``secret`` is a password OR an NT hash (``request_certificate_native``
-    detects the format). A Kerberos/ccache-only credential yields no secret here,
-    so the confirmation is left as a data gap (pending) rather than guessed.
+    detects the format) that belongs to ``username``. Delegates to the shared
+    ADCS resolver, which pairs the username only with its own secret: never the
+    domain's active password for a different account. A principal with no secret
+    of its own yields ``None``, so the confirmation is left as a data gap
+    (pending) rather than guessed.
     """
-    username = getattr(credential, "username", None)
-    secret = getattr(credential, "password", None)
-    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    if not isinstance(domain_data, dict):
-        domain_data = {}
-    if not username:
-        username = domain_data.get("username")
-    if not secret:
-        secret = domain_data.get("password") or domain_data.get("nt_hash")
-    return (
-        str(username).strip() if username else None,
-        str(secret) if secret else None,
+    from adscan_internal.services.adcs.scbe_observation import (  # noqa: PLC0415
+        resolve_reading_credential,
+    )
+
+    return resolve_reading_credential(
+        shell, domain, credential, auth_domain=auth_domain
     )
 
 
 def _confirm_one_template(
     shell: Any,
+    authorization: DetectionChangeAuthorization,
     *,
     domain: str,
     ref: Esc15TemplateRef,
@@ -191,8 +230,11 @@ def _confirm_one_template(
     """Confirm one ESC15 template; return ``(action, notes_update, hardened_cn)``.
 
     ``hardened_cn`` is the template CN when the verdict is hardened (so the caller
-    can emit the positive control), else ``None``.
+    can emit the positive control), else ``None``. ``authorization`` is the gate's
+    approval of the enrollment (:func:`authorize_detection_change`); only the
+    gate builds one, so this function cannot be reached without passing it.
     """
+    del authorization  # held as the capability; the enrollment needs no field of it
     from adscan_internal.services.adcs.esc_enrollment import confirm_esc15_vulnerable
     from adscan_internal.services.adcs.esc_types import (
         EscConfig,

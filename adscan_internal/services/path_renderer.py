@@ -135,6 +135,7 @@ def _path_compromise_class(path: Mapping[str, Any]) -> CompromiseClass:
         "direct_compromise": CompromiseClass.DOMAIN_BREAKER,
         "direct_domain_control": CompromiseClass.DOMAIN_BREAKER,
         "domain_breaker": CompromiseClass.DOMAIN_BREAKER,
+        "tier0_control": CompromiseClass.TIER0_CONTROL,
         "tier0_foothold": CompromiseClass.TIER0_FOOTHOLD,
         "followup_terminal": CompromiseClass.PRIVILEGED_ESCALATOR,
         "domain_compromise_enabler": CompromiseClass.PRIVILEGED_ESCALATOR,
@@ -153,6 +154,7 @@ def _path_compromise_class(path: Mapping[str, Any]) -> CompromiseClass:
 
 _TECHNICAL_SECTION_HEADINGS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Direct Domain Control",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 Control (no route to the domain found)",
     CompromiseClass.TIER0_FOOTHOLD: "Tier 0 Footholds",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Privileged Escalators",
     CompromiseClass.COMPROMISE_ENABLER: "Compromise Enablers",
@@ -191,6 +193,8 @@ class TechnicalRenderer:
         if cls is CompromiseClass.TIER0_FOOTHOLD:
             protocol = _detect_auth_protocol(path) or "auth"
             return f"Foothold on Tier 0 #{idx} · {protocol} · post-ex pending"
+        if cls is CompromiseClass.TIER0_CONTROL:
+            return f"Path to Tier 0 Control #{idx} · {cls.cli_badge.strip('[]')} · {n}-hop"
         return (
             f"Path to Domain Compromise #{idx} · {cls.cli_badge.strip('[]')} · "
             f"{n}-hop"
@@ -207,6 +211,7 @@ class TechnicalRenderer:
 
 _EXECUTIVE_SECTION_HEADINGS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Direct domain compromise",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 control, no route to the domain found",
     CompromiseClass.TIER0_FOOTHOLD: (
         "Critical access — control pending"
     ),
@@ -220,6 +225,7 @@ _EXECUTIVE_SECTION_HEADINGS: dict[CompromiseClass, str] = {
 
 _EXECUTIVE_CLASS_LABELS: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: "Direct domain compromise",
+    CompromiseClass.TIER0_CONTROL: "Tier 0 control",
     CompromiseClass.PRIVILEGED_ESCALATOR: "Privileged escalation",
     CompromiseClass.TIER0_FOOTHOLD: "Critical asset access (post-ex pending)",
     CompromiseClass.COMPROMISE_ENABLER: "Unprivileged account with a path to domain",
@@ -260,6 +266,8 @@ class ExecutiveRenderer:
                 f"Critical access #{idx} · {protocol} · post-exploitation pending"
             )
         label = _EXECUTIVE_CLASS_LABELS.get(cls, cls.display_label)
+        if cls is CompromiseClass.TIER0_CONTROL:
+            return f"Path to Tier 0 control #{idx} · {n}-hop"
         return f"Path to Domain Compromise #{idx} · {label} · {n}-hop"
 
     def render_section_heading(self, cls: CompromiseClass) -> str:

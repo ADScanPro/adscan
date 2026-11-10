@@ -123,6 +123,61 @@ def profile_choices() -> tuple[tuple[str, str], ...]:
         choices.append((key, label))
     return tuple(choices)
 
+
+#: What separates the profiles a surface SUGGESTS from the wider set the verb
+#: ACCEPTS, and the caption each group reads under. The discriminator is the
+#: registry's own ``table_status``, not a second list kept beside it: a profile
+#: published against the repealed ENS is accepted so a client who certified
+#: under it can declare it truthfully and be told why no verdict follows, and
+#: is not worth putting in front of an operator choosing one today.
+#:
+#: Both groups were being listed, by two surfaces, as the answer to "what are
+#: the profiles": the undeclared panel named four and a refusal named eight,
+#: with nothing saying why they differed. One rule now, read from here, and
+#: each surface says which question it is answering.
+_CURRENT_PROFILE_CAPTION = "Published against the ENS in force (RD 311/2022)"
+_SUPERSEDED_PROFILE_CAPTION = (
+    "Accepted, and resolved with no verdict: published against Real Decreto "
+    "3/2010, the repealed ENS"
+)
+
+
+def _profile_is_superseded(key: str) -> bool:
+    profile = PROFILES.get(key)
+    return (
+        profile is not None
+        and profile.table_status is ProfileTableStatus.SUPERSEDED_BY_VERSION
+    )
+
+
+def profile_groups() -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """The accepted profiles, grouped by whether they are in current use.
+
+    The order inside each group is :func:`profile_choices`'s, so a surface that
+    prints the groups and one that prints the flat list cannot disagree. An
+    empty group is dropped rather than printed with no rows.
+    """
+    current = tuple(
+        (key, label)
+        for key, label in profile_choices()
+        if not _profile_is_superseded(key)
+    )
+    superseded = tuple(
+        (key, label)
+        for key, label in profile_choices()
+        if _profile_is_superseded(key)
+    )
+    groups = [(_CURRENT_PROFILE_CAPTION, current)]
+    if superseded:
+        groups.append((_SUPERSEDED_PROFILE_CAPTION, superseded))
+    return tuple(group for group in groups if group[1])
+
+
+def current_profile_keys() -> tuple[str, ...]:
+    """The profiles a surface suggests declaring: the ones in current use."""
+    return tuple(key for key, _ in profile_groups()[0][1])
+
+
 #: The levels a dimension can carry, each with the plain-language harm test that
 #: separates it from its neighbours. The operator in front of this prompt is a
 #: pentester, not the client's security officer, so the test is the question
@@ -232,6 +287,7 @@ def render_declared_scope(
     panel and the rendered document can never disagree on one.
     """
     header = resolve_ens_applicability(scope).as_header()
+    note = str(header.get("note") or "").strip()
     lines = [
         f"[bold]Category {header['category_label']}[/bold], "
         f"derived from the five levels ({header['category_derivation_citation']}).",
@@ -245,7 +301,16 @@ def render_declared_scope(
         lines.append(
             "[bold]No measure is exigible under the declared profile.[/bold]"
         )
-        lines.append(str(header.get("profile_out_of_scope_reason") or ""))
+        # The engine note, here and not at the foot of the panel: it OPENS with
+        # `profile_out_of_scope_reason` verbatim and then carries the sentence
+        # that says what to declare instead, so printing both fields read the
+        # same two sentences twice. This panel is the surface that has room for
+        # the long form, so it owns the note and the reason is consumed with
+        # it. A compact surface owns the short field and prints no note. Same
+        # resolution the rendered report reached for the same two fields.
+        if note:
+            lines.append(note)
+            note = ""
     else:
         lines.append(
             f"{header['required_total']} of {header['measures_total']} Anexo II "
@@ -268,7 +333,6 @@ def render_declared_scope(
         lines.append(f"System covered: {scope.system_label}")
     if declared_on:
         lines.append(f"Declared on {declared_on}.")
-    note = str(header.get("note") or "").strip()
     if note:
         lines.append("")
         lines.append(note)
@@ -587,12 +651,13 @@ def run_ens_scope_wizard(
             "handles no information and provides no service has nothing to map."
         )
     if scope.profile_out_of_scope_reason:
+        # The panel above states the reason and names the profile that applies
+        # instead, so this adds the one thing it does not: that keeping the
+        # declaration as it stands is a legitimate answer to the next question.
         print_warning(
-            f"{scope.profile_out_of_scope_reason} Keeping this declaration is "
-            "legitimate, and the report will state that the profile does not "
-            "reach the system rather than reading its table anyway. To have "
-            "the measures scoped instead, declare the general profile of "
-            "Anexo II."
+            "Keeping this declaration is legitimate. The report will state "
+            "that the profile does not reach the system rather than reading "
+            "its table anyway."
         )
 
     options = [_SAVE_TO_WORKSPACE, _USE_FOR_THIS_RUN, _DISCARD_DECLARATION]

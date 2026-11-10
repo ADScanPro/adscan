@@ -6,14 +6,15 @@ It is intentionally decoupled from `adscan.py` by injecting the shell factory.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from pathlib import Path
 import os
 import re
 import shutil
 import time
-import uuid
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from adscan_internal import (
     print_error,
@@ -35,6 +36,10 @@ from adscan_internal.workspaces import (
     activate_workspace,
     create_workspace_dir,
     write_initial_workspace_variables,
+)
+from adscan_internal.workspaces.retention import (
+    auto_workspace_name,
+    close_run_workspace,
 )
 from adscan_core.rich_output_collection import (
     PhaseChapter,
@@ -284,32 +289,161 @@ def _build_ci_loot_card(
     )
 
 
-def _ci_compliance_scope_ok(args: object) -> bool:
-    """Pre-scan gate: an audit run that will report needs a scoped framework.
+def _record_scan_compliance_frameworks(shell: object, args: object) -> list[str]:
+    """Hand the scan's ``--frameworks`` selection to its finalization seam.
+
+    The scan end stamps the compliance block for these frameworks, so the web's
+    Compliance page reflects the scan without a report being rendered. The value
+    was already validated by :func:`_ci_compliance_scope_ok`; an invalid one
+    here (a LITE run, which skips that gate) records nothing.
+    """
+    from adscan_internal.cli.attack_path_execution import (
+        SCAN_COMPLIANCE_FRAMEWORKS_ATTR,
+    )
+    from adscan_internal.cli.common import _parse_frameworks
+
+    try:
+        selected = _parse_frameworks(getattr(args, "frameworks", None)) or []
+    except ValueError:
+        selected = []
+    try:
+        setattr(shell, SCAN_COMPLIANCE_FRAMEWORKS_ATTR, list(selected))
+    except Exception:  # noqa: BLE001 - a frozen test double carries no selection
+        pass
+    return list(selected)
+
+
+def _ci_workspace_dir(args: object) -> Optional[str]:
+    """The ``--workspace`` directory when it already exists (saved-policy lookup)."""
+    name = str(getattr(args, "workspace", "") or "").strip()
+    if not name:
+        return None
+    from adscan_core.paths import get_workspaces_dir  # noqa: PLC0415
+
+    path = get_workspaces_dir() / name
+    return str(path) if path.is_dir() else None
+
+
+def _ci_policy_choices(workspace_dir: Optional[str]) -> list:
+    """The policies a ``ci`` run could name: built-ins, then saved, with scope."""
+    from adscan_core.scan_policy.legacy_type_notice import PolicyChoice  # noqa: PLC0415
+    from adscan_internal.services.saved_scan_policies import (  # noqa: PLC0415
+        SCOPE_LABELS,
+        list_policies,
+    )
+
+    try:
+        policies = list_policies(workspace_dir)
+    except Exception as exc:  # noqa: BLE001 - the guidance still names the built-ins
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
+    return [
+        PolicyChoice(
+            flag_value=p.slug,
+            label=p.name,
+            scope=SCOPE_LABELS.get(p.scope, p.scope).lower(),
+        )
+        for p in policies
+    ]
+
+
+def resolve_ci_policy_environment(args: object) -> tuple[bool, Optional[str]]:
+    """The ``adscan ci`` policy gate: the run must name a scan policy. FAIL FAST.
+
+    Runs before the preflight and before anything touches the network. A run
+    names its policy with ``--policy`` (a built-in or a saved policy), or with a
+    ``checks`` section in ``--scan-config`` (how the Enterprise worker and a run
+    plan deliver theirs, possibly modified for that one scan). The retired
+    ``--type`` names none: alone it is refused with the guidance panel; next to a
+    policy it is ignored with one warning line. All copy lives in
+    :mod:`adscan_core.scan_policy.legacy_type_notice`.
+
+    Returns:
+        ``(ok, environment)``: ``ok`` is False when the run must stop (the panel
+        was printed); ``environment`` is the named policy's (``lab`` / ``real``)
+        when it could be read before the run, else ``None``.
+    """
+    from adscan_core.scan_policy import legacy_type_notice as guidance  # noqa: PLC0415
+    from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+        effective_environment,
+        policy_display_name,
+    )
+    from adscan_internal.services.saved_scan_policies import find_policy  # noqa: PLC0415
+    from adscan_internal.services.scan_config import ScanConfigError  # noqa: PLC0415
+    from rich.markup import escape as escape_markup  # noqa: PLC0415
+
+    legacy_type = str(getattr(args, "type", None) or "").strip().lower()
+    policy_name = str(getattr(args, "policy", None) or "").strip()
+    workspace_dir = _ci_workspace_dir(args)
+
+    definition = None
+    if policy_name:
+        found = find_policy(policy_name, workspace_dir)
+        if found is None:
+            guidance.print_notice(
+                guidance.build_missing_policy_notice(
+                    _ci_policy_choices(workspace_dir), unknown_name=policy_name
+                )
+            )
+            return False, None
+        definition = found.definition
+    else:
+        try:
+            checks = getattr(resolve_ci_scan_config(args), "checks", None)
+        except ScanConfigError:
+            # Reported with its own message once the run loads the config.
+            return True, None
+        if checks is not None and not checks.is_default:
+            definition = checks.definition
+
+    if definition is None:
+        choices = _ci_policy_choices(workspace_dir)
+        if legacy_type and guidance.legacy_type_builtin(legacy_type):
+            guidance.print_notice(guidance.build_ci_type_notice(legacy_type, choices=choices))
+        else:
+            guidance.print_notice(guidance.build_missing_policy_notice(choices))
+        return False, None
+    if legacy_type and guidance.legacy_type_builtin(legacy_type):
+        print_warning(
+            escape_markup(
+                guidance.ci_type_ignored_line(
+                    legacy_type, policy_named=policy_display_name(definition)
+                )
+            )
+        )
+    return True, effective_environment(definition)
+
+
+def _ci_compliance_scope_ok(args: object, environment: Optional[str] = None) -> bool:
+    """Pre-scan gate: a run for a real environment that will report needs a scoped framework.
 
     Returns ``True`` when the run may proceed. Prints the canonical error and
-    returns ``False`` when an ``--type audit`` run asked for a report without
-    choosing a compliance framework.
+    returns ``False`` when a run under a policy for a real environment asked for
+    a report without choosing a compliance framework.
 
     LITE is exempt by construction: the LITE exposure report carries no
-    compliance mapping at all, so there is nothing to scope. A ``ctf`` or
-    unclassified engagement is exempt for the reason the SSOT documents (no
-    regulatory regime, and an unknown type is a data gap).
+    compliance mapping at all, so there is nothing to scope. A lab has no
+    regulatory regime, and an unknown environment is a data gap, so neither
+    requires one (the SSOT documents both).
+
+    ``--frameworks`` also scopes the SCAN's own compliance mapping (stamped at
+    scan end, with or without a report), so an invalid value is refused here
+    whether or not a report was asked for: a typo must not silently produce a
+    scan with no mapping.
+
+    Args:
+        args: The parsed ``ci`` arguments.
+        environment: The environment of the policy the run names
+            (:func:`resolve_ci_policy_environment`); it is what the scan is about
+            to record as its workspace's environment.
     """
     from adscan_core import tier
 
     if not tier.is_pro():
         return True
-    if not getattr(args, "generate_report", False):
-        return True
 
-    from adscan_core.paths import get_workspaces_dir
     from adscan_internal.cli.common import _parse_frameworks
-    from adscan_internal.services.compliance_scope import (
-        missing_framework_error,
-        resolve_compliance_scope,
-        workspace_engagement_type,
-    )
 
     try:
         explicit = _parse_frameworks(getattr(args, "frameworks", None))
@@ -317,23 +451,71 @@ def _ci_compliance_scope_ok(args: object) -> bool:
         print_error(str(exc))
         return False
 
-    # An EXISTING workspace already carries the scan's classification and wins
-    # over the flag (``ci`` reloads its variables, so the flag would not change
-    # it anyway); a brand-new workspace has none yet, so ``--type`` is what the
-    # scan is about to persist. Either way both gates read the same value.
-    ws_name = str(getattr(args, "workspace", "") or "").strip()
-    persisted_type = (
-        workspace_engagement_type(get_workspaces_dir() / ws_name) if ws_name else None
+    if not getattr(args, "generate_report", False):
+        return True
+
+    from adscan_core.scan_policy.policy import (  # noqa: PLC0415
+        workspace_type_for_environment,
+    )
+    from adscan_internal.services.compliance_scope import (
+        missing_framework_error,
+        resolve_compliance_scope,
     )
 
     scope = resolve_compliance_scope(
         explicit=explicit,
-        engagement_type=persisted_type or getattr(args, "type", None),
+        engagement_type=workspace_type_for_environment(environment),
     )
     if scope.missing_required:
         print_error(missing_framework_error())
         return False
     return True
+
+
+def _apply_auto_revert_flag(shell: Any, flag: Optional[str]) -> None:
+    """Fold ``--auto-revert on|off`` into ``scan_config.durable_changes``."""
+    if flag not in ("on", "off"):
+        return
+    import dataclasses  # noqa: PLC0415
+
+    enabled = flag == "on"
+    config = getattr(shell, "scan_config", None)
+    durable = getattr(config, "durable_changes", None)
+    if config is None or durable is None:
+        return
+    shell.scan_config = dataclasses.replace(
+        config,
+        durable_changes=dataclasses.replace(durable, auto_revert=enabled, keep=None),
+    )
+    print_info(
+        "Automatic reversion of ADscan's directory changes: "
+        f"{'on' if enabled else 'off'} (--auto-revert)."
+    )
+
+
+def resolve_ci_scan_config(args: object):
+    """Return the run's validated ``ScanConfig``.
+
+    Precedence: an inline ``scan_config_data`` mapping (set when the run comes
+    from a RunPlan, whose scan configuration travels inside the plan), then an
+    explicit ``args.scan_config`` path, then the launcher's ``ADSCAN_SCAN_CONFIG``
+    mount. None of them = ``DEFAULT_SCAN_CONFIG``, today's behaviour.
+
+    Raises:
+        ScanConfigError: The configuration is malformed.
+    """
+    from adscan_internal.services.scan_config import (  # noqa: PLC0415
+        load_scan_config,
+        parse_scan_config,
+    )
+
+    data = getattr(args, "scan_config_data", None)
+    if isinstance(data, dict):
+        return parse_scan_config(data)
+    scan_config_path = (
+        getattr(args, "scan_config", None) or os.environ.get("ADSCAN_SCAN_CONFIG") or ""
+    )
+    return load_scan_config(scan_config_path)
 
 
 def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
@@ -345,6 +527,18 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     _ci_started_at = time.monotonic()
 
     deps.enable_auto_mode()
+
+    # Enterprise license gate — FAIL FAST, before anything else. A missing,
+    # invalid or expired license on the appliance refuses NEW assessments with a
+    # clear reason and exit 78, which the appliance worker maps to a client-safe
+    # message. No-op (silent) for LITE and PRO without the Enterprise marker.
+    from adscan_internal.cli.enterprise_license_gate import (
+        LICENSE_BLOCKED_EXIT_CODE,
+        ensure_license_allows_new_scan,
+    )
+
+    if not ensure_license_allows_new_scan("ci", workspace_dir=_ci_workspace_dir(args)):
+        return LICENSE_BLOCKED_EXIT_CODE
 
     # PRO partner-tag gate — FAIL FAST, before the heavy preflight.
     #
@@ -363,17 +557,34 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     if not ensure_partner_tag_for_pro(license_mode):
         return 1
 
+    # Scan-policy gate — FAIL FAST, before the preflight and before any network
+    # activity. An unattended scan runs only under a policy the run names.
+    policy_ok, policy_environment = resolve_ci_policy_environment(args)
+    if not policy_ok:
+        deps.exit(2)
+        return 2
+
     # Compliance-scope gate — FAIL FAST, before the scan.
     #
-    # An audit engagement that will produce a report needs its compliance
-    # framework scoped up front: it comes from the signed scope, not from
-    # anything the binary can infer. Refusing here (rather than at the report
-    # phase) means the operator is told before a long scan, not after it. The
-    # late gate in ``run_generate_report`` still covers every other entry
-    # point, and ``--type`` is the engagement classification the scan is about
-    # to persist into its own workspace, so both gates read the same thing.
-    if not _ci_compliance_scope_ok(args):
+    # A run for a real environment that will produce a report needs its
+    # compliance framework scoped up front: it comes from the signed scope, not
+    # from anything the binary can infer. Refusing here (rather than at the
+    # report phase) means the operator is told before a long scan, not after it.
+    # The late gate in ``run_generate_report`` still covers every other entry
+    # point; both read the environment of the policy the scan runs under.
+    if not _ci_compliance_scope_ok(args, policy_environment):
         return 1
+
+    # Retention gate — FAIL FAST. ``--ephemeral`` deletes the workspace that
+    # holds the report, so a report run must say where the report goes.
+    if not _ci_retention_flags_ok(args):
+        return 2
+
+    # Deliverable gate — FAIL FAST. Retired report flags print their one
+    # deprecation line, and --only / --emit / the branding posture are checked
+    # now, so a typo or an un-entitled white-label surfaces before the scan.
+    if not _announce_report_options(args):
+        return 2
 
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
@@ -394,6 +605,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     # ``license_mode`` was resolved above for the early partner-tag gate.
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
+    _record_scan_compliance_frameworks(shell, args)
 
     # Persist a client logo passed via --client-logo (the launcher already staged
     # the file into the mounted volume and forwards a container-visible path), so
@@ -428,14 +640,10 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     from adscan_internal.services.scan_config import (
         DEFAULT_SCAN_CONFIG,
         ScanConfigError,
-        load_scan_config,
     )
 
-    scan_config_path = (
-        getattr(args, "scan_config", None) or os.environ.get("ADSCAN_SCAN_CONFIG") or ""
-    )
     try:
-        shell.scan_config = load_scan_config(scan_config_path)
+        shell.scan_config = resolve_ci_scan_config(args)
     except ScanConfigError as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -454,6 +662,23 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         # Keep the attribute present and well-typed even on the default path so
         # downstream getattr(shell, "scan_config", ...) always finds it.
         shell.scan_config = DEFAULT_SCAN_CONFIG
+
+    # --policy <name> names a saved policy; a scan config's ``checks`` section is
+    # the other way to give one. Both at once is ambiguous, so the run refuses
+    # before anything is resolved (the policy itself is looked up once the
+    # workspace is open, because a workspace policy wins over a global one).
+    from adscan_internal.services.saved_scan_policies import (
+        SavedPolicyError,
+        ensure_single_policy_source,
+    )
+
+    policy_name = str(getattr(args, "policy", None) or "").strip()
+    try:
+        ensure_single_policy_source(shell.scan_config, policy_name)
+    except SavedPolicyError as exc:
+        print_error(str(exc))
+        deps.exit(2)
+        return 2
 
     # --read-only / --no-attack-paths: force the attack-path policy to 'none' so
     # paths are still computed and reported but never executed. The CLI flag maps
@@ -474,6 +699,11 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         )
         print_info("Read-only mode: attack paths will be mapped and reported, not executed.")
 
+    # --auto-revert on|off: the ONE automatic-reversion switch, applied onto the
+    # same scan-config knob (durable_changes.auto_revert) so every consumer reads
+    # one value; the flag wins over the file, like --read-only.
+    _apply_auto_revert_flag(shell, getattr(args, "auto_revert", None))
+
     # (The PRO partner-tag gate already ran as a fail-fast before the preflight,
     # above — a missing tag never reaches this far, so no second check is needed.)
 
@@ -490,7 +720,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             write_initial_workspace_variables(
                 workspace_name=args.workspace,
                 workspace_path=ws_dir,
-                workspace_type=args.type,
+                workspace_type=None,
             )
             created_workspace = True
         # Route activation through the SSOT so the environment-change ledger (and
@@ -506,7 +736,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         )
         shell.load_workspace_data(shell.current_workspace_dir)
     else:
-        ws = f"ci-{uuid.uuid4().hex[:6]}"
+        ws = auto_workspace_name("ci", getattr(args, "domain", None), shell.workspaces_dir)
         ws_dir = os.path.join(shell.workspaces_dir, ws)
         os.makedirs(ws_dir, exist_ok=True)
         activate_workspace(
@@ -514,6 +744,16 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         )
         shell.load_workspace_data(shell.current_workspace_dir)
         created_workspace = True
+
+    # The client's cleanup-only account: passed by reference (scan config section
+    # or ADSCAN_CLEANUP_* environment, held for this run only), else the one saved
+    # in the workspace, announced as such. After the workspace load on purpose:
+    # the load is what restores the saved account.
+    from adscan_internal.services.cleanup_credential_loader import (  # noqa: PLC0415
+        load_cleanup_credential_for_run,
+    )
+
+    load_cleanup_credential_for_run(shell)
 
     # --- Premium session header ---
     _ci_domain = str(getattr(args, "domain", "") or "")
@@ -537,7 +777,79 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     # cost of an operator being surprised by an unattended decision.
     print_ci_autonomous_callout()
 
+    # Scan policy (``checks``) and scan pace (``pacing``, ``--pacing``,
+    # ``--pacing-set``): resolved once, after the workspace is open so its
+    # persisted controls are the fallback, and before anything sends traffic.
+    # A policy that cannot be resolved aborts the run (exit 2), exactly like a
+    # malformed scan config: a policy never degrades to "run everything".
+    from adscan_internal.cli.scan_policy_cmd import print_ci_scan_controls
+    from adscan_internal.services.scan_controls import (
+        ScanControlsError,
+        apply_ci_scan_controls,
+        print_execution_decision,
+        stamp_unattended_entry,
+    )
+
+    if policy_name:
+        from adscan_internal.services.saved_scan_policies import scan_config_with_saved_policy
+
+        try:
+            shell.scan_config = scan_config_with_saved_policy(
+                shell.scan_config, policy_name, workspace_dir=shell.current_workspace_dir
+            )
+        except SavedPolicyError as exc:
+            print_error(str(exc))
+            deps.exit(2)
+            return 2
+
+    # --pace-profile <name>: a saved pace profile, looked up once the workspace
+    # is open (a workspace profile wins over a global one). An unknown name
+    # aborts the run like an unknown policy.
+    pace_profile = None
+    pace_profile_name = str(getattr(args, "pace_profile", None) or "").strip()
+    if pace_profile_name:
+        from adscan_internal.cli.pace_profile_cmd import resolve_ci_profile  # noqa: PLC0415
+        from adscan_internal.services.saved_pace_profiles import (  # noqa: PLC0415
+            SavedPaceProfileError,
+        )
+
+        try:
+            pace_profile = resolve_ci_profile(pace_profile_name, shell.current_workspace_dir)
+        except SavedPaceProfileError as exc:
+            print_error(str(exc))
+            deps.exit(2)
+            return 2
+
+    # The run entry decides whether the policy's attack steps run on their own
+    # (execution spec § 4). Stamped before the policy so every gate sees it.
+    stamp_unattended_entry(shell, "ci")
+    try:
+        print_ci_scan_controls(
+            apply_ci_scan_controls(
+                shell,
+                scan_config=shell.scan_config,
+                cli_level=getattr(args, "pacing", None),
+                cli_assignments=getattr(args, "pacing_set", None),
+                workspace_dir=shell.current_workspace_dir,
+                non_interactive=True,
+                pace_profile=pace_profile,
+            )
+        )
+    except ScanControlsError as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error(f"Invalid scan policy or scan pace: {exc}")
+        deps.exit(2)
+        return 2
+    print_execution_decision(shell)
+    try:
+        shell.save_workspace_data()
+    except Exception as exc:  # noqa: BLE001 - persisting the pace is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
     from adscan_internal.cli.common import build_telemetry_context
+    from adscan_internal.services.scan_controls import workspace_type  # noqa: PLC0415
 
     telemetry_context = build_telemetry_context(shell=shell, trigger="ci_start")
 
@@ -545,7 +857,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     session_properties = {
         "$set": {"installation_status": "installed"},
         "mode": "ci",
-        "scan_type": getattr(args, "type", None),
+        "scan_type": workspace_type(shell),
         "scan_mode": getattr(args, "mode", None),
         "preflight_check_passed": bool(preflight_result.passed),
         "preflight_check_fix_attempted": bool(preflight_result.fix_attempted),
@@ -554,7 +866,6 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     }
     telemetry.capture("session_start", properties=session_properties)
 
-    shell.type = args.type
     shell.interface = args.interface
     # Split-DC/DNS (issue #15): a separate AD-zone DNS server for segmented
     # networks. Stash it session-wide so every resolver-update path picks it up
@@ -586,16 +897,11 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 "Auth mode requires --domain, --dc-ip, --username, and --password"
             )
             return False
-        if not shell.type:
-            print_error(
-                "Pentest type (ctf/audit) must be configured using 'set type <value>' before starting a scan."
-            )
+        if getattr(shell, "scan_policy", None) is None:
+            print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
             return False
-        if not shell.interface:
-            print_error(
-                "Interface not found. Please configure it using 'set iface <value>'."
-            )
-            return False
+        # No interface requirement here: only broadcast poisoning needs a named
+        # NIC, and the poisoning seam skips it with a warning when none was given.
         if shell.auto is None:
             print_error(
                 "Auto mode not found. Please configure it using 'set auto <value>'."
@@ -609,7 +915,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         )
 
         emit_scan_plan(
-            COMMAND_AUDIT if shell.type == "audit" else COMMAND_CI_AUTH,
+            COMMAND_AUDIT if policy_settings.runs_full_assessment(shell) else COMMAND_CI_AUTH,
             getattr(shell, "scan_config", None),
         )
         # Chapter 1: Preflight (DNS validation, connectivity)
@@ -643,16 +949,11 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         if not args.hosts and not getattr(args, "dc_ip", None):
             print_error("Unauth mode requires --hosts or --dc-ip")
             return False
-        if not shell.type:
-            print_error(
-                "Pentest type (ctf/audit) must be configured using 'set type <value>' before starting a scan."
-            )
+        if getattr(shell, "scan_policy", None) is None:
+            print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
             return False
-        if not shell.interface:
-            print_error(
-                "Interface not found. Please configure it using 'set iface <value>'."
-            )
-            return False
+        # No interface requirement here: only broadcast poisoning needs a named
+        # NIC, and the poisoning seam skips it with a warning when none was given.
         if shell.auto is None:
             print_error(
                 "Auto mode not found. Please configure it using 'set auto <value>'."
@@ -681,10 +982,55 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
             return False
         return True
 
-    success = _run_auto_auth() if args.mode == "auth" else _run_auto_unauth()
+    from adscan_internal.services.engagement.coverage_recorder import (
+        finalize_run_coverage,
+        start_run_coverage,
+    )
 
+    # Coverage evidence for the reconciliation rule: which checks ran, from which
+    # vantage. Written as "interrupted" now so a crash closes nothing.
+    # Engagement history (PRO): a workspace scanned before the ledger existed is
+    # imported from its flat artifacts now, before this run overwrites them.
+    from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+
+    from adscan_internal.services.engagement.importer import (  # noqa: PLC0415
+        import_before_run,
+    )
+
+    import_before_run(shell.current_workspace_dir, at=_dt.now(_tz.utc).isoformat())
+    start_run_coverage(shell, authenticated=args.mode == "auth")
+    success = _run_auto_auth() if args.mode == "auth" else _run_auto_unauth()
+    # The license refused every environment this run tried to assess (its
+    # environment entitlement is used up): no report, and exit 78 below so the
+    # appliance worker stores the license reason. A refused TRUSTED forest
+    # beside an admitted primary one does not land here.
+    from adscan_internal.cli.enterprise_license_gate import (  # noqa: PLC0415
+        environment_refused_for_run,
+        record_scan_identity_usage,
+    )
+
+    environment_refused = environment_refused_for_run(shell)
+    # Scoped licences: enabled identities of the assessed domains, read from
+    # the workspace now, before an ephemeral workspace is removed below.
+    record_scan_identity_usage(shell)
+    if environment_refused:
+        success = False
+    # A run that reached its end is still not a successful assessment when the
+    # target domain's collection and attack-path discovery never completed: it
+    # holds no evidence about whether the domain resisted compromise. Exit with
+    # a status of its own so the appliance worker records it as incomplete, and
+    # never render a deliverable from it.
+    assessment_gap: tuple[str, ...] = ()
+    if success and args.mode == "auth":
+        assessment_gap = _ci_assessment_gap(shell, str(args.domain or ""))
+        if assessment_gap:
+            success = False
+    finalize_run_coverage(shell, success=bool(success))
+
+    # Flag validation is a lab activity (genuinely environment), and only for a
+    # lab that has flags: a GOAD run has none, so it must not exit 2 for them.
     should_validate_flags = (
-        success and str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+        success and policy_settings.is_lab(shell) and _ci_lab_has_capture_flags(shell)
     )
     flags_valid = not should_validate_flags
     if should_validate_flags and shell.current_workspace_dir:
@@ -726,8 +1072,38 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 missing.append("root.txt")
             print_warning(f"Flag files not found: {', '.join(missing)}")
 
+    # Resolve the durable operator_confirmed AD objects (machine account, RBCD,
+    # KeyCredentialLink) BEFORE the report renders, so the deliverable shows
+    # their final state (reverted / kept / manual_required) instead of
+    # "in progress". do_exit() calls the same hook again; it is a no-op then,
+    # because every resolved entry is terminal.
+    try:
+        from adscan_internal.cli.relay_rbcd import (  # noqa: PLC0415
+            run_operator_confirmed_exit_cleanup,
+        )
+
+        run_operator_confirmed_exit_cleanup(shell)
+    except Exception as exc:  # noqa: BLE001 — never block the report on cleanup
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+    # The final retry pass, before the report, so the deliverable shows what the
+    # best credential of the run could still undo (do_exit runs it again for
+    # whatever the ACL exit cleanup leaves; already-tried principals are skipped).
+    try:
+        from adscan_internal.services.final_revert_pass import (  # noqa: PLC0415
+            run_final_revert_retry_pass,
+        )
+
+        run_final_revert_retry_pass(shell)
+    except Exception as exc:  # noqa: BLE001 — never block the report on cleanup
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+
     report_file_path = None
-    if success and flags_valid and getattr(args, "generate_report", False):
+    deliverable_requested = bool(
+        success and flags_valid and getattr(args, "generate_report", False)
+    )
+    if deliverable_requested:
         # Chapter 4: Reporting
         print_phase_chapter(_chapter(4))
         emit_phase("report_generation")
@@ -743,30 +1119,68 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 if frameworks_raw
                 else None
             )
-            report_file_path = _run_ci_report_generation(
-                shell,
-                args,
-                report_json_path=report_json_path,
-                report_format=report_format,
-                frameworks=frameworks,
-            )
+            # A render that raises must never turn a finished scan into a
+            # failed one: the results stand, the deliverable is reported failed
+            # (exit CI_EXIT_DELIVERABLE_FAILED) and can be rendered again.
+            try:
+                report_file_path = _run_ci_report_generation(
+                    shell,
+                    args,
+                    report_json_path=report_json_path,
+                    report_format=report_format,
+                    frameworks=frameworks,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(show_locals=False, exception=exc)
+                report_file_path = None
             if not report_file_path:
                 print_warning("Report generation failed")
         else:
             print_warning("Workspace directory not available, cannot generate report")
 
-    if success and flags_valid and should_validate_flags:
+    from adscan_core.ci_exit_codes import (  # noqa: PLC0415
+        CI_EXIT_ASSESSMENT_INCOMPLETE,
+        CI_EXIT_DELIVERABLE_FAILED,
+    )
+
+    exit_code = resolve_ci_exit_code(
+        success=bool(success),
+        flags_valid=flags_valid,
+        should_validate_flags=should_validate_flags,
+        environment_refused=bool(environment_refused),
+        license_blocked_exit_code=LICENSE_BLOCKED_EXIT_CODE,
+        assessment_gap=assessment_gap,
+        deliverable_failed=deliverable_requested and not report_file_path,
+    )
+    if exit_code == 0 and should_validate_flags:
         print_success("CI scan finished successfully with flags validated.")
-        exit_code = 0
-    elif success and not flags_valid and should_validate_flags:
-        print_error("CI scan completed but flags validation failed.")
-        exit_code = 2
-    elif success:
+    elif exit_code == 0:
         print_success("CI scan finished successfully.")
-        exit_code = 0
+    elif exit_code == 2:
+        print_error("CI scan completed but flags validation failed.")
+    elif exit_code == CI_EXIT_DELIVERABLE_FAILED:
+        print_error(
+            "CI scan completed and its results are in the workspace, but the "
+            "deliverable did not render. Render it again without rescanning: "
+            "adscan deliver --workspace <name> with the same report options."
+        )
+    elif environment_refused:
+        print_error(
+            "CI scan stopped: the license does not allow assessing this target "
+            "(see the license message above)."
+        )
+    elif exit_code == CI_EXIT_ASSESSMENT_INCOMPLETE:
+        print_error(
+            f"CI scan incomplete for {mark_sensitive(str(args.domain), 'domain')}: "
+            f"{_describe_phases(assessment_gap)} did not complete, so this run "
+            "cannot say whether the domain held. No report was generated. See "
+            "the log above for the step that ended the scan early."
+        )
+        for detail in _describe_gap_details(shell, str(args.domain or ""), assessment_gap):
+            print_error(f"  {detail}")
     else:
         print_error("CI scan failed. Check the logs above for details.")
-        exit_code = 1
 
     artifact_report_path = None
     if report_file_path and os.path.exists(report_file_path):
@@ -786,39 +1200,63 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_warning(f"Failed to copy report to artifacts directory: {exc}")
+                artifact_report_path = None
 
-    if created_workspace and not getattr(args, "keep_workspace", False):
-        try:
-            # Release the workspace-scoped log file handles before removing the
-            # directory. On Windows a file with an open handle (the workspace
-            # <ws>/logs/adscan.debug.log RotatingFileHandler) cannot be deleted
-            # (WinError 32); POSIX tolerates it, but detaching first is correct
-            # on every OS.
-            try:
-                from adscan_core.logging_config import update_workspace_logging
+    # Engine contract (adscan run --plan): note which workspace this run used and
+    # whether the run is about to remove it. Nothing is written here; legacy ci
+    # behaves exactly as before. `adscan run` writes run_summary.json and the
+    # artifact manifest after this handler (and so after do_exit) returns, and
+    # never for a workspace the run removed.
+    from adscan_internal.services.engagement.run_summary import (  # noqa: PLC0415
+        note_run_workspace,
+    )
 
-                update_workspace_logging(None)
-            except Exception:  # noqa: BLE001 — best-effort; never block cleanup
-                pass
-            shutil.rmtree(shell.current_workspace_dir)
-            marked_current_workspace_1 = mark_sensitive(
-                shell.current_workspace, "workspace"
-            )
-            print_success(f"Workspace '{marked_current_workspace_1}' deleted")
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            marked_current_workspace_1 = mark_sensitive(
-                shell.current_workspace, "workspace"
-            )
-            print_error("Failed to remove workspace '{marked_current_workspace_1}'.")
-            print_exception(show_locals=False, exception=exc)
-    elif created_workspace and getattr(args, "keep_workspace", False):
-        marked_current_workspace_1 = mark_sensitive(
-            shell.current_workspace, "workspace"
+    # The workspace and its report are the run's output, so ci KEEPS its
+    # workspace by default (adscan_internal/workspaces/retention.py).
+    # ``--ephemeral`` opts in to deleting the workspace this run created.
+    # ``--output DIR`` copies the report out (the launcher mounts DIR).
+    copied_report_path = _copy_ci_report_out(
+        report_file_path,
+        getattr(args, "output", None),
+        kit_files=getattr(args, "_ci_kit_files", None),
+    )
+    ephemeral_requested = bool(getattr(args, "ephemeral", False))
+    ephemeral = bool(created_workspace and ephemeral_requested)
+    # Never delete the only copy of the report the run was asked for (the
+    # up-front gate requires --output; this covers a copy that failed).
+    report_at_risk = ephemeral and _workspace_holds_undelivered_report(
+        shell.current_workspace_dir,
+        report_file_path,
+        copied_out_to=copied_report_path or artifact_report_path,
+    )
+    workspace_removed = ephemeral and not report_at_risk
+    note_run_workspace(shell.current_workspace_dir, removed=workspace_removed)
+    # Engagement history (PRO / Enterprise): reconcile this run against the
+    # workspace's ledger and keep its evidence in runs/<run_id>/. Never for a
+    # workspace this run is about to remove; never fails the scan.
+    if not workspace_removed:
+        from adscan_internal.services.engagement.ledger_writer import (  # noqa: PLC0415
+            record_ci_run_in_ledger,
         )
-        print_info(
-            f"Workspace '{marked_current_workspace_1}' kept (--keep-workspace specified)"
+
+        record_ci_run_in_ledger(shell.current_workspace_dir, clock_released=False)
+
+    if report_at_risk:
+        print_warning(
+            f"Workspace '{mark_sensitive(shell.current_workspace, 'workspace')}' kept "
+            "despite --ephemeral: the report could not be copied out and would have "
+            "been deleted with it."
         )
+    # Shared with ``execute``: delete with --ephemeral (a failed run keeps only
+    # logs/), otherwise say where the workspace and the report are.
+    close_run_workspace(
+        name=shell.current_workspace,
+        workspace_dir=shell.current_workspace_dir,
+        created=created_workspace,
+        ephemeral=workspace_removed or (ephemeral_requested and not created_workspace),
+        failed=exit_code != 0,
+        report_path=report_file_path,
+    )
 
     # --- End-of-run loot card ---
     try:
@@ -839,6 +1277,101 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     shell.do_exit(exit=False)
     return exit_code
+
+
+def resolve_ci_exit_code(
+    *,
+    success: bool,
+    flags_valid: bool,
+    should_validate_flags: bool,
+    environment_refused: bool,
+    license_blocked_exit_code: int,
+    assessment_gap: tuple[str, ...],
+    deliverable_failed: bool = False,
+) -> int:
+    """Return ``adscan ci``'s exit status for how the run ended.
+
+    ``success`` is already False when ``assessment_gap`` is non-empty (the
+    handler clears it), so an incomplete assessment can never read 0: that
+    false green is what the release gate's exit-3 row exists to catch.
+
+    ``deliverable_failed`` (a report was asked for after a complete scan and did
+    not render) maps to ``CI_EXIT_DELIVERABLE_FAILED`` only when the scan itself
+    would have exited 0: it never masks a failed or incomplete scan, and never
+    makes a completed one read as failed.
+    """
+    from adscan_core.ci_exit_codes import (  # noqa: PLC0415
+        CI_EXIT_ASSESSMENT_INCOMPLETE,
+        CI_EXIT_DELIVERABLE_FAILED,
+    )
+
+    if success and assessment_gap:
+        success = False
+    if success:
+        if should_validate_flags and not flags_valid:
+            return 2
+        if deliverable_failed:
+            return CI_EXIT_DELIVERABLE_FAILED
+        return 0
+    if environment_refused:
+        return license_blocked_exit_code
+    if assessment_gap:
+        return CI_EXIT_ASSESSMENT_INCOMPLETE
+    return 1
+
+
+def _ci_assessment_gap(shell: Any, domain: str) -> tuple[str, ...]:
+    """Return the core phases the target domain never completed in this run.
+
+    Empty when a domain was proven compromised (proof needs no further
+    evidence) and when collection and attack-path discovery completed. Same
+    SSOT as the end-of-scan panel, so the panel and the exit status agree.
+    """
+    try:
+        from adscan_internal.services.scan_outcome_scope import (  # noqa: PLC0415
+            resolve_scan_outcome_scope,
+        )
+        from adscan_internal.services.scan_progress import (  # noqa: PLC0415
+            authenticated_assessment_gap,
+        )
+
+        if resolve_scan_outcome_scope(shell).domain_compromised:
+            return ()
+        return authenticated_assessment_gap(shell, domain, verb="start_auth")
+    except Exception as exc:  # noqa: BLE001 - never turn a judged run into a crash
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return ()
+
+
+def _describe_phases(phase_ids: tuple[str, ...]) -> str:
+    """Join the operator-facing titles of ``phase_ids`` ("A and B")."""
+    from adscan_internal.services.scan_progress import phase_titles  # noqa: PLC0415
+
+    return " and ".join(phase_titles(phase_ids))
+
+
+def _describe_gap_details(
+    shell: Any, domain: str, phase_ids: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return "<Phase>: <what did not finish>" for each phase marked incomplete."""
+    try:
+        from adscan_internal.services.scan_progress import (  # noqa: PLC0415
+            incomplete_phases,
+            phase_titles,
+        )
+
+        marks = incomplete_phases(shell, domain)
+        lines: list[str] = []
+        for phase_id, title in zip(phase_ids, phase_titles(phase_ids)):
+            detail = str((marks.get(phase_id) or {}).get("detail") or "").strip()
+            if detail:
+                lines.append(f"{title}: {detail[:1].upper()}{detail[1:]}.")
+        return tuple(lines)
+    except Exception as exc:  # noqa: BLE001 - a detail line never changes the verdict
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return ()
 
 
 def run_generate_report(
@@ -991,6 +1524,119 @@ def run_generate_report(
     return str(result_path) if result_path else None
 
 
+
+def _ci_lab_has_capture_flags(shell: Any) -> bool:
+    """Whether the lab this run targets publishes capture flags to validate.
+
+    Asked only on a lab policy. A GOAD run has no ``user.txt`` / ``root.txt``,
+    so treating their absence as "flags validation failed" (exit 2) reported a
+    complete, successful run as a failure to every unattended caller and skipped
+    the report it asked for. An unknown lab keeps the check (see
+    ``lab_publishes_capture_flags``).
+    """
+    from adscan_core.lab_catalog import lab_publishes_capture_flags  # noqa: PLC0415
+
+    if lab_publishes_capture_flags(getattr(shell, "lab_provider", None)):
+        return True
+    print_info(
+        "This lab publishes no capture flags, so flag validation does not apply "
+        "to this run."
+    )
+    return False
+
+
+def _ci_retention_flags_ok(args: object) -> bool:
+    """Refuse ``--ephemeral --generate-report`` without ``--output``.
+
+    Refusing before the scan, rather than deleting the report or silently
+    keeping the workspace after it, is the only option that neither throws away
+    the run's output nor contradicts the flag the operator passed.
+    """
+    if not getattr(args, "ephemeral", False) or not getattr(args, "generate_report", False):
+        return True
+    if getattr(args, "output", None):
+        return True
+    print_error(
+        "--ephemeral deletes the workspace that holds the report: pass --output DIR "
+        "to keep a copy of the report, or drop --ephemeral to keep the workspace."
+    )
+    return False
+
+
+def _copy_ci_report_out(
+    report_file_path: Optional[str],
+    output_dir: Optional[str],
+    *,
+    kit_files: Optional[list] = None,
+) -> Optional[str]:
+    """Copy the generated report (and its HTML twin) into ``--output``.
+
+    When the run rendered more than the report (``--only report,playbook``),
+    the kit ZIP and every other PDF it produced are copied too, so the folder
+    holds what was asked for. A report-only run copies the PDF and its HTML
+    twin, as it always has.
+
+    Returns:
+        The copied PDF path, or None when there was nothing to copy or it failed.
+    """
+    if not output_dir or not report_file_path or not os.path.exists(report_file_path):
+        return None
+    try:
+        # The shared deliverable-destination SSOT copies (the REPL copy step and
+        # the LITE report use the same function); the workspace copy stays.
+        from adscan_core.deliverable_destination import copy_to_destination  # noqa: PLC0415
+
+        html_twin = os.path.splitext(report_file_path)[0] + ".html"
+        files = [report_file_path, html_twin]
+        produced_pdfs = [f for f in (kit_files or []) if str(f).lower().endswith(".pdf")]
+        if len(produced_pdfs) > 1:
+            files += [str(f) for f in kit_files or [] if str(f) not in files]
+        copy_to_destination(files, output_dir)
+        copied = os.path.join(output_dir, os.path.basename(report_file_path))
+        print_success(f"Report copied to the --output folder: {os.path.basename(copied)}")
+        return copied
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(f"Could not copy the report to --output: {exc}")
+        return None
+
+
+def _workspace_holds_undelivered_report(
+    workspace_dir: Optional[str],
+    report_file_path: Optional[str],
+    *,
+    copied_out_to: Optional[str] = None,
+) -> bool:
+    """True when the only copy of the generated report lives in ``workspace_dir``.
+
+    ``ci`` removes the workspace it auto-created at the end of the run. Before
+    this check, ``--generate-report`` wrote the PDF into that workspace and the
+    same run then deleted it, so the operator got a success line pointing at a
+    file that no longer existed.
+
+    Args:
+        workspace_dir: The run's workspace directory.
+        report_file_path: The report the run generated, if any.
+        copied_out_to: Where the report was copied outside the workspace, if it
+            was (the GitHub Actions artifact copy).
+
+    Returns:
+        True when removing the workspace would remove the report.
+    """
+    if not workspace_dir or not report_file_path:
+        return False
+    if not os.path.exists(report_file_path):
+        return False
+    if copied_out_to and os.path.exists(copied_out_to):
+        return False
+    workspace_root = os.path.abspath(workspace_dir)
+    report = os.path.abspath(report_file_path)
+    try:
+        return os.path.commonpath([workspace_root, report]) == workspace_root
+    except ValueError:
+        return False
+
 def _run_ci_report_generation(
     shell: object,
     args: object,
@@ -999,97 +1645,51 @@ def _run_ci_report_generation(
     report_format: str,
     frameworks: Optional[list] = None,
 ) -> Optional[str]:
-    """Route ``adscan ci --generate-report`` through the unified deliver engine.
+    """Render ``adscan ci --generate-report`` through the ``deliver`` kit pipeline.
 
-    CI defaults to REPORT-ONLY (a single Security Assessment Report PDF) — the
-    web runs ``adscan ci`` and then SEPARATELY dispatches the full kit via
-    ``_maybe_dispatch_deliverable_kit``, so emitting a full kit inline here
-    would double-generate. The deliverable selection grammar (``--only``) is the
-    SAME one the deliver flow uses, so there is one selection vocabulary across
-    the product:
+    One pipeline renders every deliverable: ``ci`` builds the ``deliver``
+    namespace from the shared report-options model
+    (``adscan_core.report_options``) and runs it in-process, so a scan and its
+    branded deliverable are one command and render exactly as ``adscan deliver``
+    would on the same workspace. The selection defaults to the Security
+    Assessment Report alone (:data:`CI_DEFAULT_ONLY`); ``--only`` widens it.
 
-    * Report-only (default, or ``--only report`` / ``--only executive``) → render
-      the single PDF via :func:`run_generate_report`, preserving CI's single-PDF
-      artifact contract (pipelines and the web expect the PDF at the existing
-      report-service path).
-    * A wider explicit ``--only`` (e.g. ``--only report,playbook``) → render that
-      selection inline through the unified deliver engine, returning the headline
-      Security Assessment Report PDF as the artifact path.
+    The PDF it returns is the headline Security Assessment Report of this run
+    (published by ``run_deliver`` on the namespace), which CI's artifact copy
+    and ``--output`` plumbing consume. Every file the kit produced is kept on
+    ``args`` for ``--output`` when the selection is wider than the report.
 
-    Returns the path to the report PDF artifact, or ``None`` on failure.
+    LITE images strip the kit engine; ``ci`` is PRO-only there, so the fallback
+    to :func:`run_generate_report` (the LITE exposure report) is defensive.
+
+    Returns:
+        The path to the Security Assessment Report PDF, or ``None`` on failure.
     """
-    from adscan_internal.cli.deliver import _parse_only
-
-    raw_only = getattr(args, "only", None)
     try:
-        selected = _parse_only(raw_only)
-    except ValueError as exc:
-        print_error(str(exc))
-        return None
-    selected_slugs = {item.slug for item in selected}
+        from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
+    except ModuleNotFoundError:
+        return run_generate_report(shell, report_json_path, report_format, frameworks=frameworks)
 
-    # Report-only when the selection is exactly the assessment report (the
-    # ``report``/``executive`` slug). This is the CI/web default and keeps the
-    # single-PDF artifact contract untouched.
-    if selected_slugs == {"executive"}:
-        return run_generate_report(
-            shell,
-            report_json_path,
-            report_format,
-            frameworks=frameworks,
-            engine=getattr(args, "report_engine", "") or "",
-            renderer=getattr(args, "report_renderer", "") or "",
-            template=getattr(args, "report_template", "") or "",
-            theme=getattr(args, "report_theme", "") or "",
-            display_name=getattr(args, "display_name", "") or "",
-        )
+    ns = _ci_deliver_namespace(args, workspace_dir=Path(report_json_path).parent, frameworks=frameworks)
+    # The kit reads the change ledger from the workspace. Flush the session's
+    # live ledger first: on a first run the file can trail the session by a
+    # moment, and the report would then say the record could not be read. This
+    # is a read-only, records-nothing flush, so it uses the quiet SSOT accessor
+    # (``active_ledger``) rather than a bare getattr or the warning write-seam.
+    from adscan_internal.services.ledger_guard import active_ledger  # noqa: PLC0415
 
-    # Wider selection: render it inline via the unified deliver engine. The
-    # headline Security Assessment Report PDF is returned as the artifact path so
-    # the downstream single-PDF plumbing (artifact copy) still works.
-    return _run_ci_deliver_selection(
-        shell,
-        args,
-        report_json_path=report_json_path,
-        frameworks=frameworks,
-        only=raw_only,
-    )
-
-
-def _run_ci_deliver_selection(
-    shell: object,
-    args: object,
-    *,
-    report_json_path: str,
-    frameworks: Optional[list],
-    only: Optional[str],
-) -> Optional[str]:
-    """Render a multi-deliverable CI selection via the unified deliver engine.
-
-    Builds the ``deliver`` argparse namespace from the CI flags and runs it
-    synchronously, then returns the staged Security Assessment Report PDF (the
-    headline artifact) so CI's single-PDF artifact plumbing still resolves.
-    """
-    import argparse as _argparse
-
-    from adscan_internal.cli.deliver import run_deliver_sync as _run_deliver_sync
-
-    workspace_dir = Path(report_json_path).parent
-    fw_value = ",".join(frameworks) if frameworks else None
-    ns = _argparse.Namespace(
-        workspace=str(workspace_dir),
-        client=getattr(args, "display_name", "") or None,
-        engagement=None,
-        output=None,
-        only=only,
-        no_navigator=False,
-        frameworks=fw_value,
-        theme="",
-        report_theme=getattr(args, "report_theme", "") or "",
-    )
+    ledger = active_ledger(shell)
+    if ledger is not None:
+        try:
+            ledger.flush()
+        except Exception as exc:  # noqa: BLE001 - the render reads what is on disk
+            telemetry.capture_exception(exc)
+            print_exception(show_locals=False, exception=exc)
+    setattr(ns, "_shell", shell)
     rc = _run_deliver_sync(ns)
     if rc != 0:
         return None
+    setattr(args, "_ci_kit_files", list(getattr(ns, "_kit_copy_files", []) or []))
     # ``run_deliver`` publishes the headline artefact it actually produced on
     # the namespace. Take it from there rather than rebuilding a staging path:
     # each run stages into its own directory (so a kit can never bundle an
@@ -1097,3 +1697,80 @@ def _run_ci_deliver_selection(
     # pick up a stale report when the current run had not produced one.
     headline = getattr(ns, "_headline_pdf", "") or ""
     return headline if headline and Path(headline).is_file() else None
+
+
+def _ci_deliver_namespace(
+    args: object,
+    *,
+    workspace_dir: Path,
+    frameworks: Optional[list],
+) -> Any:
+    """The ``deliver`` namespace for a CI render, built from the shared model.
+
+    Every deliverable option is copied verbatim from the ``ci`` namespace, so
+    nothing ``deliver`` accepts can be lost on the way. Three CI rules apply on
+    top: the selection defaults to the report alone, the client falls back to
+    the retired ``--display-name`` (and the run plan's ``display_name``), and the
+    frameworks are the ones the scan resolved.
+    """
+    import argparse as _argparse
+
+    from adscan_core.report_options import CI_DEFAULT_ONLY, report_option_values
+
+    values = report_option_values(args)  # type: ignore[arg-type]
+    values["only"] = values.get("only") or CI_DEFAULT_ONLY
+    values["client"] = (
+        values.get("client") or (getattr(args, "display_name", "") or "").strip() or None
+    )
+    values["frameworks"] = ",".join(frameworks) if frameworks else None
+    ns = _argparse.Namespace(
+        workspace=str(workspace_dir),
+        output=None,
+        progress_model=None,
+        debug=bool(getattr(args, "debug", False)),
+        **values,
+    )
+    # ``ci`` already said it once, before the scan (see _announce_report_options).
+    setattr(ns, "_branding_notice_shown", True)
+    return ns
+
+
+def _announce_report_options(args: object) -> bool:
+    """Validate and announce the deliverable options before the scan starts.
+
+    A scan can run for hours, so a typo in ``--only`` or ``--emit`` and a
+    white-label request the install cannot honour are reported at the start,
+    not after the scan. Retired report flags print their one deprecation line
+    here too. Validation only applies when a report was requested.
+
+    Returns:
+        ``False`` when a deliverable option is invalid (the caller exits 2).
+    """
+    from adscan_core.report_options import (
+        CI_DEFAULT_ONLY,
+        parse_emit_values,
+        parse_only_slugs,
+        report_deprecation_notices,
+    )
+
+    for notice in report_deprecation_notices(args):  # type: ignore[arg-type]
+        print_warning(notice)
+    if not getattr(args, "generate_report", False):
+        return True
+    try:
+        parse_only_slugs(getattr(args, "only", None) or CI_DEFAULT_ONLY)
+        parse_emit_values(getattr(args, "emit", None))
+    except ValueError as exc:
+        print_error(str(exc))
+        return False
+    try:
+        from adscan_internal.services.report_branding import whitelabel_downgrade_notice
+
+        notice = whitelabel_downgrade_notice(getattr(args, "branding", None), env=os.environ)
+    except Exception as exc:  # noqa: BLE001 - a notice never blocks a scan
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        notice = None
+    if notice:
+        print_warning(notice)
+    return True

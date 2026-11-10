@@ -11,6 +11,8 @@ The service layer (adscan_internal.spraying) performs the tool execution and bas
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import json
 import os
 import re
@@ -19,7 +21,7 @@ import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
 from adscan_internal import (
     print_error,
@@ -97,6 +99,16 @@ from adscan_internal.spraying import (
     write_temp_users_file,
 )
 from adscan_internal.services.unauth_funnel_telemetry import emit_spray_completed
+from adscan_internal.services.spray_policy_service import (
+    PasswordAttemptRules,
+    resolve_password_attempt_rules,
+)
+
+if TYPE_CHECKING:
+    from adscan_internal.services.spray_policy_service import (
+        EffectiveLockout,
+        SprayPolicyResult,
+    )
 
 
 def _spray_monotonic() -> float:
@@ -182,6 +194,49 @@ def _normalize_validated_domain_hits(
     )
 
 
+def _record_cross_attributed_leak_hits(
+    shell: SprayShell, *, domain: str, credential: str, username: str
+) -> None:
+    """Attribute a validated credential back to the directory leak it came from.
+
+    Looks the proven string up in the domain's rejected-secret pool and records
+    the compromised principal against every leak that holds it. A list, not one
+    record: the same service password is legitimately written into several
+    accounts' attributes, so the proof is attributed to all of them rather than
+    to whichever one was recorded first.
+
+    Writes to the pool only. It records no finding, grades no severity and
+    reads no catalog — the promotion that turns an unproven attribute
+    disclosure into the confirmed credential finding belongs to the
+    finding-reconciliation seam, which runs after every phase boundary and is
+    called by both report tiers.
+
+    Best-effort and silent: an attribution lost here costs provenance on a
+    report, and must never cost the captured credential.
+    """
+    try:
+        from adscan_internal.services.credentials.rejected_secret_pool import (
+            find_rejected_secret_candidates,
+            record_cross_attributed_hit,
+        )
+
+        domains_data = getattr(shell, "domains_data", None)
+        if not isinstance(domains_data, dict):
+            return
+        for leak in find_rejected_secret_candidates(
+            domains_data, domain=domain, secret=credential
+        ):
+            record_cross_attributed_hit(
+                domains_data,
+                domain=domain,
+                leak=leak,
+                compromised_principal=username,
+            )
+    except Exception as exc:  # noqa: BLE001 - provenance is never worth a failure
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def handle_validated_domain_hits_followup(
     shell: SprayShell,
     *,
@@ -234,6 +289,17 @@ def handle_validated_domain_hits_followup(
         # explicitly to keep the Provenance column off "via unknown".
         _set_credential_origin(
             shell, domain=domain, username=user, origin=credential_origin
+        )
+        # A string this hit just PROVED may be one a directory attribute leaked
+        # and that the directory REFUSED for the account whose attribute held
+        # it. Record the proof against that leak so the attribute the client
+        # has to clear stops being attributable only to a spray origin. This
+        # stores a fact and nothing more: whether the pair makes the leak a
+        # confirmed credential, and at what severity, is decided once at the
+        # finding-reconciliation seam, which both report tiers call. A spray
+        # must never build that finding itself.
+        _record_cross_attributed_leak_hits(
+            shell, domain=domain, credential=credential, username=user
         )
 
     # Persist credentials to disk immediately so downstream attack-path execution
@@ -498,7 +564,6 @@ class SprayShell(Protocol):
     current_workspace_dir: str | None
     domains_data: dict
     kerbrute_path: str | None
-    netexec_path: str | None
     password_spraying_history: dict | None
 
     def _get_workspace_cwd(self) -> str: ...
@@ -515,16 +580,6 @@ class SprayShell(Protocol):
     ) -> list[str] | None: ...
 
     def do_sync_clock_with_pdc(self, domain: str, verbose: bool = False) -> bool: ...
-
-    def _run_netexec(
-        self,
-        command: str,
-        domain: str | None = None,
-        timeout: int | None = None,
-        shell: bool = False,
-        capture_output: bool = False,
-        text: bool = False,
-    ) -> subprocess.CompletedProcess[str] | None: ...
 
     def run_command(
         self, command: str, *, timeout: int | None = None, **kwargs
@@ -566,6 +621,103 @@ _SPRAYING_OPTION_MONTH_SEASON = "Password by month/season + year (e.g. March2026
 _SPRAYING_OPTION_COMPUTER_PRE2K = "Computer accounts (pre2k: hostname as password)"
 _SPRAYING_OPTION_RETRY_PASSWORDS = "Retry saved password candidates"
 _SPRAYING_OPTION_RETRY_DOMAIN_REUSE = "Retry saved SAM -> domain reuse candidates"
+
+#: Scan-policy check behind each legacy spray-menu option and each coverage-loop
+#: choice (spec 2026-11-04 § 4.4.2, § 7.2). The generic password spray (custom,
+#: environment-mined and share-found candidates) is ``step:passwordspray``.
+_SPRAY_OPTION_CHECKS: dict[str, str] = {
+    _SPRAYING_OPTION_USER_AS_PASS: "step:useraspass",
+    _SPRAYING_OPTION_USER_AS_PASS_LOWER: "step:useraspass",
+    _SPRAYING_OPTION_USER_AS_PASS_UPPER: "step:useraspass",
+    _SPRAYING_OPTION_BLANK_PASSWORD: "step:blankpassword",
+    _SPRAYING_OPTION_CUSTOM_PASSWORD: "step:passwordspray",
+    _SPRAYING_OPTION_MONTH_SEASON: "module:password_spraying.month_season",
+    _SPRAYING_OPTION_COMPUTER_PRE2K: "step:computerpre2k",
+    _SPRAYING_OPTION_RETRY_PASSWORDS: "step:passwordspray",
+    _SPRAYING_OPTION_RETRY_DOMAIN_REUSE: "module:password_spraying.reuse",
+}
+_SPRAY_CHOICE_CHECKS: dict[str, str] = {
+    "blank": "step:blankpassword",
+    "useraspass": "step:useraspass",
+    "reuse": "module:password_spraying.reuse",
+    "retry_reuse": "module:password_spraying.reuse",
+    "month_year": "module:password_spraying.month_season",
+    "season_year": "module:password_spraying.month_season",
+    "custom": "step:passwordspray",
+    "mined": "step:passwordspray",
+    "retry_found": "step:passwordspray",
+}
+
+
+#: The check that gates trying recovered local credentials against domain accounts.
+_DOMAIN_REUSE_CHECK_ID = "module:password_spraying.reuse"
+
+
+def gate_domain_reuse(shell: object) -> bool:
+    """True when recovered-credential domain reuse may run under the active policy.
+
+    When the policy switches ``module:password_spraying.reuse`` off, the refusal
+    is explained once (scan-policy notice SSOT) and False is returned. Callers
+    that ask the operator first call it before the question; the selection seam
+    calls it too, so no path sends anything with the check off.
+    """
+    if _spray_check_excluded(shell, _DOMAIN_REUSE_CHECK_ID):
+        _refuse_spray_check(shell, _DOMAIN_REUSE_CHECK_ID)
+        return False
+    return True
+
+
+def _spray_check_excluded(shell: object, check_id: str) -> bool:
+    """True when the active scan policy excludes the spray check (no policy: False)."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        check_excluded,
+    )
+
+    return bool(check_id) and check_excluded(shell, check_id)
+
+
+def _refuse_spray_check(shell: object, check_id: str) -> None:
+    from adscan_internal.services.scan_policy_enforcement import refuse  # noqa: PLC0415
+
+    refuse(shell, check_id, surface="spray")
+
+
+#: Every check behind a USER-account spray type (the coverage selector choices
+#: and the legacy menu options; pre2k is the computer-account step, gated on its
+#: own). Derived from the two maps above so a new spray type cannot be missed.
+_USER_SPRAY_CHECK_IDS: frozenset[str] = frozenset(
+    check_id
+    for check_id in (*_SPRAY_CHOICE_CHECKS.values(), *_SPRAY_OPTION_CHECKS.values())
+    if check_id and check_id != "step:computerpre2k"
+)
+_USER_SPRAY_POLICY_SKIP_NOTE = (
+    "Password spraying skipped: your scan policy excludes every password spraying "
+    "technique."
+)
+
+
+def _allowed_user_spray_checks(shell: object) -> frozenset[str]:
+    """The user-spray checks the active scan policy lets run (all without a policy)."""
+    return frozenset(
+        check_id
+        for check_id in _USER_SPRAY_CHECK_IDS
+        if not _spray_check_excluded(shell, check_id)
+    )
+
+
+def _spray_choice_allowed(shell: object, choice: str) -> bool:
+    """Whether a coverage-selector choice may be offered under the active policy.
+
+    A choice with no mapped check (``__done__``) is always allowed; any other
+    choice is offered only when its check runs, so a policy-excluded spray type
+    is never presented, auto-picked, or dispatched from the selector. A choice
+    left out is explained once through the skip-notice SSOT (repeats collapse).
+    """
+    check_id = _SPRAY_CHOICE_CHECKS.get(str(choice or ""), "")
+    if not check_id or not _spray_check_excluded(shell, check_id):
+        return True
+    _refuse_spray_check(shell, check_id)
+    return False
 _DOMAIN_HASH_SPRAY_LINE_RE = re.compile(
     r"^\s*SMB\s+\S+\s+\d+\s+\S+\s+\[(?P<status>[^\]]+)\]\s+(?P<rest>.*)$"
 )
@@ -783,6 +935,10 @@ def _get_enabled_computer_account_count(shell: SprayShell, domain: str) -> int |
 def _should_recommend_pre2k_for_ctf(shell: SprayShell, domain: str) -> bool:
     """Return True when pre2k is a meaningful recommendation in a CTF workspace."""
 
+    if _spray_check_excluded(shell, "step:computerpre2k"):
+        # Never recommend (or pre-select) a check the scan policy switches off.
+        _refuse_spray_check(shell, "step:computerpre2k")
+        return False
     count = _get_enabled_computer_account_count(shell, domain)
     if count is None:
         print_info_debug(
@@ -821,6 +977,11 @@ def _pre2k_followup_is_actionable(shell: SprayShell, domain: str) -> bool:
     - One or zero enabled computers -> suppress (nothing meaningful to spray).
     """
 
+    if _spray_check_excluded(shell, "step:computerpre2k"):
+        # The scan policy switches pre2k off: the follow-up is never offered,
+        # so its "Yes" default cannot resolve on silence.
+        _refuse_spray_check(shell, "step:computerpre2k")
+        return False
     # "pwned" counts as authenticated here: pre2k is a MACHINE-account technique
     # (computer accounts are not governed by the user account-lockout policy), so
     # an already-compromised user side does not make it redundant.
@@ -958,12 +1119,13 @@ def maybe_show_ctf_spraying_recommendation(
         return
 
     marked_domain = mark_sensitive(domain, "domain")
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    # Wording only: a lab is told about its intended foothold (genuinely environment).
+    lab = policy_settings.is_lab(shell)
     panel_lines = [
         f"Domain: {marked_domain}",
         (
             "In many HTB/CTF environments, a first foothold comes from spraying."
-            if workspace_type == "ctf"
+            if lab
             else "An early foothold often comes from targeted spraying checks."
         ),
         "",
@@ -977,13 +1139,13 @@ def maybe_show_ctf_spraying_recommendation(
         "\n".join(panel_lines),
         title=(
             "[bold yellow]Recommended CTF Next Step[/bold yellow]"
-            if workspace_type == "ctf"
+            if lab
             else "[bold yellow]Recommended Next Step[/bold yellow]"
         ),
         border_style="yellow",
         expand=False,
     )
-    if workspace_type == "ctf":
+    if lab:
         print_instruction(
             "If you skip spraying in CTF, you can miss the intended foothold path."
         )
@@ -1047,26 +1209,23 @@ def _build_domain_reuse_eligibility(
         os.path.basename(user_list_rel),
     )
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
-    safe_threshold = 2 if auth_state in {"auth", "pwned"} else 0
     eligibility = compute_spraying_eligibility(
         shell,
         domain=domain,
         user_list_file=user_list_file,
-        safe_threshold=safe_threshold,
     )
     if eligibility is None:
         return None
     if not print_spraying_eligibility(shell, domain, eligibility):
         print_info("Password spraying cancelled by user.")
         return None
-    default_confirm = shell.type == "ctf"
     if not _enforce_lockout_guardrail(
+        shell=shell,
         domain=domain,
         eligibility=eligibility,
         prompt_text=(
             "Continue with SAM-to-domain reuse validation using the full user list?"
         ),
-        default_confirm=default_confirm,
     ):
         return None
     if not eligibility.eligible_users:
@@ -1214,6 +1373,7 @@ _SPRAY_RECENT_HITS = 15
 # Bounded concurrency for the native (kerbad) blank-password spray. Each eligible
 # user gets ONE empty-password AS-REQ; the cap keeps big user bases fast without
 # flooding the KDC. Matches the conservative sweep concurrency used elsewhere.
+# Default-level value; the live value comes from the scan pacing (``kdc.blank_spray``).
 _BLANK_SPRAY_CONCURRENCY = 16
 # Max rows shown per eligibility table (eligible / excluded) so a 1-2k-user domain
 # does not flood the panel. The full counts are in the header; overflow is noted.
@@ -1224,6 +1384,9 @@ _ELIGIBILITY_TABLE_LIMIT = 20
 # if their real (unknown) PSO threshold is as low as 3. Privileged Tier-0 accounts
 # are exactly the ones behind unreadable PSOs, so erring safe here is mandatory.
 _UNREADABLE_PSO_FALLBACK_THRESHOLD = 3
+# ``EffectiveLockout.source`` for an account whose PSO assignment cannot be
+# proven absent (see ``SprayPolicyResult.pso_assignment_visible``).
+_PSO_ASSIGNMENT_UNREADABLE_SOURCE = "PSO assignment unreadable"
 
 
 def _build_spray_dashboard(spray_label: str, total: int | None = None) -> ProgressDashboard:
@@ -1960,6 +2123,14 @@ def validate_domain_reuse_with_ntlm_hash(
         result["error"] = str(exc)
         return result
 
+    # Every eligible account received one failed-or-valid attempt: record it so
+    # the per-window accounting sees it when the lockout counter is unreadable.
+    register_user_spray_attempts(
+        shell,
+        domain=domain,
+        combos=[(user, normalized_hash) for user in eligible_users],
+        mode="domain_reuse",
+    )
     result["hits"] = hits
     result["outcome_counts"] = outcomes
     store = CredentialStoreService()
@@ -2060,6 +2231,15 @@ def validate_domain_reuse_with_password(
             command=command,
             domain=domain,
             executor=_executor,
+        )
+        register_user_spray_attempts(
+            shell,
+            domain=domain,
+            combos=[
+                (user, clear_password)
+                for user in effective_eligibility.eligible_users
+            ],
+            mode="domain_reuse",
         )
         hit_entries = spray_result.get("credentials", [])
         if not isinstance(hit_entries, list):
@@ -2353,6 +2533,9 @@ def register_user_spray_attempts(
     usernames or passwords are silently skipped — the caller should not
     pass them but defensive filtering keeps the helper safe.
     """
+    _record_spray_attempt_times(
+        shell, domain, [str(u) for (u, pw) in combos if u and pw]
+    )
     try:
         history = get_password_spraying_history(shell)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2552,6 +2735,25 @@ def confirm_with_history_check(
         return proposed_combos
 
 
+def _resolve_account_lockouts(
+    spray_policy: SprayPolicyResult, file_users: list[str]
+) -> "dict[str, EffectiveLockout]":
+    """Resolve the effective lockout policy for every spray candidate.
+
+    Thin loop over :meth:`SprayPolicyResult.effective_lockout`, the single
+    resolver: unreadable PSOs, unprovable PSO assignments and an unknown domain
+    threshold all resolve there to the conservative threshold.
+    """
+    return {
+        u.strip().lower(): spray_policy.effective_lockout(
+            u.strip().lower(),
+            conservative_threshold=_UNREADABLE_PSO_FALLBACK_THRESHOLD,
+        )
+        for u in file_users
+        if u.strip()
+    }
+
+
 def _compute_spray_eligibility_pso_aware(
     *,
     file_users: list[str],
@@ -2594,22 +2796,45 @@ def _compute_spray_eligibility_pso_aware(
             lockout_threshold=default_threshold,
             safe_remaining_threshold=safe_remaining_threshold,
             minimum_remaining_attempts=None,
-            used_policy_data=False,
+            # Derived FROM the policy read (every account resolved to "cannot
+            # lock"), so the unknown-policy guardrail must not fire.
+            used_policy_data=True,
             notes=notes,
             no_lockout_enforced=True,
             eligible_details=[EligibleUser(username=u) for u in file_users],
         )
 
-    pso_users = sum(1 for u in pso_threshold_by_user if u in badpwd_by_user)
+    # Callers may pass a resolved threshold for EVERY account (the SSOT path);
+    # only the ones whose source is a PSO actually have a fine-grained policy.
+    pso_users = sum(
+        1
+        for u in pso_threshold_by_user
+        if u in badpwd_by_user
+        and str(pso_source.get(u) or "PSO '").startswith("PSO '")
+    )
     if pso_users:
         notes.append(
             f"PSO-aware eligibility: {pso_users} user(s) have a fine-grained "
             "password policy that overrides the domain default."
         )
+    n_unprovable_assignment = sum(
+        1
+        for u in file_users
+        if (pso_source.get(u.strip().lower()) or "") == _PSO_ASSIGNMENT_UNREADABLE_SOURCE
+    )
+    if n_unprovable_assignment:
+        notes.append(
+            "Fine-grained password policies may apply in this domain, but this "
+            "credential cannot read which accounts they cover. "
+            f"{n_unprovable_assignment} account(s) are treated as if the strictest "
+            f"one applies: a lockout threshold of {_UNREADABLE_PSO_FALLBACK_THRESHOLD}, "
+            "or lower if a readable policy is stricter."
+        )
     n_unreadable_pso = sum(
         1
         for u in file_users
         if "unreadable" in (pso_source.get(u.strip().lower()) or "")
+        and (pso_source.get(u.strip().lower()) or "") != _PSO_ASSIGNMENT_UNREADABLE_SOURCE
     )
     if n_unreadable_pso:
         notes.append(
@@ -2621,6 +2846,7 @@ def _compute_spray_eligibility_pso_aware(
         )
 
     minimum_remaining: int | None = None
+    n_assumed_threshold = 0
     locked_lower = locked_users or set()
     if locked_lower:
         notes.append(
@@ -2644,10 +2870,20 @@ def _compute_spray_eligibility_pso_aware(
             continue
         effective_threshold = pso_threshold_by_user.get(norm, default_threshold)
         if effective_threshold is None:
-            # No threshold data — include conservatively
+            # No threshold data for this account. "Unknown" must never read as
+            # "cannot lock": assume the conservative threshold, which with the
+            # reserve margin allows one attempt from a clean count and folds the
+            # account into the multi-password budget like any bounded one.
+            effective_threshold = _UNREADABLE_PSO_FALLBACK_THRESHOLD
+            n_assumed_threshold += 1
+        if int(effective_threshold) <= 0:
+            # This account's EFFECTIVE policy enforces no lockout (no PSO under a
+            # no-lockout domain policy, or a readable PSO with threshold 0): it
+            # cannot lock and must not narrow the multi-password budget, which is
+            # derived only from accounts that can.
             eligible.append(user)
             eligible_details.append(
-                EligibleUser(username=user, policy_note=_policy_note(norm, None))
+                EligibleUser(username=user, policy_note=_policy_note(norm, 0))
             )
             continue
 
@@ -2690,6 +2926,12 @@ def _compute_spray_eligibility_pso_aware(
                 )
             )
 
+    if n_assumed_threshold:
+        notes.append(
+            f"{n_assumed_threshold} account(s) have no readable lockout threshold; a "
+            f"conservative threshold of {_UNREADABLE_PSO_FALLBACK_THRESHOLD} was assumed."
+        )
+
     return SprayEligibilityResult(
         input_users=list(file_users),
         eligible_users=eligible,
@@ -2700,6 +2942,191 @@ def _compute_spray_eligibility_pso_aware(
         used_policy_data=True,
         notes=notes,
         eligible_details=eligible_details,
+    )
+
+
+# When the DC's lockout counter (badPwdCount) cannot be read, nothing records
+# ADscan's own failed attempts, so consecutive spray flows (username as
+# password, then blank, then a seasonal password) would each spend one more
+# attempt per account inside the same observation window. Without the counter
+# ADscan allows ONE attempt per account per window and counts its own attempts
+# itself. The window is unknown in that state, so the conservative hour the
+# lockout guardrail already recommends is used.
+_UNKNOWN_COUNTER_WINDOW_SECONDS = 3600
+_UNKNOWN_COUNTER_ATTEMPTS_PER_WINDOW = 1
+# Per-session monotonic ledger on the shell: {(domain_lower, user_lower): ts}.
+# Monotonic because ADscan steps the wall clock to the DC mid-scan; the
+# persisted wall-clock history covers attempts from an earlier session.
+_SPRAY_ATTEMPT_LEDGER_ATTR = "_spray_attempt_monotonic"
+
+
+def _record_spray_attempt_times(
+    shell: object, domain: str, usernames: "list[str]"
+) -> None:
+    """Stamp ADscan's own attempts in the per-session monotonic ledger."""
+    try:
+        ledger = getattr(shell, _SPRAY_ATTEMPT_LEDGER_ATTR, None)
+        if not isinstance(ledger, dict):
+            ledger = {}
+            setattr(shell, _SPRAY_ATTEMPT_LEDGER_ATTR, ledger)
+        now = _spray_monotonic()
+        domain_key = str(domain or "").strip().lower()
+        for username in usernames:
+            user_key = str(username or "").strip().casefold()
+            if user_key:
+                ledger[(domain_key, user_key)] = now
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not break a spray
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _users_attempted_within(
+    shell: object, domain: str, users: "list[str]", window_seconds: int
+) -> set[str]:
+    """Casefolded users ADscan already tried within ``window_seconds``.
+
+    Reads the per-session monotonic ledger and the persisted spray history
+    (wall clock, for attempts made by an earlier session). Any doubt counts as
+    attempted: an unparseable timestamp is treated as recent.
+    """
+    recent: set[str] = set()
+    domain_key = str(domain or "").strip().lower()
+    ledger = getattr(shell, _SPRAY_ATTEMPT_LEDGER_ATTR, None)
+    now_mono = _spray_monotonic()
+    if isinstance(ledger, dict):
+        for user in users:
+            key = (domain_key, str(user).strip().casefold())
+            stamp = ledger.get(key)
+            if isinstance(stamp, (int, float)) and now_mono - stamp < window_seconds:
+                recent.add(key[1])
+    try:
+        history = get_password_spraying_history(shell)  # type: ignore[arg-type]
+        domain_history = next(
+            (v for k, v in history.items() if str(k).strip().lower() == domain_key),
+            {},
+        )
+    except Exception:  # noqa: BLE001
+        domain_history = {}
+    if not isinstance(domain_history, dict) or not domain_history:
+        return recent
+    now_wall = datetime.now(timezone.utc)
+    for user in users:
+        user_key = str(user).strip().casefold()
+        if user_key in recent:
+            continue
+        entries = domain_history.get(user_key)
+        if not isinstance(entries, dict):
+            continue
+        for entry in entries.values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                last = datetime.fromisoformat(str(entry.get("last_run") or ""))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                age = (now_wall - last).total_seconds()
+            except (TypeError, ValueError):
+                age = 0.0
+            if age < window_seconds:
+                recent.add(user_key)
+                break
+    return recent
+
+
+def _min_cap(current: "int | None", new: int) -> int:
+    """The stricter of two attempt ceilings (``None`` = no ceiling yet)."""
+    return new if current is None else min(int(current), int(new))
+
+
+def _exclude_recent_attempts_without_counter(
+    shell: object,
+    domain: str,
+    result: "SprayEligibilityResult | None",
+) -> "SprayEligibilityResult | None":
+    """Allow one attempt per account per window when badPwdCount is unreadable.
+
+    Applies only to a result computed WITHOUT lockout counters
+    (``used_policy_data`` False) when the scan policy handles an unreadable
+    threshold conservatively (``resolve_password_attempt_rules``). A lab policy
+    that attempts anyway (a CTF workspace's default) keeps going without it.
+    """
+    if result is None or result.used_policy_data or result.no_lockout_enforced:
+        return result
+    if resolve_password_attempt_rules(shell).attempt_anyway_when_unknown:
+        return result
+    if not result.eligible_users:
+        return result
+    from adscan_internal.spraying import ExcludedUser  # noqa: PLC0415
+
+    recent = _users_attempted_within(
+        shell, domain, list(result.eligible_users), _UNKNOWN_COUNTER_WINDOW_SECONDS
+    )
+    minutes = _UNKNOWN_COUNTER_WINDOW_SECONDS // 60
+    notes = list(result.notes) + [
+        "The account lockout counter cannot be read with the current access, so "
+        f"ADscan allows {_UNKNOWN_COUNTER_ATTEMPTS_PER_WINDOW} attempt per account "
+        f"every {minutes} minutes and counts its own attempts."
+    ]
+    cap = _min_cap(result.attempt_cap, _UNKNOWN_COUNTER_ATTEMPTS_PER_WINDOW)
+    if not recent:
+        return replace(result, notes=notes, attempt_cap=cap)
+    kept = [u for u in result.eligible_users if str(u).strip().casefold() not in recent]
+    newly_excluded = [
+        ExcludedUser(
+            username=u,
+            reason=(
+                f"Already tried in the last {minutes} min and the lockout counter "
+                "cannot be read"
+            ),
+        )
+        for u in result.eligible_users
+        if str(u).strip().casefold() in recent
+    ]
+    notes.append(
+        f"{len(newly_excluded)} account(s) were already tried in that window and "
+        "wait for it to pass."
+    )
+    return replace(
+        result,
+        eligible_users=kept,
+        eligible_details=[
+            e
+            for e in result.eligible_details
+            if str(e.username).strip().casefold() not in recent
+        ],
+        excluded_users=list(result.excluded_users) + newly_excluded,
+        notes=notes,
+        attempt_cap=cap,
+    )
+
+
+def _apply_lockout_authority_cap(
+    result: "SprayEligibilityResult | None",
+    lockout_target: "LockoutAuthorityTarget | None",
+) -> "SprayEligibilityResult | None":
+    """Enforce the replica-DC conservative mode the operator was promised.
+
+    When the counters were read from a replica whose PDC is unreachable they
+    can lag the PDC, so at most one attempt per account per flow is allowed and
+    accounts with no readable count stay excluded (``strict_missing_badpwd``).
+    A domain where no account can lock is unaffected: the threshold is
+    replicated, only the counters lag.
+    """
+    if (
+        result is None
+        or lockout_target is None
+        or not lockout_target.conservative
+        or result.no_lockout_enforced
+    ):
+        return result
+    return replace(
+        result,
+        attempt_cap=_min_cap(result.attempt_cap, 1),
+        notes=list(result.notes)
+        + [
+            "Lockout counters were read from a replica DC that can lag the PDC; "
+            "at most one attempt per account is made in this spray."
+        ],
     )
 
 
@@ -2943,7 +3370,7 @@ def compute_spraying_eligibility(
     *,
     domain: str,
     user_list_file: str,
-    safe_threshold: int,
+    safe_threshold: int | None = None,
 ) -> SprayEligibilityResult | None:
     """Compute eligible and excluded users for password spraying.
 
@@ -2960,6 +3387,11 @@ def compute_spraying_eligibility(
     panel can render the whole funnel; it does not change the spray set, which
     is byte-identical to what the inline drop produced before.
 
+    The reserve margin, the handling of an unreadable threshold and the lab
+    ``ignore_threshold`` come from the scan policy through
+    :func:`resolve_password_attempt_rules`, the single resolver. No executor
+    passes a margin; ``safe_threshold`` exists only for tests that pin one.
+
     Returns:
         A `SprayEligibilityResult` instance (from `adscan_internal.spraying`)
         on success, or None on fatal errors (e.g., cannot read user list).
@@ -2967,6 +3399,9 @@ def compute_spraying_eligibility(
     file_users = _read_spray_user_list(user_list_file)
     if file_users is None:
         return None
+    rules = resolve_password_attempt_rules(shell)
+    if safe_threshold is None:
+        safe_threshold = rules.reserve_margin
 
     # Exclude already-owned principals from the spray set: spraying an account we
     # already control yields no new access, adds badPwdCount noise, and — because
@@ -2985,8 +3420,42 @@ def compute_spraying_eligibility(
     )
     if result is None:
         return None
+    result = _apply_ignore_threshold(result, rules)
     # SprayEligibilityResult is frozen — attach the funnel via replace().
     return replace(result, owned_drop=owned_drop)
+
+
+def _apply_ignore_threshold(
+    result: SprayEligibilityResult, rules: "PasswordAttemptRules"
+) -> SprayEligibilityResult:
+    """A lab policy's ``ignore_threshold``: every candidate is sprayable.
+
+    Accounts that are currently locked out stay excluded (spraying them is
+    pointless and extends the lockout). Only a lab policy can carry the flag
+    (``parse_password_attempts`` refuses it on a real environment).
+    """
+    if not rules.ignore_threshold:
+        return result
+    from adscan_internal.spraying import EligibleUser  # noqa: PLC0415
+
+    locked = [e for e in result.excluded_users if e.reason == "Account locked out"]
+    locked_names = {str(e.username).strip().casefold() for e in locked}
+    eligible = [u for u in result.input_users if str(u).strip().casefold() not in locked_names]
+    return replace(
+        result,
+        eligible_users=eligible,
+        excluded_users=locked,
+        eligible_details=[EligibleUser(username=u) for u in eligible],
+        minimum_remaining_attempts=None,
+        no_lockout_enforced=True,
+        used_policy_data=True,
+        attempt_cap=None,
+        notes=list(result.notes)
+        + [
+            "The scan policy is for a lab and ignores the lockout threshold, so every "
+            "account that is not locked out is sprayed."
+        ],
+    )
 
 
 def _read_spray_user_list(user_list_file: str) -> list[str] | None:
@@ -3020,7 +3489,7 @@ def _compute_candidate_spraying_eligibility(
     *,
     domain: str,
     file_users: list[str],
-    safe_threshold: int,
+    safe_threshold: int | None = None,
 ) -> SprayEligibilityResult | None:
     """Split already-filtered spray candidates into eligible / excluded.
 
@@ -3028,6 +3497,8 @@ def _compute_candidate_spraying_eligibility(
     :func:`compute_spraying_eligibility`; this half owns only the lockout-policy
     lookup and the safety split.
     """
+    if safe_threshold is None:
+        safe_threshold = resolve_password_attempt_rules(shell).reserve_margin
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
@@ -3047,6 +3518,7 @@ def _compute_candidate_spraying_eligibility(
     # reached when PSO objects are readable, so the non-PSO core split must exclude
     # locked accounts too). Empty for the NetExec fallback / no-policy paths.
     locked_users_for_result: set[str] = set()
+    lockout_target: "LockoutAuthorityTarget | None" = None
 
     if is_auth:
         auth_domain: str | None = None
@@ -3065,12 +3537,16 @@ def _compute_candidate_spraying_eligibility(
                 "Skipping password policy lookup because authenticated domain "
                 "credentials are incomplete."
             )
-            return compute_spray_eligibility(
-                file_users=file_users,
-                lockout_threshold=lockout_threshold,
-                badpwd_by_user=badpwd_by_user,
-                safe_remaining_threshold=safe_threshold,
-                strict_missing_badpwd=True,
+            return _exclude_recent_attempts_without_counter(
+                shell,
+                domain,
+                compute_spray_eligibility(
+                    file_users=file_users,
+                    lockout_threshold=lockout_threshold,
+                    badpwd_by_user=badpwd_by_user,
+                    safe_remaining_threshold=safe_threshold,
+                    strict_missing_badpwd=True,
+                ),
             )
 
         # --- Native LDAP path (badldap, PSO-aware) ---
@@ -3112,86 +3588,90 @@ def _compute_candidate_spraying_eligibility(
                 locked_users_for_result = spray_policy.locked_users
                 dp = spray_policy.default_policy
                 lockout_threshold = dp.lockout_threshold
-                no_lockout_enforced = dp.no_lockout_enforced or lockout_threshold == 0
-                native_policy_ok = True
-
                 pso_count = len(spray_policy.pso_by_dn)
+                pso_listed = len(spray_policy.pso_dns_present)
                 pso_assigned = len(spray_policy.pso_dn_by_user)
-                if no_lockout_enforced:
-                    print_info_verbose(
-                        "Password policy: no lockout enforced (threshold=0 or None). "
-                        "Spraying cannot lock accounts."
-                    )
-                elif lockout_threshold is not None:
-                    pso_info = (
-                        f", {pso_count} PSO(s) found ({pso_assigned} user(s) assigned)"
-                        if pso_count
-                        else ""
-                    )
-                    print_info_verbose(
-                        f"Password policy: lockout threshold={lockout_threshold}"
-                        f"{pso_info}."
-                    )
-                else:
+                if lockout_threshold is None:
                     print_warning_verbose(
                         "Password policy: lockout threshold unavailable from native LDAP."
                     )
-                    native_policy_ok = False
-
-                if native_policy_ok and not (
-                    no_lockout_enforced or lockout_threshold == 0
-                ):
-                    if spray_policy.badpwd_by_user:
-                        # Build effective per-user badPwdCount using PSO-aware thresholds
-                        badpwd_by_user = {}
-                        for u, count in spray_policy.badpwd_by_user.items():
-                            badpwd_by_user[u] = count
+                else:
+                    native_policy_ok = True
+                    # "No lockout" is a property of each ACCOUNT's effective policy,
+                    # resolved by the one SSOT (``effective_lockout``): a domain with
+                    # no lockout can still apply a PSO with a real threshold, and a
+                    # PSO assignment ADscan cannot read must not count as "none".
+                    account_lockouts = _resolve_account_lockouts(
+                        spray_policy, file_users
+                    )
+                    no_lockout_enforced = bool(account_lockouts) and all(
+                        lk.threshold <= 0 for lk in account_lockouts.values()
+                    )
+                    if (dp.no_lockout_enforced or lockout_threshold == 0) and not (
+                        no_lockout_enforced
+                    ):
                         print_info_verbose(
-                            f"Fetched badPwdCount for {len(badpwd_by_user)} user(s)"
+                            "Password policy: the domain policy enforces no lockout, but "
+                            "some accounts are (or may be) under a fine-grained policy "
+                            "with a lockout threshold; those stay bounded."
+                        )
+                    if no_lockout_enforced:
+                        print_info_verbose(
+                            "Password policy: no lockout enforced for any candidate "
+                            "account, so failed sign-ins do not count toward a lockout."
+                        )
+                    else:
+                        print_info_verbose(
+                            f"Password policy: lockout threshold={lockout_threshold}"
                             + (
-                                f" (PSO-aware: {pso_assigned} users have fine-grained policy)"
-                                if pso_assigned
+                                f", {pso_listed or pso_count} PSO(s) found "
+                                f"({pso_assigned} user(s) assigned"
+                                + (
+                                    ""
+                                    if spray_policy.pso_assignment_visible
+                                    else ", assignment not readable"
+                                )
+                                + ")"
+                                if (pso_listed or pso_count)
                                 else ""
                             )
                             + "."
                         )
 
-                        # Per-user PSO-aware eligibility. Gated on pso_assigned (NOT
-                        # pso_count): when a user has a PSO whose OBJECT we cannot
-                        # read (no access to the Password Settings Container), we
-                        # must NOT silently fall back to the domain threshold — a
-                        # stricter PSO would be over-estimated and a spray could lock
-                        # the account. lockout_threshold_with_source() returns the
-                        # readable PSO threshold, or a conservative fallback for
-                        # unreadable PSOs, plus a human-readable source for the UX.
-                        if pso_assigned:
-                            pso_effective: dict[str, int | None] = {}
-                            pso_source: dict[str, str] = {}
-                            for u in spray_policy.pso_dn_by_user:
-                                thr, source, _is_fallback = (
-                                    spray_policy.lockout_threshold_with_source(
-                                        u,
-                                        unreadable_pso_fallback=_UNREADABLE_PSO_FALLBACK_THRESHOLD,
-                                    )
-                                )
-                                pso_effective[u] = thr
-                                pso_source[u] = source
-
-                            return _compute_spray_eligibility_pso_aware(
-                                file_users=file_users,
-                                badpwd_by_user=badpwd_by_user,
-                                default_threshold=lockout_threshold,
-                                pso_threshold_by_user=pso_effective,
-                                safe_remaining_threshold=safe_threshold,
-                                no_lockout_enforced=no_lockout_enforced,
-                                locked_users=spray_policy.locked_users,
-                                pso_source_by_user=pso_source,
+                    if no_lockout_enforced or spray_policy.badpwd_by_user:
+                        badpwd_by_user = dict(spray_policy.badpwd_by_user)
+                        if badpwd_by_user:
+                            print_info_verbose(
+                                f"Fetched badPwdCount for {len(badpwd_by_user)} user(s)."
                             )
-                    else:
-                        print_warning_verbose(
-                            "Native LDAP returned policy but no badPwdCount data."
+                        result = _compute_spray_eligibility_pso_aware(
+                            file_users=file_users,
+                            badpwd_by_user=badpwd_by_user,
+                            default_threshold=lockout_threshold,
+                            pso_threshold_by_user={
+                                user: lk.threshold
+                                for user, lk in account_lockouts.items()
+                            },
+                            safe_remaining_threshold=safe_threshold,
+                            no_lockout_enforced=no_lockout_enforced,
+                            locked_users=spray_policy.locked_users,
+                            pso_source_by_user={
+                                user: lk.source
+                                for user, lk in account_lockouts.items()
+                            },
                         )
-                        native_policy_ok = False
+                        # The split excludes locked accounts per row; its
+                        # no-lockout short-circuit does not, so apply it here too.
+                        return _apply_lockout_authority_cap(
+                            _exclude_locked_from_result(
+                                result, spray_policy.locked_users
+                            ),
+                            lockout_target,
+                        )
+                    print_warning_verbose(
+                        "Native LDAP returned policy but no badPwdCount data."
+                    )
+                    native_policy_ok = False
             else:
                 print_warning_verbose(
                     f"Native policy fetch had errors: {'; '.join(spray_policy.fetch_errors)}. "
@@ -3223,7 +3703,14 @@ def _compute_candidate_spraying_eligibility(
                 "current domain context is not authenticated."
             )
 
-    return _exclude_locked_from_result(
+    # A domain threshold of 0 only means "cannot lock" when no PSO bounds an
+    # account (``no_lockout_enforced`` already folds that in). Otherwise the
+    # core split must not see 0, or it would declare every account sprayable;
+    # treat the threshold as unknown so the conservative path applies.
+    if lockout_threshold == 0 and not no_lockout_enforced:
+        lockout_threshold = None
+
+    result = _exclude_locked_from_result(
         compute_spray_eligibility(
             file_users=file_users,
             lockout_threshold=lockout_threshold,
@@ -3234,6 +3721,11 @@ def _compute_candidate_spraying_eligibility(
         ),
         locked_users_for_result,
     )
+    if result is not None and not result.used_policy_data:
+        # No live lockout counter: nothing on the DC records ADscan's own earlier
+        # attempts, so they are counted here instead.
+        result = _exclude_recent_attempts_without_counter(shell, domain, result)
+    return _apply_lockout_authority_cap(result, lockout_target)
 
 
 def _load_enabled_computer_sams(shell: SprayShell, domain: str) -> list[str]:
@@ -3282,7 +3774,7 @@ def compute_computer_spraying_eligibility(
     *,
     domain: str,
     computer_sams: list[str],
-    safe_threshold: int,
+    safe_threshold: int | None = None,
 ) -> SprayEligibilityResult | None:
     """Compute eligible computer accounts for pre2k checks.
 
@@ -3292,8 +3784,11 @@ def compute_computer_spraying_eligibility(
     and the live ``msDS-User-Account-Control-Computed`` UF_LOCKOUT bit exactly
     like user accounts, so the identical safety controls apply: near-lockout
     machines are excluded, currently-locked machines are dropped, and a failed
-    policy fetch fails CLOSED via ``strict_missing_badpwd=True``.
+    policy fetch fails CLOSED via ``strict_missing_badpwd=True``. The reserve
+    margin is the scan policy's (:func:`resolve_password_attempt_rules`).
     """
+    if safe_threshold is None:
+        safe_threshold = resolve_password_attempt_rules(shell).reserve_margin
     lockout_threshold = None
     badpwd_by_user = None
     no_lockout_enforced = False
@@ -3382,7 +3877,7 @@ def compute_computer_spraying_eligibility(
                 if no_lockout_enforced:
                     print_info_verbose(
                         "Password policy: no lockout enforced (threshold=0 or None). "
-                        "Spraying cannot lock computer accounts."
+                        "Failed sign-ins do not count toward a computer account lockout."
                     )
                 elif lockout_threshold is not None:
                     print_info_verbose(
@@ -3474,7 +3969,7 @@ def print_spraying_eligibility(
     no_lockout = any("no lockout" in note.lower() for note in eligibility.notes)
     if no_lockout or threshold == 0:
         lockout_badge = Text(
-            " ✓ NO LOCKOUT ENFORCED — spray freely ",
+            " ✓ NO LOCKOUT ENFORCED ",
             style=f"bold {COLOR_SAGE}",
         )
         lockout_border = COLOR_SAGE
@@ -3571,7 +4066,7 @@ def print_spraying_eligibility(
         )
 
     detail_text = Text()
-    if eligibility.safe_remaining_threshold:
+    if eligibility.safe_remaining_threshold and eligibility.used_policy_data:
         detail_text.append("Reserve  ", style="dim")
         detail_text.append(
             f"{eligibility.safe_remaining_threshold} attempt(s) held back per account",
@@ -3803,13 +4298,18 @@ def _resolve_multi_credential_spray_budget(
     if requested_count <= 0:
         return 0, "No sprayable credentials were provided."
 
-    if any("no lockout enforced" in note.lower() for note in eligibility.notes):
+    # Read the structured flag, never the note text: a note is display copy and
+    # a reworded one must not be able to unlock an unlimited budget.
+    if eligibility.no_lockout_enforced:
         return requested_count, "Domain reports no account lockout threshold."
 
+    cap = getattr(eligibility, "attempt_cap", None)
     if (
         eligibility.used_policy_data
         and eligibility.minimum_remaining_attempts is not None
     ):
+        # The strictest EFFECTIVE threshold among the accounts that can lock
+        # (domain or PSO, per account), minus their current count and the reserve.
         safe_budget = max(
             0,
             eligibility.minimum_remaining_attempts
@@ -3821,13 +4321,17 @@ def _resolve_multi_credential_spray_budget(
                 "Current BadPwdCount values leave no safe room for additional credential "
                 "attempts after applying the reserve margin.",
             )
+        if cap is not None and safe_budget > int(cap):
+            return int(cap), (
+                "Lockout counters may lag the authoritative DC; limited to "
+                f"{int(cap)} credential attempt(s) per account."
+            )
         return safe_budget, (
             "Safe credential budget derived from lockout policy and the worst eligible "
             "BadPwdCount value."
         )
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type == "ctf":
+    if policy_settings.is_lab(shell):
         return 1, (
             "Lockout threshold could not be determined. Restricting automated multi-credential "
             "attempts to one credential in CTF mode."
@@ -3962,8 +4466,16 @@ def select_domain_reuse_candidates_for_validation(
     candidates: list[DomainReuseValidationCandidate],
     source_scope: str,
 ) -> tuple[list[DomainReuseValidationCandidate], SprayEligibilityResult] | None:
-    """Select safe SAM-derived credential variants for domain reuse validation."""
+    """Select safe SAM-derived credential variants for domain reuse validation.
+
+    The execution seam of the ``module:password_spraying.reuse`` scan-policy
+    check for every SAM / NTLM-hash to domain reuse flow: when the active policy
+    switches it off, nothing is selected or sent and the refusal is explained
+    once.
+    """
     if not candidates:
+        return None
+    if not gate_domain_reuse(shell):
         return None
 
     eligibility = _build_domain_reuse_eligibility(shell, domain=domain)
@@ -4507,7 +5019,7 @@ def _show_lockout_policy_prompt(
             "[bold green]No account lockout enforced[/bold green]",
             f"Domain: {marked_domain}",
             "The domain reports no lockout threshold.",
-            "Spraying attempts will not lock accounts, but proceed responsibly.",
+            "Failed sign-ins do not count toward a lockout, but proceed responsibly.",
         ]
         print_panel(
             "\n".join(info_lines),
@@ -4540,12 +5052,17 @@ def _show_lockout_policy_prompt(
 
 def _enforce_lockout_guardrail(
     *,
+    shell: object,
     domain: str,
     eligibility: SprayEligibilityResult,
     prompt_text: str,
-    default_confirm: bool = False,
 ) -> bool:
     """Apply the centralized lockout guardrail for all spraying executions.
+
+    The default answer when the lockout threshold cannot be read comes from the
+    scan policy's password-attempt rules (``resolve_password_attempt_rules``):
+    a lab policy that attempts anyway defaults to going ahead, every other
+    policy defaults to stopping. No executor chooses it.
 
     Returns:
         True when execution can continue, False when it must stop.
@@ -4557,7 +5074,7 @@ def _enforce_lockout_guardrail(
         domain=domain,
         eligibility=eligibility,
         prompt_text=prompt_text,
-        default_confirm=default_confirm,
+        default_confirm=resolve_password_attempt_rules(shell).attempt_anyway_when_unknown,
     )
 
 
@@ -4657,6 +5174,21 @@ def resolve_user_spray_decision(
     Returns:
         The resolved :class:`UserSprayDecision`.
     """
+    if not _allowed_user_spray_checks(shell):
+        # The scan policy switches off every user-side spray: there is nothing
+        # to offer, so no prompt is rendered and no default can resolve to Yes
+        # (release gate 14.0.0: an attended Production-sensitive scan auto-
+        # answered "perform password spraying? Yes"). Each refusal is explained
+        # once through the scan-policy notice SSOT. This holds for an explicit
+        # operator command too: the policy, not the prompt, decides.
+        for check_id in sorted(_USER_SPRAY_CHECK_IDS):
+            _refuse_spray_check(shell, check_id)
+        return UserSprayDecision(
+            run=False,
+            confirm_first=False,
+            confirm_default=False,
+            note=_USER_SPRAY_POLICY_SKIP_NOTE,
+        )
     if origin is SprayRequestOrigin.OPERATOR_COMMAND:
         # Typing `spraying <domain>` IS the request. Never ask permission to do
         # what was just asked for, and never return silently.
@@ -4746,7 +5278,9 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
     from adscan_internal.services.scan_phases import phase_is_enabled
 
     if not phase_is_enabled(shell, "password_spraying"):
-        print_info("Password Spraying skipped (disabled in scan configuration).")
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
+        announce_phase_skip(shell, "password_spraying", label="Password Spraying")
         return
 
     interactive = not is_non_interactive(shell)
@@ -4839,10 +5373,9 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         domain: The domain in which to perform spraying.
     """
     has_kerbrute = bool(getattr(shell, "kerbrute_path", None))
-    has_netexec = bool(getattr(shell, "netexec_path", None))
-    if not has_kerbrute and not has_netexec:
+    if not has_kerbrute:
         print_error(
-            "Password spraying requires kerbrute and/or NetExec. Please run 'adscan install'."
+            "Password spraying requires kerbrute. Please run 'adscan install'."
         )
         return
 
@@ -4858,13 +5391,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
             "Domain": domain,
             "PDC": pdc,
             "Authentication Type": auth_type.upper(),
-            "Protocol": (
-                "Kerberos Pre-Authentication / SMB"
-                if has_kerbrute and has_netexec
-                else "Kerberos Pre-Authentication"
-                if has_kerbrute
-                else "SMB (NetExec)"
-            ),
+            "Protocol": "Kerberos Pre-Authentication",
         },
         icon="💦",
     )
@@ -4889,7 +5416,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         return
 
     options: list[str] = []
-    audit_mode = str(getattr(shell, "type", "") or "").strip().lower() == "audit"
+    audit_mode = policy_settings.runs_full_assessment(shell, require_environment=True)
     if has_kerbrute:
         options.extend(
             [
@@ -4903,8 +5430,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         # forced-rotation passwords); not offered in CTF workspaces.
         if audit_mode:
             options.append(_SPRAYING_OPTION_MONTH_SEASON)
-    if has_netexec:
-        options.append(_SPRAYING_OPTION_BLANK_PASSWORD)
+    options.append(_SPRAYING_OPTION_BLANK_PASSWORD)
     pending_candidates = _load_pending_spraying_password_candidates(
         shell, domain=domain
     )
@@ -4912,7 +5438,7 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         shell, domain=domain
     )
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
-    ctf_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+    ctf_mode = policy_settings.aims_at_domain_compromise(shell)
     pre2k_recommended = (
         _should_recommend_pre2k_for_ctf(shell, domain) if ctf_mode else True
     )
@@ -4924,6 +5450,18 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         options.append(_SPRAYING_OPTION_RETRY_PASSWORDS)
     if pending_domain_reuse_candidates:
         options.append(_SPRAYING_OPTION_RETRY_DOMAIN_REUSE)
+
+    # Scan policy (spec 2026-11-04 § 7.2): an excluded spray is never offered.
+    _policy_excluded_options = [
+        opt
+        for opt in options
+        if _spray_check_excluded(shell, _SPRAY_OPTION_CHECKS.get(opt, ""))
+    ]
+    for opt in _policy_excluded_options:
+        _refuse_spray_check(shell, _SPRAY_OPTION_CHECKS.get(opt, ""))
+    options = [opt for opt in options if opt not in _policy_excluded_options]
+    if not options:
+        return
 
     default_idx = 0
     if ctf_mode:
@@ -4966,7 +5504,6 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
     auth_state = str(shell.domains_data[domain].get("auth", "")).strip().lower()
     is_auth = auth_state in {"auth", "pwned"}
     pdc_ip = shell.domains_data[domain]["pdc"]
-    safe_threshold = 2 if is_auth else 0
 
     # Confirm repeating sprays before doing heavier eligibility checks.
     spray_password: str | None = None
@@ -5020,17 +5557,15 @@ def do_spraying(shell: SprayShell, domain: str) -> None:
         shell,
         domain=domain,
         user_list_file=user_list_file,
-        safe_threshold=safe_threshold,
     )
     if eligibility is None:
         return
 
-    default_mode = shell.type == "ctf"
     if not _enforce_lockout_guardrail(
+        shell=shell,
         domain=domain,
         eligibility=eligibility,
         prompt_text="Continue with spraying using the full user list?",
-        default_confirm=default_mode,
     ):
         print_info("Password spraying cancelled by user.")
         return
@@ -5221,6 +5756,7 @@ def spraying_with_password(
     domain: str,
     password: str,
     *,
+    check_id: str,
     entry_label: str | None = None,
     source_context: dict[str, object] | None = None,
     source_steps: list[object] | None = None,
@@ -5231,11 +5767,25 @@ def spraying_with_password(
     This is a simplified version of do_spraying that directly uses the provided password
     without showing a menu.
 
+    The executor seam of every single-password spray: ``check_id`` names the
+    scan-policy check that owns the call (``step:passwordspray`` for a candidate
+    password whose owner is unknown, ``module:password_spraying.reuse`` for an
+    owned account's own password, ``module:new_credential.password_reuse`` when
+    the trigger is a newly obtained account). It is required, so no caller can
+    reach the spray without naming its check; with that check off nothing is
+    sent and the refusal is explained once.
+
     Args:
         shell: The shell instance with spraying capabilities.
         domain: The domain in which to perform spraying.
         password: The password to use for spraying.
+        check_id: The scan-policy check that owns this spray.
     """
+    if not str(check_id or "").strip():
+        raise ValueError("spraying_with_password needs the scan-policy check that owns the call")
+    if _spray_check_excluded(shell, check_id):
+        _refuse_spray_check(shell, check_id)
+        return
     if not getattr(shell, "kerbrute_path", None):
         print_error(
             "kerbrute is not installed. Please run 'adscan install' to install it."
@@ -5374,10 +5924,10 @@ def spraying_with_month_season(
         resolve_adaptive_month_season_plan,
     )
 
-    if str(getattr(shell, "type", "") or "").strip().lower() != "audit":
+    if not policy_settings.runs_full_assessment(shell, require_environment=True):
         print_info(
-            "Month/season spraying is an audit-engagement technique and is not "
-            "offered in CTF workspaces."
+            "Month/season spraying runs only when the scan policy's objective is a "
+            "full assessment."
         )
         return
     if not getattr(shell, "kerbrute_path", None):
@@ -5616,6 +6166,11 @@ def _execute_single_password_spraying(
             lockout_context=_spray_lockout_ctx,
             eligibility=eligibility,
         )
+        # Stamp the base attempts NOW (the caller records the history after the
+        # whole flow): the adaptive follow-up below recomputes eligibility, and
+        # without a readable lockout counter only this ledger knows these
+        # accounts were just tried.
+        _record_spray_attempt_times(shell, domain, list(eligibility.eligible_users))
         if not has_year_candidate:
             if offer_variation_spray and eligibility.no_lockout_enforced:
                 _maybe_execute_lockout_free_variation_spraying(
@@ -5720,9 +6275,15 @@ def _execute_single_password_spraying(
                         shell,
                         domain=domain,
                         user_list_file=subset_users_path,
-                        safe_threshold=eligibility.safe_remaining_threshold,
                     )
-                    or eligibility
+                    # A failed re-read must not fall back to the PRE-spray
+                    # eligibility (it predates the attempt just spent): only a
+                    # domain where nothing can lock may reuse it.
+                    or (
+                        eligibility
+                        if eligibility.no_lockout_enforced
+                        else replace(eligibility, eligible_users=[], eligible_details=[])
+                    )
                 )
             finally:
                 try:
@@ -5730,11 +6291,17 @@ def _execute_single_password_spraying(
                 except OSError:
                     pass
 
-        if (
-            followup_eligibility.lockout_threshold is not None
-            and followup_eligibility.lockout_threshold > 0
-            and not followup_eligibility.eligible_users
-        ):
+        # The follow-up sprays only the unmatched accounts that the RE-COMPUTED
+        # eligibility still allows: the base spray just spent an attempt on
+        # each, so some may now sit inside the reserve margin (or, with no
+        # readable counter, inside the one-attempt window).
+        followup_allowed = {
+            str(u).strip().casefold() for u in followup_eligibility.eligible_users
+        }
+        followup_users = [
+            u for u in unmatched_users if str(u).strip().casefold() in followup_allowed
+        ]
+        if not followup_users and not followup_eligibility.no_lockout_enforced:
             followup_prompt_lines.append(
                 "Adaptive follow-up unavailable: no safe spray budget remains for unmatched users."
             )
@@ -5770,7 +6337,7 @@ def _execute_single_password_spraying(
             source_context=source_context,
             source_steps=source_steps,
             return_hits=True,
-            only_for_users=unmatched_users,
+            only_for_users=followup_users or unmatched_users,
             prompt_preamble_lines=followup_prompt_lines,
         )
         combined_hits_by_user = {
@@ -6432,13 +6999,12 @@ def _maybe_execute_lockout_free_variation_spraying(
     if not LOCKOUT_FREE_VARIATION_SPRAY_ENABLED:
         return False
 
-    # Gate by workspace type: variation spray is an audit-engagement feature,
-    # not a CTF technique. CTF challenges have authored solve paths
-    # (Kerberoasting, ESC1, ACL abuse, share creds) — brute-forcing variations
-    # would be noise. Operators who genuinely need it on a CTF can flip the
-    # workspace type or call the orchestrator directly.
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type != "audit":
+    # Gate by the scan policy's objective: variation spray belongs to a full
+    # assessment. A domain-compromise objective (a CTF has authored solve paths:
+    # Kerberoasting, ESC1, ACL abuse, share creds) would only add noise. A
+    # policy that wants it sets ``objective: full_assessment``. An unknown
+    # environment fails closed.
+    if not policy_settings.runs_full_assessment(shell, require_environment=True):
         return False
 
     if not eligibility.no_lockout_enforced:
@@ -6745,17 +7311,15 @@ def _prepare_password_spraying_eligibility(
         shell,
         domain=domain,
         user_list_file=user_list_file,
-        safe_threshold=2 if auth_state in {"auth", "pwned"} else 0,
     )
     if eligibility is None:
         return None
 
-    default_mode = shell.type == "ctf"
     if not _enforce_lockout_guardrail(
+        shell=shell,
         domain=domain,
         eligibility=eligibility,
         prompt_text=guardrail_prompt,
-        default_confirm=default_mode,
     ):
         print_info("Password spraying cancelled by user.")
         return None
@@ -6963,10 +7527,18 @@ def spraying_with_blank_password(
     dashboard = _build_spray_dashboard("Blank Password (Kerberos)", total=len(users))
     hits: list[str] = []
     state = {"tested": 0, "errors": 0, "in_flight": 0}
-    sem = asyncio.Semaphore(_BLANK_SPRAY_CONCURRENCY)
+    # KDC requests in flight from the scan pacing (``kdc.blank_spray``: 16 at the
+    # default level) plus the scan-wide request rate. Lockout rules are untouched.
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+    from adscan_core.scan_pacing.pacing_runtime import RateLimiter  # noqa: PLC0415
+
+    _blank_pacing = component_pacing(active_pacing(), "kdc.blank_spray")
+    sem = asyncio.Semaphore(_blank_pacing["in_flight"])
+    _blank_rate = RateLimiter(_blank_pacing["rate_per_s"])
 
     async def _check_one(user: str) -> None:
         async with sem:
+            await _blank_rate.acquire()
             state["in_flight"] += 1
             try:
                 result = await check_blank_password(
@@ -7003,8 +7575,14 @@ def spraying_with_blank_password(
     async def _run() -> None:
         await asyncio.gather(*[_check_one(u) for u in users], return_exceptions=True)
 
+    # ``users`` is the eligibility SSOT's selection from a fresh badPwdCount
+    # read, one attempt each: the sign-in guard does not read it again per user.
+    from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+        live_counter_checked_by_caller,
+    )
+
     try:
-        with dashboard.live_session():
+        with dashboard.live_session(), live_counter_checked_by_caller():
             asyncio.run(_run())
             try:
                 dashboard.update(
@@ -7130,6 +7708,7 @@ def execute_password_spray_attack_step(
             shell,
             domain,
             password,
+            check_id="step:passwordspray",
             entry_label=entry_label,
             source_context=source_context,
             source_steps=source_steps,
@@ -7189,7 +7768,7 @@ def spraying_with_passwords(
     if not unique_passwords:
         return []
 
-    if str(getattr(shell, "type", "") or "").strip().lower() == "ctf":
+    if policy_settings.aims_at_domain_compromise(shell):
         is_pwned = getattr(shell, "_is_ctf_domain_pwned", None)
         if callable(is_pwned):
             try:
@@ -7217,16 +7796,14 @@ def spraying_with_passwords(
         shell,
         domain=domain,
         user_list_file=user_list_file,
-        safe_threshold=2 if auth_state in {"auth", "pwned"} else 0,
     )
     if eligibility is None:
         return []
-    default_mode = str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
     if not _enforce_lockout_guardrail(
+        shell=shell,
         domain=domain,
         eligibility=eligibility,
         prompt_text="Continue with multi-password spraying using the full user list?",
-        default_confirm=default_mode,
     ):
         print_info("Password spraying cancelled by user.")
         return []
@@ -8190,13 +8767,40 @@ def execute_spraying_command(
         print_error("Error executing password spraying command.")
         print_exception(show_locals=False, exception=e)
         return []
+    _record_spray_hits_in_auth_guard(domain, hits_by_user.values())
     return list(hits_by_user.values()) if found_credentials else []
+
+
+def _record_spray_hits_in_auth_guard(domain: str, hits: "Iterable[dict[str, str]]") -> None:
+    """Tell the sign-in lockout guard which accounts the subprocess spray signed in as.
+
+    The spray runner here is an external process, so the guard never saw its
+    sign-ins. A VALID LOGIN is a success the domain acted on (it reset the
+    account's ``badPwdCount``), so it clears the guard's entry. A missing line
+    is NOT recorded as a failure: the runner prints nothing for a wrong
+    password, an unknown user, a clock error or a timeout alike, and counting
+    the latter as a wrong secret would withhold a correct one. Spraying's own
+    live ``badPwdCount`` eligibility remains its lockout protection; the native
+    spray (``_run_native_domain_spray``) is judged by the guard at the Kerberos
+    seam on every attempt.
+    """
+    try:
+        from adscan_core import auth_attempt_guard  # noqa: PLC0415
+
+        for hit in hits:
+            username = str((hit or {}).get("username") or "").strip()
+            if username:
+                auth_attempt_guard.record_success(domain, username)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not break a spray
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 # Bounded concurrency for the native domain spray. Kept modest so a large spray
 # does not flood the KDC with simultaneous AS-REQs (OPSEC + DoS avoidance). Each
 # user is an independent principal, so concurrency never changes per-account
 # badPwdCount — the one-attempt-per-user invariant is preserved regardless.
+# Default-level value; the live value comes from the scan pacing (``kdc.spray``).
 _NATIVE_SPRAY_CONCURRENCY = 5
 
 # Native CredentialStatus -> spray outcome-code mapping. VALID and
@@ -8251,12 +8855,20 @@ async def _run_native_domain_spray(
     )
 
     service = CredentialService()
-    semaphore = asyncio.Semaphore(_NATIVE_SPRAY_CONCURRENCY)
+    # AS-REQs in flight from the scan pacing (``kdc.spray``: 5 at the default
+    # level) plus its request rate. One attempt per user is unchanged.
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+    from adscan_core.scan_pacing.pacing_runtime import RateLimiter  # noqa: PLC0415
+
+    _spray_pacing = component_pacing(active_pacing(), "kdc.spray")
+    semaphore = asyncio.Semaphore(_spray_pacing["in_flight"])
+    _spray_rate = RateLimiter(_spray_pacing["rate_per_s"])
     hit_usernames: dict[str, str] = {}
     outcome_counts: dict[str, int] = {}
 
     async def _verify_one(user: str) -> tuple[str, str]:
         async with semaphore:
+            await _spray_rate.acquire()
             try:
                 # Deliberate reuse of the canonical native, Kerberos-first
                 # credential verifier — the single-attempt classifier ADscan
@@ -8275,13 +8887,21 @@ async def _run_native_domain_spray(
                 print_exception(exception=exc)
                 return user, "error"
 
-    tasks = [asyncio.ensure_future(_verify_one(user)) for user in users]
-    for coro in asyncio.as_completed(tasks):
-        user, status = await coro
-        code = _NATIVE_SPRAY_OUTCOME_CODE.get(status, "OTHER_FAILURE")
-        outcome_counts[code] = outcome_counts.get(code, 0) + 1
-        if status in _NATIVE_SPRAY_HIT_STATUSES:
-            hit_usernames.setdefault(user.lower(), user)
+    # Every caller passes the users its eligibility SSOT selected from a fresh
+    # read of their badPwdCount, with the scan policy's margin and one attempt
+    # each, so the sign-in guard does not read each account's counter again.
+    from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+        live_counter_checked_by_caller,
+    )
+
+    with live_counter_checked_by_caller():
+        tasks = [asyncio.ensure_future(_verify_one(user)) for user in users]
+        for coro in asyncio.as_completed(tasks):
+            user, status = await coro
+            code = _NATIVE_SPRAY_OUTCOME_CODE.get(status, "OTHER_FAILURE")
+            outcome_counts[code] = outcome_counts.get(code, 0) + 1
+            if status in _NATIVE_SPRAY_HIT_STATUSES:
+                hit_usernames.setdefault(user.lower(), user)
 
     return sorted(hit_usernames.values(), key=str.lower), outcome_counts
 
@@ -8451,14 +9071,12 @@ def execute_domain_spray_native(
 
 def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
     """Attempt pre2k password checks for computer accounts (hostname as password)."""
+    if _spray_check_excluded(shell, "step:computerpre2k"):
+        _refuse_spray_check(shell, "step:computerpre2k")
+        return
     from adscan_internal import print_operation_header
     from adscan_internal.cli.kerberos import ensure_kerberos_output_dir
 
-    if not getattr(shell, "netexec_path", None):
-        print_error(
-            "NetExec is not installed or configured. Please run 'adscan install'."
-        )
-        return
     if not getattr(shell, "kerbrute_path", None):
         print_error(
             "kerbrute is not installed. Please run 'adscan install' to install it."
@@ -8536,7 +9154,7 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
         _capture_spraying_ux_event(
             shell,
             "ctf_recommended_spraying_started"
-            if str(getattr(shell, "type", "") or "").strip().lower() == "ctf"
+            if policy_settings.aims_at_domain_compromise(shell)
             else "spraying_recommended_started",
             domain,
             extra={
@@ -8809,7 +9427,6 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
             shell,
             domain=domain,
             user_list_file=user_list,
-            safe_threshold=2 if requires_auth else 0,
         )
         if eligibility is None:
             return None
@@ -8830,7 +9447,13 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
         # an unknown threshold (e.g. a pre-auth spray with no LDAP read) can
         # still lock real accounts and must never be labelled "disabled".
         lockout_unknown = threshold is None
-        lockout_disabled = threshold is not None and int(threshold) <= 0
+        # "Disabled" only when no account can lock: a no-lockout domain policy
+        # with a PSO that bounds some accounts is NOT disabled.
+        lockout_disabled = (
+            threshold is not None
+            and int(threshold) <= 0
+            and bool(getattr(eligibility, "no_lockout_enforced", False))
+        )
         near_lockout = len(non_locked_excluded)
 
         rows: list[dict] = []
@@ -8876,7 +9499,7 @@ def _compute_spray_coverage_overview(shell: "SprayShell", domain: str):
         # deterministic denominator); the executor sprays the richer per-user
         # adaptive combo of that kind, and the ci one-shot guard runs each type
         # once regardless of the display percentage. Symbols are off (Word+Year).
-        audit_mode = str(getattr(shell, "type", "") or "").strip().lower() == "audit"
+        audit_mode = policy_settings.runs_full_assessment(shell, require_environment=True)
         if audit_mode:
             from adscan_internal.services.password_month_season_generator import (
                 month_season_passwords,
@@ -8949,8 +9572,13 @@ def _run_pre2k_step(shell: "SprayShell", domain: str, *, interactive: bool) -> N
     from adscan_internal.services.scan_phases import subphase_is_enabled
 
     if not subphase_is_enabled(shell, "password_spraying", "pre2k"):
-        print_info(
-            "Pre2k computer-account spray skipped (disabled in scan configuration)."
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
+        announce_phase_skip(
+            shell,
+            "password_spraying",
+            label="Pre2k computer-account spray",
+            subphase_id="pre2k",
         )
         return
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
@@ -9173,17 +9801,21 @@ def _interactive_select_spray(
             f"{_SPRAY_TYPE_LABEL.get(row['type'], row['type'])} "
             f"— {row['pct']}% covered · {row['eligible']} eligible"
         )
-    keys.append("custom")
-    labels.append("Custom password (type a password to spray)")
-    if _resolve_mined_spray_candidates(shell, domain):
-        keys.append("mined")
-        labels.append("Environment-mined base word (targeted spray)")
+    extras: list[tuple[str, str]] = [("custom", "Custom password (type a password to spray)")]
+    if _spray_choice_allowed(shell, "mined") and _resolve_mined_spray_candidates(shell, domain):
+        extras.append(("mined", "Environment-mined base word (targeted spray)"))
     if has_pending:
-        keys.append("retry_found")
-        labels.append("Retry passwords found in shares")
+        extras.append(("retry_found", "Retry passwords found in shares"))
     if has_reuse:
-        keys.append("retry_reuse")
-        labels.append("Retry SAM → domain password reuse")
+        extras.append(("retry_reuse", "Retry SAM → domain password reuse"))
+    for key, label in extras:
+        if _spray_choice_allowed(shell, key):
+            keys.append(key)
+            labels.append(label)
+    if not keys:
+        # Every spray type is excluded by the scan policy: nothing to offer, so
+        # no question is asked (its default could only run an excluded spray).
+        return None
     keys.append("__done__")
     labels.append("Done (finish spraying)")
 
@@ -9214,11 +9846,20 @@ def _dispatch_spray_choice(
     _subphase_for_choice = (
         "month_season" if choice in {"month_year", "season_year"} else choice
     )
+    _choice_check = _SPRAY_CHOICE_CHECKS.get(choice, "")
+    if _spray_check_excluded(shell, _choice_check):
+        _refuse_spray_check(shell, _choice_check)
+        return
     if choice in {
         "blank", "useraspass", "reuse", "month_year", "season_year"
     } and not subphase_is_enabled(shell, "password_spraying", _subphase_for_choice):
-        print_info(
-            f"Spray strategy '{choice}' skipped (disabled in scan configuration)."
+        from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
+        announce_phase_skip(
+            shell,
+            "password_spraying",
+            label=f"Spray strategy '{choice}'",
+            subphase_id=_subphase_for_choice,
         )
         return
     if choice in {"month_year", "season_year"}:
@@ -9234,14 +9875,20 @@ def _dispatch_spray_choice(
             shell, overview.get("owned", []), interactive=interactive
         ):
             spraying_with_password(
-                shell, domain, pwd, entry_label="owned-credential reuse"
+                shell,
+                domain,
+                pwd,
+                check_id=_SPRAY_CHOICE_CHECKS["reuse"],
+                entry_label="owned-credential reuse",
             )
     elif choice == "blank":
         spraying_with_blank_password(shell, domain)
     elif choice == "custom":
         pwd = Prompt.ask("Enter the password to spray")
         if pwd:
-            spraying_with_password(shell, domain, pwd)
+            spraying_with_password(
+                shell, domain, pwd, check_id=_SPRAY_CHOICE_CHECKS["custom"]
+            )
     elif choice == "mined":
         _spray_mined_base_word(shell, domain)
     elif choice == "retry_found":
@@ -9310,7 +9957,11 @@ def _spray_mined_base_word(shell: "SprayShell", domain: str) -> None:
     base_word = str(base_word or "").strip()
     if base_word:
         spraying_with_password(
-            shell, domain, base_word, entry_label="environment-mined base word"
+            shell,
+            domain,
+            base_word,
+            check_id=_SPRAY_CHOICE_CHECKS["mined"],
+            entry_label="environment-mined base word",
         )
 
 
@@ -9394,7 +10045,11 @@ def run_spray_coverage(
                 )
             break
         last_overview = overview
-        rows = overview["rows"]
+        # A spray type the scan policy excludes is never presented, auto-picked
+        # or dispatched: drop it from the selector rows up front (the dispatch
+        # seam still refuses, as defence in depth).
+        rows = [r for r in overview["rows"] if _spray_choice_allowed(shell, r["type"])]
+        overview = {**overview, "rows": rows}
 
         # Nothing sprayable right now — every account is locked, near lockout, or
         # owned. Re-prompting an empty selector is noise; finish the phase. (ci

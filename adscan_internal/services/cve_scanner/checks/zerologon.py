@@ -11,6 +11,18 @@ The transport mirrors netexec's ``zerologon`` module verbatim:
 (false-negative rate 0.04% per netexec's note). Source citation:
 ``reference/NetExec/nxc/modules/zerologon.py:11,29-65,73-107``.
 
+The attempt budget and the loop's rate follow the scan pace (consumer
+``cve.zerologon``): 2000 attempts at full speed by default, 20 attempts/s at
+Polite, 1000 attempts at 10/s at Fragile. A smaller budget makes a negative
+result less certain; the result's evidence and the assessment-pace disclosure
+both state it.
+
+Account lockout: the probe binds anonymously over MS-NRPC and authenticates as
+the DC's own machine account with a zero credential, so no user account is ever
+tried. Measured on GOAD 2026-11-04: after about 5,500 attempts (most of them
+answered ACCESS_DENIED) the DC account's ``badPwdCount`` and ``badPasswordTime``
+stayed 0 under a lockout threshold of 5.
+
 We never reset the DC machine password — the probe stops as soon as the
 auth bypass is proven (terminating ``ErrorCode == 0``). The synchronous
 impacket call is offloaded to a worker thread so the async runner stays
@@ -24,6 +36,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from adscan_core import telemetry
+from adscan_core.reporting.scan_pacing_disclosure import format_chance
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import RateLimiter
 from adscan_core.rich_output import print_error, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.cve_scanner.result import (
@@ -42,8 +58,13 @@ CVE_ID = "CVE-2020-1472"
 AKA = "Zerologon"
 CVSS_V3 = 10.0
 CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
-# 2000 attempts — netexec parity, ``MAX_ATTEMPTS`` at zerologon.py:11.
-DEFAULT_MAX_ATTEMPTS = 2000
+_ATTEMPTS_PARAM = _pacing_consumer("cve.zerologon").param("max_attempts")
+# 2000 attempts — netexec parity, ``MAX_ATTEMPTS`` at zerologon.py:11. The value
+# lives in the scan-pacing registry; this is the standard (``normal``) budget.
+DEFAULT_MAX_ATTEMPTS: int = _ATTEMPTS_PARAM.default
+#: Probability one attempt reveals a vulnerable DC (the all-zero credential holds
+#: for one session key in 256).
+DETECTION_PER_ATTEMPT: float = float(_ATTEMPTS_PARAM.detection_per_attempt or 0.0)
 
 # Per-attempt outcome contract (also used by the L1 probe seam).
 _NT_STATUS_ACCESS_DENIED = 0xC0000022
@@ -61,6 +82,16 @@ class ZerologonProbeResult:
     # as Error (netexec's ``sys.exit(2)`` is a CLI artifact — the closest
     # CVEStatus mapping is ``ERROR``).
     unexpected_status: bool = False
+
+
+def paced_max_attempts() -> int:
+    """The attempt budget the active scan pace allows (2000 at the default pace)."""
+    return int(component_pacing(active_pacing(), "cve.zerologon")["max_attempts"])
+
+
+def miss_probability(attempts: int) -> float:
+    """Chance a vulnerable DC answers every one of ``attempts`` with a denial."""
+    return float(_ATTEMPTS_PARAM.miss_probability(attempts) or 0.0)
 
 
 def _derive_dc_short_name(target: "ScanTarget") -> str:
@@ -128,8 +159,14 @@ def _probe_zerologon_sync(
     nt_status: int | None = None
     attempts = 0
     unexpected = False
+    # Request rate of the probe loop (``cve.zerologon``): unlimited at the default
+    # level, so the loop is unchanged there; slower levels pace the attempts
+    # instead of firing them back to back at the DC. The attempt budget is the
+    # caller's ``max_attempts``, resolved from the same pace by the check.
+    attempt_rate = RateLimiter(component_pacing(active_pacing(), "cve.zerologon")["rate_per_s"])
     try:
         for attempts in range(1, max_attempts + 1):
+            attempt_rate.acquire_sync()
             try:
                 # Per netexec, a fresh ReqChallenge precedes each Authenticate3.
                 nrpc.hNetrServerReqChallenge(
@@ -191,9 +228,10 @@ class ZerologonCheck:
     def __init__(
         self,
         *,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        max_attempts: int | None = None,
         probe: Any | None = None,
     ) -> None:
+        # ``None`` follows the scan pace when the check runs (2000 by default).
         self._max_attempts = max_attempts
         # ``probe`` is an injection point for unit tests — defaults to the
         # real synchronous impacket probe.
@@ -211,17 +249,18 @@ class ZerologonCheck:
             return [_not_applicable(target.host, "target is not a domain controller")]
 
         dc_short = _derive_dc_short_name(target)
+        budget = self._max_attempts if self._max_attempts is not None else paced_max_attempts()
         print_info_verbose(
             "[zerologon] probing "
             f"{mark_sensitive(target.host, 'host')} "
-            f"(short={mark_sensitive(dc_short, 'host')})"
+            f"(short={mark_sensitive(dc_short, 'host')}, attempts={budget})"
         )
         try:
             probe_result = await asyncio.to_thread(
                 self._probe,
                 dc_ip=target.host,
                 dc_short_name=dc_short,
-                max_attempts=self._max_attempts,
+                max_attempts=budget,
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -229,11 +268,21 @@ class ZerologonCheck:
             print_error(f"[zerologon] probe crashed against {target.host}: {exc}")
             return [_error(target.host, str(exc))]
 
-        return [_result_from_probe(target.host, probe_result)]
+        return [_result_from_probe(target.host, probe_result, max_attempts=budget)]
 
 
-def _result_from_probe(host: str, probe: ZerologonProbeResult) -> CVEResult:
-    """Map a :class:`ZerologonProbeResult` to a :class:`CVEResult`."""
+def _result_from_probe(
+    host: str,
+    probe: ZerologonProbeResult,
+    *,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> CVEResult:
+    """Map a :class:`ZerologonProbeResult` to a :class:`CVEResult`.
+
+    ``max_attempts`` is the budget the probe ran with. A negative result states
+    it and the chance it is wrong, so a reduced budget (the Fragile pace) never
+    reads as the same certainty as the standard 2000.
+    """
     if probe.vulnerable:
         summary = (
             "Zerologon confirmed: NetrServerAuthenticate3 returned "
@@ -251,7 +300,7 @@ def _result_from_probe(host: str, probe: ZerologonProbeResult) -> CVEResult:
                 summary=summary,
                 payload={
                     "attempts": probe.attempts,
-                    "max_attempts": DEFAULT_MAX_ATTEMPTS,
+                    "max_attempts": max_attempts,
                     "side_effect": "none — probe stopped after auth bypass",
                 },
             ),
@@ -260,9 +309,16 @@ def _result_from_probe(host: str, probe: ZerologonProbeResult) -> CVEResult:
         return _error(host, probe.last_error)
     if probe.unexpected_status:
         return _error(host, probe.last_error or "unexpected NTSTATUS")
-    summary = f"Zerologon not vulnerable after {probe.attempts} attempt(s)" + (
-        f" — last error: {probe.last_error}" if probe.last_error else ""
-    )
+    reduced = max_attempts < DEFAULT_MAX_ATTEMPTS
+    summary = f"Zerologon not vulnerable after {probe.attempts} attempt(s)"
+    if reduced:
+        summary += (
+            f" (the scan pace allowed {max_attempts} of the standard "
+            f"{DEFAULT_MAX_ATTEMPTS}, about a {format_chance(miss_probability(probe.attempts))} "
+            "chance a vulnerable DC denies every attempt)"
+        )
+    if probe.last_error:
+        summary += f" — last error: {probe.last_error}"
     return CVEResult(
         cve_id=CVE_ID,
         aka=AKA,
@@ -275,6 +331,10 @@ def _result_from_probe(host: str, probe: ZerologonProbeResult) -> CVEResult:
             summary=summary,
             payload={
                 "attempts": probe.attempts,
+                "max_attempts": max_attempts,
+                "standard_max_attempts": DEFAULT_MAX_ATTEMPTS,
+                "reduced_by_pace": reduced,
+                "miss_probability": round(miss_probability(probe.attempts), 6),
                 "last_nt_status": probe.nt_status,
                 "last_error": probe.last_error,
             },
@@ -315,6 +375,9 @@ __all__ = [
     "CVSS_V3",
     "CVSS_VECTOR",
     "DEFAULT_MAX_ATTEMPTS",
+    "DETECTION_PER_ATTEMPT",
     "ZerologonCheck",
     "ZerologonProbeResult",
+    "miss_probability",
+    "paced_max_attempts",
 ]

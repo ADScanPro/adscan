@@ -19,6 +19,8 @@ Design contract (post-2026-05 redesign):
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -486,11 +488,10 @@ def maybe_offer_workspace_current_vantage_refresh(
                 f"{mark_sensitive(status.domain, 'domain')}: {exc}"
             )
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type and workspace_type != "audit":
+    if not policy_settings.runs_full_assessment(shell):
         print_info_debug(
-            "[current-vantage-refresh] skipping workspace-load prompt because "
-            f"workspace type is {mark_sensitive(workspace_type, 'detail')}."
+            "[current-vantage-refresh] skipping workspace-load prompt because the "
+            "scan policy's objective is domain compromise."
         )
         return []
 

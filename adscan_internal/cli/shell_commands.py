@@ -54,8 +54,14 @@ class ShellCommandSpec:
             complete successfully (drives the post-scan "Next step"
             panel).
         is_deliverable: Surface in the post-scan deliverables list.
-        is_dev_only: Hide from default ``help``; show only with
-            ``help --all`` (reserved — no entries today).
+        is_dev_only: A capability that is not part of the shipped product and
+            is kept for development only. ONE declaration drives all three
+            surfaces: the command is hidden from ``help``, is not offered by
+            prompt completion, and a typed invocation REFUSES in a shipped
+            image (see :func:`enforce_dev_only_commands`). A development
+            image (``adscan_core.runtime_channel.is_dev_image``) runs it
+            normally. The spec may describe a hand-rolled ``do_<verb>`` that
+            already lives on the shell; the binder never overrides it.
     """
 
     verb: str
@@ -301,6 +307,115 @@ def _run_mitre_navigator(shell: Any, args: str) -> None:
 _DELIVERABLES_CATEGORY = "Deliverables"
 
 
+def _run_policy(shell: Any, args: str) -> None:
+    """``policy show|use|exclude|include|clear``: the workspace scan policy."""
+    from adscan_internal.cli.scan_policy_cmd import run_policy_command
+
+    run_policy_command(shell, args)
+
+
+def _run_pace(shell: Any, args: str) -> None:
+    """``pace list|show|create|save|use|delete``: saved pace profiles."""
+    from adscan_internal.cli.pace_profile_cmd import run_repl_command
+
+    run_repl_command(shell, args)
+
+
+def _run_show(shell: Any, args: str) -> None:
+    """``show pacing``: the effective scan pace and where each value comes from."""
+    from adscan_internal.cli.scan_pacing_cmd import run_show_command
+
+    run_show_command(shell, args)
+
+
+PACE_LONG_HELP = (
+    "Usage:\n"
+    "  pace list\n"
+    "  pace show NAME\n"
+    "  pace create NAME [--level LEVEL] [--set KNOB=VALUE ...] [--from PROFILE]\n"
+    "                   [--description TEXT] [--scope workspace|global] [--force]\n"
+    "  pace edit NAME [--level LEVEL] [--set KNOB=VALUE ...] [--description TEXT]\n"
+    "  pace save NAME [--description TEXT] [--scope workspace|global] [--force]\n"
+    "  pace use NAME\n"
+    "  pace delete NAME [--scope workspace|global] [--yes]\n"
+    "  pace export NAME [--output FILE]\n"
+    "  pace import FILE [--name NAME] [--scope workspace|global] [--force]\n\n"
+    "A pace profile is a named scan pace you tune once and reuse with any scan\n"
+    "policy: a level plus single settings such as hosts in parallel or requests\n"
+    "per second. It holds no checks and no safety settings. The scan policy\n"
+    "stays in charge: a profile never makes a scan faster than its policy allows,\n"
+    "and every value the policy lowers is named.\n\n"
+    "'pace create' and 'pace edit' without flags walk you through the level and\n"
+    "the settings, and a new profile asks whether it is saved in this workspace\n"
+    "or for all workspaces (--scope answers that without asking).\n"
+    "'pace save' stores the pace you set with 'set pacing' and\n"
+    "'set pacing.<setting>'. 'pace use' makes a profile this workspace's pace\n"
+    "('set pacing.profile NAME' does the same). Unattended runs take one with\n"
+    "'adscan ci --pace-profile NAME'. The same commands run outside the shell as\n"
+    "'adscan pace ...'.\n"
+)
+
+_POLICY_LONG_HELP = (
+    "Usage:\n"
+    "  policy show [NAME] [--checks]\n"
+    "  policy use <built-in|saved policy|FILE>\n"
+    "  policy exclude <check id|family>\n"
+    "  policy include <check id|family>\n"
+    "  policy clear [--yes]\n"
+    "  policy list\n"
+    "  policy create NAME [--from POLICY] [--exclude CHECK] [--include CHECK]\n"
+    "                     [--pacing LEVEL] [--description TEXT] [--scope workspace|global]\n"
+    "                     [--force]\n"
+    "  policy edit NAME [--exclude CHECK] [--include CHECK] [--pacing LEVEL]\n"
+    "  policy save NAME [--scope workspace|global] [--force]\n"
+    "  policy delete NAME [--scope workspace|global] [--yes]\n"
+    "  policy export NAME [--output FILE] [--format yaml|json]\n"
+    "  policy import FILE [--name NAME] [--scope workspace|global] [--force]\n\n"
+    "Choose which checks ADscan may run on this workspace. The policy is saved in\n"
+    "the workspace and applies to every later scan of it (start, execute and\n"
+    "adscan ci), and the report states it.\n\n"
+    "A new policy asks whether it is saved in this workspace or for all workspaces\n"
+    "(--scope answers without asking; --global still works). The same commands run\n"
+    "outside the shell as 'adscan policy ...', where --workspace NAME names the\n"
+    "workspace and 'policy use' applies a policy to it.\n"
+    "A workspace policy wins over a global one of the same name; built-ins are\n"
+    "read-only. 'create' and 'edit' without flags walk you through families,\n"
+    "checks and pace. The file format is the web's: 'name', 'description',\n"
+    "'checks' and 'pacing'.\n\n"
+    "Interactive scans only use a policy's exclusions; unattended execution of\n"
+    "attack steps is part of adscan ci (PRO). In the shell and in 'start', ADscan\n"
+    "still confirms each attack step with you.\n\n"
+    "Examples:\n"
+    "  policy use production_sensitive\n"
+    "  policy exclude family:password_attacks\n"
+    "  policy create \"Corp production\" --from production_sensitive --exclude step:kerberoasting\n"
+    "  policy save \"Corp production\" --global\n"
+    "  policy export \"Corp production\" --output corp-production.yaml\n"
+    "  policy list\n"
+)
+
+_SHOW_LONG_HELP = (
+    "Usage:\n"
+    "  show pacing\n\n"
+    "Show the scan pace of this workspace: every setting, its value, and where the\n"
+    "value comes from (the level, your own setting, the scan policy's limit, or a\n"
+    "deprecated environment variable).\n\n"
+    "Change it with:\n"
+    "  set pacing <fragile|polite|normal|fast>\n"
+    "  set pacing.<setting> <value|unlimited|default>\n"
+)
+
+
+def _hand_rolled_on_shell(shell: Any, args: str) -> None:
+    """Placeholder handler for a spec whose ``do_<verb>`` lives on the shell.
+
+    The binder never installs a handler over an existing ``do_<verb>``, so this
+    is not reachable through the shell. It fails loudly rather than recursing if
+    the hand-rolled method is ever removed without removing its spec.
+    """
+    raise RuntimeError("this verb is implemented directly on PentestShell")
+
+
 REGISTRY: tuple[ShellCommandSpec, ...] = (
     ShellCommandSpec(
         verb="demo",
@@ -446,6 +561,49 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
         suggested_after=(),
         is_deliverable=False,
     ),
+    # The interactive reverse shell (listener, payloads, agent, RunasCs
+    # upgrade) is withdrawn from the shipped product: it depended on a
+    # bundled third-party tool that is no longer shipped. It stays available
+    # on the development image so it can still be tested. ``do_session`` is a
+    # hand-rolled method on PentestShell, so the binder never binds this
+    # handler; the entry exists to carry ``is_dev_only`` for every surface.
+    ShellCommandSpec(
+        verb="session",
+        category="Sessions",
+        short_help="Reverse-shell sessions (development image only).",
+        long_help=(
+            "Usage:\n"
+            "  session <listener|list|use|kill|current|interact|payload|launch|...>\n\n"
+            "Interactive reverse-shell sessions. Development-only capability: it\n"
+            "is not part of the shipped product and refuses to run outside a\n"
+            "development image.\n"
+        ),
+        handler=_hand_rolled_on_shell,
+        suggested_after=(),
+        is_deliverable=False,
+        is_dev_only=True,
+    ),
+    ShellCommandSpec(
+        verb="policy",
+        category="General",
+        short_help="Choose which checks ADscan may run on this workspace (scan policy).",
+        long_help=_POLICY_LONG_HELP,
+        handler=_run_policy,
+    ),
+    ShellCommandSpec(
+        verb="pace",
+        category="General",
+        short_help="Save, reuse and apply named scan paces (pace profiles).",
+        long_help=PACE_LONG_HELP,
+        handler=_run_pace,
+    ),
+    ShellCommandSpec(
+        verb="show",
+        category="General",
+        short_help="Show workspace settings: 'show pacing' lists the scan pace.",
+        long_help=_SHOW_LONG_HELP,
+        handler=_run_show,
+    ),
 )
 
 
@@ -484,6 +642,59 @@ def categories() -> tuple[str, ...]:
         if spec.category not in seen:
             seen.append(spec.category)
     return tuple(seen)
+
+
+def dev_only_verbs() -> frozenset[str]:
+    """Return every verb flagged ``is_dev_only`` (the single declaration).
+
+    Every surface that enumerates commands (help, prompt completion, dispatch)
+    must consult this, never hand-list a verb.
+    """
+    return frozenset(s.verb for s in REGISTRY if s.is_dev_only)
+
+
+DEV_ONLY_REFUSAL = (
+    "'{verb}' is a development-only capability and is not part of the shipped "
+    "product. It is only available on the development image."
+)
+
+
+def enforce_dev_only_commands(cls: type) -> type:
+    """Make every ``is_dev_only`` verb refuse to run in a shipped image.
+
+    Replaces ``do_<verb>`` on ``cls`` with a guard that, at CALL time, either
+    delegates to the original (development image) or prints
+    :data:`DEV_ONLY_REFUSAL`. Doing it on the class covers every route to the
+    verb at once: the REPL dispatch, ``adscan execute`` (which resolves
+    ``do_<verb>`` itself) and internal callers. It deliberately refuses with a
+    clear reason instead of letting the verb fail on a missing dependency,
+    which would send an operator to install something that cannot fix it.
+    """
+    import functools
+
+    for verb in dev_only_verbs():
+        name = f"do_{verb}"
+        original = getattr(cls, name, None)
+        if original is None or getattr(original, "_dev_only_guarded", False):
+            continue
+
+        def _make_guard(captured: Callable[..., Any], captured_verb: str):
+            @functools.wraps(captured)
+            def _guard(self: Any, *args: Any, **kwargs: Any) -> Any:
+                from adscan_core.rich_output import print_warning
+                from adscan_core.runtime_channel import is_dev_image
+
+                if not is_dev_image():
+                    print_warning(DEV_ONLY_REFUSAL.format(verb=captured_verb))
+                    return None
+                return captured(self, *args, **kwargs)
+
+            _guard._dev_only_guarded = True  # type: ignore[attr-defined]
+            return _guard
+
+        setattr(cls, name, _make_guard(original, verb))
+
+    return cls
 
 
 # ---------------------------------------------------------------------------
@@ -539,11 +750,15 @@ def bind_registered_shell_commands(cls: type) -> type:
 
 
 __all__ = [
+    "PACE_LONG_HELP",
     "REGISTRY",
     "ShellCommandSpec",
     "bind_registered_shell_commands",
     "categories",
+    "DEV_ONLY_REFUSAL",
     "deliverables",
+    "dev_only_verbs",
+    "enforce_dev_only_commands",
     "get_spec",
     "specs_by_category",
     "specs_suggested_after",

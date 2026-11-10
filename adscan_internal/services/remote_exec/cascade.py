@@ -123,7 +123,7 @@ async def _resolve_methods(
     fp_override: HostFingerprint | None,
     intel: EdrIntelligence | None,
     intel_cache: HostIntelligenceCache | None,
-    workspace_type: str | None,
+    prefer_speed: bool,
     require_stdout: bool,
     on_intel_resolved: Callable[[HostFingerprint, list[ExecMethod]], None] | None,
 ) -> tuple[tuple[ExecMethod, ...], HostFingerprint | None, bool]:
@@ -154,7 +154,7 @@ async def _resolve_methods(
         fp,
         intel_obj,
         require_stdout=require_stdout,
-        workspace_type=workspace_type,
+        prefer_speed=prefer_speed,
     )
     ranked_methods = tuple(m.method for m in ranked)
 
@@ -184,7 +184,7 @@ async def execute_with_fallback(
     fp_override: HostFingerprint | None = None,
     intel: EdrIntelligence | None = None,
     intel_cache: HostIntelligenceCache | None = None,
-    workspace_type: str | None = None,
+    prefer_speed: bool = False,
     timeout: int = 60,
     require_stdout: bool = True,
     on_method_attempt: Callable[[ExecMethod], None] | None = None,
@@ -210,8 +210,9 @@ async def execute_with_fallback(
         fp_override: Pre-computed fingerprint to skip the I/O scan.
         intel: Per-host catch history. Updated on success/failure.
         intel_cache: Workspace-scoped fingerprint cache.
-        workspace_type: ``"ctf"`` / ``"audit"`` / ``"engagement"``;
-            biases the selector slightly toward speed or stealth.
+        prefer_speed: The scan policy ranks the fastest methods first
+            (its ``remote_execution`` setting); biases the selector slightly
+            toward speed.
         timeout: Per-method timeout AND, multiplied by the number of
             methods, the global deadline.
         require_stdout: When True (default) backends that do not capture
@@ -238,7 +239,7 @@ async def execute_with_fallback(
         fp_override=fp_override,
         intel=intel,
         intel_cache=intel_cache,
-        workspace_type=workspace_type,
+        prefer_speed=prefer_speed,
         require_stdout=require_stdout,
         on_intel_resolved=on_intel_resolved,
     )
@@ -327,7 +328,7 @@ async def execute_with_fallback(
                 chosen=method,
                 methods_failed=methods_failed,
                 from_cache=from_cache,
-                workspace_type=workspace_type,
+                prefer_speed=prefer_speed,
             )
             return RemoteExecResult(
                 success=True,
@@ -361,7 +362,7 @@ async def execute_with_fallback(
         chosen=None,
         methods_failed=methods_failed,
         from_cache=from_cache,
-        workspace_type=workspace_type,
+        prefer_speed=prefer_speed,
     )
     return RemoteExecResult(
         success=False,
@@ -405,7 +406,7 @@ def _emit_choice_telemetry(
     chosen: ExecMethod | None,
     methods_failed: list[tuple[str, str]],
     from_cache: bool,
-    workspace_type: str | None,
+    prefer_speed: bool,
 ) -> None:
     """Emit a single ``remote_exec.adaptive_choice`` telemetry event."""
     try:
@@ -417,7 +418,7 @@ def _emit_choice_telemetry(
             "method_chosen": chosen.value if chosen is not None else None,
             "methods_failed": methods_failed,
             "from_cache": from_cache,
-            "workspace_type": workspace_type,
+            "remote_execution": "speed" if prefer_speed else "low_footprint",
         }
         capture = getattr(telemetry, "capture_event", None)
         if callable(capture):

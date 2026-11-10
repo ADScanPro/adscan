@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -207,24 +208,263 @@ def _registry_read_outcome_line(result, *, sam_label: str, lsa_label: str) -> st
     return f"Secrets recovered  ·  {counts}"
 
 
+@dataclass(frozen=True)
+class _BackupOpsTarget:
+    """The controller this escalation acts against, and how it was chosen.
+
+    ``label`` is the graph label of the edge's target, which the status updates
+    key on. ``connect_ip`` is what the SMB session dials and ``spn_hostname``
+    what the Kerberos ticket names: an IP in an SPN fails auth, so the two stay
+    separate. ``selection_reason`` records WHY this controller was used, so a
+    later reader can tell the graph's pinned choice from a live fallback.
+    """
+
+    label: str
+    connect_ip: str
+    spn_hostname: str
+    selection_reason: str
+    pinned_by_step: bool
+
+
+def _graph_node_entry_for_label(
+    graph: dict[str, Any], label: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Return ``(node_id, node)`` for the node denoting *label*, or ``None``.
+
+    Compares on the host/account part of a ``NAME@REALM`` label, case-folded, so
+    a step's target label resolves to the node the graph derived it from. Walks
+    nodes in sorted id order, so the answer is deterministic.
+    """
+    wanted = str(label or "").strip().split("@", 1)[0].strip().lower()
+    if not wanted:
+        return None
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, dict):
+        return None
+    for node_id, node in sorted(nodes.items(), key=lambda item: str(item[0])):
+        if not isinstance(node, dict):
+            continue
+        props = (
+            node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        )
+        for candidate in (
+            node.get("label"),
+            props.get("name"),
+            props.get("samaccountname"),
+            props.get("dnshostname"),
+        ):
+            token = str(candidate or "").strip().split("@", 1)[0].strip().lower()
+            if token and token == wanted:
+                return str(node_id), node
+    return None
+
+
+def _graph_node_for_label(graph: dict[str, Any], label: str) -> dict[str, Any] | None:
+    """Return the node denoting *label*, or ``None``."""
+    entry = _graph_node_entry_for_label(graph, label)
+    return entry[1] if entry else None
+
+
+def _backup_ops_edge_target_label(shell: Any, domain: str) -> str:
+    """Return the label the escalation edge currently points at.
+
+    Read from the GRAPH rather than assumed, because the target is a property of
+    the derivation and not of this executor: a graph collected by an earlier
+    version points the edge at the domain object, a current one pins the
+    controller. Degrades to the domain label, which is what the pre-pin graphs
+    carry.
+    """
+    graph = load_attack_graph(shell, domain)
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+    group_norm = _BACKUP_OPS_GROUP_LABEL.strip().lower()
+    if isinstance(nodes, dict):
+        for edge in graph.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("relation") or "").strip() != _BACKUP_OPS_GRAPH_RELATION:
+                continue
+            source = nodes.get(str(edge.get("from") or "").strip())
+            source_label = (
+                str(source.get("label") or source.get("name") or "").strip()
+                if isinstance(source, dict)
+                else ""
+            )
+            if source_label.split("@", 1)[0].strip().lower() != group_norm:
+                continue
+            target = nodes.get(str(edge.get("to") or "").strip())
+            target_label = (
+                str(target.get("label") or target.get("name") or "").strip()
+                if isinstance(target, dict)
+                else ""
+            )
+            if target_label:
+                return target_label
+    domain_record = resolve_domain_node_record_for_domain(shell, domain, graph=graph)
+    return str(
+        domain_record.get("label") or domain_record.get("name") or domain
+    ).strip()
+
+
+def _resolve_backup_ops_target(
+    shell: Any, *, domain: str, step_target_label: str | None
+) -> _BackupOpsTarget | None:
+    """Resolve the controller to act against, obeying the step's pinned target.
+
+    The GRAPH decides which controller this step is about: it pinned one
+    deterministically when the path was built, which is the only way the
+    displayed chain and the executed action can agree. So the step's target is
+    read, never re-chosen here. Reachability is then resolved live through the
+    SSOT ``select_reachable_dc_ip`` on the port this operation actually uses
+    (445, for the remote-registry pipe), so a pinned controller that is down
+    does not fail a step another controller would have served — and the
+    controller actually exercised is written back onto the step by the caller.
+
+    Returns ``None`` only when the domain records no controller at all.
+    """
+    from adscan_internal.models.domain import (
+        resolve_dc_ip,
+        resolve_domain_controllers,
+    )
+    from adscan_internal.services.dns_discovery_service import select_reachable_dc_ip
+
+    domains_data = getattr(shell, "domains_data", None)
+    domain_data = (
+        domains_data.get(domain, {}) if isinstance(domains_data, dict) else {}
+    )
+    if not isinstance(domain_data, dict):
+        domain_data = {}
+
+    graph = load_attack_graph(shell, domain)
+    pinned_node = (
+        _graph_node_for_label(graph, step_target_label) if step_target_label else None
+    )
+    pinned_is_computer = (
+        isinstance(pinned_node, dict)
+        and str(pinned_node.get("kind") or "").strip().lower() == "computer"
+    )
+    pinned_props = (
+        pinned_node.get("properties")
+        if pinned_is_computer and isinstance(pinned_node.get("properties"), dict)
+        else {}
+    )
+
+    recorded_ip = resolve_dc_ip(domain_data) or ""
+    dc_set = resolve_domain_controllers(domain_data)
+    spn_hostname = (
+        str(pinned_props.get("dnshostname") or "").strip()
+        or dc_set.primary_fqdn
+        or str(domain_data.get("pdc_hostname") or "").strip()
+    )
+
+    provided: list[str | None] = [str(pinned_props.get("ip_address") or "").strip() or None]
+    provided.append(recorded_ip or None)
+    for record in dc_set.dcs:
+        provided.extend(record.aliases)
+
+    dns_candidates: list[str] = []
+    if spn_hostname and "." in spn_hostname:
+        try:
+            dns_service = shell._get_dns_discovery_service()  # noqa: SLF001
+            dns_candidates = dns_service.resolve_ipv4_addresses_robust(
+                spn_hostname, resolver=recorded_ip or None
+            )
+        except Exception as exc:  # noqa: BLE001 — resolution is an enrichment
+            print_exception(exception=exc)
+            dns_candidates = []
+
+    try:
+        selection = select_reachable_dc_ip(
+            reachability_host=shell,
+            dns_candidates=dns_candidates,
+            provided_ips=provided,
+            # 445: this escalation drives the remote-registry pipe over SMB, so
+            # the generic 389/88 DC-liveness set would answer a question this
+            # operation never asks.
+            probe_ports=(445,),
+        )
+        connect_ip = selection.selected_ip or recorded_ip
+        reason = selection.reason
+    except Exception as exc:  # noqa: BLE001 — never fail the step over the probe
+        print_exception(exception=exc)
+        connect_ip = recorded_ip
+        reason = "probe_unavailable"
+
+    if not connect_ip:
+        return None
+
+    return _BackupOpsTarget(
+        label=str(step_target_label or "").strip()
+        or _backup_ops_edge_target_label(shell, domain),
+        connect_ip=connect_ip,
+        spn_hostname=spn_hostname,
+        selection_reason=reason,
+        pinned_by_step=pinned_is_computer,
+    )
+
+
+def _backup_ops_target_notes(target: _BackupOpsTarget) -> dict[str, object]:
+    """Return the write-back notes naming the controller actually exercised.
+
+    The graph pins a controller deterministically before anything runs; this is
+    the other half of that contract. Recording the address dialled AND the reason
+    it was chosen means a re-render shows the controller that answered rather
+    than the one the graph pinned, and a later reader can tell a pinned choice
+    from a live fallback without re-probing anything.
+    """
+    return {
+        "action": _BACKUP_OPS_GRAPH_RELATION,
+        "exercised_target": target.label,
+        "exercised_dc_ip": target.connect_ip,
+        "dc_selection_reason": target.selection_reason,
+        "target_pinned_by_step": target.pinned_by_step,
+    }
+
+
+def read_backup_ops_exercised_notes(shell: Any, *, domain: str) -> dict[str, object]:
+    """Return the exercised-controller fields recorded on the escalation edge.
+
+    The executor writes the controller it actually dialled (and why) onto the
+    edge; this reads those fields back so the attack STEP can carry the same
+    record. Keeping one writer and reading from it means the step and the edge
+    can never name different controllers. Best-effort: an unreadable graph
+    returns ``{}`` and the step simply carries no provenance.
+    """
+    keys = ("exercised_target", "exercised_dc_ip", "dc_selection_reason")
+    try:
+        graph = load_attack_graph(shell, domain)
+        for edge in graph.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("relation") or "").strip() != _BACKUP_OPS_GRAPH_RELATION:
+                continue
+            notes = edge.get("notes")
+            if not isinstance(notes, dict):
+                continue
+            carried = {key: notes[key] for key in keys if notes.get(key)}
+            if carried:
+                return carried
+    except Exception as exc:  # noqa: BLE001 — provenance is an enrichment
+        print_exception(exception=exc)
+    return {}
+
+
 def _update_backup_ops_da_edge(
     shell: Any,
     *,
     domain: str,
     status: str,
     notes: dict[str, object] | None = None,
+    target_label: str | None = None,
 ) -> None:
-    graph = load_attack_graph(shell, domain)
-    domain_record = resolve_domain_node_record_for_domain(shell, domain, graph=graph)
-    domain_label = str(
-        domain_record.get("label") or domain_record.get("name") or domain
-    ).strip()
+    to_label = str(target_label or "").strip() or _backup_ops_edge_target_label(
+        shell, domain
+    )
     update_edge_status_by_labels(
         shell,
         domain,
         from_label=_BACKUP_OPS_GROUP_LABEL,
         relation=_BACKUP_OPS_GRAPH_RELATION,
-        to_label=domain_label,
+        to_label=to_label,
         status=status,
         notes=notes,
     )
@@ -484,12 +724,23 @@ def offer_backup_operators_escalation(
     domain: str,
     username: str,
     password: str,
+    target_label: str | None = None,
 ) -> bool:
     """Backup Operators escalation via native async RRP (no netexec).
 
     Uses NativeDumpService.backup_operator_dump() which opens HKLM\\SAM,
     HKLM\\SECURITY and HKLM\\SYSTEM with REG_OPTION_BACKUP_RESTORE flags,
     downloads the hives via ADMIN$, and parses them in-process.
+
+    Args:
+        target_label: The attack step's own target, when this runs as a step.
+            The graph pinned that controller when the path was built, so it is
+            OBEYED rather than re-chosen here — one decision, taken once, which
+            is what makes the displayed chain and the executed action agree.
+            ``None`` (the standalone offer) falls back to the domain's recorded
+            controller. Either way reachability is resolved live through
+            ``select_reachable_dc_ip``, and the controller actually exercised is
+            recorded on the edge.
 
     Returns True if we extracted a usable DC machine account hash.
     """
@@ -501,13 +752,25 @@ def offer_backup_operators_escalation(
     from adscan_internal.services.smb_transport import SMBConfig
 
     try:
-        pdc_ip: str = str(shell.domains_data.get(domain, {}).get("pdc") or "")
-        pdc_hostname: str | None = shell.domains_data.get(domain, {}).get("pdc_hostname")
-        if not pdc_ip:
-            print_error("Backup Operators escalation requires a PDC IP.")
+        target = _resolve_backup_ops_target(
+            shell, domain=domain, step_target_label=target_label
+        )
+        if target is None:
+            print_error(
+                "Backup Operators escalation requires a reachable domain controller."
+            )
             update_active_step_status(shell, domain=domain, status="failed",
                                       notes={"reason": "missing_pdc"})
             return False
+        pdc_ip: str = target.connect_ip
+        pdc_hostname: str | None = target.spn_hostname or None
+        edge_target_label = target.label
+        print_info_debug(
+            "[backup-ops] Controller resolved: "
+            f"target={mark_sensitive(edge_target_label, 'hostname')} "
+            f"connect={mark_sensitive(pdc_ip, 'ip')} "
+            f"reason={target.selection_reason} pinned={target.pinned_by_step}"
+        )
 
         marked_domain = mark_sensitive(domain, "domain")
         marked_pdc = mark_sensitive(pdc_ip, "ip")
@@ -556,6 +819,7 @@ def offer_backup_operators_escalation(
             if not Confirm.ask("Proceed with Backup Operators escalation?", default=False):
                 print_warning("Backup Operators escalation skipped by user.")
                 _update_backup_ops_da_edge(shell, domain=domain, status="discovered",
+                                           target_label=edge_target_label,
                                            notes={"action": _BACKUP_OPS_GRAPH_RELATION,
                                                   "skipped": True})
                 return False
@@ -563,8 +827,13 @@ def offer_backup_operators_escalation(
         # ── State tracking ────────────────────────────────────────────────
         _mark_backup_ops_attempted(shell, domain=domain, username=username,
                                    pdc=pdc_ip, hostname=pdc_hostname)
-        _update_backup_ops_da_edge(shell, domain=domain, status="attempted",
-                                   notes={"action": _BACKUP_OPS_GRAPH_RELATION})
+        _update_backup_ops_da_edge(
+            shell,
+            domain=domain,
+            status="attempted",
+            target_label=edge_target_label,
+            notes=_backup_ops_target_notes(target),
+        )
         update_active_step_status(shell, domain=domain, status="attempted",
                                   notes={"action": "backup_operator"})
 
@@ -616,7 +885,9 @@ def offer_backup_operators_escalation(
         if not result.success:
             display.phase_error(f"Hive dump failed: {result.error or 'unknown error'}")
             _update_backup_ops_da_edge(shell, domain=domain, status="failed",
-                                       notes={"reason": "dump_failed"})
+                                       target_label=edge_target_label,
+                                       notes={"reason": "dump_failed",
+                                              **_backup_ops_target_notes(target)})
             update_active_step_status(shell, domain=domain, status="failed",
                                       notes={"reason": "dump_failed"})
             return False
@@ -672,7 +943,9 @@ def offer_backup_operators_escalation(
                                          prompt_for_user_privs_after=False,
                                          credential_origin="backup_operators")
             _update_backup_ops_da_edge(shell, domain=domain, status="failed",
-                                       notes={"reason": "no_machine_hash"})
+                                       target_label=edge_target_label,
+                                       notes={"reason": "no_machine_hash",
+                                              **_backup_ops_target_notes(target)})
             update_active_step_status(shell, domain=domain, status="failed",
                                       notes={"reason": "no_machine_hash"})
             return False
@@ -681,8 +954,13 @@ def offer_backup_operators_escalation(
 
         _mark_backup_ops_success(shell, domain=domain, username=username,
                                  pdc=pdc_ip, hostname=dc_hostname_final)
-        _update_backup_ops_da_edge(shell, domain=domain, status="success",
-                                   notes={"action": _BACKUP_OPS_GRAPH_RELATION})
+        _update_backup_ops_da_edge(
+            shell,
+            domain=domain,
+            status="success",
+            target_label=edge_target_label,
+            notes=_backup_ops_target_notes(target),
+        )
         update_active_step_status(shell, domain=domain, status="success",
                                   notes={"action": "backup_operator"})
 
@@ -767,6 +1045,7 @@ def offer_backup_operators_escalation(
 
 
 __all__ = [
+    "read_backup_ops_exercised_notes",
     "record_backup_ops_discovered",
     "offer_backup_operators_escalation",
     "handle_backup_ops_sysvol_cleanup",

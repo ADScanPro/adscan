@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from typing import Any
 
 from rich.prompt import Confirm
@@ -117,8 +119,7 @@ class WindowsSensitiveScanPolicyService:
 
     def select_ai_triage_scope(self, *, shell: Any) -> str | None:
         """Select one AI triage scope after filesystem mapping."""
-        pentest_type = str(getattr(shell, "type", "") or "").strip().lower()
-        if pentest_type == "ctf":
+        if policy_settings.aims_at_domain_compromise(shell):
             return "credentials"
 
         options = [
@@ -169,8 +170,7 @@ class WindowsSensitiveScanPolicyService:
                 f"domain is already pwned: domain={mark_sensitive(domain, 'domain')}"
             )
             return False
-        run_type = str(getattr(shell, "type", "") or "").strip().lower()
-        default_continue = run_type != "ctf"
+        default_continue = policy_settings.runs_full_assessment(shell)
         prompt = (
             "Credential-like findings detected. Continue analyzing remaining prioritized files?"
         )

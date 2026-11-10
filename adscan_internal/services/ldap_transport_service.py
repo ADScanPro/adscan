@@ -53,7 +53,10 @@ from adscan_internal.services.auth_error_classification import (
 )
 from adscan_internal.services.async_bridge import run_async_sync, run_sync_off_loop
 from adscan_core.pal import auth as pal_auth
+from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.rich_output import print_exception, print_info_verbose
+from adscan_core.auth_attempt_guard import AuthAttemptRefused
+from adscan_core.rich_output import print_warning
 
 
 SD_FLAGS_DACL_CONTROL: str = "sd_flags_dacl"
@@ -158,7 +161,11 @@ class ADscanLDAPConfig:
       priority over the ``KRB5CCNAME`` environment variable. Use this for programmatic
       flows where the ccache was minted by ``KerberosTicketService`` at a known path.
     - ``paged_size``: LDAP paged-search page size passed to badldap via the
-      ``pagesize`` URL param. Max 1000 (badldap enforces this). Default 1000.
+      ``pagesize`` URL param. Max 1000 (badldap enforces this). Default from the
+      scan pacing (``ldap.paged_search``: 1000 at the default level).
+    - ``page_delay_s``: pause between two pages of one paged search, passed to
+      badldap via the ``rate`` URL param. Default from the scan pacing (0 at the
+      default level, so the URL carries no ``rate`` and nothing changes).
     - ``require_confidential``: the operation reads (or writes) a CONFIDENTIAL
       directory attribute (e.g. ``msDS-ManagedPassword`` for gMSA). AD only
       returns such attributes over a SEALED channel — LDAPS (TLS) or plain LDAP
@@ -221,7 +228,16 @@ class ADscanLDAPConfig:
     encrypt: bool = False
     tls_sni: str | None = None
     ccache_path: str | None = None
-    paged_size: int = 1000
+    paged_size: int = field(
+        default_factory=lambda: int(
+            component_pacing(active_pacing(), "ldap.paged_search")["page_size"]
+        )
+    )
+    page_delay_s: float = field(
+        default_factory=lambda: float(
+            component_pacing(active_pacing(), "ldap.paged_search")["page_delay_s"]
+        )
+    )
     require_confidential: bool = False
     use_starttls: bool = False
     """Request an RFC 2830 StartTLS upgrade on a plain LDAP/389 connection.
@@ -346,6 +362,27 @@ class ADscanLDAPConfig:
                 or self.auth_kdc
             )
 
+        # A named principal must carry its own secret (a password, an NT hash in
+        # the password slot, an AES key, a ccache or a CredentialContext). Refuse
+        # here rather than bind with an empty one: that is a failed logon on a
+        # real account (see credential_routing.require_credential_material).
+        from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+            require_credential_material,
+        )
+        from adscan_internal.services._kerberos_ccache_guard import (  # noqa: PLC0415
+            ambient_ccache_check,
+        )
+
+        require_credential_material(
+            transport="LDAP",
+            username=self.username,
+            password=self.password,
+            aes_key=self.aes_key,
+            ccache_path=self.ccache_path,
+            extra_material=(self.credential_context,),
+            ambient_kerberos=ambient_ccache_check(self.use_kerberos, self.username),
+        )
+
         # Note: ADscanLDAPConfig intentionally does NOT have a separate
         # ``nt_hash`` field. Pass-the-hash via LDAP works by placing the hash
         # in ``password`` and letting ``_build_ldap_connection_url`` detect
@@ -360,7 +397,39 @@ class ADscanLDAPConfig:
 
     @property
     def config_dn(self) -> str:
+        """Fallback Configuration NC derived from the scanned domain's DN.
+
+        Only correct for a forest ROOT domain: in a child domain the
+        Configuration NC lives under the forest root. Prefer
+        ``ADscanLDAPConnection.config_dn``, which reads the RootDSE
+        ``configurationNamingContext`` (see :func:`resolve_configuration_nc`).
+        """
         return f"CN=Configuration,{self.domain_dn}"
+
+
+def resolve_configuration_nc(
+    server_info: Any, *, fallback_domain_dn: str = ""
+) -> str:
+    """Return the forest Configuration NC DN (SSOT for every config-NC search).
+
+    The Configuration NC is per-FOREST: a child domain's DCs advertise the
+    forest root's ``CN=Configuration,DC=<root>`` in the RootDSE
+    ``configurationNamingContext``. Building it from the scanned domain's DN
+    fails (noSuchObject) in any child domain. Order: RootDSE value, then the
+    domain-derived DN as a last resort (correct for a forest root).
+    """
+    if isinstance(server_info, dict):
+        raw = server_info.get("configurationNamingContext")
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        value = str(raw or "").strip()
+        if value:
+            return value
+    if fallback_domain_dn:
+        return f"CN=Configuration,{fallback_domain_dn}"
+    return ""
 
 
 _LDAP_SCOPE_MAP: dict[Any, int] = {
@@ -542,6 +611,8 @@ def _build_ldap_connection_url(config: "ADscanLDAPConfig") -> tuple[str, bool]:
         # pagesize URL param (badldap enforces max 1000).
         if config.paged_size and config.paged_size != 1000:
             params.append(f"pagesize={min(int(config.paged_size), 1000)}")
+        if config.page_delay_s and config.page_delay_s > 0:
+            params.append(f"rate={float(config.page_delay_s):g}")
 
         # etypes → repeated etype= params (badldap parses via int_list).
         if config.etypes:
@@ -726,6 +797,8 @@ def _build_ldap_connection_url(config: "ADscanLDAPConfig") -> tuple[str, bool]:
     params_ntlm: list[str] = []
     if config.paged_size and config.paged_size != 1000:
         params_ntlm.append(f"pagesize={min(int(config.paged_size), 1000)}")
+    if config.page_delay_s and config.page_delay_s > 0:
+        params_ntlm.append(f"rate={float(config.page_delay_s):g}")
     if config.encrypt and not config.use_ldaps:
         params_ntlm.append("encrypt=true")
 
@@ -857,7 +930,14 @@ class ADscanLDAPConnection:
 
     @property
     def config_dn(self) -> str:
-        return self.config.config_dn
+        """Forest Configuration NC, read from the RootDSE of the bound DC.
+
+        Falls back to the domain-derived DN only when the RootDSE did not
+        advertise ``configurationNamingContext``.
+        """
+        return resolve_configuration_nc(
+            self._server_info, fallback_domain_dn=self.config.domain_dn
+        )
 
     def search(
         self,
@@ -974,9 +1054,10 @@ class ADscanLDAPConnection:
         Args:
             dn: Distinguished name of the object to modify.
             changes: badldap-style changes dict:
-                ``{'attribute': [('MODIFY_REPLACE', [value])]}``
-                Change operation keys follow ldap3/badldap conventions:
-                MODIFY_ADD, MODIFY_DELETE, MODIFY_REPLACE.
+                ``{'attribute': [('replace', [value])]}``
+                The operation is one of badldap's ``ChangeOperation`` names,
+                lower-case: ``'add'``, ``'delete'``, ``'replace'``. The ldap3
+                constants (``MODIFY_REPLACE`` and friends) are NOT accepted.
             encode: When True (default), badldap encodes str/int values.
                 Set to False when passing raw bytes (e.g. nTSecurityDescriptor,
                 msDS-KeyCredentialLink) to avoid double-encoding.
@@ -1398,7 +1479,8 @@ def build_ldap_config_for_domain(
         domain: Target domain key to look up.
         username: Account name for authentication.
         password: Plaintext password (ignored when nt_hash or ccache_path is set).
-        nt_hash: NT hash for pass-the-hash Kerberos.
+        nt_hash: NT hash for pass-the-hash; carried in the config's ``password``
+            slot, which the transport recognises as a hash.
         ccache_path: Explicit ccache file path for ``kerberos-ccache`` auth.
         auth_domain: Cross-domain auth override for the credential's home domain.
         auth_kdc: KDC IP override for cross-domain authentication.
@@ -1446,7 +1528,10 @@ def build_ldap_config_for_domain(
         use_ldaps=use_ldaps,
         use_kerberos=kerberos_active,
         username=username,
-        password=None if (nt_hash or ccache_path) else password,
+        # ``ADscanLDAPConfig`` has no NT-hash field: the hash travels in
+        # ``password`` and the URL builder detects its form (``_is_nt_hash``).
+        # Dropping it here bound with NO secret, a failed logon every time.
+        password=None if ccache_path else (nt_hash or password),
         ccache_path=ccache_path,
         auth_domain=auth_domain,
         auth_kdc=auth_kdc,
@@ -2308,6 +2393,66 @@ def _diag_dump_bind_exception(exc: BaseException) -> None:
             f"[ldap_transport][diag] bind exception dump failed: "
             f"{type(inner).__name__}: {inner}"
         )
+
+
+# Lockout guard (``adscan_core.auth_attempt_guard``) for binds that send a
+# secret without Kerberos: NTLM and SIMPLE. A Kerberos bind is judged at kerbad
+# ``get_TGT`` (``_kerberos_recovery``), so it is not counted twice here. What a
+# failed bind means is decided by the shared classifier
+# ``adscan_core.auth_outcome.classify_ldap_bind``, from the RAW diagnostic
+# message AD returned: only ``data 52e`` is a wrong secret. A bare
+# invalidCredentials / SEC_E_LOGON_DENIED without the sub-status is UNKNOWN,
+# because it is also what a DC answers when NTLM is disabled by policy, and
+# counting it would withhold a correct secret from the Kerberos fallback.
+
+
+def _ldap_guard_target(cfg: "ADscanLDAPConfig") -> "tuple[str, str, str] | None":
+    """``(realm, principal, secret)`` when this bind sends an NTLM or SIMPLE secret.
+
+    A bind with a username and no password is NOT anonymous:
+    ``_build_ldap_connection_url`` quotes the missing password as an empty one,
+    so the domain controller judges an empty secret for that principal and
+    counts the failure. That exact bind (a re-read built from a stored NT hash
+    with ``password=None``) locked a domain account in a lab run, so it is
+    judged like any other secret.
+    """
+    if cfg.use_kerberos or not cfg.username:
+        return None
+    realm = str(cfg.auth_domain or cfg.domain or "").strip()
+    if not realm:
+        return None
+    return realm, str(cfg.username), str(cfg.password or "")
+
+
+def _ldap_bind_failure_text(exc: BaseException) -> str:
+    """The bind failure chain, with badldap's raw ``diagnosticMessage`` kept.
+
+    badldap's formatted message replaces ``data 52e`` with the WINERROR name, so
+    the raw ``diagnostic_message`` (bytes) is appended for the classifier.
+    """
+    parts: list[str] = []
+    for item in _walk_exception_chain(exc):
+        parts.append(str(item))
+        raw = getattr(item, "diagnostic_message", None)
+        if isinstance(raw, (bytes, bytearray)):
+            parts.append(bytes(raw).decode("utf-8", errors="ignore"))
+        elif raw:
+            parts.append(str(raw))
+        resultname = getattr(item, "resultname", None)
+        if resultname:
+            parts.append(str(resultname))
+    return " ".join(parts)
+
+
+def _record_ldap_bind_outcome(
+    target: "tuple[str, str, str]", exc: "BaseException | None"
+) -> None:
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+    from adscan_core.auth_outcome import SUCCESS, classify_ldap_bind  # noqa: PLC0415
+
+    realm, principal, secret = target
+    verdict = SUCCESS if exc is None else classify_ldap_bind(_ldap_bind_failure_text(exc))
+    auth_attempt_guard.record_verdict(realm, principal, secret, verdict)
 
 
 def _plain_ldap_can_seal(config: "ADscanLDAPConfig") -> bool:
@@ -3257,6 +3402,10 @@ async def async_connect_with_ldap_fallback(
         and not _ldap_ntlm_disabled_high(getattr(config, "posture_snapshot", None))
         and not str(getattr(config, "ccache_path", "") or "").strip()
         and not getattr(config, "aes_key", None)
+        # NTLM can only send a password or an NT hash (both ride in
+        # ``password``). Without one the last resort would be an NTLM bind with
+        # an empty secret, a failed logon on the account.
+        and str(getattr(config, "password", "") or "").strip()
     ):
         import dataclasses as _dc_ntlm_lr
 
@@ -3372,16 +3521,30 @@ async def async_connect_with_ldap_fallback(
                     # answer. See vendor/badldap/badldap/client.py bind_only.
                     conn._bind_only = True
 
-                if connect_timeout is not None:
-                    ok, err = await asyncio.wait_for(
-                        conn.connect(), timeout=connect_timeout
+                guard_target = _ldap_guard_target(cfg)
+                if guard_target is not None:
+                    from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+                        check_attempt,
                     )
-                else:
-                    ok, err = await conn.connect()
-                if not ok:
-                    raise err or RuntimeError(
-                        f"{transport_label} connect returned ok=False"
-                    )
+
+                    check_attempt(*guard_target)
+                try:
+                    if connect_timeout is not None:
+                        ok, err = await asyncio.wait_for(
+                            conn.connect(), timeout=connect_timeout
+                        )
+                    else:
+                        ok, err = await conn.connect()
+                    if not ok:
+                        raise err or RuntimeError(
+                            f"{transport_label} connect returned ok=False"
+                        )
+                except Exception as bind_exc:
+                    if guard_target is not None:
+                        _record_ldap_bind_outcome(guard_target, bind_exc)
+                    raise
+                if guard_target is not None:
+                    _record_ldap_bind_outcome(guard_target, None)
 
                 # Determine which confidentiality mechanism sealed this channel.
                 #   LDAPS (636) ......... TLS transport
@@ -3413,6 +3576,11 @@ async def async_connect_with_ldap_fallback(
                 )
                 return LDAPConnectResult(client=conn, mechanism=mechanism)
 
+            except AuthAttemptRefused as refused:
+                # The lockout guard withheld this bind. Every later rung binds as
+                # the same principal, so stop here instead of trying them.
+                print_warning(str(refused))
+                raise
             except Exception as exc:
                 last_exc = exc
                 _diag_dump_bind_exception(exc)

@@ -12,7 +12,7 @@ import re
 
 from rich.prompt import Confirm
 
-from adscan_core.paths import get_logs_dir
+from adscan_core.telemetry import mask_secrets
 from adscan_internal import (
     print_error,
     print_error_debug,
@@ -65,7 +65,6 @@ class AIPolicyExecutor:
         self._confirm_callback = confirm_callback or (
             lambda question, default: Confirm.ask(question, default=default)
         )
-        self._audit_path = get_logs_dir() / "ai_audit.log"
         self._command_descriptions: dict[str, str] = {}
         self._allowed_cli_commands = self._discover_allowed_cli_commands()
 
@@ -303,16 +302,31 @@ class AIPolicyExecutor:
         )()
         return Path(workspace_cwd) / "ai_output"
 
+    @property
+    def _audit_path(self) -> Path | None:
+        """``<workspace>/logs/ai_audit.log`` of the active workspace, else None.
+
+        The entries carry domains, commands and their results, so they live in
+        the workspace and leave with it. Outside a workspace nothing is kept.
+        """
+        workspace_dir = getattr(self._shell, "current_workspace_dir", None)
+        if not workspace_dir:
+            return None
+        return Path(workspace_dir) / "logs" / "ai_audit.log"
+
     def _audit(self, event: str, payload: dict[str, Any]) -> None:
-        """Append one JSON-lines audit entry."""
+        """Append one JSON-lines audit entry to the active workspace's log."""
+        audit_path = self._audit_path
+        if audit_path is None:
+            return
         entry = {
             "ts": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
             "event": event,
             "payload": payload,
         }
         try:
-            self._audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._audit_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(audit_path, "a", encoding="utf-8") as handle:
+                handle.write(mask_secrets(json.dumps(entry, ensure_ascii=False)) + "\n")
         except Exception:
             print_warning("AI audit logging failed (non-fatal).")

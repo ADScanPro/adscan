@@ -238,4 +238,11 @@ def resolve_population_tier_breakdown(
         ),
         "tier1": int(breakdown.get("tier1", 0) or 0),
         "tier2": int(breakdown.get("tier2", 0) or 0),
+        # Named, so the ordinary-account sentence can say who the Tier 1
+        # remainder is (``privilege_tier_labels.tier1_remainder_sentence``).
+        "tier1_accounts": sorted(
+            str(name).strip().lower()
+            for name, value in tier_map.items()
+            if str(value) == "tier1" and str(name or "").strip()
+        ),
     }

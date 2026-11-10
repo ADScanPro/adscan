@@ -300,6 +300,51 @@ def _type_style(trust_type: str) -> str:
     return _TYPE_STYLE.get(trust_type, "white")
 
 
+def _posture_cell(trust: Any) -> Text:
+    """Render the trust's own posture: transitivity, SID filtering, extras.
+
+    The operator sees the same facts the client's trust panel shows, decoded by
+    the same module (``adscan_core.ad_trust``), so the two never disagree about
+    one trust. A weakening is called out; a healthy trust reads quietly.
+    """
+    from adscan_core.ad_trust import (
+        SID_FILTERING_ENFORCED,
+        SID_FILTERING_NOT_APPLICABLE,
+        TGT_DELEGATION_ENABLED,
+        TRANSITIVITY_NON_TRANSITIVE,
+        decode_trust_facts,
+    )
+
+    cell = Text()
+    try:
+        facts = decode_trust_facts(
+            trust_attributes=getattr(trust, "trust_attributes", 0),
+            trust_direction=getattr(trust, "trust_direction", None),
+            local_domain=getattr(trust, "source_domain", "") or None,
+            partner_domain=getattr(trust, "target_domain", "") or None,
+        )
+    except Exception:  # noqa: BLE001 — a display cell never breaks the panel
+        return cell
+
+    parts: list[tuple[str, str]] = []
+    if facts.transitivity == TRANSITIVITY_NON_TRANSITIVE:
+        parts.append(("non-transitive", "dim"))
+    if facts.sid_filtering == SID_FILTERING_ENFORCED:
+        parts.append(("SID filtering", "green"))
+    elif facts.sid_filtering != SID_FILTERING_NOT_APPLICABLE:
+        parts.append(("SID filtering weakened", "yellow"))
+    if facts.tgt_delegation == TGT_DELEGATION_ENABLED:
+        parts.append(("TGT forwarding", "yellow"))
+    if not parts:
+        return Text("—", style="dim")
+
+    for index, (label, style) in enumerate(parts):
+        if index:
+            cell.append(" · ", style="dim")
+        cell.append(label, style=style)
+    return cell
+
+
 def _remediation_for(error: str) -> str:
     text = (error or "").lower()
     if "signing" in text or "channel binding" in text or "strongerauth" in text:
@@ -366,6 +411,7 @@ def render_trust_summary_panel(
     matrix.add_column("Partner", style="bold")
     matrix.add_column("Direction")
     matrix.add_column("Type")
+    matrix.add_column("Posture")
 
     for trust in trusts:
         direction = getattr(trust, "trust_direction", "Unknown")
@@ -376,6 +422,7 @@ def render_trust_summary_panel(
             mark_sensitive(getattr(trust, "target_domain", ""), "domain"),
             Text(direction, style="dim"),
             Text(ttype, style=_type_style(ttype)),
+            _posture_cell(trust),
         )
 
     # Discovered domains table

@@ -53,6 +53,8 @@ from adscan_core.paths import (
     get_locks_dir as _core_get_locks_dir,
     get_resolver_locks_dir as _core_get_resolver_locks_dir,
     get_sessions_dir as _core_get_sessions_dir,
+    get_workspace_lock_path as _core_get_workspace_lock_path,
+    normalize_workspace_lock_name as _core_normalize_workspace_lock_name,
 )
 
 
@@ -64,6 +66,8 @@ __all__ = (
     "claim_resolver_ip",
     "cleanup_session_dir",
     "cleanup_stale_session_dirs",
+    "sweep_orphaned_execution_workspaces",
+    "sweep_stale_workspace_locks",
     "create_session_dir",
     "get_locks_dir",
     "get_resolver_locks_dir",
@@ -137,6 +141,10 @@ class LockHandle:
     path: Path
     fd: IO[str]
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Remove the file when the lock is released. Set for workspace locks: their
+    # name carries the workspace (often the client) name, so they must not
+    # outlive the run.
+    unlink_on_release: bool = False
 
 
 def _format_lock_metadata(
@@ -184,10 +192,26 @@ def read_lock_metadata(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _same_file_still_at_path(handle: IO[str], path: Path) -> bool:
+    """True when ``path`` still names the inode ``handle`` has open.
+
+    A lock file that is unlinked on release can be removed between our
+    ``open`` and our ``flock``; locking the orphaned inode would then lock
+    nothing. Comparing the inode after the lock closes that race.
+    """
+    try:
+        opened = os.fstat(handle.fileno())
+        current = os.stat(path)
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+
+
 def _try_flock(
     path: Path,
     *,
     metadata: dict[str, Any],
+    unlink_on_release: bool = False,
 ) -> LockHandle | None:
     """Attempt to acquire an exclusive non-blocking ``flock`` on ``path``.
 
@@ -196,6 +220,31 @@ def _try_flock(
     """
     if path in _HELD_LOCK_PATHS:
         return None
+    if unlink_on_release:
+        # The file may be unlinked by a releasing owner while we lock it;
+        # retry until the inode we lock is the one at the path.
+        for _attempt in range(5):
+            handle = _try_flock_once(path, metadata=metadata)
+            if handle is None:
+                return None
+            if _same_file_still_at_path(handle.fd, path):
+                handle.unlink_on_release = True
+                return handle
+            _HELD_LOCK_PATHS.discard(path)
+            try:
+                handle.fd.close()
+            except OSError:
+                pass
+        return None
+    return _try_flock_once(path, metadata=metadata)
+
+
+def _try_flock_once(
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+) -> LockHandle | None:
+    """One ``open`` + non-blocking ``flock`` attempt (see :func:`_try_flock`)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115
     # ``fcntl`` is POSIX-only (absent on Windows). Load it lazily so this module
@@ -245,6 +294,13 @@ def release_lock(handle: LockHandle | None) -> None:
         fd.flush()
     except OSError:
         pass
+    if handle.unlink_on_release:
+        # Unlink while still holding the lock, so no other process can lock
+        # this inode thinking it is the live one (see _same_file_still_at_path).
+        try:
+            handle.path.unlink()
+        except OSError:
+            pass
     try:
         fcntl = importlib.import_module("fcntl")
         fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
@@ -266,16 +322,12 @@ def release_lock(handle: LockHandle | None) -> None:
 
 def normalize_workspace_name(name: str) -> str:
     """Canonical key used for workspace lock paths."""
-    return str(name or "").strip().lower()
+    return _core_normalize_workspace_lock_name(name)
 
 
 def _workspace_lock_path(workspace_name: str) -> Path:
-    safe = normalize_workspace_name(workspace_name)
-    if not safe:
-        raise ValueError("workspace_name must be non-empty")
-    # Restrict to a path-safe subset; the lock path is operator-visible.
-    sanitized = "".join(c if c.isalnum() or c in "-._" else "_" for c in safe)
-    return get_locks_dir() / f"workspace-{sanitized}.lock"
+    get_locks_dir()  # created on demand
+    return _core_get_workspace_lock_path(workspace_name)
 
 
 def acquire_workspace_lock(
@@ -291,7 +343,82 @@ def acquire_workspace_lock(
         command_name=command_name,
         extra={"workspace_name": normalize_workspace_name(workspace_name)},
     )
-    return _try_flock(path, metadata=metadata)
+    return _try_flock(path, metadata=metadata, unlink_on_release=True)
+
+
+def sweep_stale_workspace_locks() -> int:
+    """Remove workspace lock files whose recorded owner is no longer running.
+
+    Locks are unlinked on release, so a leftover is a run killed before it
+    could release, or a lock written by an older launcher. Its file name keeps
+    the workspace name. The sweep never takes the lock itself (a concurrent
+    acquire must never see a false "busy"): it reads the owner PID written in
+    the file and removes the file only when that PID is gone. A file with no
+    readable owner is left alone (it may be one being created right now; the
+    acquirer's inode check already copes with a file removed under it).
+
+    Returns:
+        How many stale lock files were removed.
+    """
+    removed = 0
+    locks_dir = _core_get_workspace_lock_path("x").parent
+    if not locks_dir.is_dir():
+        return 0
+    for path in locks_dir.glob("workspace-*.lock"):
+        if path in _HELD_LOCK_PATHS:
+            continue
+        metadata = read_lock_metadata(path)
+        try:
+            owner_pid = int(metadata.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if owner_pid <= 0 or is_pid_alive(owner_pid):
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def sweep_orphaned_execution_workspaces() -> int:
+    """Remove execution workspaces whose own workspace is already gone.
+
+    A scan writes its artifacts into a hidden ``.run_<logical>_<scanid>``
+    directory that is a SIBLING of the logical workspace, so deleting the
+    workspace never removed it and it kept a full copy of the engagement: the
+    reports, the change ledger, the logs, any certificate with its private key.
+    Deleting a workspace is the whole end-of-engagement procedure, so an
+    execution workspace whose logical workspace no longer exists is a delete
+    that only half happened; finishing it is completing what the operator
+    already asked for, and they cannot be expected to find these by hand (the
+    workspace listing hides every dot-prefixed directory).
+
+    Only directories no run is using are removed (the lock, plus a window of
+    write quiet), so a scan is never robbed of the directory it is writing
+    into. Its lock file goes with it, because that file name carries the
+    logical workspace name. Best-effort: never raises.
+
+    Returns:
+        How many execution workspaces were removed.
+    """
+    from adscan_core.execution_workspace import (  # noqa: PLC0415
+        orphaned_execution_workspaces,
+        remove_execution_workspaces,
+    )
+    from adscan_core.paths import get_workspaces_dir  # noqa: PLC0415
+
+    try:
+        workspaces_dir = get_workspaces_dir()
+        if not workspaces_dir.is_dir():
+            return 0
+        removal = remove_execution_workspaces(
+            orphaned_execution_workspaces(workspaces_dir)
+        )
+    except Exception:  # noqa: BLE001 - housekeeping never blocks a launch
+        return 0
+    return len(removal.removed)
 
 
 def acquire_install_lock(*, command_name: str) -> LockHandle | None:

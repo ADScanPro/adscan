@@ -15,7 +15,14 @@ from adscan_internal.rich_output import (
     print_warning_debug,
 )
 from adscan_internal.services.collector.acl_parser import ACLParser
+from adscan_internal.services.collector.collection_integrity import (
+    REASON_ABORTED,
+    REASON_NO_OBJECTS,
+    REASON_TRANSPORT_LOST,
+    note_stage_exception,
+)
 from adscan_internal.services.collector.models import (
+    COLLECTION_SCOPE_DOMAIN_COMPROMISE,
     CollectionResult,
     CollectorEdge,
     CollectorNode,
@@ -282,6 +289,117 @@ def _replace_dataclass(obj: Any, **changes: Any) -> Any:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+#: Attributes of the domain root the password / account policy is decoded from.
+DOMAIN_POLICY_ATTRIBUTES: tuple[str, ...] = (
+    "minPwdLength",
+    "lockoutThreshold",
+    "lockoutObservationWindow",
+    "maxPwdAge",
+    "pwdHistoryLength",
+    "pwdProperties",
+    "ms-DS-MachineAccountQuota",
+    # Per-attribute replication metadata: the exact timestamp each
+    # password-policy attribute was last modified (more precise than
+    # whenChanged, which moves with any change to the domain object).
+    "msDS-ReplAttributeMetaData",
+)
+
+
+def domain_policy_from_attrs(attrs: dict[str, list[Any]]) -> DomainPolicy:
+    """Decode the domain root's policy attributes into a :class:`DomainPolicy`.
+
+    The single decoder for the scan's collector and the recheck ``observe`` read
+    (``services/recheck/observers.py``), so the two can never grade the same
+    domain root differently.
+    """
+    repl_blobs = _values(attrs, "msDS-ReplAttributeMetaData")
+    pwd_attrs = _parse_repl_attr_metadata(repl_blobs, _DDP_PWD_ATTRS)
+    # Decode the ``pwdProperties`` bitmask: bit 0 (DOMAIN_PASSWORD_COMPLEX
+    # = 0x1) controls whether the Default Domain Password Policy enforces
+    # complexity ("must meet complexity requirements"). When the attribute
+    # is unreadable / absent we record ``None`` so downstream consumers
+    # can distinguish "not collected" from "explicitly disabled".
+    pwd_props_raw = _int_attr(attrs, "pwdProperties")
+    if pwd_props_raw is None:
+        complexity_enabled: bool | None = None
+        # ``pwdProperties`` unreadable — cannot prove reversible encryption
+        # either way. ``None`` keeps "not collected" distinct from "disabled".
+        reversible_encryption_enabled: bool | None = None
+    else:
+        complexity_enabled = bool(pwd_props_raw & 0x1)
+        # Bit 0x10 = DOMAIN_PASSWORD_STORE_CLEARTEXT: the Default Domain
+        # Password Policy stores passwords with reversible encryption
+        # (recoverable to cleartext). CIS Microsoft Windows Server
+        # Benchmark 1.1.7 requires this Disabled.
+        reversible_encryption_enabled = bool(pwd_props_raw & 0x10)
+    return DomainPolicy(
+        min_pwd_length=_int_attr(attrs, "minPwdLength"),
+        lockout_threshold=_int_attr(attrs, "lockoutThreshold"),
+        lockout_window_minutes=_100ns_to_minutes(
+            _int_attr(attrs, "lockoutObservationWindow")
+        ),
+        max_pwd_age_days=_100ns_to_days(_int_attr(attrs, "maxPwdAge")),
+        pwd_history_length=_int_attr(attrs, "pwdHistoryLength"),
+        machine_account_quota=_int_attr(attrs, "ms-DS-MachineAccountQuota"),
+        complexity_enabled=complexity_enabled,
+        reversible_encryption_enabled=reversible_encryption_enabled,
+        pwd_attrs_when_changed=pwd_attrs,
+        pwd_policy_last_changed=pwd_attrs[0][1] if pwd_attrs else None,
+    )
+
+
+#: Attributes a roasting-exposure read needs (Kerberoasting and AS-REP roasting).
+ROASTING_ATTRIBUTES: tuple[str, ...] = (
+    "sAMAccountName",
+    "objectSid",
+    "objectClass",
+    "distinguishedName",
+    "servicePrincipalName",
+    "userAccountControl",
+)
+
+
+def roasting_exposure_from_attrs(attrs: dict[str, list[Any]]) -> dict[str, Any]:
+    """Whether one account is exposed to Kerberoasting / AS-REP roasting.
+
+    Same signals as the collector (``hasspn``, ``dontreqpreauth``, enabled) and
+    the same predicates as every roastable listing
+    (``adscan_core.kerberos_roasting``), so a recheck read and the scan agree.
+    Returns ``sid`` (upper-case, ``""`` when absent), ``enabled`` (``None`` when
+    ``userAccountControl`` is unreadable), ``kerberoastable`` and
+    ``asrep_roastable``; a disabled account is exposed to neither.
+    """
+    from adscan_core.kerberos_roasting import (  # noqa: PLC0415
+        AccountSignals,
+        is_asrep_roastable,
+        is_kerberoastable,
+    )
+
+    raw_sid = _first(attrs, "objectSid")
+    sid = _decode_sid(raw_sid).upper() if raw_sid else ""
+    uac = _int_attr(attrs, "userAccountControl")
+    enabled = _uac_enabled(uac)
+    signals = AccountSignals(
+        object_classes=tuple(str(v) for v in _values(attrs, "objectClass")),
+        distinguished_name=_first_str(attrs, "distinguishedName"),
+    )
+    active = enabled is True
+    return {
+        "sid": sid,
+        "samaccountname": _first_str(attrs, "sAMAccountName"),
+        "enabled": enabled,
+        "kerberoastable": active
+        and is_kerberoastable(signals, has_spn=_has_spn(_str_values(attrs, "servicePrincipalName"))),
+        "asrep_roastable": active
+        and is_asrep_roastable(signals, preauth_required=not _uac_dontreqpreauth(uac or 0)),
+    }
+
+
+def ldap_entry_attributes(entry: Any) -> dict[str, list[Any]]:
+    """Public name of the collector's entry decoder (raw binary SID kept)."""
+    return _attrs(entry)
 
 
 def _attrs(entry: Any) -> dict[str, list[Any]]:
@@ -900,6 +1018,10 @@ class ADscanLDAPCollector:
         # DNS cannot resolve its FQDN. None (lab scripts / tests) leaves ADCS
         # collection targeting the FQDN — byte-for-byte the pre-fix behaviour.
         self._shell: Any = None
+        # Set per-call: hand CAs whose registry probe found no CA-host
+        # administrator back on the result instead of recording them, so the
+        # collection orchestrator can re-run them once roles resolve.
+        self._defer_ca_registry_rerun = False
 
     def collect(
         self,
@@ -919,10 +1041,11 @@ class ADscanLDAPCollector:
         auth_kdc: str | None = None,
         aes_key: str | None = None,
         ccache_path: str | None = None,
-        collection_scope: str = "ctf",
+        collection_scope: str = COLLECTION_SCOPE_DOMAIN_COMPROMISE,
         posture_sink: Optional["PostureSink"] = None,
         posture_snapshot: Optional["DomainPosture"] = None,
         shell: Any = None,
+        defer_ca_registry_rerun: bool = False,
     ) -> CollectionResult:
         """Collect all AD objects for the domain and return a CollectionResult.
 
@@ -934,6 +1057,12 @@ class ADscanLDAPCollector:
         enables the ADCS CA-host reachable-IP recovery: when the DC's DNS cannot
         resolve a member CA's FQDN, the reachable-IP SSOT recovers its IP from
         the workspace inventory. None (lab scripts / tests) is unchanged.
+
+        ``defer_ca_registry_rerun`` (the collection orchestrator) returns the AD
+        CS CAs whose registry probe found no CA-host administrator on
+        ``CollectionResult.adcs_registry_pending`` instead of recording them as
+        not assessed; the caller MUST then finish them
+        (``adcs.ca_registry_rerun.rerun_pending_ca_registry_probes``).
         """
         if credentials is None:
             # Legacy path — translate the flat kwargs into a credentials
@@ -978,6 +1107,7 @@ class ADscanLDAPCollector:
         # Stash the shell for the duration of this call so the ADCS phase can
         # reach the reachable-IP SSOT without widening every phase signature.
         self._shell = shell
+        self._defer_ca_registry_rerun = bool(defer_ca_registry_rerun)
         try:
             return self._collect_with(
                 credentials=credentials,
@@ -986,6 +1116,7 @@ class ADscanLDAPCollector:
             )
         finally:
             self._shell = None
+            self._defer_ca_registry_rerun = False
 
     def _collect_with(
         self,
@@ -1053,6 +1184,21 @@ class ADscanLDAPCollector:
                     _adcs_t = time.monotonic()
                     self._collect_adcs(conn, credentials.domain, acl_parser, result)
                     result.adcs_elapsed = time.monotonic() - _adcs_t
+                # Adopt the ACL enumeration census BEFORE the parser goes out of
+                # scope. One parser instance served every phase above, so these
+                # counters are the whole run's "how many security descriptors
+                # did we actually read" denominator, which is what lets the
+                # delegated-rights positive control be an observation with a
+                # count rather than an absence of findings.
+                result.security_descriptors_parsed = (
+                    acl_parser.security_descriptors_parsed
+                )
+                result.access_control_entries_examined = (
+                    acl_parser.access_control_entries_examined
+                )
+                result.security_descriptors_without_dacl = (
+                    acl_parser.security_descriptors_without_dacl
+                )
                 # Capture which confidentiality mechanism sealed the channel
                 # BEFORE __exit__ resets it to None. Consumed by the operator
                 # cleartext advisory (C.b) below.
@@ -1061,7 +1207,16 @@ class ADscanLDAPCollector:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             from adscan_internal.services.auth_error_classification import (
+                is_transport_loss_error,
                 is_unreachable_foreign_realm_error,
+            )
+
+            # The connection-scoped block aborted: the stage in flight and every
+            # stage after it never ran. Never a complete collection.
+            result.record_stage_failure(
+                self._active_phase or "connect",
+                REASON_TRANSPORT_LOST if is_transport_loss_error(exc) else REASON_ABORTED,
+                type(exc).__name__,
             )
 
             # A foreign/trust realm we cannot authenticate to (cross-forest
@@ -1094,6 +1249,15 @@ class ADscanLDAPCollector:
         finally:
             self._active_scope = None
             self._active_phase = None
+        # An authenticated object pass that returned no user at all was cut
+        # short: every readable domain holds at least its built-in accounts.
+        if (
+            scope.users
+            and not credentials.is_anonymous
+            and not result.stage_failures
+            and not any(node.kind == "User" for node in result.nodes.values())
+        ):
+            result.record_stage_failure("objects_acls", REASON_NO_OBJECTS)
         self._maybe_advise_cleartext(credentials, config, sealing_mechanism)
         print_info_debug(
             "[ldap-collector] done "
@@ -1212,6 +1376,7 @@ class ADscanLDAPCollector:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "domain_node", exc)
             print_warning_debug(f"[ldap-collector] _collect_domain_node failed: {exc}")
 
     def _collect_domain_policy(
@@ -1225,25 +1390,13 @@ class ADscanLDAPCollector:
             conn.search(
                 search_base=config.domain_dn,
                 search_filter="(objectClass=domainDNS)",
-                attributes=[
-                    "minPwdLength",
-                    "lockoutThreshold",
-                    "lockoutObservationWindow",
-                    "maxPwdAge",
-                    "pwdHistoryLength",
-                    "pwdProperties",
-                    "ms-DS-MachineAccountQuota",
-                    # Per-attribute replication metadata — gives us the exact
-                    # timestamp each password-policy attribute was last modified,
-                    # which is far more precise than whenChanged (which includes
-                    # any modification to the domain object, e.g. creationTime).
-                    "msDS-ReplAttributeMetaData",
-                ],
+                attributes=list(DOMAIN_POLICY_ATTRIBUTES),
                 search_scope="BASE",
             )
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "domain_policy", exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_domain_policy failed: {exc}"
             )
@@ -1253,42 +1406,7 @@ class ADscanLDAPCollector:
         if not entries:
             return
 
-        attrs = _attrs(entries[0])
-
-        repl_blobs = _values(attrs, "msDS-ReplAttributeMetaData")
-        pwd_attrs = _parse_repl_attr_metadata(repl_blobs, _DDP_PWD_ATTRS)
-        # Decode the ``pwdProperties`` bitmask: bit 0 (DOMAIN_PASSWORD_COMPLEX
-        # = 0x1) controls whether the Default Domain Password Policy enforces
-        # complexity ("must meet complexity requirements"). When the attribute
-        # is unreadable / absent we record ``None`` so downstream consumers
-        # can distinguish "not collected" from "explicitly disabled".
-        pwd_props_raw = _int_attr(attrs, "pwdProperties")
-        if pwd_props_raw is None:
-            complexity_enabled: bool | None = None
-            # ``pwdProperties`` unreadable — cannot prove reversible encryption
-            # either way. ``None`` keeps "not collected" distinct from "disabled".
-            reversible_encryption_enabled: bool | None = None
-        else:
-            complexity_enabled = bool(pwd_props_raw & 0x1)
-            # Bit 0x10 = DOMAIN_PASSWORD_STORE_CLEARTEXT: the Default Domain
-            # Password Policy stores passwords with reversible encryption
-            # (recoverable to cleartext). CIS Microsoft Windows Server
-            # Benchmark 1.1.7 requires this Disabled.
-            reversible_encryption_enabled = bool(pwd_props_raw & 0x10)
-        result.domain_policy = DomainPolicy(
-            min_pwd_length=_int_attr(attrs, "minPwdLength"),
-            lockout_threshold=_int_attr(attrs, "lockoutThreshold"),
-            lockout_window_minutes=_100ns_to_minutes(
-                _int_attr(attrs, "lockoutObservationWindow")
-            ),
-            max_pwd_age_days=_100ns_to_days(_int_attr(attrs, "maxPwdAge")),
-            pwd_history_length=_int_attr(attrs, "pwdHistoryLength"),
-            machine_account_quota=_int_attr(attrs, "ms-DS-MachineAccountQuota"),
-            complexity_enabled=complexity_enabled,
-            reversible_encryption_enabled=reversible_encryption_enabled,
-            pwd_attrs_when_changed=pwd_attrs,
-            pwd_policy_last_changed=pwd_attrs[0][1] if pwd_attrs else None,
-        )
+        result.domain_policy = domain_policy_from_attrs(_attrs(entries[0]))
 
     def _collect_psos(
         self,
@@ -1331,6 +1449,7 @@ class ADscanLDAPCollector:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "psos", exc)
             print_warning_debug(f"[ldap-collector] _collect_psos failed: {exc}")
             return
 
@@ -1475,6 +1594,7 @@ class ADscanLDAPCollector:
                 f"objects_received={len(conn.entries)} "
                 f"error_type={type(exc).__name__}"
             )
+            note_stage_exception(result, "objects_acls", exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_objects search failed: {exc}"
             )
@@ -1610,6 +1730,7 @@ class ADscanLDAPCollector:
         except Exception as exc:  # noqa: BLE001 - never abort the sweep
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "deleted_objects_acls", exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_deleted_objects search failed: {exc}"
             )
@@ -1653,6 +1774,7 @@ class ADscanLDAPCollector:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "group_memberships", exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_group_memberships search failed: {exc}"
             )
@@ -1707,6 +1829,7 @@ class ADscanLDAPCollector:
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "gpo_links", exc)
             print_warning_debug(
                 f"[ldap-collector] _collect_gpo_links search failed: {exc}"
             )
@@ -1758,10 +1881,17 @@ class ADscanLDAPCollector:
         )
 
         try:
-            entries = query_trusted_domains(conn, config.domain_dn)
+            # The query swallows its own search failure (returns []), so the
+            # cut-off is reported through on_error: [] must not read as "none".
+            entries = query_trusted_domains(
+                conn,
+                config.domain_dn,
+                on_error=lambda err: note_stage_exception(result, "trusts", err),
+            )
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "trusts", exc)
             print_warning_debug(f"[ldap-collector] _collect_trusts query failed: {exc}")
             return
 
@@ -1791,7 +1921,14 @@ class ADscanLDAPCollector:
                         method="trustedDomain",
                         notes={
                             "trustDirection": entry.direction,
+                            # The raw integers alongside the labels: the web
+                            # ingestion used to int() the label field, fail, and
+                            # fall back to a direction the directory never
+                            # reported. The artifact now carries both forms so
+                            # no consumer has to guess which it is holding.
+                            "trustDirectionRaw": entry.direction_raw,
                             "trustType": entry.trust_type,
+                            "trustTypeRaw": entry.trust_type_raw,
                             "trustAttributes": entry.trust_attributes,
                             "attributeFlags": list(entry.attribute_flags),
                             # Explicit boolean so downstream consumers (attack-graph
@@ -1826,17 +1963,49 @@ class ADscanLDAPCollector:
                 ADCSCollector,
             )
 
+            from adscan_internal.services.adcs.ca_host_access import (
+                build_ca_host_smb_config_builder,
+                collected_directory_roles,
+            )
+
+            # CA-host registry reads (ESC6 / ESC11 / Certighost / ESC12) need a
+            # PROVEN CA-host administrator. The attack graph that normally
+            # proves it does not exist yet, so the membership this pass already
+            # read (objects + group memberships run before ADCS) is the
+            # evidence: a scan that starts as Domain Admin qualifies here. A CA
+            # still without an administrator is deferred to the orchestrator
+            # when it asked for it (``defer_ca_registry_rerun``).
+            conn_config = getattr(conn, "config", None)
+            conn_dc_ip = getattr(conn_config, "dc_ip", None)
+            directory_roles = collected_directory_roles(
+                self._shell, domain=domain, result=result
+            )
             adcs_result = ADCSCollector(
                 connection=conn,
                 domain=domain,
                 acl_parser=acl_parser,
+                smb_config_builder=build_ca_host_smb_config_builder(
+                    self._shell,
+                    domain=domain,
+                    dc_ip=str(conn_dc_ip) if conn_dc_ip else None,
+                    directory_roles=directory_roles,
+                ),
                 shell=self._shell,
+                directory_roles=directory_roles,
+                defer_unresolved_registry=self._defer_ca_registry_rerun,
             ).collect()
             for node in adcs_result.nodes.values():
                 result.add_node(node)
             for edge in adcs_result.edges:
                 result.add_edge(edge)
+            result.adcs_registry_pending.extend(adcs_result.adcs_registry_pending)
+            # A certificate-services search cut off mid-read is a gap in THIS
+            # collection, not an absence of AD CS: carry it up.
+            for failure in adcs_result.stage_failures:
+                stage = failure.stage if failure.stage.startswith("adcs") else f"adcs.{failure.stage}"
+                result.record_stage_failure(stage, failure.reason, failure.detail)
         except Exception as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            note_stage_exception(result, "adcs", exc)
             print_info_debug(f"[ldap-collector] ADCS collection skipped: {exc}")

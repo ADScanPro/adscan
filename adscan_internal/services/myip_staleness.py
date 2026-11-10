@@ -35,6 +35,12 @@ from adscan_internal.rich_output import (
     print_warning,
 )
 from adscan_core.rich_output import print_exception
+from adscan_internal.services.listener_ip import (
+    interface_can_receive_callback,
+    myip_is_declared,
+    record_interface_myip,
+    resolve_interface_kind,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +238,15 @@ def check_and_refresh_myip(
     interface = str(getattr(shell, "interface", "") or "").strip()
     stored_ip = str(getattr(shell, "myip", "") or "").strip()
 
+    # An operator-declared myip (``set myip <ip>``) is an assertion, not a guess:
+    # it usually names an address on NO local interface (a pivot, a NAT front),
+    # so "differs from the interface IP" is expected and must never be repaired.
+    if stored_ip and myip_is_declared(shell):
+        print_info_debug(
+            "[myip] Staleness check skipped: myip was declared by the operator."
+        )
+        return stored_ip
+
     if not interface:
         print_info_debug("[myip] Staleness check skipped: no interface configured.")
         return stored_ip or None
@@ -258,6 +273,34 @@ def check_and_refresh_myip(
     current_ip = staleness["current_ip"]
 
     if staleness["is_missing"]:
+        # Only a REAL interface's address is worth recording as the session myip.
+        # A container bridge, a veth end (which is what a bridge-mode container's
+        # own eth0 is), a host-only hypervisor adapter or a Hyper-V vEthernet
+        # carries an address no AD target can dial back to, so recording it would
+        # seed the whole listener-IP ladder with a wrong value AND announce a
+        # configuration decision ADscan never actually made. The ladder resolves
+        # the callback address per target instead (the kernel route toward each
+        # host), so leaving myip unset here is strictly more honest than guessing.
+        # The verdict comes from the kernel, not from the interface's name: see
+        # listener_ip.resolve_interface_kind.
+        if not interface_can_receive_callback(interface):
+            kind = resolve_interface_kind(interface)
+            print_info_debug(
+                f"[myip] Not auto-configuring from {interface!r} ({current_ip}): the "
+                f"kernel reports it as {kind.value}, whose address is unreachable "
+                "from an AD target. The listener-IP ladder resolves the callback "
+                "address per target instead."
+            )
+            telemetry.capture(
+                "myip_virtual_interface_skipped",
+                {
+                    "interface": interface,
+                    "interface_kind": kind.value,
+                    "context": context,
+                },
+            )
+            return stored_ip or None
+
         try:
             _display_ip_initialized_warning(
                 interface=interface,
@@ -267,7 +310,7 @@ def check_and_refresh_myip(
         except Exception as exc:  # never let display failure block the update
             print_info_debug(f"[myip] Display error: {exc}")
 
-        shell.myip = current_ip
+        record_interface_myip(shell, current_ip)
         _persist_myip_update(shell, context=context)
         print_info_verbose(
             f"[myip] Auto-configured: interface={interface} new={current_ip} context={context!r}"
@@ -298,7 +341,7 @@ def check_and_refresh_myip(
     except Exception as exc:  # never let display failure block the update
         print_info_debug(f"[myip] Display error: {exc}")
 
-    shell.myip = current_ip
+    record_interface_myip(shell, current_ip)
     _persist_myip_update(shell, context=context)
     print_info_verbose(
         f"[myip] Auto-updated: interface={interface} old={stored_ip} new={current_ip} context={context!r}"

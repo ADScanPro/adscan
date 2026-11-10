@@ -68,6 +68,7 @@ from adscan_internal.rich_output import (
     confirm_operation,
 )
 from adscan_internal.rich_output import mark_sensitive
+from adscan_core.rich_output import prompt_ask
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces.computers import (
     consume_service_targeting_fallback_notice,
@@ -119,15 +120,16 @@ from adscan_internal.services.host_reachability_filter import (
     render_no_reachable_panel,
 )
 from adscan_internal.services.smb_privilege import (
-    SMBPrivilegeConfig,
     SMBPrivilegeStatus,
     check_smb_privilege_batch,
+    local_account_privilege_config,
 )
 from adscan_internal.services.exploitation.lsass_orchestrator import (
     LsassMethod,
     LsassMethodSelector,
     LsassDumpOrchestrator,
     derive_lsass_posture_notes,
+    lsass_interrupted_on_every_low_footprint_method,
     _ALL_METHODS,
 )
 from adscan_internal.workspaces.edr_intelligence import EdrIntelligence
@@ -169,7 +171,9 @@ _CONSOLE = RichConsole()
 
 def _render_fingerprint_panel(fp: HostFingerprint, ranked: list[LsassMethod]) -> None:
     """Print host security posture panel + ranked method table."""
-    if fp.ppl_level == 0:
+    if fp.ppl_level is None:
+        ppl_label = f"[{_MUTED}]not read[/{_MUTED}]"
+    elif fp.ppl_level == 0:
         ppl_label = f"[{_ACID}]off[/{_ACID}]"
     elif fp.ppl_level == 1:
         ppl_label = f"[{_LAVA}]RunAsPPL=1  (PPL enabled)[/{_LAVA}]"
@@ -201,11 +205,11 @@ def _render_fingerprint_panel(fp: HostFingerprint, ranked: list[LsassMethod]) ->
     if ranked:
         best = ranked[0]
         reasons: list[str] = []
-        if fp.ppl_enabled and best.ppl_safe:
+        if fp.ppl_enabled is True and best.ppl_safe:
             reasons.append("PPL-safe")
         if not best.needs_upload:
             reasons.append("no upload")
-        if not fp.has_edr and not fp.ppl_enabled:
+        if not fp.has_edr and fp.ppl_enabled is False:
             reasons.append("clean host → LOTL preferred")
         rationale = "  ·  ".join(reasons) if reasons else best.description[:60]
         lines.append("")
@@ -264,8 +268,6 @@ def _prompt_method_confirm(ranked: list[LsassMethod]) -> LsassMethod | None:
     Returns the method to use, or None if the operator chose to abort.
     Accepts: Enter (confirm), 1-N (pick method by rank), q (quit).
     """
-    from rich.prompt import Prompt as _RPrompt
-
     best = ranked[0]
     upload_tag = f"  [{_AMBER}]↑ uploads binary[/{_AMBER}]" if best.needs_upload else ""
     _CONSOLE.print(
@@ -277,7 +279,9 @@ def _prompt_method_confirm(ranked: list[LsassMethod]) -> LsassMethod | None:
         f"  [{_MUTED}]·[/{_MUTED}]  [{_MUTED}]1-{n}[/{_MUTED}] to pick"
         f"  [{_MUTED}]·[/{_MUTED}]  [{_MUTED}]q[/{_MUTED}] to quit\n"
     )
-    answer = _RPrompt.ask("  ?", default="y", console=_CONSOLE).strip().lower()
+    answer = prompt_ask(
+        "  Dump method (Enter to confirm)", default="y", console=_CONSOLE
+    ).strip().lower()
     if answer in ("q", "quit", "n", "no", "0"):
         return None
     if answer.isdigit():
@@ -457,8 +461,6 @@ def _confirm_severe_lsass(target_label: str, host: str) -> bool:
     Windows telemetry surface in the dump catalog; the gate exists to keep
     accidental keystrokes from generating SOC tickets.
     """
-    from rich.prompt import Prompt as _RPrompt
-
     short = (host.split(".")[0] if host else "").strip()
     if not short or short.lower() in {"all", "all hosts"}:
         # Bulk path has its own confirmation panel; fall through to a simple yes.
@@ -473,7 +475,11 @@ def _confirm_severe_lsass(target_label: str, host: str) -> bool:
         f"  [{_MUTED}]to confirm, or [/{_MUTED}][bold {_LAVA}]y[/bold {_LAVA}]"
         f"  [{_MUTED}]to override the gate, or Enter to abort.[/{_MUTED}]"
     )
-    answer = _RPrompt.ask("  ?", default="", console=_CONSOLE).strip()
+    # Explicit safe default: "n" aborts. An empty default rendered as a blank
+    # "(auto: )" in non-interactive runs, hiding what the gate resolved to.
+    answer = prompt_ask(
+        f"  Confirm LSASS dump on {short}?", default="n", console=_CONSOLE
+    ).strip()
     if not answer:
         return False
     return answer == short or answer.lower() in {"y", "yes"}
@@ -981,15 +987,6 @@ _SAM_REUSE_EXCLUDED_USERNAMES = {
     "defaultuser0",
 }
 _SAM_REUSE_EXCLUDED_RIDS = {"501", "503", "504"}
-_SAM_REUSE_REASON_LABELS = {
-    "empty_username": "Empty username",
-    "machine_account": "Machine account",
-    "disabled_builtin_account": "Disabled built-in account",
-    "disabled_builtin_rid": "Disabled built-in RID",
-    "empty_hash": "Empty NTLM hash",
-    "invalid_hash": "Invalid NTLM hash",
-    "not_reused_across_hosts": "Not reused across hosts",
-}
 
 
 def _resolve_bulk_hosts_target(
@@ -1034,19 +1031,21 @@ def _native_dump_concurrency(dump_kind: str) -> int:
     LSASS creates a minidump on disk and triggers AV/Sysmon; keep it low.
     SAM/LSA are registry-only and tolerate higher parallelism safely.
     """
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    pacing = component_pacing(active_pacing(), "dump.native")
     if dump_kind == "lsass":
-        raw = os.environ.get("ADSCAN_LSASS_DUMP_CONCURRENCY", "5")
-        default = 5
-    elif dump_kind in ("sam", "lsa"):
-        raw = os.environ.get("ADSCAN_NATIVE_DUMP_CONCURRENCY", "20")
-        default = 20
-    else:
-        raw = os.environ.get("ADSCAN_NATIVE_DUMP_CONCURRENCY", "15")
-        default = 15
-    try:
-        return max(1, min(64, int(str(raw).strip())))
-    except ValueError:
-        return default
+        return int(pacing["lsass_concurrency"])
+    if dump_kind in ("sam", "lsa"):
+        return int(pacing["sam_lsa_concurrency"])
+    return int(pacing["other_concurrency"])
+
+
+def _paced_semaphore(concurrency: int):
+    """A dump fan-out semaphore that shrinks under the scan-wide strain safeguard."""
+    from adscan_core.scan_pacing.pacing_runtime import active_runtime  # noqa: PLC0415
+
+    return active_runtime().semaphore(concurrency)
 
 
 # Keep legacy alias so any external caller still compiles.
@@ -1839,428 +1838,6 @@ def _persist_dpapi_result(
                 print_exception(exception=exc)
 
 
-def _run_optional_local_admin_reuse_validation(
-    shell: Any,
-    *,
-    domain: str,
-    candidates: list[dict[str, Any]],
-    total_discovered: int = 0,
-    excluded_by_reason: dict[str, int] | None = None,
-) -> None:
-    """Run optional local credential reuse validation for SAM bulk dump candidates.
-
-    This runs active validation (`--local-auth`) only for local accounts where the
-    same credential appears on multiple hosts. Confirmed admin reuse (Pwn3d) will
-    record LocalAdminPassReuse attack-step edges.
-    """
-    from adscan_internal.cli.smb import run_local_cred_reuse
-
-    marked_domain = mark_sensitive(domain, "domain")
-    excluded_by_reason = excluded_by_reason or {}
-    candidate_count = 0
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        username = str(item.get("username") or "").strip()
-        if not username:
-            continue
-        candidate_count += 1
-
-    total_excluded = int(sum(excluded_by_reason.values()))
-    reasons_text = ", ".join(
-        f"{_SAM_REUSE_REASON_LABELS.get(reason, reason)}={count}"
-        for reason, count in sorted(excluded_by_reason.items())
-    )
-    if not reasons_text:
-        reasons_text = "none"
-
-    print_panel(
-        "\n".join(
-            [
-                "[bold]Local Credential Reuse Validation[/bold]",
-                f"Domain: {marked_domain}",
-                "",
-                "ADscan identified only reusable local credential candidates",
-                "(same local credential observed across multiple hosts).",
-                "Validation is optional and records paths only when admin access",
-                "is confirmed (Pwn3d).",
-                "",
-                f"Local accounts discovered: {total_discovered}",
-                f"Candidates selected: {candidate_count}",
-                f"Excluded: {total_excluded}",
-                f"Exclusion reasons: {reasons_text}",
-            ]
-        ),
-        title="[bold magenta]SAM Reuse Validation[/bold magenta]",
-        border_style="magenta",
-        expand=False,
-    )
-    if candidate_count == 0:
-        print_info(
-            f"Skipping local credential reuse validation in {marked_domain}: no reusable local credentials were detected."
-        )
-        return
-
-    if not confirm_operation(
-        operation_name="Local Credential Reuse Validation",
-        description=(
-            "Validates only reusable local credentials and records LocalAdminPassReuse "
-            "steps when admin access is confirmed."
-        ),
-        context={
-            "Domain": marked_domain,
-            "Reusable Candidates": str(candidate_count),
-            "Discovery Scope": "SAM dump (all hosts)",
-            "Validation Method": "native local-auth (admin access required)",
-        },
-        default=True,
-        icon="🔁",
-        show_panel=True,
-    ):
-        print_info(
-            f"Skipped local credential reuse validation for {marked_domain} by user choice."
-        )
-        return
-    resolved_candidates = _resolve_reuse_candidate_credentials(
-        shell=shell,
-        candidates=candidates,
-    )
-    resolved_rows = _build_resolved_reuse_candidate_rows(
-        shell=shell,
-        candidates=resolved_candidates,
-    )
-    if resolved_rows:
-        print_info_table(
-            resolved_rows,
-            ["User", "RID", "Hosts", "Credential Type", "Credential", "Method"],
-            title="Local Credential Reuse Candidates",
-        )
-
-    by_user: dict[str, int] = {}
-    for item in resolved_candidates:
-        username = str(item.get("username") or "").strip().lower()
-        if not username:
-            continue
-        by_user[username] = int(by_user.get(username, 0)) + 1
-    repeated_users = sorted(
-        ((user, count) for user, count in by_user.items() if count > 1),
-        key=lambda entry: entry[0],
-    )
-    if repeated_users:
-        repeated_text = ", ".join(
-            f"{mark_sensitive(user, 'user')} ({count} variants)"
-            for user, count in repeated_users
-        )
-        print_info(
-            "Detected multiple credential variants for the same local account; "
-            f"each variant is validated separately: {repeated_text}"
-        )
-
-    print_info(
-        f"Running local credential reuse validation for {len(resolved_rows)} candidate(s) in {marked_domain}."
-    )
-    validation_results: list[dict[str, Any]] = []
-    for item in sorted(
-        resolved_candidates, key=lambda value: str(value.get("username") or "").lower()
-    ):
-        user_clean = str(item.get("username") or "").strip()
-        cred_clean = str(item.get("credential") or "").strip()
-        rid_clean = str(item.get("rid") or "").strip()
-        if not user_clean or not cred_clean:
-            continue
-        marked_user = mark_sensitive(user_clean, "user")
-        print_info(
-            f"Validating local credential reuse for {marked_user} (RID {rid_clean}) across enabled hosts."
-        )
-        try:
-            result = run_local_cred_reuse(
-                shell,
-                domain=domain,
-                username=user_clean,
-                credential=cred_clean,
-                prompt_dump_after_reuse=False,
-            )
-            validation_results.append(
-                {
-                    "username": user_clean,
-                    "rid": rid_clean or "-",
-                    "source_hosts": int(item.get("source_hosts", 0) or 0),
-                    "credential": cred_clean,
-                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
-                    "result": result if isinstance(result, dict) else {},
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_warning(
-                f"Local admin reuse validation failed for {marked_user}; continuing."
-            )
-            validation_results.append(
-                {
-                    "username": user_clean,
-                    "rid": rid_clean or "-",
-                    "source_hosts": int(item.get("source_hosts", 0) or 0),
-                    "credential": cred_clean,
-                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
-                    "result": {
-                        "status": "error",
-                        "error": str(exc),
-                        "reuse_targets": [],
-                        "created_edges": 0,
-                    },
-                }
-            )
-
-    _print_local_reuse_validation_summary(
-        domain=domain,
-        results=validation_results,
-        title="Local Reuse Validation Summary",
-    )
-    _run_optional_domain_account_reuse_validation(
-        shell=shell,
-        domain=domain,
-        candidates=resolved_candidates,
-        source_scope="SAM dump (all hosts)",
-        local_validation_results=validation_results,
-    )
-
-
-def _supports_local_reuse_execution(shell: Any) -> bool:
-    """Return True when shell can execute local credential reuse validation."""
-    required = (
-        "is_hash",
-        "execute_local_cred_reuse",
-    )
-    for attr in required:
-        value = getattr(shell, attr, None)
-        if not callable(value):
-            return False
-    return True
-
-
-def _select_reuse_candidates_with_checkbox(
-    shell: Any,
-    *,
-    candidates: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Allow operator to choose reuse-validation candidates via checkbox."""
-    if not candidates:
-        return []
-
-    options: list[str] = []
-    option_to_candidate: dict[str, dict[str, Any]] = {}
-    for idx, item in enumerate(candidates, start=1):
-        username = str(item.get("username") or "").strip()
-        rid = str(item.get("rid") or "-").strip() or "-"
-        source_hosts = int(item.get("source_hosts", 0) or 0)
-        credential = str(item.get("credential") or "").strip()
-        if not username or not credential:
-            continue
-        if credential.lower() == _EMPTY_NTLM_HASH:
-            # Never present a blank-password account as a reuse candidate.
-            continue
-        marked_user = mark_sensitive(username, "user")
-        label = f"{idx}. {marked_user} (RID {rid}, seen on {source_hosts} host(s))"
-        options.append(label)
-        option_to_candidate[label] = item
-
-    if not options:
-        return []
-
-    checkbox = getattr(shell, "_questionary_checkbox", None)
-    if callable(checkbox):
-        selected_labels = checkbox(
-            "Select local credentials to validate for reuse:",
-            options,
-        )
-        if selected_labels is None:
-            return []
-        selected = [
-            option_to_candidate[label]
-            for label in selected_labels
-            if label in option_to_candidate
-        ]
-        return selected
-
-    # Fallback when interactive checkbox is unavailable: keep all candidates.
-    return list(option_to_candidate.values())
-
-
-def _run_single_host_local_admin_reuse_validation(
-    shell: Any,
-    *,
-    domain: str,
-    source_host: str,
-    candidates: list[dict[str, Any]],
-) -> None:
-    """Run optional local reuse validation for SAM dump from a single host."""
-    from adscan_internal.cli.smb import run_local_cred_reuse
-
-    if not candidates:
-        return
-
-    if not _supports_local_reuse_execution(shell):
-        print_info_debug(
-            "[sam_reuse] Skipping single-host local reuse validation: shell "
-            "does not expose required local reuse helpers."
-        )
-        return
-
-    marked_domain = mark_sensitive(domain, "domain")
-    marked_source_host = mark_sensitive(source_host, "hostname")
-    print_panel(
-        "\n".join(
-            [
-                "[bold]Single-Host SAM Reuse Validation[/bold]",
-                f"Domain: {marked_domain}",
-                f"Source Host: {marked_source_host}",
-                "",
-                "Select which extracted local credentials should be tested",
-                "across all enabled hosts using local-auth validation.",
-                "ADscan records LocalAdminPassReuse only on confirmed Pwn3d hits.",
-            ]
-        ),
-        title="[bold magenta]SAM Reuse Validation[/bold magenta]",
-        border_style="magenta",
-        expand=False,
-    )
-
-    selected_candidates = _select_reuse_candidates_with_checkbox(
-        shell,
-        candidates=candidates,
-    )
-    if not selected_candidates:
-        print_info(
-            f"Skipped local credential reuse validation for {marked_domain}: no candidate selected."
-        )
-        return
-
-    selected_rows: list[dict[str, Any]] = []
-    for item in selected_candidates:
-        username = str(item.get("username") or "").strip()
-        rid = str(item.get("rid") or "-").strip() or "-"
-        source_hosts = int(item.get("source_hosts", 0) or 0)
-        if not username:
-            continue
-        selected_rows.append(
-            {
-                "User": mark_sensitive(username, "user"),
-                "RID": rid,
-                "Hosts": source_hosts,
-                "Method": "Local-auth reuse validation",
-            }
-        )
-
-    if not selected_rows:
-        print_info(
-            f"Skipped local credential reuse validation for {marked_domain}: no candidate selected."
-        )
-        return
-
-    if not confirm_operation(
-        operation_name="Local Credential Reuse Validation",
-        description=(
-            "Runs local-auth reuse validation on selected credentials and "
-            "records LocalAdminPassReuse steps only for confirmed admin hits."
-        ),
-        context={
-            "Domain": marked_domain,
-            "Source Host": marked_source_host,
-            "Selected Candidates": str(len(selected_rows)),
-            "Validation Method": "native local-auth (admin access required)",
-        },
-        default=True,
-        icon="🔁",
-        show_panel=True,
-    ):
-        print_info(
-            f"Skipped local credential reuse validation for {marked_domain} by user choice."
-        )
-        return
-
-    resolved_candidates = _resolve_reuse_candidate_credentials(
-        shell=shell,
-        candidates=selected_candidates,
-    )
-    resolved_rows = _build_resolved_reuse_candidate_rows(
-        shell=shell,
-        candidates=resolved_candidates,
-    )
-    if resolved_rows:
-        print_info_table(
-            resolved_rows,
-            ["User", "RID", "Hosts", "Credential Type", "Credential", "Method"],
-            title="Selected Local Reuse Candidates",
-        )
-
-    validation_results: list[dict[str, Any]] = []
-    for item in sorted(
-        resolved_candidates, key=lambda value: str(value.get("username") or "").lower()
-    ):
-        user_clean = str(item.get("username") or "").strip()
-        cred_clean = str(item.get("credential") or "").strip()
-        rid_clean = str(item.get("rid") or "").strip()
-        if not user_clean or not cred_clean:
-            continue
-        marked_user = mark_sensitive(user_clean, "user")
-        print_info(
-            f"Validating local credential reuse for {marked_user} (RID {rid_clean}) across enabled hosts."
-        )
-        try:
-            result = run_local_cred_reuse(
-                shell,
-                domain=domain,
-                username=user_clean,
-                credential=cred_clean,
-                prompt_dump_after_reuse=False,
-            )
-            validation_results.append(
-                {
-                    "username": user_clean,
-                    "rid": rid_clean or "-",
-                    "source_hosts": int(item.get("source_hosts", 0) or 0),
-                    "credential": cred_clean,
-                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
-                    "result": result if isinstance(result, dict) else {},
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_warning(
-                f"Local admin reuse validation failed for {marked_user}; continuing."
-            )
-            validation_results.append(
-                {
-                    "username": user_clean,
-                    "rid": rid_clean or "-",
-                    "source_hosts": int(item.get("source_hosts", 0) or 0),
-                    "credential": cred_clean,
-                    "credential_was_cracked": bool(item.get("credential_was_cracked")),
-                    "result": {
-                        "status": "error",
-                        "error": str(exc),
-                        "reuse_targets": [],
-                        "created_edges": 0,
-                    },
-                }
-            )
-
-    _print_local_reuse_validation_summary(
-        domain=domain,
-        results=validation_results,
-        title="Single-Host Reuse Validation Summary",
-    )
-    _run_optional_domain_account_reuse_validation(
-        shell=shell,
-        domain=domain,
-        candidates=resolved_candidates,
-        source_scope="SAM dump (single host)",
-        local_validation_results=validation_results,
-    )
-
-
 def _run_optional_domain_account_reuse_validation(
     shell: Any,
     *,
@@ -2269,9 +1846,15 @@ def _run_optional_domain_account_reuse_validation(
     source_scope: str,
     local_validation_results: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Optionally validate whether SAM credentials are also valid domain creds."""
+    """Optionally validate whether SAM credentials are also valid domain creds.
+
+    Gated by the ``module:password_spraying.reuse`` scan-policy check: when the
+    policy switches it off, nothing is asked (the selection seam explains the
+    refusal once) and nothing is sent.
+    """
     from adscan_internal.cli.spraying import (
         DomainReuseValidationCandidate,
+        gate_domain_reuse,
         handle_validated_domain_hits_followup,
         select_domain_reuse_candidates_for_validation,
         validate_selected_domain_reuse_candidates,
@@ -2320,6 +1903,8 @@ def _run_optional_domain_account_reuse_validation(
                         source_hostnames.add(host_clean)
 
     if not grouped:
+        return
+    if not gate_domain_reuse(shell):
         return
 
     marked_domain = mark_sensitive(domain, "domain")
@@ -3253,6 +2838,13 @@ def run_dump_registries(
     REG_OPTION_BACKUP_RESTORE, downloads via ADMIN$, and parses in-process.
     No smbFolder, no impacket_scripts_dir dependency.
     """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "backupoperatorescalation"):
+        return
     import tempfile
     from adscan_internal.services.async_bridge import run_async_sync
     from adscan_internal.services.exploitation.native_dump_service import (
@@ -3481,6 +3073,13 @@ def run_dump_lsass(
     islocal: str | None = None,  # kept for future extensions
 ) -> None:
     """Dump LSASS using the native async SMB stack only."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dumplsass"):
+        return
     if _is_bulk_dump_target(host):
         hosts = _resolve_native_bulk_hosts(shell, domain=domain, requested_host=host)
         with _temporary_dump_creds(
@@ -3532,6 +3131,13 @@ def run_dump_lsa(
     include_machine_accounts: bool = True,
 ) -> None:
     """Dump LSA secrets over SMB using the native async SMB stack only."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dumplsa"):
+        return
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="LSA"
     ):
@@ -3609,6 +3215,13 @@ def run_dump_sam(
     islocal: str,
 ) -> None:
     """Dump SAM database over SMB using the native async SMB stack only."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dumpsam"):
+        return
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="SAM"
     ):
@@ -3672,6 +3285,13 @@ def run_dump_sam_winrm(
     shell: Any, *, domain: str, username: str, password: str, host: str
 ) -> None:
     """WinRM SAM dumping is disabled until a native WinRM backend exists."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dumpsam"):
+        return
     _ = (shell, domain, username, password, host)
     print_warning(
         "WinRM SAM dumping previously depended on an external command. "
@@ -3689,6 +3309,13 @@ def run_dump_dpapi(
     islocal: str,
 ) -> None:
     """Dump DPAPI material over SMB using the native async SMB stack only."""
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dumpdpapi"):
+        return
     if _is_bulk_dump_target(host) and not _ensure_pro_for_all_hosts_dump(
         shell, dump_label="DPAPI"
     ):
@@ -3792,7 +3419,7 @@ async def _run_native_dump_batch(
         hosts = list(reach.reachable)
 
     concurrency = _native_dump_concurrency(dump_kind)
-    semaphore = asyncio.Semaphore(concurrency)
+    semaphore = _paced_semaphore(concurrency)
 
     async def _run_one(host: str) -> tuple[str, Any]:
         async with semaphore:
@@ -3858,7 +3485,7 @@ async def _run_native_dump_batch_live(
     _CONSOLE.print(f"  {ENDPOINT_POSTURE_BADGE_LEGEND}\n")
 
     concurrency = _native_dump_concurrency(dump_kind)
-    semaphore = asyncio.Semaphore(concurrency)
+    semaphore = _paced_semaphore(concurrency)
     all_results: list[tuple[str, Any]] = []
     # Per-host endpoint posture, observed on the way into each dump. Kept in
     # a side map rather than widened into the result tuple, which callers and
@@ -4008,7 +3635,7 @@ async def _run_lsass_campaign_async(
     waiting for the slowest host. Credentials are saved to shell in-flight.
     """
     concurrency = _native_dump_concurrency("lsass")
-    semaphore = asyncio.Semaphore(concurrency)
+    semaphore = _paced_semaphore(concurrency)
     _creds = getattr(shell, "current_creds", None) or {}
     auth_username: str | None = str(_creds.get("username") or "").strip() or None
     campaign_results: list[_LsassCampaignResult] = []
@@ -4565,17 +4192,26 @@ async def _run_native_local_admin_reuse_check_async(
 ) -> None:
     """Native replacement for netexec --local-auth reuse check (single cred).
 
-    Reads targets from ``targets_file``, runs SMBPrivilegeConfig checks in
+    Reads targets from ``targets_file``, runs local-account SMB checks in
     parallel, streams Pwn3d!/not-admin results live, and records attack steps.
+    Domain controllers are never targeted (``local_reuse_targets``): a local
+    sign-in there is a sign-in as the DOMAIN account of the same name. The
+    caller (``_offer_native_local_admin_reuse``) tells the operator once.
     """
-    hosts = _load_native_bulk_hosts(targets_file)
+    from adscan_internal.services.local_reuse_targets import (
+        domain_controller_matcher,
+        split_out_domain_controllers,
+    )
+
+    is_dc = domain_controller_matcher(shell, domain)
+    hosts, _skipped_dcs = split_out_domain_controllers(
+        _load_native_bulk_hosts(targets_file), is_dc
+    )
     if not hosts:
-        print_warning("No SMB targets found for local admin reuse check.")
+        print_warning("No member hosts found for the local admin reuse check.")
         return
 
     concurrency = _native_dump_concurrency("sam")  # 20 (auth-only, low overhead)
-    creds = getattr(shell, "current_creds", None) or {}
-    dc_ip = creds.get("dc_ip") or getattr(shell, "current_dc_ip", None) or ""
 
     _CONSOLE.print(
         f"\n[bold {_ICE}]◉  Local Admin Reuse[/bold {_ICE}]"
@@ -4595,15 +4231,19 @@ async def _run_native_local_admin_reuse_check_async(
     reachable_hosts = list(reach.reachable)
     offline_hosts = list(reach.offline)
 
+    # Local-auth through the one local-account config SSOT. This used to set
+    # ``auth_domain`` to the AD domain, which put the AD domain in the NTLM
+    # domain field: the target forwarded the logon to a domain controller, so
+    # the attempt tested the DOMAIN account of that name (raising its failed
+    # sign-in count on every host) instead of the local one.
     configs = [
-        SMBPrivilegeConfig(
-            target_ip=h,
-            domain=".",  # local auth (".") means local machine
+        local_account_privilege_config(
+            host=h,
             username=username,
-            nt_hash=nt_hash,
-            auth_domain=domain,
-            kdc_ip=dc_ip or h,
+            credential=nt_hash,
+            is_hash=True,
             timeout=10,
+            is_domain_controller=is_dc,
         )
         for h in reachable_hosts
     ]
@@ -4688,8 +4328,20 @@ def _offer_native_local_admin_reuse(
     domain: str,
     admin_creds: list[Any],
 ) -> None:
-    """After single-host SAM dump: offer native reuse check for admin creds."""
-    from rich.prompt import Confirm as _RConfirm
+    """After single-host SAM dump: offer native reuse check for admin creds.
+
+    Gated by the ``module:local_credential_reuse`` scan-policy check through the
+    shared consent seam (``cli/smb.local_credential_reuse_consented``): off in
+    the policy means nothing is sent, and an unattended run proceeds only when a
+    policy in force enables it.
+    """
+    from adscan_internal.cli.smb import local_credential_reuse_consented
+    from adscan_internal.services.scan_phases import LOCAL_CREDENTIAL_REUSE_CHECK_ID
+    from adscan_internal.services.scan_policy_enforcement import gate_check_runner
+
+    # Refuse before describing the offer; the consent seam below re-checks.
+    if not gate_check_runner(shell, LOCAL_CREDENTIAL_REUSE_CHECK_ID):
+        return
 
     workspace_dir = getattr(shell, "current_workspace_dir", None) or ""
     targets_file, _ = resolve_domain_service_target_file(
@@ -4702,7 +4354,17 @@ def _offer_native_local_admin_reuse(
     if not targets_file:
         return
 
-    n_hosts = len(_load_native_bulk_hosts(targets_file))
+    from adscan_internal.services.local_reuse_targets import (
+        announce_skipped_domain_controllers,
+        domain_controller_matcher,
+        split_out_domain_controllers,
+    )
+
+    member_hosts, skipped_dcs = split_out_domain_controllers(
+        _load_native_bulk_hosts(targets_file), domain_controller_matcher(shell, domain)
+    )
+    announce_skipped_domain_controllers(skipped_dcs, domain=domain)
+    n_hosts = len(member_hosts)
     if not n_hosts:
         return
 
@@ -4720,7 +4382,7 @@ def _offer_native_local_admin_reuse(
         )
     )
 
-    if not _RConfirm.ask(f"  [{_ICE}]Proceed?[/{_ICE}]", default=True):
+    if not local_credential_reuse_consented(shell, prompt=f"  [{_ICE}]Proceed?[/{_ICE}]"):
         return
 
     for cred in admin_creds:
@@ -5838,6 +5500,8 @@ def _native_execute_dump_dpapi(
         process_dpapi_credentials,
     )
 
+    # How many recovered secrets are tried per account is the sign-in lockout
+    # guard's decision (scan policy margin + live badPwdCount), not this caller's.
     ad_users = _load_dpapi_ad_users(shell, domain)
     enriched = _run_native_async(
         process_dpapi_credentials(
@@ -6795,7 +6459,12 @@ async def run_intelligent_lsass_dump(
             fp=fp,
             outcome=outcome_for(
                 success=result.success,
-                interrupted_every_retry=False,
+                # Interrupted only when EVERY realistic low-footprint method
+                # met an active product and was cut off; a caught noisy method
+                # alone never counts (Exposure-Validation positive control).
+                interrupted_every_retry=lsass_interrupted_on_every_low_footprint_method(
+                    result
+                ),
             ),
             source_method=result.method_used or None,
         )

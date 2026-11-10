@@ -89,7 +89,9 @@ _WELL_KNOWN: dict[str, tuple[str, str]] = {
     "S-1-5-32-577": ("RDS Management Servers", "Group"),
     "S-1-5-32-578": ("Hyper-V Administrators", "Group"),
     "S-1-5-32-579": ("Access Control Assistance Operators", "Group"),
-    "S-1-5-32-581": ("Default Account", "User"),
+    # BUILTIN alias 581 is the System Managed Accounts Group (the DefaultAccount
+    # user is the domain RID 503, not a BUILTIN SID).
+    "S-1-5-32-581": ("System Managed Accounts Group", "Group"),
     "S-1-5-32-582": ("Storage Replica Administrators", "Group"),
     "S-1-5-32-583": ("Device Owners", "Group"),
     # Other NT Authority
@@ -263,6 +265,24 @@ def _looks_like_sid(value: str) -> bool:
     return str(value or "").strip().upper().startswith("S-1-")
 
 
+#: The attack graph keys some nodes by a typed id (``name:<SID>`` for an edge
+#: endpoint, ``name:<username>`` for a user node). The prefix is an internal key
+#: format, never part of the object's name, so every display helper drops it.
+_GRAPH_NODE_ID_PREFIX = "name:"
+
+
+def strip_graph_node_id_prefix(value: str) -> str:
+    """Drop the attack graph's internal ``name:`` node-id prefix, if present.
+
+    ``name:S-1-5-11`` -> ``S-1-5-11``. Case-insensitive. Any other value is
+    returned stripped and otherwise unchanged.
+    """
+    text = str(value or "").strip()
+    if text[: len(_GRAPH_NODE_ID_PREFIX)].lower() == _GRAPH_NODE_ID_PREFIX:
+        return text[len(_GRAPH_NODE_ID_PREFIX):].strip()
+    return text
+
+
 def well_known_sid_display_name(sid: str) -> str | None:
     """Return the client-readable display name for a well-known Windows SID.
 
@@ -415,7 +435,7 @@ def humanize_principal_label(label: str) -> str:
     (the writeup lowercases accounts, the report keeps the realm), so this never
     disturbs a working label.
     """
-    raw = str(label or "").strip()
+    raw = strip_graph_node_id_prefix(label)
     if not raw:
         return raw
     name_part, sep, realm = raw.partition("@")
@@ -583,7 +603,7 @@ def format_graph_node_label(
     Returns:
         The client-facing display label. ``"N/A"`` for an empty node.
     """
-    node_value = str(node or "").strip()
+    node_value = strip_graph_node_id_prefix(node)
     if not node_value:
         return "N/A"
     domain_value = str(domain or "").strip().lower()

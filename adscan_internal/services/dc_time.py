@@ -1335,3 +1335,153 @@ def register_clock_resync_for_shell(shell: Any) -> None:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"failed to arm PKINIT clock-resync backstop: {exc}")
+
+
+# ----- Wall-clock restore at session end (decision D5) -----------------------
+#
+# The steps above align the host clock with a DC; nothing used to put it back.
+# One DC days off real time then moved the licence's clock high-water mark and
+# blocked every later assessment. At session end the wall clock goes back to
+# "pre-scan time + elapsed time", never the DC's time (``adscan_core/wall_clock``).
+
+
+@dataclass(frozen=True)
+class WallClockRestoreResult:
+    """What the session-end restore did (for logs and tests)."""
+
+    restored: bool
+    detail: str
+
+
+def arm_wall_clock_restore(shell: Any) -> None:
+    """Capture this session's wall-clock baseline and arm an exit safety net.
+
+    Call once at shell setup, before anything can step the clock. The explicit
+    restore runs from ``do_exit``; ``atexit`` covers an exit that skips it (an
+    uncaught exception). Under the Docker runtime the host helper also restores
+    when it shuts down, which covers a container killed outright.
+    """
+    from adscan_core.wall_clock import SessionClock
+
+    if getattr(shell, "_session_wall_clock", None) is None:
+        try:
+            setattr(shell, "_session_wall_clock", SessionClock())
+        except Exception:  # noqa: BLE001
+            return
+    if not getattr(shell, "_wall_clock_atexit_armed", False):
+        import atexit
+
+        atexit.register(_restore_wall_clock_quietly, shell)
+        try:
+            setattr(shell, "_wall_clock_atexit_armed", True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _restore_wall_clock_quietly(shell: Any) -> None:
+    try:
+        restore_wall_clock_after_session(shell)
+    except Exception:  # noqa: BLE001 — interpreter shutdown: never raise
+        pass
+
+
+def _is_container_runtime() -> bool:
+    import os
+
+    return os.getenv("ADSCAN_CONTAINER_RUNTIME") == "1"
+
+
+def restore_wall_clock_after_session(shell: Any) -> WallClockRestoreResult:
+    """Put the host wall clock back to pre-scan time + elapsed time.
+
+    Idempotent: a second call finds nothing to do. Never raises. Afterwards
+    the Enterprise licence clock mark is advanced from the RESTORED clock, the
+    only instant it may come from (it is skipped while any session still holds
+    the clock stepped).
+    """
+    import os
+
+    result = WallClockRestoreResult(restored=False, detail="clock not moved this session")
+    session_clock = getattr(shell, "_session_wall_clock", None)
+    sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
+    try:
+        if _is_container_runtime():
+            if sock_path:
+                result = _restore_through_host_helper(sock_path, session_clock)
+        elif session_clock is not None:
+            target = session_clock.restore_target()
+            if target is not None:
+                from adscan_core.pal import clock as pal_clock
+                from adscan_core.pal.platform import is_windows
+
+                if is_windows() and pal_clock.is_domain_time_synced_natively() is True:
+                    # The only Windows step is ``w32tm /resync`` against the
+                    # host's own time source, which the OS keeps anyway:
+                    # setting the clock back would undo a correct sync.
+                    result = WallClockRestoreResult(
+                        restored=False,
+                        detail="Windows host time is kept by its own domain time source",
+                    )
+                else:
+                    step = pal_clock.set_system_wall_clock(target)
+                    result = WallClockRestoreResult(restored=step.stepped, detail=step.reason)
+    except Exception as exc:  # noqa: BLE001 — exit path must never raise
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return WallClockRestoreResult(restored=False, detail=f"restore failed: {exc}")
+    if result.restored:
+        print_info_debug("wall-clock restore: host clock restored to real time")
+    else:
+        print_info_debug(f"wall-clock restore: {result.detail}")
+    _record_license_mark_from_restored_clock()
+    return result
+
+
+def _restore_through_host_helper(sock_path: str, session_clock: Any) -> WallClockRestoreResult:
+    """Ask the host helper to release this session's hold on the clock."""
+    from adscan_internal.host_privileged_helper import (
+        HostHelperError,
+        host_helper_client_request,
+    )
+
+    try:
+        resp = host_helper_client_request(sock_path, op="restore_system_time", payload={})
+    except (HostHelperError, OSError) as exc:
+        return WallClockRestoreResult(restored=False, detail=f"host helper unavailable: {exc}")
+    message = str(getattr(resp, "message", "") or "")
+    if not message.startswith("Unsupported op"):
+        return WallClockRestoreResult(
+            restored=bool(getattr(resp, "ok", False)) and message == "host clock restored",
+            detail=message or "host helper answered",
+        )
+    # An older helper without the op: compute the target from this session's
+    # baseline (the container shares the host kernel clock) and set it.
+    target = session_clock.restore_target() if session_clock is not None else None
+    if target is None:
+        return WallClockRestoreResult(restored=False, detail="clock not moved this session")
+    try:
+        resp = host_helper_client_request(
+            sock_path,
+            op="set_system_time",
+            payload={"datetime_iso": target.isoformat(timespec="seconds")},
+        )
+    except (HostHelperError, OSError) as exc:
+        return WallClockRestoreResult(restored=False, detail=f"host helper unavailable: {exc}")
+    return WallClockRestoreResult(
+        restored=bool(getattr(resp, "ok", False)),
+        detail=str(getattr(resp, "message", "") or "set_system_time"),
+    )
+
+
+def _record_license_mark_from_restored_clock() -> None:
+    """Advance the licence clock mark now that the clock is real time again."""
+    try:
+        from adscan_core.tier import is_enterprise_edition
+
+        if not is_enterprise_edition():
+            return
+        from adscan_core.enterprise_license import record_last_seen
+
+        record_last_seen(datetime.now(timezone.utc))
+    except Exception:  # noqa: BLE001 — best-effort
+        return

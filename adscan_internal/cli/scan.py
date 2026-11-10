@@ -7,6 +7,8 @@ behaviour stable for the current CLI.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 import os
 import re
 from typing import Any, Protocol
@@ -82,7 +84,8 @@ def ask_for_unauth_scan(self, domain: str) -> None:
     # In CTF mode, once we are authenticated/compromised we do not want additional
     # unauth noise, so we skip it entirely.
     current_auth = _get_domain_auth_state(self, domain)
-    if self.type == "ctf" and current_auth in ["auth", "pwned"]:
+    _compromise_objective = policy_settings.aims_at_domain_compromise(self)
+    if _compromise_objective and current_auth in ["auth", "pwned"]:
         return
 
     if self.auto and current_auth not in ["auth", "pwned"]:
@@ -98,14 +101,14 @@ def ask_for_unauth_scan(self, domain: str) -> None:
             self.do_unauth_scan(domain)
         return
 
-    if self.type == "ctf" and current_auth in ["auth", "pwned"]:
+    if _compromise_objective and current_auth in ["auth", "pwned"]:
         marked_domain = mark_sensitive(domain, "domain")
         print_info_verbose(
             f"Skipping unauthenticated scan for domain {marked_domain} as it is authenticated."
         )
         return
 
-    if self.type == "audit" and current_auth in ["auth", "pwned"]:
+    if not _compromise_objective and current_auth in ["auth", "pwned"]:
         marked_domain = mark_sensitive(domain, "domain")
         if Confirm.ask(
             f"Do you want to perform an unauthenticated scan for the domain {marked_domain}?",
@@ -125,8 +128,12 @@ def do_unauth_scan(self, domain: str) -> None:
     from adscan_internal.services.scan_phases import phase_is_enabled  # noqa: PLC0415
 
     if not phase_is_enabled(self, "unauthenticated_attack_surface"):
-        print_info(
-            "Unauthenticated Attack Surface skipped (disabled in scan configuration)."
+        from adscan_internal.services.scan_policy_notice import (  # noqa: PLC0415
+            announce_phase_skip,
+        )
+
+        announce_phase_skip(
+            self, "unauthenticated_attack_surface", label="Unauthenticated Attack Surface"
         )
         return
 
@@ -150,7 +157,17 @@ def do_unauth_scan(self, domain: str) -> None:
         ensure_shell_domain_context(self, domain)
 
     # In CTF, once we are authenticated/compromised, avoid additional unauth noise.
-    if self.type == "ctf" and initial_auth in ["auth", "pwned"]:
+    if policy_settings.aims_at_domain_compromise(self) and initial_auth in ["auth", "pwned"]:
+        return
+
+    # Enterprise environment count — before the first unauthenticated probe of
+    # this domain. No-op outside an Enterprise license that limits environments.
+    from adscan_internal.cli.enterprise_license_gate import (  # noqa: PLC0415
+        PHASE_UNAUTH,
+        ensure_environment_admitted,
+    )
+
+    if not ensure_environment_admitted(self, domain, dc_ip=pdc_ip, phase=PHASE_UNAUTH):
         return
 
     pdc = self.domains_data.get(domain, {}).get("pdc", "N/A")
@@ -1450,6 +1467,16 @@ def _render_cn_inference_panel(self: Any, domain: str, result: Any) -> None:
     _get_console().print(panel)
 
 
+def _distinct_description_accounts(creds: Any) -> int:
+    """Count the distinct accounts a list of description-credential hits names."""
+    names = {
+        str(getattr(cred, "samaccountname", "") or "").strip().lower()
+        for cred in creds or ()
+    }
+    names.discard("")
+    return len(names)
+
+
 def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) -> None:
     """Persist enrichment artefacts and surface findings into ADscan state."""
     import json as _json
@@ -1584,9 +1611,26 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
     # ── Interactive review — operator validates before credential store ──
     # desc_creds_verified contains only the operator-accepted items.
     # desc_creds (full list) is still used for audit-trail counts below.
-    desc_creds_verified = _review_description_credential_candidates(
-        self, domain, desc_creds
+    #
+    # The review's "Save and verify now" signs in with the description value,
+    # which is exactly what ``step:userdescription`` declares. When the scan
+    # policy switches that check off, nothing is offered and nothing is signed
+    # in with (release gate 14.0.0); what was read is still reported, as a
+    # mapped finding marked not verified, further down.
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        HARVESTED_SECRET_NOT_VERIFIED_BY_POLICY,
+        gate_harvested_secret_verification,
     )
+
+    description_verification_allowed = not desc_creds or gate_harvested_secret_verification(
+        self, "userdescription", domain=domain
+    )
+    if description_verification_allowed:
+        desc_creds_verified = _review_description_credential_candidates(
+            self, domain, desc_creds
+        )
+    else:
+        desc_creds_verified = []
 
     # ── GPP cpassword leaks ──────────────────────────────────────────────
     try:
@@ -1949,6 +1993,38 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
             }
         )
 
+    if not description_verification_allowed:
+        # Mapped, not verified: the scan policy forbids the sign-in that would
+        # prove these values, so each is reported as a credential-shaped value
+        # in a readable description, explicitly unverified, with the reason.
+        # One record per (account, field): two rules matching one description
+        # are one leak.
+        seen_unverified: set[tuple[str, str]] = set()
+        for cred in desc_creds:
+            if not cred.raw_value:
+                continue
+            leak_key = (str(cred.samaccountname).lower(), str(cred.field))
+            if leak_key in seen_unverified:
+                continue
+            seen_unverified.add(leak_key)
+            described_leaks.append(
+                {
+                    "username": cred.samaccountname,
+                    "field": cred.field,
+                    "rule": cred.rule_name,
+                    "ml_probability": cred.ml_probability,
+                    "verified": False,
+                    "verification": HARVESTED_SECRET_NOT_VERIFIED_BY_POLICY,
+                }
+            )
+            described_evidence.append(
+                {
+                    "type": "string",
+                    "summary": f"Credential pattern in {cred.field} (rule: {cred.rule_name})",
+                    "artifact_path": "users.json",
+                }
+            )
+
     if described_leaks:
         try:
             from adscan_core.reporting.technical_report import (
@@ -1978,8 +2054,13 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
         "ldap_anonymous_active_users_count": len(results.ldap_active_users),
         "smb_samr_users_count": len(results.samr_users),
         "smb_samr_descriptions_sensitive_count": len(sensitive_descs),
-        "smb_samr_descriptions_credentials_count": len(desc_creds),        # total found by CredSweeper
-        "smb_samr_descriptions_credentials_saved_count": len(desc_creds_verified),  # operator-accepted
+        # Distinct ACCOUNTS whose description carried a credential, not rule
+        # hits: one description matched by two rules is one account, and the
+        # coverage report reads this figure as "N account descriptions".
+        "smb_samr_descriptions_credentials_count": _distinct_description_accounts(desc_creds),
+        "smb_samr_descriptions_credentials_saved_count": _distinct_description_accounts(
+            desc_creds_verified
+        ),  # operator-accepted
         "gpp_cpassword_leaks_count": len(decrypted_leaks),
         "gpp_autologon_credentials_count": len(autologin_leaks),
     }
@@ -2096,7 +2177,9 @@ def _apply_unauth_enrichment_results(self: Any, *, domain: str, results: Any) ->
 
 def ask_for_ldap_scan(self, domain: str) -> None:
     """Prompt user to perform unauthenticated LDAP service scan."""
-    if _get_domain_auth_state(self, domain) == "pwned" and self.type == "ctf":
+    if _get_domain_auth_state(self, domain) == "pwned" and policy_settings.aims_at_domain_compromise(
+        self
+    ):
         return
     if self.auto:
         self.do_ldap_anonymous(domain)

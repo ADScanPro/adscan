@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 from rich.panel import Panel
 from rich.prompt import Confirm
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import IntPrompt
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
@@ -49,8 +49,13 @@ from adscan_internal.cli.cracking import (
     handle_hash_cracking,
     handle_hash_cracking_batch,
 )
-from adscan_internal.services.session_compromise_state_service import (
+from adscan_core.credential_origins import (
     NON_COMPROMISE_ORIGINS,
+    NOT_RECOVERED_ORIGINS,
+    ORIGIN_ADSCAN_PROVISIONED,
+)
+from adscan_internal.services.session_compromise_state_service import (
+    is_adscan_created_account_for_shell,
     mark_session_user_compromised,
 )
 from adscan_internal.services.credentials.credential_origin import (
@@ -137,7 +142,10 @@ class CredentialVerdict(str, Enum):
             not run at all because no domain controller was resolvable. A data
             gap is neither a confirmation nor a refutation.
         NOT_STORED: Nothing was recorded — the input was unusable (no domain,
-            empty secret).
+            empty secret), or the active scan policy switches off the check
+            whose sign-in would verify a harvested secret (a description or
+            GPP password with ``step:userdescription`` / ``step:gpppassword``
+            off): such a secret is never stored and never signed in with.
     """
 
     VERIFIED = "verified"
@@ -721,6 +729,17 @@ def _prompt_for_domain_user_selection(
     Returns:
         The selected username, or ``None`` when selection is cancelled/invalid.
     """
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    if is_non_interactive(shell):
+        # Which account to act as is the operator's decision. Unattended, the
+        # "default" would be whichever stored credential happens to be first,
+        # and acting as it (verifying, deleting) is never a safe guess.
+        print_warning(
+            f"{prompt_label} needs an operator choice; not run in non-interactive "
+            "mode. Name the account explicitly instead."
+        )
+        return None
     print_panel(
         Text.from_markup(
             f"[bold {ADSCAN_PRIMARY}]{GLYPH_ACTIVE} {domain}[/bold {ADSCAN_PRIMARY}]",
@@ -881,6 +900,17 @@ def delete_cred(shell: Any, domain: str) -> None:
 
     user_list = _get_selectable_domain_users(shell, domain=domain)
     if not user_list:
+        return
+
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    if is_non_interactive(shell):
+        # Unattended, the checkbox resolves to EVERY option: never delete stored
+        # credentials without an operator choosing them.
+        print_warning(
+            "Deleting a stored credential needs an operator choice; not run in "
+            "non-interactive mode."
+        )
         return
 
     checkbox = getattr(shell, "_questionary_checkbox", None)
@@ -2538,6 +2568,26 @@ def add_credential(
         return CredentialVerdict.NOT_STORED
     domain = normalized_domain
 
+    # Scan-policy backstop for HARVESTED secrets (release gate 14.0.0). A
+    # description or GPP password can only be confirmed by signing in with it,
+    # and that sign-in is exactly what its check declares. When the policy
+    # switches the check off, nothing is stored and nothing is sent, whichever
+    # path read the secret. The harvesting call sites gate first (and record the
+    # read as a mapped finding); this is the funnel-level guarantee for any path
+    # that does not.
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_harvested_secret_verification,
+    )
+
+    if host is None and not gate_harvested_secret_verification(
+        shell, credential_origin, domain=domain
+    ):
+        print_info_debug(
+            "[add_credential] harvested secret not stored: the scan policy excludes "
+            f"its verification (origin={mark_sensitive(str(credential_origin), 'detail')})."
+        )
+        return CredentialVerdict.NOT_STORED
+
     # SSOT UPN normalization — ``add_credential`` is the funnel every
     # credential-add flow in the codebase goes through, and MULTIPLE upstream
     # callers can surface a UPN (``user@domain``) instead of a bare
@@ -2619,6 +2669,49 @@ def add_credential(
                 )
             user = bare_user
 
+    # SSOT reserved-bucket guard. ``add_credential`` creates
+    # ``shell.domains_data[domain]`` when the key is absent, and that dict is
+    # persisted to ``variables.json`` and read as "the workspace's domains" by
+    # the report, the web CTEM and every domain enumerator. So a credential
+    # added under a reserved bucket — which happens the moment material captured
+    # off the wire with no attributable domain is CRACKED, since the crack path
+    # passes through whatever key the hash was filed under — would inject a
+    # non-domain into the domain map and render it to a client as a domain.
+    #
+    # The cracked plaintext is far more attributable than the hash was, so the
+    # ladder is re-run first: a cracked ``MEEREEN$`` becomes a real essos.local
+    # credential here rather than being discarded. Only when it still cannot be
+    # placed is the pair not stored — there is no domain to authenticate it
+    # against, so storing it would be a credential for a domain that does not
+    # exist. Nothing is lost: the hash stays in the bucket on disk and the
+    # scan-end reconcile re-files it as soon as its domain becomes resolvable.
+    from adscan_core.workspace_domain_buckets import (  # noqa: PLC0415
+        is_reserved_domain_bucket,
+    )
+
+    if is_reserved_domain_bucket(domain):
+        from adscan_internal.services.captured_credential_attribution import (  # noqa: PLC0415
+            resolve_capture_domain,
+        )
+
+        reattributed = resolve_capture_domain(shell, principal=user)
+        if reattributed:
+            print_info_debug(
+                "add_credential: re-attributed captured credential "
+                f"{mark_sensitive(user, 'user')} to "
+                f"{mark_sensitive(reattributed, 'domain')}."
+            )
+            domain = reattributed
+        else:
+            print_warning(
+                f"Recovered a secret for {mark_sensitive(user, 'user')} that is not "
+                "yet attributed to a collected domain — kept for cracking and "
+                "re-filed automatically once the domain is known, but not stored "
+                "as a domain credential (there is no domain to authenticate it "
+                "against)."
+            )
+            return CredentialVerdict.NOT_STORED
+
     # SSOT provenance seam. ``add_credential`` is the funnel every capture goes
     # through, and when it runs inside an executing attack step the technique
     # that produced this credential is already known — it IS the step's
@@ -2637,6 +2730,18 @@ def add_credential(
         credential_origin = (
             resolve_active_step_credential_origin(shell, domain=domain) or None
         )
+
+    # An account ADscan itself created (the ledger records it) carries a
+    # password ADscan chose: it is ADscan's own credential, never one the
+    # assessment recovered from the client. Its origin says so, whatever step
+    # stored it, so no client surface lists it as compromised. The engine still
+    # holds and uses it for the follow-up steps.
+    if str(
+        credential_origin or ""
+    ).strip().lower() not in NON_COMPROMISE_ORIGINS and is_adscan_created_account_for_shell(
+        shell, domain, user
+    ):
+        credential_origin = ORIGIN_ADSCAN_PROVISIONED
 
     if not skip_hash_cracking and not ui_silent:
         # Professional credential addition header
@@ -2676,7 +2781,7 @@ def add_credential(
     # the identity-compromise event, the session-compromised milestone) while
     # remaining a fully owned principal for attack-path discovery.
     is_self_introduced_credential = (
-        str(credential_origin or "").strip().lower() in NON_COMPROMISE_ORIGINS
+        str(credential_origin or "").strip().lower() in NOT_RECOVERED_ORIGINS
     )
 
     # SSOT hardening (empty-fed re-verification guard): an EMPTY secret fed for a
@@ -2850,9 +2955,12 @@ def add_credential(
                 is_hash=is_hash,
             )
             credential_persisted = True
-            _apply_credential_metadata(
-                shell, domain=domain, user=user, metadata=metadata, secret=cred
-            )
+            # No ``credentials_meta`` write here: that map is keyed by the DOMAIN
+            # principal's username, and a local account (a host's LAPS-managed
+            # Administrator, a local MSSQL login) shares its name with a domain
+            # account it is not. Writing the local secret's kind there relabelled
+            # the domain Administrator's NT hash as a password, and a consumer
+            # that trusted the label sent the hash as a password.
 
             # Phase 3: AdminTo edge emission lives inside
             # ``_check_local_creds_native_smb`` (the native SMB Pwn3d!
@@ -2969,7 +3077,26 @@ def add_credential(
         superseded_nt_hash: str | None = None
         if current_cred is not None:
             current_is_hash = shell.is_hash(current_cred)
-            if not current_is_hash and is_hash:
+            from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+                same_secret,
+            )
+
+            if (
+                not current_is_hash
+                and is_hash
+                and same_secret(current_cred, cred) is False
+            ):
+                # The stored password is NOT the password this hash belongs to:
+                # two different secrets for one principal, so one is stale.
+                # Verify the INCOMING secret and let the store rank the two by
+                # provenance and recency. Substituting the stored password here
+                # used to re-verify a superseded secret (a failed logon on the
+                # account) and discard the current one.
+                print_info_verbose(
+                    "Stored password and incoming hash are different secrets for "
+                    "this account; evaluating the incoming one."
+                )
+            elif not current_is_hash and is_hash:
                 print_info_verbose(
                     "Current credential is not a hash and new credential is a hash. Keeping existing."
                 )
@@ -3952,6 +4079,9 @@ def _domain_credential_failure_was_unclassified(shell: Any) -> bool:
     from adscan_internal.services.credential_service import CredentialStatus
 
     last_result = getattr(shell, "_last_domain_credential_verification_result", None)
+    if getattr(last_result, "skipped_for_lockout", False):
+        # Withheld by the lockout guard: nothing was judged, nothing to explain.
+        return False
     status = getattr(last_result, "status", None)
     if status in {CredentialStatus.INVALID, CredentialStatus.USER_NOT_FOUND}:
         return not bool(getattr(last_result, "verdict_is_definitive", False))
@@ -4712,46 +4842,6 @@ def save_ntlm_hash(
         print_error("Error saving hash.")
         print_exception(show_locals=False, exception=e)
         return False
-
-
-def return_credentials(shell: Any, domain: str) -> tuple[str | None, str | None]:
-    """Allow selecting a user and return their credentials.
-
-    Args:
-        shell: The PentestShell instance with domains_data
-        domain: The domain from which to select credentials
-
-    Returns:
-        tuple: (username, password) if a valid user is selected, (None, None) otherwise
-    """
-    if (
-        domain not in shell.domains_data
-        or "credentials" not in shell.domains_data[domain]
-    ):
-        print_error("No credentials available for selection")
-        return None, None
-
-    user_list = list(shell.domains_data[domain]["credentials"].keys())
-    shell.console.print("\nAvailable users:")
-    for idx, user in enumerate(user_list):
-        shell.console.print(f"{idx + 1}. {user}")
-
-    try:
-        # default="1" so a non-interactive run (adscan ci) resolves to the
-        # first user instead of returning "" → int("") ValueError crash.
-        selected_idx = int(Prompt.ask("\nSelect a user by number: ", default="1")) - 1
-        if 0 <= selected_idx < len(user_list):
-            selected_user = user_list[selected_idx]
-            selected_cred = shell.domains_data[domain]["credentials"][selected_user]
-            return selected_user, selected_cred
-        print_error("Invalid selection")
-        return None, None
-
-    except ValueError as e:
-        telemetry.capture_exception(e)
-        print_exception(exception=e)
-        print_error("Please enter a valid number")
-        return None, None
 
 
 def extract_creds_from_hash(file_path: str) -> dict[str, str] | None:
@@ -6876,7 +6966,7 @@ def handle_found_credentials(
         evidence_entries = [
             {
                 "type": "artifact",
-                "summary": f"Credential findings ({cred_type})",
+                "summary": "Secrets found in files readable over SMB shares",
                 "artifact_path": file_path,
             }
             for cred_type, file_path in saved_files.items()

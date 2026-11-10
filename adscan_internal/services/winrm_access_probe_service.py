@@ -5,12 +5,14 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import ipaddress
-import os
 from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from adscan_internal import print_info_debug
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import active_runtime
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.current_vantage_reachability_service import (
     load_current_vantage_reachability_report,
@@ -35,7 +37,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 WINRM_ACCESS_PROBE_BACKEND = "winrm-psrp"
-DEFAULT_WINRM_PROBE_WORKERS = 32
+#: Default-level worker count (scan-pacing consumer ``sweep.winrm_access``).
+DEFAULT_WINRM_PROBE_WORKERS = _pacing_consumer("sweep.winrm_access").param("workers").default
 WINRM_PROBE_SCRIPT = (
     "$ErrorActionPreference = 'Stop'; "
     "[pscustomobject]@{ComputerName=$env:COMPUTERNAME; UserName=[Environment]::UserName} "
@@ -487,8 +490,13 @@ def run_winrm_access_probe_sweep(
     except Exception:  # noqa: BLE001 - best-effort; None keeps legacy behaviour
         sweep_kdc_ip = None
 
+    runtime = active_runtime()
     worker_count = max(
-        1, min(max_workers or DEFAULT_WINRM_PROBE_WORKERS, len(probe_targets))
+        1,
+        min(
+            runtime.effective_limit(max_workers or get_winrm_probe_worker_count()),
+            len(probe_targets),
+        ),
     )
     print_info_debug(
         "[winrm_probe] starting PSRP access sweep: "
@@ -503,10 +511,16 @@ def run_winrm_access_probe_sweep(
         sync_clock_with_pdc=sync_clock_with_pdc,
         domain=domain,
     )
+    def _paced_probe(**kwargs: Any) -> ServiceAccessFinding:
+        # Per-host pause / request rate from the scan pacing (a no-op at the
+        # default level), applied in the worker thread before the probe.
+        runtime.before_op_sync(kwargs["target"].host)
+        return _probe_one_target(**kwargs)
+
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
             executor.submit(
-                _probe_one_target,
+                _paced_probe,
                 target=target,
                 domain=domain,
                 username=username,
@@ -544,14 +558,8 @@ def run_winrm_access_probe_sweep(
 
 
 def get_winrm_probe_worker_count() -> int:
-    """Return operator-configurable WinRM probe concurrency."""
-    raw_value = os.getenv("ADSCAN_WINRM_PROBE_WORKERS", "").strip()
-    if not raw_value:
-        return DEFAULT_WINRM_PROBE_WORKERS
-    try:
-        return max(1, min(int(raw_value), 128))
-    except ValueError:
-        return DEFAULT_WINRM_PROBE_WORKERS
+    """Return the WinRM probe concurrency from the scan pacing."""
+    return int(component_pacing(active_pacing(), "sweep.winrm_access")["workers"])
 
 
 # ---------------------------------------------------------------------------

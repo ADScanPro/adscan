@@ -89,6 +89,14 @@ def ask_for_flags(
             / ``"aes128_key"`` / ``"ccache_path"``. ``None`` falls back to
             the legacy auto-detect heuristic in :func:`execute_get_flags`.
     """
+    from adscan_core.lab_catalog import lab_publishes_capture_flags  # noqa: PLC0415
+
+    if not lab_publishes_capture_flags(getattr(shell, "lab_provider", None)):
+        # A GOAD range has no flag files; searching every profile for them only
+        # costs time and ends in a "no flags captured" warning. The explicit
+        # `get_flags` command still runs when an operator asks for it.
+        print_info("This lab publishes no capture flags; skipping flag collection.")
+        return
     if shell.auto:
         get_flags(shell, domain, username, password, secret_kind=secret_kind)
     else:

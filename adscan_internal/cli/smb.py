@@ -10,6 +10,8 @@ extraction operations (dumps), see `dumps.py`.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from typing import Any
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1017,7 +1019,10 @@ def execute_smb_rid_cycling(
 
 def run_null_shares(shell: Any, *, domain: str) -> None:
     """Run SMB share enumeration via a null session and render results."""
-    if shell.type == "ctf" and shell.domains_data[domain]["auth"] in ["auth", "pwned"]:
+    if policy_settings.aims_at_domain_compromise(shell) and shell.domains_data[domain]["auth"] in [
+        "auth",
+        "pwned",
+    ]:
         return
 
     # Use the native aiosmb stack — pass username="" and credential="" so
@@ -1292,7 +1297,10 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
     tokens (e.g. enabled_computers_ips.txt) to individual IP strings so
     run_native_shares_view can probe each host independently.
     """
-    if shell.type == "ctf" and shell.domains_data[domain]["auth"] in ["auth", "pwned"]:
+    if policy_settings.aims_at_domain_compromise(shell) and shell.domains_data[domain]["auth"] in [
+        "auth",
+        "pwned",
+    ]:
         return
 
     target_tokens, target_source = _resolve_guest_smb_targets(shell, domain=domain)
@@ -1405,7 +1413,21 @@ def run_auth_shares(
     Uses the native aiosmb stack.  Resolves the same target scope as the
     previous nxc path, then calls run_native_shares_view per host so
     each host gets its own premium share table.
+
+    Execution seam of ``module:new_credential.share_access`` (the share
+    collection re-run as ``username``; it also needs
+    ``module:domain_collection.shares``): off, nothing is sent and the refusal
+    is explained once.
     """
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID):
+        return
     if domain not in shell.domains:
         marked_domain = mark_sensitive(domain, "domain")
         print_error(
@@ -1688,7 +1710,10 @@ def _render_live_share_exposure_surface(
 
 def run_rid_cycling(shell: Any, *, domain: str) -> None:
     """Run RID cycling against PDC and write discovered users list."""
-    if shell.type == "ctf" and shell.domains_data[domain]["auth"] in ["auth", "pwned"]:
+    if policy_settings.aims_at_domain_compromise(shell) and shell.domains_data[domain]["auth"] in [
+        "auth",
+        "pwned",
+    ]:
         return
 
     print_operation_header(
@@ -2121,7 +2146,7 @@ def run_pass_policy(shell: Any, *, domain: str) -> None:
 
 
 async def _probe_smbv1_hosts(
-    hosts: list[str], *, timeout: float = 10.0, concurrency: int = 64
+    hosts: list[str], *, timeout: float | None = None, concurrency: int | None = None
 ) -> list[str]:
     """Return the subset of ``hosts`` that answer a raw SMBv1 negotiate.
 
@@ -2131,12 +2156,19 @@ async def _probe_smbv1_hosts(
     """
     import asyncio
 
+    from adscan_core.scan_pacing import active_pacing, component_pacing
+    from adscan_core.scan_pacing.pacing_runtime import active_runtime
     from adscan_internal.services.collector.smb_collector import smb1_probe
 
-    sem = asyncio.Semaphore(concurrency)
+    # Unset values come from the scan pacing (``probe.smb_negotiate``: 64 / 10 s).
+    pacing = component_pacing(active_pacing(), "probe.smb_negotiate")
+    timeout = pacing["timeout_s"] if timeout is None else timeout
+    runtime = active_runtime()
+    sem = runtime.semaphore(pacing["concurrency"] if concurrency is None else concurrency)
 
     async def _one(host: str) -> str | None:
         async with sem:
+            await runtime.before_op(host)
             try:
                 return host if await smb1_probe(host, timeout=timeout) else None
             except Exception:  # noqa: BLE001 — a probe failure is "not SMBv1"
@@ -3174,6 +3206,44 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
         )
 
 
+def local_credential_reuse_consented(shell: Any, *, prompt: str) -> bool:
+    """Decide whether to try a recovered local credential on the other hosts.
+
+    The single consent seam of the ``module:local_credential_reuse`` scan-policy
+    check, shared by every surface that offers it (a stored local credential,
+    the post-SAM-dump offer). When the active policy switches the check off,
+    nothing is asked and the refusal is explained once. Otherwise the prompt
+    defaults to yes only when a scan policy is in force (and therefore enables
+    the check): an unattended run resolves to the default, so it tries the
+    credential on other hosts only under a policy that turns the check on.
+
+    Args:
+        shell: The pentest shell.
+        prompt: The yes/no question shown to an interactive operator.
+
+    Returns:
+        True when the reuse check should run.
+    """
+    from adscan_core.rich_output import confirm_ask  # noqa: PLC0415
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        LOCAL_CREDENTIAL_REUSE_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+        policy_active,
+    )
+
+    if not gate_check_runner(shell, LOCAL_CREDENTIAL_REUSE_CHECK_ID):
+        return False
+    enabled_by_policy = policy_active(shell)
+    if not enabled_by_policy:
+        print_info_debug(
+            "[local_reuse] no scan policy in force: the reuse check defaults to "
+            "skip and runs only on an explicit yes."
+        )
+    return bool(confirm_ask(prompt, default=enabled_by_policy))
+
+
 def run_local_cred_reuse(
     shell: Any,
     *,
@@ -3182,8 +3252,22 @@ def run_local_cred_reuse(
     credential: str,
     prompt_dump_after_reuse: bool = False,
 ) -> dict[str, Any] | None:
-    """Test local admin credential reuse across enabled computers."""
+    """Test local admin credential reuse across enabled computers.
+
+    The execution seam of the ``module:local_credential_reuse`` scan-policy
+    check: when the active policy switches it off, nothing is sent and the
+    refusal is explained once through the scan-policy notice SSOT.
+    """
     from adscan_internal import print_operation_header
+    from adscan_internal.services.scan_phases import (  # noqa: PLC0415
+        LOCAL_CREDENTIAL_REUSE_CHECK_ID,
+    )
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if not gate_check_runner(shell, LOCAL_CREDENTIAL_REUSE_CHECK_ID):
+        return None
 
     cred_type = "Hash" if shell.is_hash(credential) else "Password"
     print_operation_header(
@@ -3245,7 +3329,24 @@ def run_local_cred_reuse(
         f"({count_target_file_entries(targets_file)} target(s))"
     )
 
-    all_hosts = list(load_target_entries(targets_file))
+    # Never a domain controller: it has no local accounts, so a "local" sign-in
+    # there is checked against the DOMAIN account of the same name.
+    from adscan_internal.services.local_reuse_targets import (  # noqa: PLC0415
+        announce_skipped_domain_controllers,
+        domain_controller_matcher,
+        split_out_domain_controllers,
+    )
+
+    is_dc = domain_controller_matcher(shell, domain)
+    all_hosts, skipped_dcs = split_out_domain_controllers(
+        load_target_entries(targets_file), is_dc
+    )
+    announce_skipped_domain_controllers(skipped_dcs, domain=domain)
+    if not all_hosts:
+        print_warning(
+            f"No member hosts to test for local credential reuse in {mark_sensitive(domain, 'domain')}."
+        )
+        return None
 
     # Liveness re-gate on 445 — skip hosts down since the port scan so a stale
     # dead host does not stall a worker (mirrors run_auth_shares / the native SMB
@@ -3279,6 +3380,7 @@ def run_local_cred_reuse(
             username=username,
             credential=credential,
             is_hash=is_hash,
+            is_domain_controller=is_dc,
         )
     )
     synthetic_output = _synthesize_local_cred_reuse_output(results)
@@ -3343,13 +3445,21 @@ async def _sweep_local_cred_reuse(
     is_hash: bool,
     timeout: int = 15,
     max_workers: int | None = None,
+    is_domain_controller: Any = None,
 ) -> list[Any]:
     """Probe local-account credential reuse across hosts via native aiosmb.
 
-    Each per-host config authenticates in LOCAL-auth mode: the credential domain
-    is set to the target host itself, so the DC is never consulted and a wrong
-    credential can only ever touch a per-machine local SAM (domain-lockout safe).
-    ``use_kerberos=False`` because a local SAM account has no Kerberos TGT.
+    ``is_domain_controller`` (``local_reuse_targets.domain_controller_matcher``)
+    drops any domain controller still in ``hosts`` and is handed to the config
+    builder, which refuses a DC target outright.
+
+    Each per-host config authenticates in LOCAL-auth mode through
+    ``smb_privilege.local_account_privilege_config``: the NTLM domain is the
+    host's own account domain, so the DC is never consulted and a wrong
+    credential can only ever touch a per-machine local SAM (domain-lockout
+    safe); Kerberos is never requested; and the lockout guard
+    (``adscan_core.auth_attempt_guard``) keys each attempt to the host's own
+    realm, counting failures per local account per host.
 
     Returns one ``SMBPrivilegeResult`` per host (ADMIN == netexec ``Pwn3d!``).
     Never raises — the underlying batch maps failures to result statuses.
@@ -3358,24 +3468,25 @@ async def _sweep_local_cred_reuse(
         get_smb_probe_worker_count,
     )
     from adscan_internal.services.smb_privilege import (  # noqa: PLC0415
-        SMBPrivilegeConfig,
         check_smb_privilege_batch,
+        local_account_privilege_config,
     )
 
+    if is_domain_controller is not None:
+        hosts = [host for host in hosts if not is_domain_controller(host)]
     if not hosts:
         return []
 
+    # Local-auth through the one local-account config SSOT: the host's own
+    # account domain (never the AD domain), never Kerberos, guard-keyed per host.
     configs = [
-        SMBPrivilegeConfig(
-            target_ip=host,
-            # Local-auth: credential domain == the target host → local SAM
-            # validation, never a domain bind (no domain-account lockout risk).
-            domain=host,
+        local_account_privilege_config(
+            host=host,
             username=username,
-            password=None if is_hash else credential,
-            nt_hash=credential if is_hash else None,
-            use_kerberos=False,
+            credential=credential,
+            is_hash=is_hash,
             timeout=timeout,
+            is_domain_controller=is_domain_controller,
         )
         for host in hosts
     ]
@@ -3555,7 +3666,7 @@ def _collect_unsigned_relay_from_graph(shell: Any, *, domain: str) -> list[str] 
 
 
 async def _probe_unsigned_relay_hosts(
-    hosts: list[str], *, timeout: float = 10.0, concurrency: int = 64
+    hosts: list[str], *, timeout: float | None = None, concurrency: int | None = None
 ) -> list[str]:
     """Return the hosts whose SMB signing is NOT required (relay-able).
 
@@ -3567,12 +3678,19 @@ async def _probe_unsigned_relay_hosts(
     """
     import asyncio
 
+    from adscan_core.scan_pacing import active_pacing, component_pacing
+    from adscan_core.scan_pacing.pacing_runtime import active_runtime
     from adscan_internal.services.collector.smb_collector import negotiate_only
 
-    sem = asyncio.Semaphore(concurrency)
+    # Unset values come from the scan pacing (``probe.smb_negotiate``: 64 / 10 s).
+    pacing = component_pacing(active_pacing(), "probe.smb_negotiate")
+    timeout = pacing["timeout_s"] if timeout is None else timeout
+    runtime = active_runtime()
+    sem = runtime.semaphore(pacing["concurrency"] if concurrency is None else concurrency)
 
     async def _one(host: str) -> str | None:
         async with sem:
+            await runtime.before_op(host)
             try:
                 props = await negotiate_only(host, 445, int(timeout))
             except Exception:  # noqa: BLE001 — unreachable/errored host is not a target
@@ -3752,9 +3870,15 @@ def run_ask_for_smb_gpp(shell: Any, *, domain: str) -> None:
     """
     from adscan_internal.rich_output import confirm_operation
     from adscan_internal.services.scan_phases import subphase_is_enabled
+    from adscan_internal.services.scan_policy_notice import announce_phase_skip
 
     if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_autologin"):
-        print_info("GPP autologin search skipped (disabled in scan configuration).")
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="GPP autologin search",
+            subphase_id="gpp_autologin",
+        )
         return
 
     if shell.auto:
@@ -3777,10 +3901,24 @@ def run_ask_for_smb_gpp_autologin(shell: Any, *, domain: str) -> None:
         subphase_is_enabled,
     )
 
+    from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
     if not phase_is_enabled(shell, "quick_credential_wins"):
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="GPP autologin search",
+            subphase_id="gpp_autologin",
+            config_line=False,
+        )
         return
     if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_autologin"):
-        print_info("GPP autologin search skipped (disabled in scan configuration).")
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="GPP autologin search",
+            subphase_id="gpp_autologin",
+        )
         return
 
     if shell.auto:
@@ -3803,10 +3941,24 @@ def run_ask_for_smb_gpp_passwords(shell: Any, *, domain: str) -> None:
         subphase_is_enabled,
     )
 
+    from adscan_internal.services.scan_policy_notice import announce_phase_skip
+
     if not phase_is_enabled(shell, "quick_credential_wins"):
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="GPP password search",
+            subphase_id="gpp_passwords",
+            config_line=False,
+        )
         return
     if not subphase_is_enabled(shell, "quick_credential_wins", "gpp_passwords"):
-        print_info("GPP password search skipped (disabled in scan configuration).")
+        announce_phase_skip(
+            shell,
+            "quick_credential_wins",
+            label="GPP password search",
+            subphase_id="gpp_passwords",
+        )
         return
 
     if shell.auto:
@@ -4015,8 +4167,21 @@ def run_ntlm_theft(
     """
     from adscan_internal.services import ExploitationService
 
-    if not shell.myip:
-        print_error("MyIP must be configured before generating files")
+    # The bait is opened later by an unknown host, so there is no target to route
+    # toward: use the untargeted ladder (declared callback address, then the
+    # interface-derived one). No startup interface is required for a session that
+    # declared one with 'set listener-ip'.
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_untargeted_listener_ip,
+    )
+
+    listener_selection = resolve_untargeted_listener_ip(shell)
+    if not listener_selection.resolved:
+        print_error(
+            listener_selection.failure_message(
+                subject="whoever opens the generated files"
+            )
+        )
         if completion_event:
             completion_event.set()
         return
@@ -4038,7 +4203,7 @@ def run_ntlm_theft(
     service = ExploitationService()
     result = service.smb.generate_ntlm_theft_files(
         ntlm_theft_path=ntlm_theft_path,
-        capture_ip=shell.myip,
+        capture_ip=str(listener_selection.ip),
         output_dir=output_log_dir,
         scan_id=None,
     )
@@ -4226,10 +4391,18 @@ def _offer_share_credential_hunt(
     action_hunt = "Search readable shares for credentials"
     action_bait = "Drop NTLMv2 capture bait on writable shares"
 
+    # Each action is its own scan-policy check: the readable-share credential
+    # hunt (``module:share_credential_hunt``) and the writable-share bait
+    # (``module:writeshare_bait``). One switched off is never offered and its
+    # refusal is explained once.
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
     available_actions: list[str] = []
-    if can_hunt:
+    if can_hunt and gate_check_runner(shell, "module:share_credential_hunt"):
         available_actions.append(action_hunt)
-    if has_writable:
+    if has_writable and gate_check_runner(shell, "module:writeshare_bait"):
         available_actions.append(action_bait)
 
     if not available_actions:
@@ -4486,21 +4659,22 @@ def run_ntlmv2_capture_for_writable_shares(
     needing ``ShareView`` objects).
 
     Gating:
-    * **listener IP** (``shell.myip``) must be set — no listener, no capture.
+    * **listener IP** must resolve (a declared ``myip``, else the interface
+      ``myip``, via ``resolve_untargeted_listener_ip``) — no listener, no capture.
     * **target host** must be a non-empty string.
-    * **CTF** (``shell.type == "ctf"``): drop in ALL writable folders.
-      Interactive presents them with ALL pre-selected (operator can trim);
-      non-interactive (CI) auto-selects ALL with no prompt — this is what makes
-      the htb-regression CI solve Breach autonomously.
-    * **Audit** (``shell.type != "ctf"``): interactive presents the writable
+    * **Automatic** (the scan policy's ``writeshare_bait`` setting, the Lab /
+      CTF default): drop in ALL writable folders. Interactive presents them with
+      ALL pre-selected (operator can trim); non-interactive (CI) auto-selects ALL
+      with no prompt — this is what makes the htb-regression CI solve Breach
+      autonomously.
+    * **Ask** (the real-environment default): interactive presents the writable
       folders with the browse-likely ones (``transfer``, ``upload``, ...)
       pre-selected and root + others left unselected; the operator decides.
-      Non-interactive (audit CI): SKIP entirely — never drop unattended on a
-      real client.
+      Non-interactive: SKIP entirely — never drop unattended on a real client.
 
     Args:
         shell: The active ``PentestShell`` (or equivalent namespace); must have
-            ``myip``, ``type``, and ``auto`` attributes.
+            ``myip`` and ``auto`` attributes and its scan policy.
         domain: Target AD domain (used for Kerberos realm + credential dict).
         host: Target host name or IP (SMB connection + bait destination).
         writable_share_names: Iterable of share names confirmed writable. Empty
@@ -4522,13 +4696,21 @@ def run_ntlmv2_capture_for_writable_shares(
     if not writable_share_names:
         return None
 
-    listener_ip = str(getattr(shell, "myip", "") or "").strip()
-    if not listener_ip:
+    # Same question the 'capture_ntlm_share_drop' command asks, so the offer
+    # and the execution can never disagree about whether a listener exists.
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_untargeted_listener_ip,
+    )
+
+    listener_selection = resolve_untargeted_listener_ip(shell)
+    if not listener_selection.resolved:
         print_info_debug(
-            "ntlmv2-share-capture: writable share(s) found but no listener IP "
-            "(shell.myip unset); skipping the bait offer."
+            "ntlmv2-share-capture: writable share(s) found; skipping the bait "
+            "offer. "
+            + listener_selection.failure_message(subject="whoever opens the bait file")
         )
         return None
+    listener_ip = str(listener_selection.ip)
 
     target_host = str(host or "").strip()
     if not target_host:
@@ -4538,12 +4720,16 @@ def run_ntlmv2_capture_for_writable_shares(
         )
         return None
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    is_ctf = workspace_type == "ctf"
+    # The scan policy's writable-share bait setting: automatic plants on every
+    # writable folder; ask confirms first and never plants unattended.
+    plants_automatically = (
+        policy_settings.policy_setting(shell, policy_settings.WRITESHARE_BAIT)
+        == policy_settings.WRITESHARE_BAIT_AUTOMATIC
+    )
     non_interactive = is_non_interactive(shell)
 
     # Audit + non-interactive: never drop bait unattended on a real client.
-    if not is_ctf and non_interactive:
+    if not plants_automatically and non_interactive:
         print_info_debug(
             "ntlmv2-share-capture: audit + non-interactive session; skipping the "
             "bait offer (never drop unattended on a real client)."
@@ -4570,7 +4756,7 @@ def run_ntlmv2_capture_for_writable_shares(
         "Drop an NTLM-capture bait on the writable share(s) to harvest hashes "
         "when a privileged user browses them? Writable folders will then be "
         "enumerated (SMB2 MxAc) to choose drop targets.",
-        default=is_ctf,
+        default=plants_automatically,
     ):
         return None
 
@@ -4608,7 +4794,7 @@ def run_ntlmv2_capture_for_writable_shares(
 
     # ── Part 3: target selection UX, gated by workspace type ─────────────────
     selected_targets: list[Any]
-    if is_ctf:
+    if plants_automatically:
         if non_interactive:
             # CTF CI: auto-select ALL writable folders, no prompt. This makes
             # the htb-regression run capture autonomously on Breach.
@@ -4666,7 +4852,7 @@ def run_ntlmv2_capture_for_writable_shares(
     # CTF already drops all up front, so it gets no provider. Audit interactive
     # only; never runs in CI.
     additional_provider = None
-    if not is_ctf and not non_interactive:
+    if not plants_automatically and not non_interactive:
 
         def _additional_targets_provider(already_dropped: list[Any]) -> list[Any]:
             dropped_keys = {t.key for t in already_dropped}
@@ -4711,6 +4897,7 @@ def run_ntlmv2_capture_for_writable_shares(
             targets=selected_targets,
             target_host=target_host,
             listener_ip=listener_ip,
+            listener_bind_ip=listener_selection.bind_ip,
             file_type=URL_BAIT,
             additional_targets_provider=additional_provider,
         )
@@ -4854,7 +5041,7 @@ def ask_for_smb_shares_read(
     )
     from adscan_internal.rich_output import confirm_operation
 
-    if shell.domains_data[domain]["auth"] == "pwned" and shell.type == "ctf":
+    if policy_settings.domain_compromise_reached(shell, domain):
         return
 
     original_shares_count = len(shares)
@@ -5233,6 +5420,10 @@ def _build_rclone_copy_command(
     if isinstance(max_size_bytes, int) and max_size_bytes > 0:
         max_size_mb = max(1, int(max_size_bytes // (1024 * 1024)))
         command_parts.extend(["--max-size", f"{max_size_mb}M"])
+    bwlimit = getattr(tuning, "bwlimit_mibps", None)
+    if bwlimit:
+        # Scan pacing bandwidth cap (MiB/s, rclone's ``M`` suffix is MiB).
+        command_parts.extend(["--bwlimit", f"{float(bwlimit):g}M"])
     return " ".join(command_parts)
 
 
@@ -7014,7 +7205,6 @@ def run_smb_share_tree_mapping_with_rclone(
         shares=shares,
         share_map=share_map,
     )
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
     mapping_mode = _resolve_smb_mapping_mode(shell)
     expected_cache_metadata = _build_smb_rclone_mapping_cache_metadata(
         domain=domain,
@@ -7080,7 +7270,6 @@ def run_smb_share_tree_mapping_with_rclone(
             cached = try_use_mapping_cache(
                 shell,
                 manifest_path=aggregate_map_abs,
-                workspace_type=workspace_type,
                 transport_label="SMB",
                 loader=_smb_loader,
             )
@@ -7368,8 +7557,7 @@ def _resolve_default_deterministic_share_analysis_method(
     del password
     if _is_null_session_smb_auth(shell, domain=domain, username=username):
         return "deterministic_manspider"
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type == "audit":
+    if policy_settings.runs_full_assessment(shell):
         return "deterministic_rclone_mapped"
     return "deterministic_rclone_direct"
 
@@ -7902,9 +8090,15 @@ def run_smb_share_credential_hunt(
         AIBackendAvailabilityService,
     )
 
-    domain_data = getattr(shell, "domains_data", {}).get(domain, {})
-    username = str(username or domain_data.get("username") or "").strip()
-    password = str(credential or domain_data.get("password") or "").strip()
+    # Username and secret from the SAME principal (pairing SSOT): an explicit
+    # username never borrows the domain's active password.
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
+    )
+
+    username, password = resolve_principal_secret_pair(
+        getattr(shell, "domains_data", {}), domain=domain, username=username, secret=credential
+    )
     if not username or not password:
         print_warning("No domain credentials available — cannot scan shares for credentials.")
         return {"completed": False, "credential_findings": 0, "phases_run": []}
@@ -8654,9 +8848,8 @@ def _run_post_mapping_deterministic_rclone_credsweeper_scan(
         f"Running deterministic share analysis ({marked_phase_label}) via rclone."
     )
     max_document_file_size_bytes = get_sensitive_phase_max_file_size_bytes(phase)
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "unknown"
     cache_enabled = (
-        workspace_type in {"audit", "ctf"}
+        policy_settings.policy_environment(shell) is not None
         and str(backend_context.get("mode", "") or "").strip() == "mapped"
     )
     cache_service = SMBRclonePhaseCacheService()
@@ -8873,9 +9066,8 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
     print_info(
         f"Running deterministic share analysis ({mark_sensitive(phase_label, 'text')}) via rclone."
     )
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "unknown"
     cache_enabled = (
-        workspace_type in {"audit", "ctf"}
+        policy_settings.policy_environment(shell) is not None
         and str(backend_context.get("mode", "") or "").strip() == "mapped"
     )
     cache_service = SMBRclonePhaseCacheService()
@@ -9681,10 +9873,9 @@ def _select_deterministic_share_analysis_method(
         password=password,
         selected_method=selected_method,
     )
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "unknown"
     print_info_debug(
         "Deterministic SMB backend selected automatically: "
-        f"workspace_type={workspace_type} method={selected_method}"
+        f"method={selected_method}"
     )
     return selected_method
 
@@ -10669,8 +10860,7 @@ def _resolve_ai_triage_max_prompt_chars() -> int:
 
 def _confirm_continue_after_findings(*, shell: Any) -> bool:
     """Ask once whether prioritized analysis should continue after findings."""
-    run_type = str(getattr(shell, "type", "") or "").strip().lower()
-    default_continue = run_type != "ctf"
+    default_continue = policy_settings.runs_full_assessment(shell)
     return Confirm.ask(
         "Credential-like findings detected. Continue analyzing remaining prioritized files?",
         default=default_continue,
@@ -10816,7 +11006,19 @@ def _handle_prioritized_findings_actions(
                 )
                 print_exception(exception=exc)
 
-    if spray_candidates and domain in getattr(shell, "domains", []):
+    # A secret found with no username is a candidate password whose owner is
+    # unknown: spraying it is ``step:passwordspray``. With that check off nothing
+    # is asked (no selection, no question) and nothing is sent.
+    from adscan_internal.rich_output import confirm_ask  # noqa: PLC0415
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_check_runner,
+    )
+
+    if (
+        spray_candidates
+        and domain in getattr(shell, "domains", [])
+        and gate_check_runner(shell, "step:passwordspray", surface="spray")
+    ):
         spray_secret = spray_candidates[0]
         if len(spray_candidates) > 1:
             idx = _select_action_index(
@@ -10827,7 +11029,7 @@ def _handle_prioritized_findings_actions(
             )
             if idx is not None:
                 spray_secret = spray_candidates[idx]
-        if Confirm.ask(
+        if confirm_ask(
             "Run password spraying using selected secret without associated username?",
             default=False,
         ):
@@ -10859,6 +11061,7 @@ def _handle_prioritized_findings_actions(
                 shell.spraying_with_password(
                     domain,
                     spray_secret,
+                    check_id="step:passwordspray",
                     source_context=source_context,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -10989,9 +11192,8 @@ def _format_size_human(num_bytes: int) -> str:
 
 
 def _select_post_mapping_ai_scope(shell: Any) -> str | None:
-    """Select triage scope after share mapping based on pentest type."""
-    pentest_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if pentest_type == "ctf":
+    """Select triage scope after share mapping, from the scan policy's objective."""
+    if policy_settings.aims_at_domain_compromise(shell):
         return "credentials"
 
     options = [
@@ -11026,7 +11228,7 @@ def ask_for_smb_descriptions(shell: Any, *, domain: str) -> None:
     """
     from adscan_internal.rich_output import confirm_operation
 
-    if shell.type == "ctf" and shell.domains_data[domain]["auth"] in [
+    if policy_settings.aims_at_domain_compromise(shell) and shell.domains_data[domain]["auth"] in [
         "auth",
         "pwned",
     ]:

@@ -38,7 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 CVE_ID = "ADSCAN-WEBDAV-ENABLED"
 AKA = "WebDAVEnabled"
-CVSS_V3 = 5.3
+# Derived from CVSS_VECTOR below; stays in the MEDIUM band.
+CVSS_V3 = 5.4
 CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:N"
 
 WEBDAV_PIPE = "DAV RPC SERVICE"

@@ -78,12 +78,26 @@ from typing import Any
 #:   an instance that is only template-shape (weak DC but no established abuse), or
 #:   that the confirmation could not run against (DC unreachable / value absent /
 #:   opt-out / no credential), stays here by default.
+#: * ``nopac`` / ``printnightmare`` / ``certighost`` — CVEs whose check infers
+#:   the flaw instead of observing it. ADscan never runs the exploit, and these
+#:   checks read a side effect of the patch level: the KDC issuing a ticket
+#:   without a PAC on request (noPac), an exposed print spooler whose OS build
+#:   is below the July 2021 fix or whose Point and Print policy allows
+#:   non-admin driver installs, read from the registry (PrintNightmare),
+#:   the certificate authority host's build revision below the July 2026 fix
+#:   with the chase flag set (Certighost). Each is graded High (a CVE confirmed
+#:   by a non-disruptive probe, Zerologon or MS17-010, is Critical), and its
+#:   prose names the patch the client checks to settle it. Founder decision,
+#:   2026-11-05: severity follows the source of certainty.
 CONFIRMATION_PENDING_FINDING_KEYS: frozenset[str] = frozenset(
     {
         "unauthorized_external_tenant_replication",
         "shadow_credentials_present",
         "adcs_esc15",
         "adcs_esc14",
+        "nopac",
+        "printnightmare",
+        "certighost",
     }
 )
 

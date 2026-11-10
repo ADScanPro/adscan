@@ -88,7 +88,7 @@ def requires_tool(tool_name: str, install_hint: str = None) -> Callable:
     """Decorator to check if external tool is available.
 
     Usage:
-        @requires_tool("netexec", "Install with: adscan install")
+        @requires_tool("manspider", "Install with: adscan install")
         def run_netexec_command(self, ...):
             # Method implementation
 

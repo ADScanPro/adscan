@@ -13,10 +13,19 @@ or any probe failure all degrade to ``available=False`` with an honest reason.
 ``adscan_core.linux_capabilities`` is imported ONLY inside the POSIX branch: it
 reads ``/proc`` and shells ``getcap``, so it is Linux-only. Importing this
 module on Windows must succeed.
+
+The module also owns interface ENUMERATION (names, IPv4 addresses, the MAC /
+link-local triple) and interface TYPING (:func:`interface_kind`). Typing lives
+here for the same reason enumeration does: whether an interface is a real NIC, a
+bridge or container plumbing is an OS fact the kernel already records, so it is
+read from the kernel behind one API with a Linux and a Windows side, never
+guessed from the interface's name in a caller.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from enum import StrEnum
 
 from adscan_core.pal.platform import current_os, is_windows
 
@@ -27,6 +36,73 @@ NET_ADMIN = "NET_ADMIN"
 
 # CAP_NET_RAW is Linux capability bit 13 (not exported by linux_capabilities).
 _CAP_NET_RAW_BIT = 13
+
+
+class InterfaceKind(StrEnum):
+    """What kind of device one network interface is.
+
+    A ``StrEnum`` so it serialises naturally into a telemetry payload or a debug
+    line. The vocabulary is deliberately about what the interface *is*, not about
+    what a caller should do with it: ordering and usability are policy decisions
+    that belong to the consumer (see
+    ``adscan_internal.services.listener_ip``), not to the PAL.
+    """
+
+    #: A real NIC with backing hardware: ethernet, wifi, a VM's own virtio NIC.
+    PHYSICAL = "physical"
+    #: Rides a real NIC: a VLAN subinterface, a bond, a bridge that enslaves a
+    #: physical port (a libvirt host bridging guests onto the client LAN).
+    STACKED = "stacked"
+    #: A tunnel that carries routed traffic: tun/tap (OpenVPN, Tailscale),
+    #: WireGuard, IP-in-IP / GRE / SIT encapsulation.
+    TUNNEL = "tunnel"
+    #: A local-only L2 bridge with no physical port: ``docker0``, a compose
+    #: ``br-<id>``, ``virbr0``, a Kubernetes ``cni0``/``cbr0``.
+    BRIDGE = "bridge"
+    #: Virtual plumbing that reaches nothing outside this host: a veth pair end
+    #: (which is what a bridge-mode container's own ``eth0`` is), an overlay
+    #: encapsulation device, a dummy, a VMware ``vmnet`` host-only adapter.
+    VIRTUAL_OTHER = "virtual_other"
+    #: The loopback device.
+    LOOPBACK = "loopback"
+    #: The OS exposes no kind for this interface. Windows (``psutil`` carries no
+    #: adapter description) and an unreadable ``/sys`` both land here. NOT a
+    #: verdict about the interface: the caller falls back to its own heuristic.
+    UNKNOWN = "unknown"
+
+
+#: Where the Linux kernel publishes per-interface facts.
+_SYSFS_NET_ROOT = "/sys/class/net"
+
+#: Path segment every software-only device sits under. Checked as a RELATIVE
+#: segment, not an absolute prefix, so a fake sysfs tree in a test behaves the
+#: same as the real one.
+_SYSFS_VIRTUAL_SEGMENT = os.path.join("devices", "virtual", "net")
+
+#: ``/sys/class/net/<n>/type`` values that settle the kind on their own. These
+#: are the ``ARPHRD_*`` constants from ``<linux/if_arp.h>``; measured against a
+#: real kernel rather than taken from documentation.
+_ARPHRD_LOOPBACK = 772
+_ARPHRD_IP_TUNNEL_TYPES = frozenset(
+    {
+        768,  # ARPHRD_TUNNEL  - IP-in-IP (ipip, and Calico's tunl0)
+        769,  # ARPHRD_TUNNEL6 - IPv6 tunnel
+        776,  # ARPHRD_SIT     - IPv6-in-IPv4
+        778,  # ARPHRD_IPGRE   - GRE over IP
+    }
+)
+
+#: ``DEVTYPE`` values (from ``/sys/class/net/<n>/uevent``, set by the driver's
+#: ``struct device_type``). Only a driver that declares one appears here, so the
+#: absence of a ``DEVTYPE`` is never evidence of anything.
+_DEVTYPE_BRIDGE = frozenset({"bridge"})
+_DEVTYPE_STACKED = frozenset({"vlan", "bond"})
+_DEVTYPE_TUNNEL = frozenset({"wireguard"})
+#: Reaches the same verdict as the final fallthrough, and kept explicit so that
+#: "is a vxlan handled?" has an answer at the point of classification rather than
+#: by elimination. ``gretap``/``erspan`` are deliberately absent: measured
+#: against a real kernel, their drivers declare no ``DEVTYPE`` at all.
+_DEVTYPE_OVERLAY = frozenset({"vxlan", "geneve", "openvswitch"})
 
 
 @dataclass(frozen=True)
@@ -284,6 +360,211 @@ def interface_ipv4_addresses() -> list[str]:
     return values
 
 
+def _sysfs_text(path: str) -> str:
+    """Return a stripped sysfs attribute's text, or ``""`` if unreadable."""
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _sysfs_devtype(interface_dir: str) -> str:
+    """Return the lower-cased ``DEVTYPE=`` from an interface's ``uevent``."""
+
+    for line in _sysfs_text(os.path.join(interface_dir, "uevent")).splitlines():
+        if line.startswith("DEVTYPE="):
+            return line.partition("=")[2].strip().lower()
+    return ""
+
+
+def _sysfs_arphrd_type(interface_dir: str) -> int | None:
+    """Return the interface's ``ARPHRD_*`` type number, or ``None``."""
+
+    raw = _sysfs_text(os.path.join(interface_dir, "type"))
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _sysfs_has_backing_device(interface_dir: str) -> bool:
+    """Return whether this interface has real hardware behind it.
+
+    Two independent signals, OR-ed deliberately toward "physical": the ``device``
+    symlink a driver gets from ``SET_NETDEV_DEV``, and the interface NOT living
+    under ``devices/virtual/net``. Either one alone is enough, because the costly
+    mistake here is demoting a real NIC, never promoting a virtual one.
+    """
+
+    if os.path.exists(os.path.join(interface_dir, "device")):
+        return True
+    try:
+        resolved = os.path.realpath(interface_dir)
+    except OSError:
+        return False
+    return _SYSFS_VIRTUAL_SEGMENT not in resolved
+
+
+def _stacked_on_physical(interface_dir: str, sysfs_net_root: str) -> bool:
+    """Return whether this device sits directly on top of a real NIC.
+
+    The kernel publishes netdev adjacency as symlinks on BOTH ends:
+    ``lower_<name>`` on the device points DOWN to what it sits on, while
+    ``master`` and ``upper_<name>`` point UP to what owns it. Only ``lower_*`` is
+    read here, which is what keeps a veth end enslaved to ``docker0`` out: that
+    veth has ``master`` and ``upper_docker0`` and no ``lower_*`` at all, so it
+    cannot be promoted by this test however the bridge above it is arranged.
+
+    This is the generic form of the ``brif/`` membership test above, and it
+    answers the devices whose driver declares no ``DEVTYPE``: ``team`` (the Red
+    Hat family's NIC aggregation), ``macvlan`` and ``ipvlan``. ``vlan`` and
+    ``bond`` never reach here because they declare one.
+
+    ONE HOP, and the lower device must itself be PHYSICAL by the same
+    two-signal test rung 2 uses. One hop is bounded by construction, needs no
+    depth cap and no reasoning about cycles, and covers the whole named case (a
+    team over real NICs, a macvlan or ipvlan over a real NIC). It deliberately
+    declines a chain: a macvlan over a LAN bridge, or over a team, stays
+    ``VIRTUAL_OTHER``. That is a shape nobody here has, and it is a RANK rather
+    than a reject, so the cost of declining it is that such a device sorts
+    behind a real NIC and is still returned when it is the only candidate.
+    """
+
+    try:
+        entries = os.listdir(interface_dir)
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.startswith("lower_"):
+            continue
+        lower_name = entry[len("lower_") :]
+        if not lower_name or os.sep in lower_name or ".." in lower_name:
+            continue
+        lower_dir = os.path.join(sysfs_net_root, lower_name)
+        if os.path.isdir(lower_dir) and _sysfs_has_backing_device(lower_dir):
+            return True
+    return False
+
+
+def _bridge_interface_kind(interface_dir: str, sysfs_net_root: str) -> InterfaceKind:
+    """Classify a bridge by whether it enslaves a physical port.
+
+    A bridge carrying a real NIC (a libvirt or Proxmox host that bridges guests
+    onto the client LAN, where the bridge holds the only routable address) is
+    reachable and reads as :attr:`InterfaceKind.STACKED`. A bridge whose ports
+    are all veth ends, or which has no port at all, is container plumbing and
+    reads as :attr:`InterfaceKind.BRIDGE`. The name cannot tell these apart,
+    which is the whole reason to ask the kernel.
+    """
+
+    brif = os.path.join(interface_dir, "brif")
+    try:
+        members = os.listdir(brif)
+    except OSError:
+        return InterfaceKind.BRIDGE
+    for member in members:
+        member_dir = os.path.join(sysfs_net_root, member)
+        if os.path.isdir(member_dir) and _sysfs_has_backing_device(member_dir):
+            return InterfaceKind.STACKED
+    return InterfaceKind.BRIDGE
+
+
+def interface_kind(
+    interface_name: str,
+    *,
+    sysfs_net_root: str | None = None,
+) -> InterfaceKind:
+    """Return what kind of device one network interface is.
+
+    "Is this interface container plumbing or a real path off this host?" is an OS
+    fact, so it is answered from the kernel rather than guessed from the name. On
+    Linux every signal comes from ``/sys/class/net/<name>/``, measured against a
+    real kernel: a backing ``device`` link (physical), ``DEVTYPE=bridge`` or a
+    ``bridge/`` directory, ``DEVTYPE=wireguard``, a ``tun_flags`` attribute
+    (tun/tap, which is how OpenVPN and Tailscale appear), the ``ARPHRD_*``
+    ``type`` number for IP-in-IP / GRE / SIT, ``DEVTYPE=vlan``/``bond``, and
+    finally a ``lower_*`` adjacency link onto a real NIC (which is how a
+    ``team``, ``macvlan`` or ``ipvlan`` is recognised, since those declare no
+    ``DEVTYPE``).
+
+    The order of those checks is load-bearing, not incidental: a bridge and an
+    overlay BOTH carry ``lower_*`` links, so the adjacency check runs last, after
+    every branch that rests on a signal a driver declares.
+
+    Never raises, and never guesses: an interface the kernel does not type, a
+    missing or unreadable ``/sys``, and Windows all return
+    :attr:`InterfaceKind.UNKNOWN` so the caller can apply its own fallback
+    instead of inheriting a fabricated verdict.
+
+    Windows returns ``UNKNOWN`` by design. The PAL's Windows backend is
+    ``psutil``, which exposes addresses and link stats but no adapter kind or
+    description, and the available alternatives are worse than honest ignorance:
+    a WMI dependency is not worth taking for a ranking hint, and a MAC-OUI guess
+    would misclassify the real NIC of any ADscan instance running inside a VM.
+
+    Args:
+        interface_name: The interface name as the OS reports it.
+        sysfs_net_root: Override the sysfs net directory. For tests, which must
+            not depend on the NICs of whatever machine runs them.
+
+    Returns:
+        The :class:`InterfaceKind`; :attr:`InterfaceKind.UNKNOWN` when the OS
+        does not say.
+    """
+
+    name = str(interface_name or "").strip()
+    if not name or os.sep in name or (os.altsep and os.altsep in name) or ".." in name:
+        return InterfaceKind.UNKNOWN
+
+    root = sysfs_net_root
+    if root is None:
+        if is_windows():
+            return InterfaceKind.UNKNOWN
+        root = _SYSFS_NET_ROOT
+
+    try:
+        interface_dir = os.path.join(root, name)
+        if not os.path.isdir(interface_dir):
+            return InterfaceKind.UNKNOWN
+
+        if _sysfs_arphrd_type(interface_dir) == _ARPHRD_LOOPBACK:
+            return InterfaceKind.LOOPBACK
+        if _sysfs_has_backing_device(interface_dir):
+            return InterfaceKind.PHYSICAL
+
+        devtype = _sysfs_devtype(interface_dir)
+        if devtype in _DEVTYPE_BRIDGE or os.path.isdir(
+            os.path.join(interface_dir, "bridge")
+        ):
+            return _bridge_interface_kind(interface_dir, root)
+        if devtype in _DEVTYPE_TUNNEL:
+            return InterfaceKind.TUNNEL
+        if os.path.exists(os.path.join(interface_dir, "tun_flags")):
+            return InterfaceKind.TUNNEL
+        if _sysfs_arphrd_type(interface_dir) in _ARPHRD_IP_TUNNEL_TYPES:
+            return InterfaceKind.TUNNEL
+        if devtype in _DEVTYPE_STACKED:
+            return InterfaceKind.STACKED
+        if devtype in _DEVTYPE_OVERLAY:
+            return InterfaceKind.VIRTUAL_OTHER
+        # LAST before the fallthrough, and the position is the correctness
+        # question. A bridge carries lower_* links to its ports and a vxlan bound
+        # to a NIC carries lower_<nic>, both measured, so reading lower_* any
+        # earlier would relabel a container bridge or an overlay as STACKED. Every
+        # branch above claims its device from a signal the driver declares; this
+        # one only refines what is otherwise unclassified.
+        if _stacked_on_physical(interface_dir, root):
+            return InterfaceKind.STACKED
+        # Under devices/virtual/net with no driver-declared kind and nothing real
+        # underneath: a veth end (a bridge-mode container's own eth0), a dummy, a
+        # VMware vmnet, a macvlan stacked on another virtual device.
+        return InterfaceKind.VIRTUAL_OTHER
+    except Exception:  # noqa: BLE001 - an unreadable /sys is honest ignorance
+        return InterfaceKind.UNKNOWN
+
+
 def interface_mac_ipv4_linklocal(interface_name: str) -> tuple[str, str, str] | None:
     """Return ``(mac, ipv4, ipv6_linklocal)`` for one interface, or ``None``.
 
@@ -351,11 +632,13 @@ __all__ = [
     "NET_BIND_PRIVILEGED",
     "NET_RAW",
     "CapabilityStatus",
+    "InterfaceKind",
     "can_bind_privileged_port",
     "capability_available",
     "interface_ipv4_addresses",
     "interface_ipv4_addresses_for",
     "interface_ipv4_for",
+    "interface_kind",
     "interface_mac_ipv4_linklocal",
     "interface_names",
 ]

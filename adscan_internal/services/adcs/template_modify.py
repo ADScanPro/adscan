@@ -251,6 +251,98 @@ def make_template_esc1_vulnerable(
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def apply_template_snapshot(
+    conn: ADscanLDAPConnection, snapshot: TemplateSnapshot
+) -> tuple[bool, Optional[str]]:
+    """Write every snapshotted attribute (and the DACL) back on an open connection.
+
+    The connection is bound as whoever performs the restore, so the shared revert
+    precedence can run it as the cleanup account, a privileged account or the
+    account that made the change. Returns ``(ok, error)``.
+    """
+    errors: list[str] = []
+    attr_payload: dict[str, Any] = {
+        "msPKI-Enrollment-Flag": [("replace", [str(snapshot.enroll_flag)])],
+        "msPKI-Certificate-Name-Flag": [("replace", [str(snapshot.name_flag)])],
+        "msPKI-RA-Signature": [("replace", [str(snapshot.ra_signature)])],
+    }
+    if snapshot.pki_eku:
+        attr_payload["pKIExtendedKeyUsage"] = [("replace", list(snapshot.pki_eku))]
+    if snapshot.app_policy:
+        attr_payload["msPKI-Certificate-Application-Policy"] = [
+            ("replace", list(snapshot.app_policy))
+        ]
+    if not conn.modify(snapshot.template_dn, attr_payload):
+        errors.append("LDAP modify (attributes) returned false.")
+
+    # Security descriptor: replace verbatim from the snapshot.
+    sd_bytes = _b64decode(snapshot.sd_b64)
+    ok_sd = conn.modify(
+        snapshot.template_dn,
+        {"nTSecurityDescriptor": [("replace", sd_bytes)]},
+        encode=False,
+        controls=SD_FLAGS_DACL_CONTROL,
+    )
+    if not ok_sd:
+        errors.append("LDAP modify (security descriptor) returned false.")
+    if errors:
+        return False, "; ".join(errors)
+    return True, None
+
+
+def template_matches_snapshot(conn: ADscanLDAPConnection, snapshot: TemplateSnapshot) -> bool:
+    """Re-read the template and confirm the attributes ESC4 changes match the snapshot.
+
+    Fail-closed: any read error or mismatch returns False. Covers every
+    attribute :func:`make_template_esc1_vulnerable` writes (the enrollment and
+    name flags, the RA signature count, the EKU and the application policy).
+    """
+    try:
+        conn.search(
+            search_base=snapshot.template_dn,
+            search_filter="(objectClass=*)",
+            attributes=[
+                "msPKI-Enrollment-Flag",
+                "msPKI-Certificate-Name-Flag",
+                "msPKI-RA-Signature",
+                "pKIExtendedKeyUsage",
+                "msPKI-Certificate-Application-Policy",
+            ],
+            search_scope="BASE",
+        )
+        if not conn.entries:
+            return False
+        attrs = conn.entries[0].entry_attributes_as_dict
+
+        def _int(name: str) -> Optional[int]:
+            values = attrs.get(name) or []
+            try:
+                return int(values[0]) if values else 0
+            except (TypeError, ValueError):
+                return None
+
+        def _set(name: str) -> set[str]:
+            return {str(v).strip() for v in (attrs.get(name) or []) if str(v).strip()}
+
+        if _int("msPKI-Enrollment-Flag") != snapshot.enroll_flag:
+            return False
+        if _int("msPKI-Certificate-Name-Flag") != snapshot.name_flag:
+            return False
+        if _int("msPKI-RA-Signature") != snapshot.ra_signature:
+            return False
+        if snapshot.pki_eku and _set("pKIExtendedKeyUsage") != set(snapshot.pki_eku):
+            return False
+        if snapshot.app_policy and _set("msPKI-Certificate-Application-Policy") != set(
+            snapshot.app_policy
+        ):
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def restore_template(
     *,
     domain: str,
@@ -260,10 +352,12 @@ def restore_template(
     snapshot: TemplateSnapshot,
     dc_fqdn: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Restore every attribute we mutated to the snapshot values.
+    """Restore every attribute we mutated to the snapshot values, as ``username``.
 
     Includes nTSecurityDescriptor restore so any DACL changes (e.g. an
     Enroll right we granted as part of an ESC4 chain) are also rolled back.
+    The ESC4 step reverts through :func:`apply_template_snapshot` under the
+    shared revert precedence instead.
     """
     cfg = _build_ldap_config(
         domain=domain,
@@ -272,42 +366,9 @@ def restore_template(
         username=username,
         password=password,
     )
-    errors: list[str] = []
     try:
         with ADscanLDAPConnection(cfg) as conn:
-            # Attributes first (cheap if they're already correct).
-            attr_payload: dict[str, Any] = {
-                "msPKI-Enrollment-Flag": [("replace", [str(snapshot.enroll_flag)])],
-                "msPKI-Certificate-Name-Flag": [
-                    ("replace", [str(snapshot.name_flag)])
-                ],
-                "msPKI-RA-Signature": [("replace", [str(snapshot.ra_signature)])],
-            }
-            if snapshot.pki_eku:
-                attr_payload["pKIExtendedKeyUsage"] = [
-                    ("replace", list(snapshot.pki_eku))
-                ]
-            if snapshot.app_policy:
-                attr_payload["msPKI-Certificate-Application-Policy"] = [
-                    ("replace", list(snapshot.app_policy))
-                ]
-            ok_attrs = conn.modify(snapshot.template_dn, attr_payload)
-            if not ok_attrs:
-                errors.append("LDAP modify (attributes) returned false.")
-
-            # Security descriptor — replace verbatim from the snapshot.
-            sd_bytes = _b64decode(snapshot.sd_b64)
-            ok_sd = conn.modify(
-                snapshot.template_dn,
-                {"nTSecurityDescriptor": [("replace", sd_bytes)]},
-                encode=False,
-                controls=SD_FLAGS_DACL_CONTROL,
-            )
-            if not ok_sd:
-                errors.append("LDAP modify (security descriptor) returned false.")
-        if errors:
-            return False, "; ".join(errors)
-        return True, None
+            return apply_template_snapshot(conn, snapshot)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -328,6 +389,8 @@ __all__ = [
     "snapshot_template",
     "make_template_esc1_vulnerable",
     "restore_template",
+    "apply_template_snapshot",
+    "template_matches_snapshot",
     "write_snapshot_to_disk",
     "read_snapshot_from_disk",
 ]

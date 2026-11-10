@@ -138,9 +138,10 @@ class DomainRodcPrpDetectionService(BaseService):
     ) -> str | None:
         """Resolve one schema attribute GUID by ``lDAPDisplayName``."""
         try:
-            schema_dn = (
-                f"CN=Schema,CN=Configuration,{self._derive_base_dn(target_domain)}"
+            config_dn = getattr(connection, "config_dn", "") or (
+                f"CN=Configuration,{self._derive_base_dn(target_domain)}"
             )
+            schema_dn = f"CN=Schema,{config_dn}"
             connection.search(
                 search_base=schema_dn,
                 search_filter=f"(&(objectClass=attributeSchema)(lDAPDisplayName={attribute_name}))",

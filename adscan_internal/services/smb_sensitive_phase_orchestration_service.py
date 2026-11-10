@@ -6,6 +6,8 @@ while leaving acquisition and backend execution inside the CLI module.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 
 from typing import Any, Callable
 
@@ -66,7 +68,7 @@ def select_sensitive_scan_phases(
         )
         return frozenset()
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    wide = policy_settings.reaches_wide(shell)
 
     # Non-interactive (CI / pipe / auto mode): skip the checkbox entirely.
     # Defaults mirror the interactive defaults (single source of truth):
@@ -75,10 +77,10 @@ def select_sensitive_scan_phases(
     # on real clients — the operator opts into it interactively.
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
     if _is_non_interactive(shell):
-        ci_phases = _ALL_PHASES if workspace_type == "ctf" else _DEFAULT_SELECTED_PHASES
+        ci_phases = _ALL_PHASES if wide else _DEFAULT_SELECTED_PHASES
         print_info_debug(
             f"{transport_label} phase selection: auto-selecting "
-            + ("all phases" if workspace_type == "ctf"
+            + ("all phases" if wide
                else "default phases (heavy artifacts excluded)")
         )
         return ci_phases
@@ -100,7 +102,7 @@ def select_sensitive_scan_phases(
     # CTF: pre-select all phases (environment is stable, operator may still
     # want to deselect specific ones).
     # Audit: pre-select the three lighter phases, heavy artifacts opt-in.
-    default_phases = _ALL_PHASES if workspace_type == "ctf" else _DEFAULT_SELECTED_PHASES
+    default_phases = _ALL_PHASES if wide else _DEFAULT_SELECTED_PHASES
     default_labels = [
         f"{str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get('label', p) or p)}  — "
         f"{str(SMB_SENSITIVE_SCAN_PHASES.get(p, {}).get('description', '') or '')}"
@@ -156,11 +158,7 @@ def should_skip_sensitive_scan_prompt_for_ctf_pwned(*, shell: Any, domain: str) 
                 "CTF pwned-domain check failed during SMB prompt gating; "
                 f"falling back to domain auth state. error={type(exc).__name__}: {exc}"
             )
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    domain_auth = str(
-        getattr(shell, "domains_data", {}).get(domain, {}).get("auth", "") or ""
-    ).strip().lower()
-    return workspace_type == "ctf" and domain_auth == "pwned"
+    return policy_settings.domain_compromise_reached(shell, domain)
 
 
 def should_continue_with_deeper_sensitive_scan(
@@ -249,8 +247,7 @@ def should_continue_with_heavy_artifact_analysis(
             f"domain is already pwned: domain={mark_sensitive(domain, 'domain')}"
         )
         return False
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    default = workspace_type == "ctf"
+    default = policy_settings.reaches_wide(shell)
     prompt = (
         "Do you want to continue with heavy artifact analysis "
         "(ZIP/DMP/PCAP/VDI)? This is slower and more resource-intensive."

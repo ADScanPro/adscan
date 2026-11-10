@@ -115,6 +115,7 @@ def resolve_elevation_scope(
     domain: str,
     target_host: str,
     domains_data: dict[str, Any] | None,
+    acting_principal_domain_admin: bool = False,
 ) -> ElevationScope:
     """Decide the elevation SCOPE for a provisioning follow-up from the target.
 
@@ -130,6 +131,20 @@ def resolve_elevation_scope(
         domains_data: The session ``domains_data`` mapping (used only to resolve
             the DC topology for ``domain``). ``None`` / missing is treated as "DC
             topology unknown" and resolves to the conservative LOCAL scope.
+        acting_principal_domain_admin: The commands run AS a principal whose
+            group closure, read before any write, administers the domain. Its
+            rights, not the host's role, then decide the scope: ``net user
+            /domain`` and ``net group /domain`` reach the domain controller from
+            any domain-joined host under that principal's token.
+
+    Which consumer reaches the host-role branch below: only the MSSQL SYSTEM
+    escalation, whose acting principal IS the host (``NT AUTHORITY\\SYSTEM`` is
+    the machine account), so the host's role is exactly that principal's rights.
+    The HasSession ScheduledTask follow-up never reaches it: it decides by the
+    session user's group closure, calls this only when that user administers the
+    domain (always with ``acting_principal_domain_admin=True``), and creates
+    nothing otherwise, because a local elevation there is refused by the host or
+    adds nothing the executor that registered the task does not already hold.
 
     Returns:
         An :class:`ElevationScope`. When the DC topology is unknown or the host
@@ -149,7 +164,7 @@ def resolve_elevation_scope(
     except Exception:  # noqa: BLE001 - topology read is best-effort
         is_dc = False
 
-    if is_dc:
+    if is_dc or acting_principal_domain_admin:
         return ElevationScope(
             scope=ElevationTargetScope.DOMAIN,
             group_name="Domain Admins",
@@ -159,6 +174,10 @@ def resolve_elevation_scope(
             rationale=(
                 "Target is a domain controller; the account is elevated "
                 "domain-wide to Domain Admins."
+                if is_dc
+                else "The commands run as a principal with domain-wide administrative "
+                "rights; the account is created in the domain and elevated to "
+                "Domain Admins from this host."
             ),
         )
 
@@ -262,6 +281,7 @@ def plan_privileged_account(
     prompt_title: str = "Privileged account provisioning",
     create_label: str = "Create a new account, then elevate (recommended)",
     reuse_label_prefix: str = "Reuse an owned account: ",
+    acting_principal_domain_admin: bool = False,
 ) -> PrivilegedAccountPlan:
     """Resolve a full privileged-account provisioning plan (create/reuse + scope).
 
@@ -285,6 +305,8 @@ def plan_privileged_account(
             ``CREATE_NEW``.
         prompt_title / create_label / reuse_label_prefix: Prompt customization
             forwarded to :func:`decide_provisioning_action`.
+        acting_principal_domain_admin: Forwarded to
+            :func:`resolve_elevation_scope`.
 
     Returns:
         A :class:`PrivilegedAccountPlan`. ``action`` is ``CANCEL`` when the
@@ -301,6 +323,7 @@ def plan_privileged_account(
         domains_data=effective_domains_data
         if isinstance(effective_domains_data, dict)
         else None,
+        acting_principal_domain_admin=acting_principal_domain_admin,
     )
 
     pool = reuse_pool if isinstance(reuse_pool, dict) else {}

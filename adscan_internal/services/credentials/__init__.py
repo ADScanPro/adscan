@@ -29,6 +29,7 @@ from adscan_internal.services.credentials.privilege_role import (
     credential_secret_fingerprint,
     get_credential_meta,
     pick_credential_for_local_admin,
+    resolve_secret_kind,
     resolve_secret_provenance_strength,
     set_credential_kerberos_material,
     set_credential_nt_hash,
@@ -76,4 +77,5 @@ __all__ = [
     "set_credential_nt_hash",
     "set_credential_origin",
     "set_credential_secret_kind",
+    "resolve_secret_kind",
 ]

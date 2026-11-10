@@ -26,12 +26,12 @@ Only a bind-mounted directory does that. The ADscan **state** directory
 bind-mounted for exactly this purpose — it is the documented home for small
 cross-run markers (the launcher mounts it at ``docker_runtime.py``; see also
 ``telemetry_preference.py`` and ``cli/first_run_panel.py`` which already live
-there). ``~/.adscan/config.json`` is deliberately NOT used: it sits at the root
-of ``~/.adscan``, which is **not** mounted into the container, so a flag written
-there from a Docker session would be discarded when the container exits (this is
-the same reason ``telemetry_preference`` avoids ``config.json``). The whole point
-of show-once is cross-context persistence, so the store has to be the mounted
-state dir.
+there). ``~/.adscan/config.json`` is deliberately NOT used: it is the operator
+preferences and entitlements file, mounted into the container as a single file,
+and the home root it sits in is **not** mounted, so a new marker file written
+beside it from a Docker session would be discarded when the container exits.
+The whole point of show-once is cross-context persistence, so the store has to
+be the mounted state dir.
 
 Robustness contract
 -------------------

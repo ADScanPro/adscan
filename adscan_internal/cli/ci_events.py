@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 
 import logging
@@ -362,19 +363,176 @@ def emit_operation_progress(
     )
 
 
+def emit_run_started(*, kind: str) -> None:
+    """Emit the ``run_started`` lifecycle event (contract: closed object)."""
+    from adscan_core.engagement.run_identity import current_run_id
+
+    emit_event("run_started", run_id=current_run_id(), kind=kind)
+
+
+def emit_run_completed(
+    *, kind: str, status: str, exit_code: int, result_path: str | None = None
+) -> None:
+    """Emit the ``run_completed`` lifecycle event (contract: closed object).
+
+    Args:
+        kind: The RunPlan kind.
+        status: ``completed`` | ``failed`` | ``cancelled`` | ``interrupted``.
+        exit_code: The process exit code the run ends with.
+        result_path: Workspace-relative path of ``run_summary.json``, when one
+            was written.
+    """
+    from adscan_core.engagement.run_identity import current_run_id
+
+    fields: dict[str, object] = {
+        "run_id": current_run_id(),
+        "kind": kind,
+        "status": status,
+        "exit_code": int(exit_code),
+    }
+    if result_path:
+        fields["result_path"] = result_path
+    emit_event("run_completed", **fields)
+
+
+# --------------------------------------------------------------------------- #
+# Versioned file sink (adscan.events/1)
+# --------------------------------------------------------------------------- #
+#
+# ``ADSCAN_EVENTS_FILE`` (``adscan run --events-file``) receives the VERSIONED
+# stream: a ``stream_header`` first, then every event with a contiguous ``seq``,
+# appended and flushed one line at a time. It is read from the environment at
+# each write (``adscan run`` sets it after this module is imported), and a change
+# of path or run id starts a new stream with its own header. The stderr stream
+# below keeps its historical line shape (no header, no seq) because the appliance
+# worker parses it today. Event PAYLOADS are not frozen: interactive_resolution,
+# for one, now nests the operator's answer under ``response`` on both sinks.
+
+EVENTS_SCHEMA_TAG = "adscan.events/1"
+_EVENTS_FILE_ENV = "ADSCAN_EVENTS_FILE"
+_RUN_KIND_ENV = "ADSCAN_RUN_KIND"
+_RUN_KINDS = frozenset({"scan", "recheck", "postprocess", "doctor", "deliver"})
+
+_FILE_LOCK = threading.Lock()
+
+
+class _EventFileStream:
+    """One open versioned stream: the handle, its identity and its counter."""
+
+    def __init__(self, path: str, run_id: str, handle) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.handle = handle
+        self.seq = 0
+        self.torn = False
+
+    def write(self, event: dict) -> None:
+        """Append one event line; ``seq`` is consumed only by a line that landed.
+
+        The line is serialised BEFORE a sequence number is taken, so an event
+        that cannot be serialised consumes none. A write that failed part-way
+        (disk full) may have left a fragment; the next line then starts with a
+        newline, so the fragment sits alone on its own line and every later line
+        is whole.
+        """
+        seq = self.seq + 1
+        line = dict(event)
+        line["seq"] = seq
+        text = json.dumps(line, ensure_ascii=False) + "\n"
+        if self.torn:
+            text = "\n" + text
+        try:
+            self.handle.write(text)
+            self.handle.flush()
+        except Exception:
+            self.torn = True
+            raise
+        self.torn = False
+        self.seq = seq
+
+
+_FILE_STREAM: _EventFileStream | None = None
+
+
+def _events_file_path() -> str | None:
+    value = str(os.environ.get(_EVENTS_FILE_ENV, "") or "").strip()
+    return value or None
+
+
+def reset_event_file_stream() -> None:
+    """Close the current versioned stream (tests, and the end of a run)."""
+    global _FILE_STREAM  # noqa: PLW0603
+    with _FILE_LOCK:
+        if _FILE_STREAM is not None:
+            try:
+                _FILE_STREAM.handle.close()
+            except Exception:  # pragma: no cover — closing must never raise
+                pass
+        _FILE_STREAM = None
+
+
+def _open_stream(path: str) -> _EventFileStream:
+    from adscan_core.engagement.run_identity import current_run_id
+
+    run_id = current_run_id()
+    handle = open(path, "a", encoding="utf-8")  # noqa: SIM115 — kept open for the run
+    stream = _EventFileStream(path, run_id, handle)
+    header: dict[str, object] = {
+        "type": "stream_header",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "schema": EVENTS_SCHEMA_TAG,
+        "run_id": run_id,
+    }
+    kind = str(os.environ.get(_RUN_KIND_ENV, "") or "").strip()
+    if kind in _RUN_KINDS:
+        header["kind"] = kind
+    stream.write(header)
+    return stream
+
+
+def _write_event_file(event: dict) -> None:
+    """Append ``event`` to the versioned stream, opening it (with a header) if needed."""
+    global _FILE_STREAM  # noqa: PLW0603
+    path = _events_file_path()
+    if path is None:
+        return
+    from adscan_core.engagement.run_identity import current_run_id
+
+    with _FILE_LOCK:
+        stream = _FILE_STREAM
+        if stream is None or stream.path != path or stream.run_id != current_run_id():
+            if stream is not None:
+                try:
+                    stream.handle.close()
+                except Exception:  # pragma: no cover
+                    pass
+            stream = _FILE_STREAM = _open_stream(path)
+        stream.write(event)
+
+
 def _write_event(event: dict) -> None:
-    """Serialize and write a single JSON event line to stderr."""
+    """Serialize one event to every enabled sink.
+
+    stderr carries the historical shape (no header, no ``seq``) when the
+    ``stderr-json`` sink is on; the versioned file gets the same payload plus
+    its sequence number. A failing sink never raises into the scan.
+    """
+    _debug_event("emit", event)
+    if _CI_SESSION and _STRUCTURED_STDERR_ENABLED:
+        try:
+            sys.stderr.write(json.dumps(event, ensure_ascii=False) + "\n")
+            sys.stderr.flush()
+        except Exception:  # pragma: no cover — never raise from telemetry-like helper
+            pass
     try:
-        _debug_event("emit", event)
-        sys.stderr.write(json.dumps(event, ensure_ascii=False) + "\n")
-        sys.stderr.flush()
-    except Exception:  # pragma: no cover — never raise from telemetry-like helper
-        pass
+        _write_event_file(event)
+    except Exception as exc:  # noqa: BLE001 — never raise from telemetry-like helper
+        _LOGGER.debug("Event file sink write failed: %s", exc, exc_info=True)
 
 
 def _should_emit_events() -> bool:
-    """Return whether structured execution events are explicitly enabled."""
-    return _CI_SESSION and _STRUCTURED_STDERR_ENABLED
+    """Return whether any structured execution event sink is enabled."""
+    return (_CI_SESSION and _STRUCTURED_STDERR_ENABLED) or _events_file_path() is not None
 
 
 def _debug_event(stage: str, event: dict) -> None:

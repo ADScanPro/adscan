@@ -41,7 +41,8 @@ if TYPE_CHECKING:  # pragma: no cover
 
 CVE_ID = "ADSCAN-BADSUCCESSOR-2025"
 AKA = "BadSuccessor"
-CVSS_V3 = 9.0
+# Derived from CVSS_VECTOR below; stays in the CRITICAL band.
+CVSS_V3 = 9.9
 CVSS_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
 
 # Server 2025 functional level — first level introducing dMSAs.

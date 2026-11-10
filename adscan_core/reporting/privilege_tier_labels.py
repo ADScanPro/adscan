@@ -160,7 +160,52 @@ def highest_privilege_tier_token(tokens: Any) -> str:
     return best
 
 
+#: How many Tier 1 accounts the remainder sentence names before it counts the rest.
+TIER1_REMAINDER_NAMED_MAX = 5
+
+
+def tier1_remainder_sentence(count: Any, names: Any = ()) -> str:
+    """"The other N accounts (a, b) are Tier 1 server or application administrators."
+
+    The ordinary-account sentence counts the Tier 2 population, so the Tier 1
+    accounts it leaves out are named here, once, for every surface (both reports
+    and the web). ``names`` are the graded accounts' sAMAccountNames; they are
+    shown lower-cased, at most :data:`TIER1_REMAINDER_NAMED_MAX`, with the rest
+    counted. Empty when ``count`` is 0.
+    """
+    try:
+        total = max(0, int(count or 0))
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return ""
+    shown: list[str] = []
+    for name in names or ():
+        text = str(name or "").strip().lower()
+        if text and text not in shown:
+            shown.append(text)
+    shown = shown[:total]
+    listed = shown[:TIER1_REMAINDER_NAMED_MAX]
+    rest = total - len(listed)
+    names_part = ""
+    if listed:
+        if rest > 0:
+            names_part = f" ({', '.join(listed)} and {rest} more)"
+        elif len(listed) == 1:
+            names_part = f" ({listed[0]})"
+        else:
+            names_part = f" ({', '.join(listed[:-1])} and {listed[-1]})"
+    if total == 1:
+        return f"The other account{names_part} is a Tier 1 server or application administrator."
+    return (
+        f"The other {total} accounts{names_part} are Tier 1 server or application "
+        "administrators."
+    )
+
+
 __all__ = [
+    "TIER1_REMAINDER_NAMED_MAX",
+    "tier1_remainder_sentence",
     "PRIVILEGE_TIER_TOKEN_ORDER",
     "TIER0_ROLLUP_LABEL",
     "TIER0_TOKENS",

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.observations/1",
+  "title": "ADscan observation record v1",
+  "description": "One entry per run, per domain, per check, written by the code that performed the check when it ran (adscan_core/engagement/observations.py). Coverage, compliance positives and the recheck view are projections of this document. May name AD objects in examined_ids and instances, so it stays on the node unless the data policy allows findings.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "run_id", "run_status", "vantage", "observations"],
+  "properties": {
+    "schema": {"const": "adscan.observations/1"},
+    "run_id": {"type": "string", "maxLength": 64},
+    "run_status": {"enum": ["complete", "partial", "interrupted", "unknown"]},
+    "vantage": {"enum": ["unauth", "auth", "privileged_read"]},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check_id", "domain_id", "outcome", "scope_kind", "complete"],
+        "properties": {
+          "check_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,127}$"},
+          "domain_id": {"type": "string", "minLength": 1, "maxLength": 255},
+          "outcome": {"enum": ["clear", "finding", "observed", "not_assessed", "failed"]},
+          "scope_kind": {"enum": ["domain", "object", "host", "route"]},
+          "complete": {"type": "boolean"},
+          "examined": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+          "total": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+          "examined_ids": {"type": "array", "items": {"type": "string"}},
+          "vantage": {"enum": ["unauth", "auth", "privileged_read"]},
+          "reason": {"type": "string", "maxLength": 1024},
+          "source": {"enum": ["detector", "phase", "explicit"]},
+          "positive_key": {"type": "string", "pattern": "^[a-z0-9_]{1,128}$"},
+          "instances": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    }
+  }
+}

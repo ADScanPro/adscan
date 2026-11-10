@@ -97,6 +97,7 @@ _ADCS_ESC_NAMES: Final[dict[str, str]] = {
     "ADCSESC9": "Template skips identity verification",
     "ADCSESC10": "Template uses SChannel without verification",
     "ADCSESC11": "NTLM relay to ICPR endpoint",
+    "ADCSESC12": "CA key usable from the CA host (HSM password stored in clear text)",
     "ADCSESC13": "Template with abusable issuance policy OID",
     "ADCSESC14": "Template with mappable altSecurityIdentities",
     "ADCSESC15": "Template with wildcard EKU and editable SAN",

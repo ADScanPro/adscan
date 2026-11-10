@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from adscan_internal.services.async_bridge import run_async_sync
+from adscan_internal.services.listener_ip import present_pending_callback_advice
 from adscan_internal.services.adcs.esc_types import EscConfig, EscResult
 from adscan_internal.services.adcs.esc_preflight import (
     _ESC15_CONFIRM_TITLE,
@@ -68,8 +69,16 @@ async def run_esc(config: EscConfig) -> EscResult:
 
 
 def run_esc_sync(config: EscConfig) -> EscResult:
-    """Synchronous wrapper for use from attack_path_execution.py."""
-    return run_async_sync(run_esc(config))
+    """Synchronous wrapper for use from attack_path_execution.py.
+
+    The relay ESCs (8, 8-KRB, 11) queue "no callback arrived" guidance from inside
+    their coroutines; it is shown here, once the event loop has finished and its
+    listeners are closed, so an operator-paced prompt cannot hold the loop.
+    """
+    try:
+        return run_async_sync(run_esc(config))
+    finally:
+        present_pending_callback_advice(getattr(config, "shell", None))
 
 
 async def run_esc15_confirm(

@@ -151,7 +151,11 @@ def enqueue_cracking_job(
         # empty recovered-credentials section must never be read as proof that
         # every password held.
         record_cracking_coverage_for_domain(shell, domain, wordlists_dir=wordlists_dir)
-        workspace_type = str(getattr(shell, "type", "") or "")
+        from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
+            shell_wordlist_profile,
+        )
+
+        workspace_type = shell_wordlist_profile(shell)
         runtime_kwargs: dict[str, Any] = {}
         max_effort = ""
         if effort:

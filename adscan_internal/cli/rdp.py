@@ -94,8 +94,21 @@ def ask_for_rdp_access(
 
     marked_host = mark_sensitive(host, "hostname")
     marked_username = mark_sensitive(username, "user")
+    from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    if is_non_interactive(shell):
+        # An unattended run (``ci``, ``execute``, the web worker) has nobody at a
+        # desktop to use an interactive session, and opening one is one more
+        # sign-in as the account. The access itself is already proven by the
+        # step's own verification.
+        print_info_verbose(
+            f"Interactive RDP to {marked_host} as {marked_username} not opened: "
+            "unattended run."
+        )
+        return
     answer = Confirm.ask(
-        f"Do you want to access host {marked_host} via RDP as user {marked_username}?"
+        f"Do you want to access host {marked_host} via RDP as user {marked_username}?",
+        default=False,
     )
     if answer:
         rdp_access(
@@ -432,8 +445,12 @@ def run_rdp_service_access_sweep(
     # Per-host connect timeout: use a fraction of the global budget, capped
     # between 5 and 30 seconds so we don't stall on a single unresponsive host.
     connect_timeout = max(5.0, min(30.0, global_timeout / max(len(host_list), 1)))
-    # Concurrency: cap at 10 workers, minimum 3.
-    workers = min(10, max(3, len(host_list)))
+    # Concurrency from the scan pacing (``sweep.rdp_access``): at most
+    # ``max_workers`` (10 at the default level), at least ``min_workers`` (3).
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    rdp_pacing = component_pacing(active_pacing(), "sweep.rdp_access")
+    workers = min(rdp_pacing["max_workers"], max(rdp_pacing["min_workers"], len(host_list)))
 
     workspace_cwd = resolve_workspace_cwd(shell)
     domains_dir = getattr(shell, "domains_dir", "domains")

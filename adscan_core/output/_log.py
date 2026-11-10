@@ -1536,19 +1536,10 @@ def _log_exception_to_file(
             args=(),
             exc_info=exc_info,
         )
-        emitted = False
-        for handler in (
-            getattr(_logging_config, "_file_handler", None),
-            getattr(_logging_config, "_workspace_file_handler", None),
-        ):
-            if handler is None:
-                continue
-            try:
-                handler.emit(record)
-                emitted = True
-            except Exception:
-                continue
-        if emitted:
+        # File sinks only (the active workspace's logs, else the global log
+        # of a maintenance command, else the pre-workspace buffer). Every sink
+        # takes it, so the traceback also lands in adscan.debug.log.
+        if _logging_config.emit_to_file_sinks(record, respect_levels=False):
             return
     except Exception:
         pass
@@ -1653,6 +1644,18 @@ def print_exception(
             # Without --debug: shows generic error message
             print_exception(show_locals=True, exception=e)
     """
+    # A lockout-guard refusal (possibly wrapped inside a transport error) is a
+    # deliberate safety skip, not an error: the guard already printed the one
+    # operator line, so nothing further is rendered on screen. The evidence sinks
+    # below still receive it.
+    if visible and exception is not None:
+        try:
+            from adscan_core.auth_attempt_guard import refusal_in_chain
+
+            if refusal_in_chain(exception) is not None:
+                visible = False
+        except Exception:
+            pass
     _log_exception_to_file(
         message="Exception rendered via print_exception",
         exception=exception,

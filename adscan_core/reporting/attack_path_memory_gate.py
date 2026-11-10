@@ -792,6 +792,15 @@ _COMPLETE_STATEMENT = (
     "Attack-path discovery evaluated the full set of candidate routes."
 )
 
+#: The COMPLETE statement when the full search produced no route at all. A
+#: complete search that found nothing is a measured result (a hardened domain),
+#: so the block says so in words instead of leaving a bare zero to be read as an
+#: unmeasured one.
+_COMPLETE_NO_ROUTE_STATEMENT = (
+    "Attack-path discovery evaluated the full set of candidate routes; none "
+    "reaches a high-value target."
+)
+
 
 def _coverage_statement(examined_routes: int) -> str:
     """Render the client-facing coverage sentence for a bounded discovery.
@@ -904,8 +913,9 @@ def build_attack_path_coverage(
     *,
     bounded: bool = False,
     sampled: bool = False,
-    examined_routes: int = 0,
+    examined_routes: int | None = None,
     exposure_source_count: int | None = None,
+    reported_routes: int | None = None,
 ) -> dict[str, Any]:
     """Build the ``attack_path_coverage`` block for one domain.
 
@@ -924,34 +934,55 @@ def build_attack_path_coverage(
             coverage-floored SAMPLE of routes (every reachable high-value target
             represented, routes per target capped). The exposure count is the
             stable metric across re-scans.
-        examined_routes: Raw candidate routes examined before a BOUNDED stop, when
-            known — surfaced to the client as the coverage boundary, never the
-            reason for it. Ignored for the complete and sampled modes.
+        examined_routes: Raw candidate routes the traversal examined. For a
+            BOUNDED stop it is surfaced to the client as the coverage boundary,
+            never the reason for it (``None`` reads as 0 there, the historical
+            shape). For the COMPLETE mode it is the size of the full candidate
+            set the DFS walked, and ``None`` means the recording seam did not
+            know it: it is persisted as ``None``, never as a fabricated ``0``,
+            because "complete over zero routes" is a claim and an unknown count
+            is not. Ignored for the sampled mode (persisted as 0, unchanged).
         exposure_source_count: For the SAMPLED mode, how many principals can reach
             a high-value target — the stable exposure figure the statement anchors
             the re-scan narrative on. Omitted (``None``) still yields a valid
             statement, without the concrete number.
+        reported_routes: How many routes the computation PRODUCED (the set the
+            deliverable and the web render), when the recording seam knows it.
+            Lets anyone reading the block reconcile it with the path set it
+            describes. ``None`` when unknown. A COMPLETE block with
+            ``reported_routes == 0`` carries an explicit "no route" statement.
 
     Returns:
         The block to hand to ``record_attack_path_coverage``. Always carries
         ``statement`` so the recorder accepts it, plus ``mode``, ``complete``,
-        ``sampled``, ``examined_routes`` and ``exposure_source_count``.
+        ``sampled``, ``examined_routes``, ``reported_routes`` and
+        ``exposure_source_count``.
     """
-    examined = max(0, int(examined_routes))
     source_count = (
         max(0, int(exposure_source_count))
         if isinstance(exposure_source_count, int)
         else None
     )
+    reported = (
+        max(0, int(reported_routes)) if isinstance(reported_routes, int) else None
+    )
+    examined: int | None
     if bounded:
         mode = COVERAGE_MODE_BOUNDED
+        examined = max(0, int(examined_routes or 0))
         statement = _coverage_statement(examined)
     elif sampled:
         mode = COVERAGE_MODE_SAMPLED
+        examined = 0
         statement = _sampled_statement(source_count)
     else:
         mode = COVERAGE_MODE_COMPLETE
-        statement = _COMPLETE_STATEMENT
+        examined = (
+            max(0, int(examined_routes)) if isinstance(examined_routes, int) else None
+        )
+        statement = (
+            _COMPLETE_NO_ROUTE_STATEMENT if reported == 0 else _COMPLETE_STATEMENT
+        )
     return {
         "mode": mode,
         # ``complete`` stays the historical field the view/merge key on; it is True
@@ -959,6 +990,7 @@ def build_attack_path_coverage(
         "complete": mode == COVERAGE_MODE_COMPLETE,
         "sampled": mode == COVERAGE_MODE_SAMPLED,
         "examined_routes": examined,
+        "reported_routes": reported,
         "exposure_source_count": source_count,
         "statement": statement,
     }

@@ -254,6 +254,10 @@ class CredentialVerificationResult:
     is_admin: bool = False
     protocol_used: str = "kerberos"
     verdict_is_definitive: bool = False
+    # True when the account-lockout guard withheld the sign-in: the credential was
+    # never judged (not invalid, not an error), so nothing may be recorded against
+    # it and no other protocol is tried.
+    skipped_for_lockout: bool = False
     # Raw command output is kept for in-process consumers (e.g. CLI) but is
     # intentionally excluded from serialized representations to avoid leaking
     # potentially sensitive information.
@@ -326,6 +330,32 @@ class PasswordChangeResult:
     raw_output: Optional[str] = None
 
 
+def _lockout_skip_result(
+    exc: BaseException,
+    *,
+    username: str,
+    domain: str,
+    credential_type: str,
+    protocol_used: str = "kerberos",
+) -> "Optional[CredentialVerificationResult]":
+    """A skipped (not failed) result when the lockout guard refused, else ``None``."""
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+
+    refusal = refusal_in_chain(exc)
+    if refusal is None:
+        return None
+    return CredentialVerificationResult(
+        status=CredentialStatus.ERROR,
+        username=username,
+        domain=domain,
+        credential_type=credential_type,
+        error_message=str(refusal),
+        protocol_used=protocol_used,
+        verdict_is_definitive=False,
+        skipped_for_lockout=True,
+    )
+
+
 class CredentialService(BaseService):
     """Service for credential operations.
 
@@ -374,6 +404,7 @@ class CredentialService(BaseService):
         into the transport configs for auth-plan pruning.
         """
         from adscan_internal.services.kerberos_transport import (
+            KerberosAttemptRefused,
             KerberosAuthError,
             KerberosClockSkewError,
             KerberosConfig,
@@ -418,6 +449,18 @@ class CredentialService(BaseService):
                 credential_type=credential_type,
                 error_message=msg,
                 verdict_is_definitive=definitive,
+            )
+
+        def _skipped(exc: BaseException) -> "CredentialVerificationResult":
+            """The lockout guard withheld the sign-in: skipped, not failed."""
+            return CredentialVerificationResult(
+                status=CredentialStatus.ERROR,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                error_message=str(exc),
+                verdict_is_definitive=False,
+                skipped_for_lockout=True,
             )
 
         async def _classify_auth_error(
@@ -580,6 +623,11 @@ class CredentialService(BaseService):
             ccache = await get_tgt(cfg)
             return _ok(ccache)
 
+        except KerberosAttemptRefused as exc:
+            # Never sent: no verdict, and no NTLM fallback (the guard would refuse
+            # that sign-in too, and the credential was not judged).
+            return _skipped(exc)
+
         except KerberosEtypeError:
             # RC4 rejected (AES-only KDC) — retry with AES etypes only.
             from dataclasses import replace as _dc_replace
@@ -587,6 +635,8 @@ class CredentialService(BaseService):
             try:
                 ccache = await get_tgt(cfg_aes)
                 return _ok(ccache)
+            except KerberosAttemptRefused as exc:
+                return _skipped(exc)
             except KerberosAuthError as exc:
                 return await _classify_auth_error(
                     exc, requested_etypes=[18, 17], context="AES-only KDC"
@@ -673,6 +723,14 @@ class CredentialService(BaseService):
             return _fail(CredentialStatus.ERROR, diagnosis)
 
         except Exception as exc:  # noqa: BLE001
+            skipped = _lockout_skip_result(
+                exc,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+            )
+            if skipped is not None:
+                return skipped
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             return _fail(CredentialStatus.ERROR, str(exc))
@@ -835,6 +893,15 @@ class CredentialService(BaseService):
                 verdict_is_definitive=True,
             )
         except Exception as exc:  # noqa: BLE001
+            skipped = _lockout_skip_result(
+                exc,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                protocol_used="ntlm-ldap",
+            )
+            if skipped is not None:
+                return skipped
             # Transport failure (LDAP also unreachable) → no verdict here; let
             # the SMB backstop try. A definitive bind rejection → NTLM verdict.
             if _ldap_mod.is_ldaps_transport_failure(exc):
@@ -916,6 +983,15 @@ class CredentialService(BaseService):
                 verdict_is_definitive=True,
             )
         except SMBAuthError as exc:
+            skipped = _lockout_skip_result(
+                exc,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                protocol_used="ntlm-smb",
+            )
+            if skipped is not None:
+                return skipped
             # SMBAuthError is deliberately BROAD at the transport layer (it also
             # covers Kerberos/ticket/AP-exchange failures so the SMB fallback
             # chain can react). Only a status code that names the credential is
@@ -942,6 +1018,15 @@ class CredentialService(BaseService):
                 verdict_is_definitive=True,
             )
         except Exception as exc:  # noqa: BLE001
+            skipped = _lockout_skip_result(
+                exc,
+                username=username,
+                domain=domain,
+                credential_type=credential_type,
+                protocol_used="ntlm-smb",
+            )
+            if skipped is not None:
+                return skipped
             # SMB also unreachable / inconclusive → no verdict; the caller keeps
             # the precise KDC-filtered diagnosis.
             telemetry.capture_exception(exc)

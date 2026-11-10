@@ -480,6 +480,23 @@ class RRPRPC:
 				return None, None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
 			return None, None, e
 
+	async def QueryValueSize(self, key, value_name):
+		"""Return ``(value_type, size_in_bytes, err)`` without transferring the value's data.
+
+		ADscan addition (see :func:`rrp.hBaseRegQueryValueSize`): a presence /
+		non-empty check on a secret value never has to read the secret.
+		"""
+		try:
+			key = await self.__get_rawhandle(key)
+			val_type, size, err = await rrp.hBaseRegQueryValueSize(self.dce, key, value_name)
+			if err is not None:
+				raise err
+			return val_type, size, None
+		except Exception as e:
+			if isinstance(e, rrp.DCERPCSessionError):
+				return None, None, OSError(e.get_error_code(), system_errors.ERROR_MESSAGES[e.get_error_code()][1])
+			return None, None, e
+
 	async def SaveKey(self, key, file_name):
 		try:
 			key = await self.__get_rawhandle(key)

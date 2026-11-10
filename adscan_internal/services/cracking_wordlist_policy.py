@@ -1,8 +1,13 @@
-"""Wordlist selection policy for the auto-crack job, by workspace type.
+"""Wordlist selection policy for the auto-crack job, by wordlist profile.
 
-CTF favours speed (rockyou hits weak lab passwords). Audit favours recall under a
-bounded wall-clock: an ESCALATING sequence of tiers, each run as a separate
-background pass, so a match on tier 1 avoids ever paying for tier 3.
+The profile is the scan policy's ``cracking_wordlist`` setting
+(:mod:`adscan_core.scan_policy.settings`). ``rockyou`` favours speed (it hits
+weak lab passwords). ``real_world`` favours recall under a bounded wall-clock:
+an ESCALATING sequence of tiers, each run as a separate background pass, so a
+match on tier 1 avoids ever paying for tier 3. The functions keep their
+``workspace_type`` parameter name for compatibility and accept the legacy
+workspace types (``ctf`` / ``audit``) as profile spellings
+(:func:`wordlist_profile`).
 
 This module is also the cracking-effort SSOT (see
 docs/superpowers/plans/2026-07-07-cracking-effort-engine.md Task 3):
@@ -35,6 +40,8 @@ missing at run time.
 """
 
 from __future__ import annotations
+
+from adscan_core.scan_policy import settings as policy_settings
 
 import os
 import sys
@@ -69,6 +76,35 @@ _COMBINED = "combined_audit_base.txt"
 # custom_wordlist_dir(domain) / custom_targeted.txt, NOT a generic "wordlist.txt".
 _CUSTOM_TARGETED = "custom_targeted.txt"
 
+#: The legacy workspace types, read as the wordlist profile they stood for (a
+#: caller, or a background-job record persisted by an older version, may still
+#: pass one).
+_LEGACY_WORDLIST_PROFILES: dict[str, str] = {
+    "audit": policy_settings.CRACKING_WORDLIST_REAL_WORLD,
+    "ctf": policy_settings.CRACKING_WORDLIST_ROCKYOU,
+}
+
+
+def wordlist_profile(value: Any) -> str:
+    """Normalise a wordlist profile (or a legacy workspace type) to a profile.
+
+    Anything unknown or empty is ``rockyou``, the behaviour an unknown type had.
+    """
+    token = str(value or "").strip().lower()
+    token = _LEGACY_WORDLIST_PROFILES.get(token, token)
+    if token == policy_settings.CRACKING_WORDLIST_REAL_WORLD:
+        return token
+    return policy_settings.CRACKING_WORDLIST_ROCKYOU
+
+
+def shell_wordlist_profile(shell: Any) -> str:
+    """The wordlist profile the scan policy active on ``shell`` sets."""
+    return policy_settings.policy_setting(shell, policy_settings.CRACKING_WORDLIST)
+
+
+def _uses_real_world_wordlists(value: Any) -> bool:
+    return wordlist_profile(value) == policy_settings.CRACKING_WORDLIST_REAL_WORLD
+
 
 def wordlist_tiers_for_workspace(
     workspace_type: str, domain: str, wordlists_dir: str
@@ -79,9 +115,8 @@ def wordlist_tiers_for_workspace(
     is missing at run time — so listing the combined/custom list here is safe
     even before it has been built.
     """
-    wt = str(workspace_type or "").strip().lower()
     rockyou = os.path.join(wordlists_dir, _ROCKYOU)
-    if wt == "audit":
+    if _uses_real_world_wordlists(workspace_type):
         from adscan_internal.services.custom_wordlist_service import (  # noqa: PLC0415
             custom_wordlist_dir,
         )
@@ -491,8 +526,7 @@ def base_for(
     falls back to the built-in default resolution so a bad config entry never
     breaks cracking.
     """
-    wt = str(workspace_type or "").strip().lower()
-    if wt != "audit":
+    if not _uses_real_world_wordlists(workspace_type):
         path = os.path.join(wordlists_dir, _DEFAULT_CTF_BASE_FILENAME)
         if os.path.isfile(path):
             return path, _estimate_line_count(path, _ROCKYOU_LINES_FALLBACK)
@@ -1006,16 +1040,15 @@ def resolve_configured_effort(shell: Any) -> Optional[str]:
 
 
 def default_effort_for_workspace(workspace_type: str) -> str:
-    """The active-by-default effort tier when no ``cracking.effort`` was
-    configured, so the effort engine is never dormant.
+    """The effort a legacy workspace type stood for (``audit`` -> ``balanced``,
+    anything else -> ``fast``).
 
-    ``audit`` -> ``balanced`` (matches today's audit auto-crack policy,
-    upgraded to the rule-aware ladder). Everything else (``ctf``, unknown) ->
-    ``fast``, matching the existing CTF "near-instant" precedent.
+    Kept for callers that only hold a type; a scan reads its policy's
+    ``cracking_effort`` setting through :func:`resolve_effort_or_default`.
     """
-    return (
-        "balanced" if str(workspace_type or "").strip().lower() == "audit" else "fast"
-    )
+    if _uses_real_world_wordlists(workspace_type):
+        return policy_settings.CRACKING_EFFORT_BALANCED
+    return policy_settings.CRACKING_EFFORT_FAST
 
 
 def resolve_effort_or_default(shell: Any) -> str:
@@ -1031,7 +1064,7 @@ def resolve_effort_or_default(shell: Any) -> str:
     configured = resolve_configured_effort(shell)
     if configured:
         return configured
-    return default_effort_for_workspace(getattr(shell, "type", ""))
+    return policy_settings.policy_setting(shell, policy_settings.CRACKING_EFFORT)
 
 
 # --- Effort ESTIMATE (per-mode wall-clock for the interactive selector + web) --
@@ -1324,7 +1357,7 @@ def build_estimates_payload(
     Pure logic (no IO). The IO writer lives in
     :func:`cracking_benchmark.write_benchmark_estimates`.
     """
-    base_path, base_lines = base_for("audit", wordlists_dir)
+    base_path, base_lines = base_for(policy_settings.CRACKING_WORDLIST_REAL_WORLD, wordlists_dir)
     modes: dict[str, dict] = {}
     for mode in BENCHMARK_MODES:
         per_tier: dict[str, dict] = {}

@@ -302,8 +302,32 @@ class ADCSWebEnrollmentProbe:
 
         Returns True (EPA enforced), False (EPA not enforced), or None
         (inconclusive / error / bad credential).
+
+        Both NTLM sign-ins pass the lockout guard (``adscan_core.
+        auth_attempt_guard``) like every other authenticating seam: a secret the
+        domain already rejected, an account at its failure budget or with too
+        little live headroom is never sent. A 401 without the binding token is
+        ambiguous (EPA, or a wrong secret), so it is judged only together with
+        the second answer: accepted with the token clears it, refused again
+        counts both sign-ins as failures.
         """
+        from adscan_core import auth_attempt_guard  # noqa: PLC0415
+
+        realm = str(credential.domain or "")
+        principal = str(credential.username or "")
+        secret = credential.nt_hash or credential.password or ""
+
+        def _sign_in_allowed() -> bool:
+            try:
+                auth_attempt_guard.check_attempt(realm, principal, secret)
+            except auth_attempt_guard.AuthAttemptRefused as refused:
+                print_info_debug(f"[adcs-web-probe] EPA test not sent: {refused}")
+                return False
+            return True
+
         try:
+            if not _sign_in_allowed():
+                return None
             status_no_cbt = await self._ntlm_http_auth_status(
                 host, target, port, timeout, credential, use_cbt=False
             )
@@ -311,8 +335,12 @@ class ADCSWebEnrollmentProbe:
                 return None
             # Auth accepted WITHOUT a channel-binding token -> EPA not enforced.
             if status_no_cbt != 401:
+                if _http_auth_accepted(status_no_cbt):
+                    auth_attempt_guard.record_success(realm, principal, secret)
                 return False
 
+            if not _sign_in_allowed():
+                return None
             status_cbt = await self._ntlm_http_auth_status(
                 host, target, port, timeout, credential, use_cbt=True
             )
@@ -320,10 +348,14 @@ class ADCSWebEnrollmentProbe:
                 return None
             # Accepted only WITH the channel-binding token -> EPA enforced.
             if status_cbt != 401:
+                if _http_auth_accepted(status_cbt):
+                    auth_attempt_guard.record_success(realm, principal, secret)
                 return True
 
             # Both attempts 401 — most likely an invalid credential; do not
-            # claim EPA either way (unknown never suppresses ESC8).
+            # claim EPA either way (unknown never suppresses ESC8). The domain
+            # counted both sign-ins against the account.
+            auth_attempt_guard.record_failure(realm, principal, secret, weight=2)
             return None
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
@@ -402,6 +434,10 @@ class ADCSWebEnrollmentProbe:
             auth_msg, _c2, _e2 = await client.authenticate(
                 challenge, cb_data=cb_data, spn=spn
             )
+            if auth_msg is None:
+                # The lockout guard (or the NTLM client) refused to produce the
+                # AUTHENTICATE message: nothing is sent, the test is inconclusive.
+                return None
             writer.write(
                 _build_ntlm_get(
                     host, CERTSRV_ENROLL_PATH, auth_msg, keep_alive=False
@@ -646,6 +682,15 @@ def _tls_server_endpoint_cbt_appdata(writer: asyncio.StreamWriter) -> bytes | No
     if not cert_der:
         return None
     return b"tls-server-end-point:" + hashlib.sha256(cert_der).digest()
+
+
+def _http_auth_accepted(status: int) -> bool:
+    """True when an HTTP answer after the NTLM authenticate means the sign-in held.
+
+    A page or a redirect, or 403 (signed in, not authorised): the domain
+    accepted the secret. Any other non-401 answer says nothing about it.
+    """
+    return 200 <= int(status) < 400 or int(status) == 403
 
 
 def _build_ntlm_client(credential: WebProbeCredential):

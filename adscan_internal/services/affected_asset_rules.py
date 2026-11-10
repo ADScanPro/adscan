@@ -417,8 +417,8 @@ NON_CATALOG_RULE_KEYS: frozenset[str] = frozenset(
 # ADCS ESC families by representation (see the per-finding mapping table):
 #   * enrollment ESCs — the enrolling principal -> the vulnerable template (+CA).
 #   * ACL ESCs — the writing/holding principal -> the template or CA ACL.
-#   * CA-flag / web-enrollment ESCs — the CA itself (dangerous flag / HTTP enroll);
-#     the broad source principal is noise, so TARGET_ONLY.
+#   * CA-flag / web-enrollment ESCs — the CA itself (dangerous flag / HTTP enroll)
+#     plus who can exploit it (the edge source, one object even when broad).
 _ADCS_ESC_ENROLLMENT: tuple[str, ...] = tuple(
     f"adcs_esc{n}" for n in (1, 2, 3, 9, 10, 13, 15, 17)
 )
@@ -437,14 +437,22 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         key: _adcs_rule(representation=Representation.BOTH, source_label="holder")
         for key in _ADCS_ESC_ACL_HOLDER
     },
+    # CA-flag / web-enrollment ESCs: the CA is the weak point, and the edge
+    # source (usually a broad identity such as Authenticated Users) is who can
+    # exploit it. It renders as ONE object with its reach explained, so it is
+    # surfaced rather than hidden as noise.
     **{
-        key: _adcs_rule(representation=Representation.TARGET_ONLY)
+        key: _adcs_rule(representation=Representation.BOTH, source_label="")
         for key in _ADCS_ESC_CA_FLAG
     },
     # Certighost (CVE-2026-54121): the affected asset is the certificate
     # authority itself (a CA-level EditFlags + patch weakness), so TARGET_ONLY,
     # mirroring the ESC6/8/11/16 CA-flag findings.
     "certighost": _adcs_rule(representation=Representation.TARGET_ONLY),
+    # ESC12: the CA host (its administrators can use the CA key held in the
+    # YubiHSM, the KSP password being stored in its registry) plus the
+    # certificate authority itself.
+    "adcs_esc12": _adcs_rule(representation=Representation.BOTH, source_label="ca-host"),
     # --- Decommissioned CA still trusted in NTAuthCertificates ----------------
     # The affected assets are the retired CA host(s), carried as
     # details.certificate_authorities[] keyed by ``ca_host``. The host is orphaned
@@ -578,6 +586,10 @@ AFFECTED_ASSET_RULES: dict[str, AssetRule] = {
         scope=Scope.HOST_SCOPED,
         record_containers=("findings",),
         record_qualifier="field",
+        # The producer names each record ``username``, a key the shared walker
+        # does not read on its own; without this the account was dropped and the
+        # finding named only the domain (release gate 14.0.0).
+        record_name_field="username",
     ),
     # --- GPP passwords: the SYSVOL artifact + redacted secret, plus the
     # two-axis unauthenticated-reach context -----------------------------------

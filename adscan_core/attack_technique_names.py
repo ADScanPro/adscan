@@ -190,6 +190,9 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
         "PrinterBugSurface",
         "WebDAVEnabled",
         "DropTheMIC",
+        "DropTheMIC2",
+        # Legacy: the CVE-2019-1040 check emitted this relation before it
+        # was renamed DropTheMIC; kept so existing graphs still classify.
         "NTLMReflection",
         "Ntlmv1Enabled",
         "MssqlS4U2selfEscalation",
@@ -240,7 +243,7 @@ _EDGE_CATALOG_NAMES: Final[frozenset[str]] = frozenset(
 #: These also match the ``ADCSESC<N>`` shape pattern below; the explicit set
 #: keeps them covered even if the numbering scheme ever changes.
 _ADCS_ESC_NAMES: Final[frozenset[str]] = frozenset(
-    {f"ADCSESC{n}" for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16)}
+    {f"ADCSESC{n}" for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)}
 )
 
 

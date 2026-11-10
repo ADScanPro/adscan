@@ -24,14 +24,14 @@ arbitrary host-file exposure.
 from __future__ import annotations
 
 import os
-import platform
-import subprocess
 import sys
 from pathlib import Path
 from typing import Final
 
 from adscan_core import telemetry
+from adscan_core.deliverable_destination import display_path_for
 from adscan_core.pal import paths as pal_paths
+from adscan_core.pal import process as pal_process
 from adscan_core.rich_output import print_info_debug
 from adscan_core.rich_output import print_exception
 
@@ -106,28 +106,13 @@ def _request_open_via_host_helper(file_path: Path) -> bool:
 def _try_local_opener(file_path: Path) -> bool:
     """Best-effort local desktop opener (used outside the container).
 
-    Returns True when a launcher command was successfully spawned. The
-    actual GUI launch is asynchronous and cannot be confirmed from here.
+    Delegates the OS split to the PAL (``os.startfile`` on Windows, the
+    desktop opener on POSIX). Returns True when a launcher command was
+    successfully spawned. The actual GUI launch is asynchronous and cannot be
+    confirmed from here.
     """
     try:
-        system = platform.system()
-        if system == "Linux":
-            subprocess.Popen(  # noqa: S603,S607
-                ["xdg-open", str(file_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        if system == "Darwin":
-            subprocess.Popen(  # noqa: S603,S607
-                ["open", str(file_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        if system == "Windows":  # pragma: no cover — runtime is Linux
-            os.startfile(str(file_path))  # type: ignore[attr-defined]  # pylint: disable=no-member
-            return True
+        return pal_process.open_with_desktop_app(str(file_path))
     except Exception as exc:  # noqa: BLE001 — opener is non-critical
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -149,6 +134,11 @@ def display_host_path(path: Path | str) -> str:
     raw = str(path)
     if not _is_container_runtime():
         return raw
+    # The operator's deliverables folder is a separate mount; its SSOT knows
+    # the host path the launcher forwarded.
+    mapped = display_path_for(raw)
+    if mapped != raw:
+        return mapped
     if raw == _CONTAINER_ADSCAN_ROOT:
         return _HOST_ADSCAN_ROOT
     prefix = _CONTAINER_ADSCAN_ROOT + "/"

@@ -19,6 +19,8 @@ class RcloneTuning:
     transfers: int
     checkers: int
     buffer_size: str
+    #: Per-process bandwidth cap in MiB/s (rclone ``--bwlimit``); None = no cap.
+    bwlimit_mibps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -95,11 +97,32 @@ def choose_rclone_tuning(
         checkers = _clamp(max(2, checkers // 2), 2, 8)
         buffer_size = "4Mi"
 
+    # Scan pacing (``smb.share_download``): every cap is unset at the default
+    # level, so the CPU-sized tuning above is used unchanged. Slower levels bound
+    # the number of rclone processes, the streams each opens against its target,
+    # and the total bandwidth (split evenly across the processes).
+    from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+    pacing = component_pacing(active_pacing(), "smb.share_download")
+    max_workers = pacing["max_target_workers"]
+    if max_workers is not None:
+        target_workers = _clamp(target_workers, 1, max(1, int(max_workers)))
+    max_streams = pacing["max_streams_per_target"]
+    if max_streams is not None:
+        streams = max(2, int(max_streams))
+        transfers = _clamp(transfers, 1, max(1, streams // 2))
+        checkers = _clamp(checkers, 1, max(1, streams - transfers))
+    bandwidth = pacing["bandwidth_mibps"]
+    bwlimit = None
+    if bandwidth is not None:
+        bwlimit = round(max(0.1, float(bandwidth) / max(1, target_workers)), 2)
+
     return RcloneTuning(
         target_workers=target_workers,
         transfers=transfers,
         checkers=checkers,
         buffer_size=buffer_size,
+        bwlimit_mibps=bwlimit,
     )
 
 

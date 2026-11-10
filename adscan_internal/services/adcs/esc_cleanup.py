@@ -1,6 +1,8 @@
 """Rollback context manager and ledger helpers for ESC exploitation."""
 from __future__ import annotations
 
+from adscan_internal.services.ledger_guard import ledger_or_warn
+
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Optional
@@ -60,7 +62,7 @@ def register_ldap_change(
     method: str,
 ) -> Optional[str]:
     """Register a destructive change to the environment ledger. Returns change_id."""
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     try:
@@ -139,7 +141,7 @@ def register_issued_certificate(
     Returns:
         The ledger ``change_id``, or ``None`` when no ledger is available.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     subject = principal or "an unnamed principal"
@@ -244,7 +246,7 @@ def register_ca_private_key_exfiltrated(
     Returns:
         The ledger ``change_id``, or ``None`` when no ledger is available.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     identity = ca_subject or ca_name or (f"the CA on {ca_host}" if ca_host else "the CA")
@@ -320,7 +322,7 @@ def register_forged_certificate(
     Returns:
         The ledger ``change_id``, or ``None`` when no ledger is available.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     subject_display = principal or subject or "an unnamed principal"
@@ -390,7 +392,7 @@ def register_ca_backup_service(
     Returns:
         The ledger ``change_id``, or ``None`` when no ledger is available.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     try:
@@ -438,7 +440,7 @@ def register_ca_backup_temp_pfx(
     Returns:
         The ledger ``change_id``, or ``None`` when no ledger is available.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
+    ledger = ledger_or_warn(shell)
     if ledger is None:
         return None
     try:
@@ -470,138 +472,231 @@ def register_ca_backup_temp_pfx(
     return change_id
 
 
-def resolve_ca_backup_service(
+def discard_ca_backup_record(shell: Any, change_id: Optional[str]) -> None:
+    """Discard a write-ahead CA-backup record whose change never happened.
+
+    The service was never created, or the temporary key file was never observed
+    and a re-read confirmed nothing is there: the record describes a change that
+    did not occur, so it leaves the cleanup report instead of reading as a revert.
+    """
+    ledger = ledger_or_warn(shell)
+    if ledger is None or not change_id:
+        return
+    try:
+        ledger.discard_change(change_id)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _revert_ca_backup_artifact(
     shell: Any,
     change_id: Optional[str],
     *,
-    created: bool,
-    verified_gone: Optional[bool],
+    domain: str,
+    purpose: str,
+    revert_and_confirm: Callable[[Any], tuple[bool, Optional[str]]],
+    extra_before_creator: Any,
+    verification_method: str,
+    manual_instructions: str,
+    object_dn: str,
+    description: str,
+) -> bool:
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        run_revert_with_precedence,
+    )
+
+    result = run_revert_with_precedence(
+        shell,
+        ledger=ledger_or_warn(shell) if change_id else None,
+        change_id=change_id,
+        domain=domain,
+        purpose=purpose,
+        revert_and_confirm=revert_and_confirm,
+        verification_method=verification_method,
+        manual_instructions=manual_instructions,
+        object_dn=object_dn,
+        extra_before_creator=extra_before_creator,
+        description=description,
+    )
+    return result.confirmed
+
+
+def revert_ca_backup_service(
+    shell: Any,
+    change_id: Optional[str],
+    *,
+    domain: str,
     service_name: str,
+    revert_and_confirm: Callable[[Any], tuple[bool, Optional[str]]],
+    extra_before_creator: Any = (),
     ca_host: Optional[str] = None,
-) -> None:
-    """Resolve a write-ahead CA-backup service record at cleanup.
+) -> bool:
+    """Remove the transient CA-backup service through the shared revert precedence.
 
-    A service is genuinely reversible, so the record is marked reverted only on
-    a VERIFIED removal (a fresh open of the service returns not-found), never on
-    "we called delete and swallowed the exception".
-
-    - ``created=False`` (the service was never created): the record describes a
-      change that never happened → discarded.
-    - ``verified_gone is True``: the service was removed and re-verified absent →
-      reverted-confirmed.
-    - ``verified_gone is False`` (it still opens): ``manual_required``
-      (revert failed) with the exact object and the client's command.
-    - ``verified_gone is None`` (removal could not be verified — connection
-      lost): ``manual_required`` (session ended) — never assume it is gone.
+    A service is genuinely reversible, so the record is marked reverted only when
+    ``revert_and_confirm(candidate)`` removed it as that candidate AND a fresh open
+    of the service returned not-found, never on "we called delete and swallowed the
+    exception". The client cleanup account, a verified privileged credential, then
+    the account that made the backup (``extra_before_creator``); each attempt is
+    recorded, and when none confirms the record is ``manual_required`` naming the
+    exact service and the client's command. Synchronous: call through
+    ``asyncio.to_thread``.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
-    if ledger is None or not change_id:
-        return
-    try:
-        if not created:
-            ledger.discard_change(change_id)
-            return
-        if verified_gone is True:
-            ledger.mark_reverted_confirmed(
-                change_id, verification_method="ca_backup_service_reopen_absent"
-            )
-            return
-        reason = (
-            _tax.MANUAL_REASON_REVERT_FAILED
-            if verified_gone is False
-            else _tax.MANUAL_REASON_SESSION_DIED
-        )
-        error = (
-            "The temporary service is still present on the CA host."
-            if verified_gone is False
-            else "ADscan could not confirm the temporary service was removed."
-        )
-        ledger.mark_manual_required(
-            change_id,
-            reason=reason,
-            remediation_command=_tax.ca_backup_service_remediation(
-                service_name=service_name, ca_host=ca_host
-            ),
-            remediation_object_dn=f"Service {service_name} on {ca_host or 'the CA host'}",
-            error=error,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+    return _revert_ca_backup_artifact(
+        shell,
+        change_id,
+        domain=domain,
+        purpose=_tax.KIND_CA_BACKUP_SERVICE,
+        revert_and_confirm=revert_and_confirm,
+        extra_before_creator=extra_before_creator,
+        verification_method="ca_backup_service_reopen_absent",
+        manual_instructions=_tax.ca_backup_service_remediation(
+            service_name=service_name, ca_host=ca_host
+        ),
+        object_dn=f"Service {service_name} on {ca_host or 'the CA host'}",
+        description="CA backup service removal",
+    )
 
 
-def resolve_ca_backup_temp_pfx(
+def revert_ca_backup_temp_pfx(
     shell: Any,
     change_id: Optional[str],
     *,
-    observed: bool,
-    gone: Optional[bool],
+    domain: str,
     unc_path: str,
-) -> None:
-    """Resolve a write-ahead CA-backup temp-PFX record at cleanup.
+    revert_and_confirm: Callable[[Any], tuple[bool, Optional[str]]],
+    extra_before_creator: Any = (),
+) -> bool:
+    """Remove the temporary CA key file through the shared revert precedence.
 
-    - ``gone is True`` and the file was observed: reverted-confirmed.
-    - ``gone is True`` and it was never observed: the file was never created →
-      discarded.
-    - ``gone is False`` (still present): ``manual_required`` (revert failed).
-    - ``gone is None`` (could not verify — connection lost): ``manual_required``
-      (session ended) — never assume a CA key file is gone.
+    Same lifecycle as :func:`revert_ca_backup_service`: reverted only when the
+    candidate's removal is followed by a re-read that finds the file (and its
+    working directory) absent, otherwise ``manual_required``. Never assume a CA
+    key file is gone. Synchronous: call through ``asyncio.to_thread``.
     """
-    ledger = getattr(shell, "environment_change_ledger", None)
-    if ledger is None or not change_id:
-        return
-    try:
-        if gone is True:
-            if observed:
-                ledger.mark_reverted_confirmed(
-                    change_id, verification_method="ca_backup_temp_pfx_absence_reread"
-                )
-            else:
-                ledger.discard_change(change_id)
-            return
-        reason = (
-            _tax.MANUAL_REASON_REVERT_FAILED
-            if gone is False
-            else _tax.MANUAL_REASON_SESSION_DIED
+    return _revert_ca_backup_artifact(
+        shell,
+        change_id,
+        domain=domain,
+        purpose=_tax.KIND_CA_BACKUP_TEMP_PFX,
+        revert_and_confirm=revert_and_confirm,
+        extra_before_creator=extra_before_creator,
+        verification_method="ca_backup_temp_pfx_absence_reread",
+        manual_instructions=_tax.ca_backup_temp_pfx_remediation(unc_path=unc_path),
+        object_dn=unc_path,
+        description="CA key file removal",
+    )
+
+
+def target_ticket_candidates(config: Any, elevated_ccache: Optional[str]) -> list:
+    """The compromised target's PKINIT ccache as a revert candidate, when held."""
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        KIND_CCACHE,
+        ROLE_TARGET_TICKET,
+        RevertCandidate,
+    )
+
+    if not elevated_ccache:
+        return []
+    return [
+        RevertCandidate(
+            role=ROLE_TARGET_TICKET,
+            username=str(getattr(config, "target_account", "") or ""),
+            domain=config.domain,
+            secret=str(elevated_ccache),
+            kind=KIND_CCACHE,
         )
-        error = (
-            "The temporary CA key file is still present on the CA host."
-            if gone is False
-            else "ADscan could not confirm the temporary CA key file was removed."
+    ]
+
+
+def esc_revert_with_precedence(
+    config: Any,
+    *,
+    change_id: Optional[str],
+    purpose: str,
+    revert_and_confirm: Callable[[Any], tuple[bool, Optional[str]]],
+    verification_method: str,
+    manual_instructions: str,
+    object_dn: str,
+    description: str,
+    elevated_ccache: Optional[str] = None,
+    supported_kinds: Optional[Any] = None,
+) -> bool:
+    """Undo one change an ESC step made, through the shared revert precedence.
+
+    Any transport: ``revert_and_confirm(candidate)`` does the undo as the
+    candidate and re-reads the object (see
+    :func:`revert_credentials.run_revert_with_precedence`). The client cleanup
+    account, then a verified privileged credential, then the compromised
+    target's ticket when held, then the account that made the change; each
+    attempt is recorded and only a confirming re-read reaches
+    ``reverted_confirmed``. Synchronous: call through ``asyncio.to_thread``.
+    """
+    from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
+        run_revert_with_precedence,
+    )
+
+    result = run_revert_with_precedence(
+        config.shell,
+        ledger=ledger_or_warn(config.shell) if change_id else None,
+        change_id=change_id,
+        domain=config.domain,
+        purpose=purpose,
+        revert_and_confirm=revert_and_confirm,
+        verification_method=verification_method,
+        manual_instructions=manual_instructions,
+        object_dn=object_dn,
+        creator_username=str(config.username or ""),
+        creator_secret=str(config.effective_secret or ""),
+        creator_domain=config.auth_domain or config.domain,
+        extra_before_creator=target_ticket_candidates(config, elevated_ccache),
+        supported_kinds=supported_kinds,
+        description=description,
+    )
+    return result.confirmed
+
+
+def esc_revert_ldap_change(
+    config: Any,
+    *,
+    change_id: Optional[str],
+    purpose: str,
+    revert: Callable[[Any], bool],
+    verify: Callable[[Any], bool],
+    verification_method: str,
+    manual_instructions: str,
+    object_dn: str,
+    description: str,
+    connect: Callable[[Any], Any],
+    elevated_ccache: Optional[str] = None,
+) -> bool:
+    """:func:`esc_revert_with_precedence` over LDAP (``connect`` opens a config).
+
+    ``revert(conn)`` and ``verify(conn)`` run on one connection bound as the
+    candidate. Callers pass ``connect`` from their own module so their LDAP
+    transport stays patchable.
+    """
+
+    def _revert_and_confirm(candidate: Any) -> tuple[bool, Optional[str]]:
+        ldap_cfg = candidate.ldap_config(
+            dc_ip=config.dc_ip, dc_fqdn=getattr(config, "dc_fqdn", None) or None
         )
-        ledger.mark_manual_required(
-            change_id,
-            reason=reason,
-            remediation_command=_tax.ca_backup_temp_pfx_remediation(unc_path=unc_path),
-            remediation_object_dn=unc_path,
-            error=error,
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
+        with connect(ldap_cfg) as conn:
+            if not revert(conn):
+                return False, "the directory refused the change"
+            if not verify(conn):
+                return False, "the re-read still shows the change"
+        return True, None
 
-
-def mark_reverted(shell: Any, change_id: Optional[str]) -> None:
-    if not change_id:
-        return
-    ledger = getattr(shell, "environment_change_ledger", None)
-    if ledger:
-        try:
-            ledger.mark_reverted(change_id)
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-
-
-def mark_revert_failed(
-    shell: Any, change_id: Optional[str], *, error: str, instructions: str
-) -> None:
-    if not change_id:
-        return
-    ledger = getattr(shell, "environment_change_ledger", None)
-    if ledger:
-        try:
-            ledger.mark_failed(change_id, error=error, manual_cleanup_instructions=instructions)
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
+    return esc_revert_with_precedence(
+        config,
+        change_id=change_id,
+        purpose=purpose,
+        revert_and_confirm=_revert_and_confirm,
+        verification_method=verification_method,
+        manual_instructions=manual_instructions,
+        object_dn=object_dn,
+        description=description,
+        elevated_ccache=elevated_ccache,
+    )

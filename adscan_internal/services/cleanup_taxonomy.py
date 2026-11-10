@@ -16,6 +16,21 @@ blocklist.
 
 from __future__ import annotations
 
+from adscan_core.reporting import cleanup_commands as _cleanup_commands
+# A computer account ADscan created and could only disable (shared copy SSOT).
+from adscan_core.reporting.cleanup_disclosures import (
+    KEPT_LABEL_DEFAULT,
+    MANUAL_REASON_NEUTRALIZED,
+    MANUAL_REASON_NEUTRALIZED_LABEL,
+)
+# Why a change is still in place and whose action it needs (shared with the
+# reports and the web CTEM): the outcome classes, their copy, the revert roles.
+from adscan_core.reporting.cleanup_outcome import (
+    REASON_NO_PRIVILEGED_CREDENTIAL,
+    REASON_NO_PRIVILEGED_CREDENTIAL_LABEL,
+    REVERT_ROLE_LABELS,
+)
+
 # ── Cleanup status taxonomy (the persisted ``revert_status`` vocabulary) ──────
 # Transient (non-terminal) states.
 STATUS_PENDING = "pending"
@@ -56,6 +71,38 @@ MANUAL_REASON_MISSING_CREDENTIAL = "missing_credential"
 MANUAL_REASON_MISSING_METADATA = "missing_metadata"
 MANUAL_REASON_ACCESS_DENIED = "access_denied"
 MANUAL_REASON_OPERATOR_DECLINED = "operator_declined"
+#: The revert RAN (the directory accepted the undo) but no credential could
+#: open a follow-up read to confirm the change is gone. Distinct from
+#: ``revert_failed``: nothing says the change is still present, only that it is
+#: unconfirmed, so the client is asked to check rather than told it failed.
+MANUAL_REASON_REVERT_UNCONFIRMED = "revert_unconfirmed"
+#: A password the assessment reset whose previous value it never held (not the
+#: scan account, not cracked, not recovered as a hash), so nothing could put it
+#: back. Replaces the old ``not_attempted`` for this case: the reason is the
+#: missing secret, and the report says so.
+MANUAL_REASON_ORIGINAL_SECRET_UNKNOWN = "original_secret_unknown"
+#: The previous password was put back from its NT hash only (SAMR
+#: ``UserInternal1Information``). Sign-in with the old password works again, but
+#: the account's Kerberos AES keys cannot be rebuilt from a hash, so its owner
+#: has to change the password once. A client action, hence the manual bucket.
+MANUAL_REASON_PASSWORD_RESTORED_FROM_HASH = "password_restored_from_hash"
+#: Automatic reversion was on, but no account available to the assessment had
+#: the rights to undo the change: no client cleanup account and no verified
+#: privileged account among the candidates the revert had or tried. Recorded
+#: by ``revert_credentials.stamp_revert_rights`` when the revert gives up, never
+#: inferred later. A missing input, not a failed revert, and the client closes
+#: it by providing a cleanup account.
+MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL = REASON_NO_PRIVILEGED_CREDENTIAL
+
+#: ``manual_required`` reasons a later attempt (another credential, the exit
+#: cleanup, the final retry pass) can still overturn into a confirmed revert.
+RETRYABLE_REVERT_REASONS = frozenset(
+    {
+        MANUAL_REASON_REVERT_FAILED,
+        MANUAL_REASON_REVERT_UNCONFIRMED,
+        MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL,
+    }
+)
 
 _MANUAL_REASON_LABELS: dict[str, str] = {
     MANUAL_REASON_REVERT_FAILED: "Automatic rollback failed after retries",
@@ -65,6 +112,17 @@ _MANUAL_REASON_LABELS: dict[str, str] = {
     MANUAL_REASON_MISSING_METADATA: "Original-state metadata was unavailable",
     MANUAL_REASON_ACCESS_DENIED: "Rollback was denied by the directory",
     MANUAL_REASON_OPERATOR_DECLINED: "Operator chose to keep the object instead of reverting it",
+    MANUAL_REASON_REVERT_UNCONFIRMED: (
+        "Rollback ran, but a follow-up read could not confirm it"
+    ),
+    MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL: REASON_NO_PRIVILEGED_CREDENTIAL_LABEL,
+    MANUAL_REASON_ORIGINAL_SECRET_UNKNOWN: (
+        "The previous password was not known, so it could not be put back"
+    ),
+    MANUAL_REASON_PASSWORD_RESTORED_FROM_HASH: (
+        "Previous password restored. Its owner must change it once"
+    ),
+    MANUAL_REASON_NEUTRALIZED: MANUAL_REASON_NEUTRALIZED_LABEL,
 }
 
 
@@ -131,7 +189,7 @@ STATUS_STYLE: dict[str, str] = {
 STATUS_LABEL: dict[str, str] = {
     STATUS_REVERTED_CONFIRMED: "Reverted (confirmed)",
     STATUS_LEGACY_REVERTED: "Reverted",
-    STATUS_KEPT: "Kept by operator",
+    STATUS_KEPT: KEPT_LABEL_DEFAULT,
     STATUS_PENDING: "Pending",
     STATUS_REVERT_IN_PROGRESS: "Revert in progress",
     STATUS_REVERT_FAILED_RETRYING: "Retrying revert",
@@ -171,6 +229,36 @@ KIND_FORGED_CERTIFICATE = "forged_certificate"
 # otherwise manual_required.
 KIND_CA_BACKUP_SERVICE = "ca_backup_service"
 KIND_CA_BACKUP_TEMP_PFX = "ca_backup_temp_pfx"
+
+# ── Preparatory lifecycle writes (an account enabled, an object restored) ─────
+# Not the attack step itself: the change ADscan makes so the step can run. Each
+# is a directory change the client must see. An account ADscan enabled is set
+# back to disabled at exit and re-read to confirm it; a restored object is left
+# for the client to decide (deleting it again is their call), so it is always a
+# manual item.
+KIND_ACCOUNT_ENABLED = "account_enabled"
+KIND_OBJECT_RESTORED = "object_restored"
+# ESC7: ADscan granted itself the CA officer role (Issue and Manage
+# Certificates) through ManageCA, and removes it again at the end of the step.
+KIND_CA_OFFICER_ADDED = "ca_officer_added"
+
+# ── Directory writes of the ACL write seams (``cli/exploits.py``) ─────────────
+# Recorded at the seam every caller funnels through (the attack-path ACE step,
+# the interactive ACL menu, the post-step follow-ups), via
+# ``services/directory_write_ledger.py``.
+#: A password ADscan reset (ForceChangePassword, the GenericAll fallback, the
+#: must-change rotation, or the reset a staged logon script performs). The
+#: previous secret is gone, so it is always a MANUAL item.
+KIND_PASSWORD_CHANGED = "password_changed"
+#: A service principal name ADscan added to an account for targeted
+#: Kerberoasting. Removed at exit (that one value only) and re-read to confirm.
+KIND_SPN_ADDED = "spn_added"
+#: An access control entry ADscan added to an object's DACL.
+KIND_DACL_ACE_ADDED = "dacl_ace_added"
+#: An object whose owner ADscan changed.
+KIND_OWNER_CHANGED = "owner_changed"
+#: A group membership ADscan added (never a membership that already existed).
+KIND_GROUP_MEMBERSHIP_ADDED = "group_membership_added"
 
 # ── Remote-artefact kinds (files ADscan writes on an assessed HOST) ───────────
 # These are not directory objects: nothing in Active Directory changes, but a
@@ -235,18 +323,23 @@ KIND_DISPLAY: dict[str, str] = {
     "keycredentiallink_added": "KeyCredentialLink",
     "upn_changed": "User principal name",
     "altsecurityidentities_written": "Certificate mapping attribute",
+    "victim_attribute_written": "Attribute on the computer account ADscan created",
+    "dacl_grant_dcsync": "Replication rights granted on the domain object",
     "gpo_ldap_attribute_modified": "Group Policy object attribute",
     "gpo_gpt_ini_modified": "Group Policy version file",
     "gpo_sysvol_dir_created": "Group Policy folder in SYSVOL",
     "gpo_sysvol_file_created": "Group Policy file in SYSVOL",
     "mssql_admin_account_created": "Database administrator account",
-    "mssql_postex_account": "Database account",
+    "mssql_postex_account": "Administrator account or Domain Admins membership",
     "mssql_clr_assembly_loaded": "Database CLR assembly",
     "mssql_clr_config_changed": "Database CLR configuration",
     "mssql_xp_cmdshell_enabled": "Database command execution setting",
     "scheduled_task_created": "Scheduled task created on an assessed host",
     "logon_script_path_modified": "Logon script path (scriptPath)",
     "rodc_prp_modified": "RODC password-replication policy (msDS-RevealOnDemandGroup)",
+    KIND_ACCOUNT_ENABLED: "Disabled account enabled",
+    KIND_OBJECT_RESTORED: "Deleted object restored from the AD Recycle Bin",
+    KIND_CA_OFFICER_ADDED: "Certificate manager (officer) right on your CA",
 }
 
 
@@ -279,11 +372,13 @@ MANUAL_SHADOW_CREDS = (
 MANUAL_DACL_ACE = (
     "Remove the access control entry added during the engagement. RIGHTS_NOTEThis "
     "removes every ACE the trustee holds on the object, so confirm the trustee has "
-    "no legitimate rights on it before running it:\n"
+    "no legitimate rights on it before running it.\n"
+    "  Import-Module ActiveDirectory\n"
     '  dsacls "OBJECT_DN" /R "TRUSTEE"\n'
-    "  # verify it is gone (should return nothing):\n"
-    "  (Get-Acl \"AD:OBJECT_DN\").Access | "
-    "Where-Object { $_.IdentityReference -like '*TRUSTEE_NAME*' }"
+    "Then confirm the entry is gone. The check counts the entries the trustee still "
+    "holds on the object and should print 0.\n"
+    "  @((Get-Acl \"AD:OBJECT_DN\").Access | "
+    "Where-Object { $_.IdentityReference -like '*TRUSTEE_NAME*' }).Count"
 )
 
 
@@ -342,24 +437,70 @@ def dacl_ace_remediation(
     body = body.replace("RIGHTS_NOTE", rights_note)
     return body
 
+#: The owner is written through ``DirectoryEntry`` with ``SecurityMasks`` set
+#: to ``Owner``: that sends the LDAP SD-flags control for the owner alone. A
+#: ``Set-ADObject -Replace @{nTSecurityDescriptor=...}`` round trip returns
+#: without error and leaves the owner unchanged (measured on a lab domain
+#: controller, 2026-11-06), so it must never be the instruction.
 MANUAL_OWNER = (
-    "Restore the original owner of the object manually:\n"
-    "  $sd = Get-ADObject TARGET -Properties ntSecurityDescriptor\n"
-    "  $sd.ntSecurityDescriptor.SetOwner([System.Security.Principal.NTAccount]'ORIGINAL_OWNER')\n"
-    "  Set-ADObject TARGET -Replace @{ntSecurityDescriptor=$sd.ntSecurityDescriptor}"
+    "Restore the original owner of TARGET. The commands below write the owner only, so "
+    "the object's permissions stay as they are. Run them as a domain administrator.\n"
+    "  Import-Module ActiveDirectory\n"
+    "  $dn = (Get-ADObject -LDAPFilter '(|(sAMAccountName=TARGET)(name=TARGET))')"
+    ".DistinguishedName\n"
+    "  $entry = [ADSI]\"LDAP://$dn\"\n"
+    "  $entry.psbase.Options.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Owner\n"
+    "  $entry.psbase.ObjectSecurity.SetOwner("
+    "[System.Security.Principal.NTAccount]'ORIGINAL_OWNER')\n"
+    "  $entry.psbase.CommitChanges()\n"
+    "Then confirm the owner. The check should print ORIGINAL_OWNER.\n"
+    "  ([ADSI]\"LDAP://$dn\").psbase.ObjectSecurity"
+    ".GetOwner([System.Security.Principal.NTAccount]).Value"
 )
 
 MANUAL_SPN = (
     "Remove the injected service principal name manually:\n"
     "  Set-ADUser -Identity TARGET -ServicePrincipalNames @{Remove='SPN'}\n"
-    "  or: Set-ADComputer -Identity TARGET -ServicePrincipalNames @{Remove='SPN'}"
+    "For a computer account, use this instead:\n"
+    "  Set-ADComputer -Identity TARGET -ServicePrincipalNames @{Remove='SPN'}"
 )
 
 MANUAL_PASSWORD = (
-    "Coordinate with the client to reset the target account password to a known value:\n"
-    "  Set-ADAccountPassword -Identity TARGET -NewPassword"
-    " (ConvertTo-SecureString 'NewPass' -AsPlainText -Force)\n"
-    "  This account's previous credential has been permanently replaced."
+    "The password of TARGET was reset during the engagement and its previous value "
+    "is no longer in place. Coordinate with the account's owner, then set a password "
+    "they control:\n"
+    "  Set-ADAccountPassword -Identity 'TARGET' -Reset -NewPassword "
+    "(Read-Host -AsSecureString 'New password')\n"
+    "For an account a person signs in with, require a new password at the next "
+    "sign-in:\n"
+    "  Set-ADUser -Identity 'TARGET' -ChangePasswordAtLogon $true\n"
+    "Then confirm the reset. PasswordLastSet should be later than the engagement:\n"
+    "  Get-ADUser -Identity 'TARGET' -Properties PasswordLastSet"
+)
+
+#: The previous password was put back from its NT hash: the owner changes it
+#: once so the account's Kerberos AES keys exist again.
+MANUAL_PASSWORD_RESTORED_FROM_HASH = (
+    "The password of TARGET was reset during the engagement and then put back from "
+    "its stored hash, so the account's owner can sign in with the previous password "
+    "again. A hash cannot rebuild the account's Kerberos AES keys, so ask the owner to "
+    "change the password once, or set one they control:\n"
+    "  Set-ADUser -Identity 'TARGET' -ChangePasswordAtLogon $true\n"
+    "Then confirm the change. PasswordLastSet should be later than the engagement:\n"
+    "  Get-ADUser -Identity 'TARGET' -Properties PasswordLastSet"
+)
+
+#: The reset a staged logon script performs runs on the target's own logon,
+#: outside ADscan's observation, so the record must not claim it happened. Used
+#: until ADscan confirms the new credential; then :data:`MANUAL_PASSWORD` applies.
+MANUAL_PASSWORD_PENDING_LOGON = (
+    "A logon script staged during the engagement resets this account's password the "
+    "next time the user who runs it logs on. Check whether the reset ran:\n"
+    "  Get-ADUser -Identity TARGET -Properties PasswordLastSet\n"
+    "If PasswordLastSet is later than the time the script was staged, the previous "
+    "password is gone; reset it to a value the client controls:\n"
+    "  Set-ADAccountPassword -Identity TARGET -Reset -NewPassword"
+    " (ConvertTo-SecureString 'NewPass' -AsPlainText -Force)"
 )
 
 MANUAL_GROUP_MEMBERSHIP = (
@@ -378,11 +519,35 @@ MANUAL_RBCD = (
     "  Set-ADComputer -Identity TARGET -Clear 'msDS-AllowedToActOnBehalfOfOtherIdentity'"
 )
 
+MANUAL_ACCOUNT_ENABLED = (
+    "Disable the account again. It was disabled before the engagement:\n"
+    "  Disable-ADAccount -Identity 'TARGET'\n"
+    "Then verify the change. Enabled should read False:\n"
+    "  Get-ADObject -LDAPFilter '(sAMAccountName=TARGET)' -Properties userAccountControl"
+)
+
+MANUAL_OBJECT_RESTORED = (
+    "This object was deleted before the engagement and was restored from the AD "
+    "Recycle Bin. Confirm with its owner whether it should stay restored; if not, "
+    "delete it again:\n"
+    "  Remove-ADObject -Identity 'OBJECT_DN' -Confirm:$false"
+)
+
+MANUAL_CA_OFFICER = (
+    "Remove the Issue and Manage Certificates permission granted to TARGET on the "
+    "certificate authority: open the Certification Authority console (certsrv.msc) "
+    "on the CA host, then Properties > Security, select the account and clear "
+    "'Issue and Manage Certificates'. Then confirm the account no longer holds it. "
+    "Run this on the CA host:\n"
+    "  certutil -getreg CA\\Security"
+)
+
 MANUAL_KEYCREDENTIALLINK = (
     "Restore msDS-KeyCredentialLink on the target to its prior value list, removing "
     "the value added during the engagement:\n"
     "  Get-ADObject TARGET -Properties msDS-KeyCredentialLink\n"
-    "  Set-ADObject TARGET -Clear 'msDS-KeyCredentialLink'  # only if originally empty"
+    "Clear the whole attribute only if it was empty before the engagement:\n"
+    "  Set-ADObject TARGET -Clear 'msDS-KeyCredentialLink'"
 )
 
 MANUAL_MACHINE_ACCOUNT = (
@@ -396,9 +561,9 @@ MANUAL_MACHINE_ACCOUNT = (
 MANUAL_USER_ACCOUNT = (
     "Delete the account created during the engagement with a privileged account:\n"
     "  Remove-ADUser -Identity 'TARGET' -Confirm:$false\n"
-    "  # for a host-local account instead of a domain one, on the host:\n"
+    "For a host-local account instead of a domain one, run this on the host:\n"
     "  Remove-LocalUser -Name 'TARGET'\n"
-    "  # confirm it is gone (a domain account should return nothing):\n"
+    "Then confirm a domain account is gone. The check should return nothing:\n"
     "  Get-ADUser -Filter \"sAMAccountName -eq 'TARGET'\""
 )
 
@@ -425,10 +590,10 @@ MANUAL_LOGON_SCRIPT_PATH = (
     "account:\n"
     "  1. Read the current value:\n"
     "     Get-ADUser -Identity 'TARGET' -Properties scriptPath | Select-Object scriptPath\n"
-    "  2. Clear it if the account had no logon script before, or set it back to the "
-    "original value otherwise:\n"
+    "  2. Clear it if the account had no logon script before:\n"
     "     Set-ADUser -Identity 'TARGET' -Clear scriptPath\n"
-    "     # or: Set-ADUser -Identity 'TARGET' -ScriptPath 'ORIGINAL_SCRIPT'\n"
+    "     If it had one, set it back to the original value instead:\n"
+    "     Set-ADUser -Identity 'TARGET' -ScriptPath 'ORIGINAL_SCRIPT'\n"
     "  3. Remove the staged script file from the NETLOGON share and confirm it is gone."
 )
 
@@ -533,7 +698,9 @@ MANUAL_FORGED_CERTIFICATE = (
     "  3. Reset the password of the impersonated account (FORGED_IDENTITY) so any Kerberos "
     "material already obtained with the forged certificate stops granting access, and "
     "review Event 4768 (a Kerberos ticket was requested) with a certificate mapping to "
-    "that account from unexpected hosts."
+    "that account from unexpected hosts:\n"
+    "     Set-ADAccountPassword -Identity 'FORGED_IDENTITY' -Reset -NewPassword "
+    "(Read-Host -AsSecureString 'New password')"
 )
 
 # The transient service used to run the backup. Placeholders filled by
@@ -651,11 +818,132 @@ def ca_backup_service_remediation(
     return body.replace("CA_HOST", ca_host or "the CA host")
 
 
+def object_restored_remediation(object_dn: str | None) -> str:
+    """Render the client-facing note for an object restored from the Recycle Bin."""
+    return MANUAL_OBJECT_RESTORED.replace("OBJECT_DN", object_dn or "the restored object")
+
+
 def ca_backup_temp_pfx_remediation(*, unc_path: str | None = None) -> str:
     """Render the client-facing remediation for the temporary CA key file."""
     return MANUAL_CA_BACKUP_TEMP_PFX.replace(
         "PFX_PATH", unc_path or "C:\\Windows\\Tasks"
     )
+
+
+# ── Templates for the kinds whose writers stamp their own procedure ───────────
+# The writer of each kind below normally stores a fully rendered command when it
+# settles the change. These are the fallback for a record that ends up still in
+# place without one (kept by policy, or a session that died), so no change is
+# ever disclosed without a way to remove it.
+MANUAL_TEMPLATE_MODIFIED = (
+    "The certificate template TARGET was modified during the engagement. Read its "
+    "current settings and compare them with your change records or a backup of the "
+    "template:\n"
+    "  Get-ADObject -SearchBase ('CN=Certificate Templates,CN=Public Key Services,"
+    "CN=Services,' + (Get-ADRootDSE).configurationNamingContext) "
+    "-LDAPFilter '(cn=TARGET)' -Properties *\n"
+    "Restore the changed attributes (enrollment flags, extended key usages, "
+    "permissions) in the Certificate Templates console (certtmpl.msc)."
+)
+
+MANUAL_CA_TEMPLATE_ENABLED = (
+    "The certificate template TARGET was published on your certification authority "
+    "during the engagement. If it was not published before, remove it from the CA's "
+    "issued templates. Run this on the CA host:\n"
+    "  certutil -SetCATemplates -TARGET\n"
+    "Then confirm it is no longer listed:\n"
+    "  certutil -CATemplates"
+)
+
+MANUAL_ACL_MODIFIED = (
+    "The permissions of TARGET were changed during the engagement. List the access "
+    "control entries and remove the ones added during the engagement:\n"
+    "  $dn = (Get-ADObject -LDAPFilter '(|(sAMAccountName=TARGET)(name=TARGET))')"
+    ".DistinguishedName\n"
+    "  (Get-Acl \"AD:$dn\").Access | Format-Table IdentityReference, "
+    "ActiveDirectoryRights, AccessControlType"
+)
+
+MANUAL_SPN_RELOCATED = (
+    "The service principal name SPN was moved to TARGET during the engagement. "
+    "Remove it from that account and give it back to ORIGINAL_OWNER:\n"
+    "  Set-ADObject -Identity (Get-ADObject -LDAPFilter '(sAMAccountName=TARGET)')"
+    ".DistinguishedName -Remove @{servicePrincipalName='SPN'}\n"
+    "  Set-ADObject -Identity (Get-ADObject -LDAPFilter "
+    "'(sAMAccountName=ORIGINAL_OWNER)').DistinguishedName -Add @{servicePrincipalName='SPN'}"
+)
+
+MANUAL_UPN_CHANGED = (
+    "The user principal name of TARGET was changed during the engagement. Set it back "
+    "to its previous value:\n"
+    "  Set-ADUser -Identity 'TARGET' -UserPrincipalName 'ORIGINAL_UPN'\n"
+    "Then confirm it:\n"
+    "  Get-ADUser -Identity 'TARGET' -Properties UserPrincipalName"
+)
+
+MANUAL_ALTSECID = (
+    "A certificate mapping (altSecurityIdentities) was written on TARGET during the "
+    "engagement. Read the attribute and remove the value added during the engagement:\n"
+    "  Get-ADObject -Identity (Get-ADObject -LDAPFilter '(sAMAccountName=TARGET)')"
+    ".DistinguishedName -Properties altSecurityIdentities\n"
+    "  Set-ADObject -Identity (Get-ADObject -LDAPFilter '(sAMAccountName=TARGET)')"
+    ".DistinguishedName -Remove @{altSecurityIdentities='MAPPING'}"
+)
+
+MANUAL_VICTIM_ATTRIBUTE = (
+    "An attribute was written on the computer account TARGET, which the assessment "
+    "created. Deleting that computer account removes the change:\n"
+    "  Remove-ADComputer -Identity 'TARGET' -Confirm:$false"
+)
+
+MANUAL_DCSYNC_GRANT = (
+    "Directory replication rights were granted to TRUSTEE on the domain object during "
+    "the engagement. Remove them. This removes every permission the trustee holds on "
+    "the domain object, so confirm it has no legitimate rights there first.\n"
+    "  Import-Module ActiveDirectory\n"
+    "  dsacls (Get-ADDomain).DistinguishedName /R 'TRUSTEE'\n"
+    "Then confirm the entries are gone. The check counts the entries the trustee still "
+    "holds on the domain object and should print 0.\n"
+    "  @((Get-Acl \"AD:$((Get-ADDomain).DistinguishedName)\").Access | "
+    "Where-Object { $_.IdentityReference -like '*TRUSTEE_NAME*' }).Count"
+)
+
+MANUAL_GPO_CHANGE = (
+    "The Group Policy object TARGET was changed during the engagement to run an "
+    "immediate scheduled task. Remove the task from the policy and confirm the policy "
+    "no longer carries it:\n"
+    "  Get-GPO -Guid 'GPO_GUID' | Format-List DisplayName, ModificationTime\n"
+    "Open the policy in the Group Policy Management console (gpmc.msc), go to "
+    "Preferences > Control Panel Settings > Scheduled Tasks, and delete the task "
+    "added during the engagement. Then run a policy update on an affected host:\n"
+    "  gpupdate /force"
+)
+
+MANUAL_MSSQL_ACCOUNT = (
+    "A database or host account (TARGET) was created during the engagement. Delete "
+    "it with an administrator account:\n"
+    "  Remove-ADUser -Identity 'TARGET' -Confirm:$false\n"
+    "For a host-local account instead of a domain one, run this on the host:\n"
+    "  Remove-LocalUser -Name 'TARGET'"
+)
+
+MANUAL_MSSQL_CONFIGURATION = (
+    "A SQL Server setting (OPTION) was changed on TARGET during the engagement. "
+    "Set it back to its previous value as a sysadmin:\n"
+    "  Invoke-Sqlcmd -ServerInstance 'TARGET' -Query \"EXEC sp_configure 'OPTION', "
+    "ORIGINAL_VALUE; RECONFIGURE;\"\n"
+    "Then confirm the running value:\n"
+    "  Invoke-Sqlcmd -ServerInstance 'TARGET' -Query \"EXEC sp_configure 'OPTION';\""
+)
+
+MANUAL_MSSQL_ASSEMBLY = (
+    "A CLR assembly (ASSEMBLY) was loaded into the msdb database on TARGET during the "
+    "engagement. Drop it as a sysadmin:\n"
+    "  Invoke-Sqlcmd -ServerInstance 'TARGET' -Database msdb -Query "
+    "\"DROP ASSEMBLY [ASSEMBLY];\""
+)
+
+MANUAL_COMPUTER_ACCOUNT = MANUAL_MACHINE_ACCOUNT
 
 
 # Per-kind remediation template (raw, with TARGET/SPN/GROUP/MEMBER placeholders).
@@ -675,6 +963,9 @@ KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     "scheduled_task_created": MANUAL_SCHEDULED_TASK,
     "logon_script_path_modified": MANUAL_LOGON_SCRIPT_PATH,
     "rodc_prp_modified": MANUAL_RODC_PRP,
+    KIND_ACCOUNT_ENABLED: MANUAL_ACCOUNT_ENABLED,
+    KIND_OBJECT_RESTORED: MANUAL_OBJECT_RESTORED,
+    KIND_CA_OFFICER_ADDED: MANUAL_CA_OFFICER,
     KIND_ISSUED_CERTIFICATE: MANUAL_ISSUED_CERTIFICATE,
     KIND_CA_PRIVATE_KEY_EXFILTRATED: MANUAL_CA_PRIVATE_KEY_EXFILTRATED,
     KIND_FORGED_CERTIFICATE: MANUAL_FORGED_CERTIFICATE,
@@ -685,6 +976,25 @@ KIND_REMEDIATION_TEMPLATE: dict[str, str] = {
     # ``finalize()`` without one.
     KIND_REMOTE_FILE_WRITTEN: MANUAL_REMOTE_ARTIFACT,
     KIND_REMOTE_FILE_UPLOADED: MANUAL_REMOTE_ARTIFACT,
+    "template_modified": MANUAL_TEMPLATE_MODIFIED,
+    "template_mutated": MANUAL_TEMPLATE_MODIFIED,
+    "ca_template_enabled": MANUAL_CA_TEMPLATE_ENABLED,
+    "acl_modified": MANUAL_ACL_MODIFIED,
+    "spn_relocated": MANUAL_SPN_RELOCATED,
+    "computer_account_created": MANUAL_COMPUTER_ACCOUNT,
+    "upn_changed": MANUAL_UPN_CHANGED,
+    "altsecurityidentities_written": MANUAL_ALTSECID,
+    "victim_attribute_written": MANUAL_VICTIM_ATTRIBUTE,
+    "dacl_grant_dcsync": MANUAL_DCSYNC_GRANT,
+    "gpo_ldap_attribute_modified": MANUAL_GPO_CHANGE,
+    "gpo_gpt_ini_modified": MANUAL_GPO_CHANGE,
+    "gpo_sysvol_dir_created": MANUAL_GPO_CHANGE,
+    "gpo_sysvol_file_created": MANUAL_GPO_CHANGE,
+    "mssql_admin_account_created": MANUAL_MSSQL_ACCOUNT,
+    "mssql_postex_account": MANUAL_MSSQL_ACCOUNT,
+    "mssql_clr_assembly_loaded": MANUAL_MSSQL_ASSEMBLY,
+    "mssql_clr_config_changed": MANUAL_MSSQL_CONFIGURATION,
+    "mssql_xp_cmdshell_enabled": MANUAL_MSSQL_CONFIGURATION,
 }
 
 
@@ -742,6 +1052,23 @@ def issued_certificate_remediation(
     return header + body
 
 
+#: Who undid a change, as the report's "Performed as" column names it. The
+#: revert precedence (``revert_credentials``) is: the client's cleanup account,
+#: then a privileged account the assessment verified, then the account that made
+#: the change. Keys mirror ``revert_credentials.ROLE_*``.
+#: What each revert role is called ("Performed as", the accounts a revert
+#: tried). Owned by ``adscan_core.reporting.cleanup_outcome`` so the web CTEM
+#: names the roles with the same words.
+REVERT_ROLE_PERFORMED_AS: dict[str, str] = REVERT_ROLE_LABELS
+
+
+def revert_performed_as(role: str | None, principal: str | None) -> str:
+    """Render the "Performed as" value: the role, then the account in brackets."""
+    label = REVERT_ROLE_PERFORMED_AS.get(str(role or ""), "Assessment account")
+    name = str(principal or "").strip()
+    return f"{label} ({name})" if name else label
+
+
 def remediation_template_for_kind(kind: str | None) -> str:
     """Return the raw (placeholder-bearing) remediation template for a kind."""
     raw = str(kind or "").strip()
@@ -750,7 +1077,344 @@ def remediation_template_for_kind(kind: str | None) -> str:
     )
 
 
+
+# ── The instruction for ONE ledger record (the SSOT every surface reads) ──────
+#
+# A change left in place for ANY reason (kept by policy or by the operator, a
+# revert that failed or could not be confirmed, a revert never attempted, a
+# session that died) is disclosed with a runnable instruction built from the
+# values the ledger recorded: the object, the trustee, the rights, the previous
+# owner, the exact key-credential value. ``remediation_for_entry`` is the one
+# place that builds it; the ledger stamps it when a record becomes kept or
+# manual, ``finalize()`` stamps it on any record left without one, and the
+# report normalizer derives it at display time for workspaces written before
+# this existed. A writer that already stored its own rendered command keeps it.
+
+#: Tokens of the raw templates that must never reach a client unfilled when the
+#: ledger holds the value. A test asserts a record with full detail renders
+#: none of them.
+TEMPLATE_TOKENS = (
+    "TARGET",
+    "OBJECT_DN",
+    "TRUSTEE_NAME",
+    "TRUSTEE",
+    "RIGHTS_NOTE",
+    "ORIGINAL_OWNER",
+    "GROUP",
+    "MEMBER",
+)
+
+
+# The PowerShell building blocks live in ``adscan_core`` so the web CTEM, which
+# cannot import the engine, rebuilds a superseded stored instruction with the
+# exact same code.
+_ps_quote = _cleanup_commands.ps_quote
+_is_dn = _cleanup_commands.is_dn
+_bare_name = _cleanup_commands.bare_name
+_dn_expression = _cleanup_commands.dn_expression
+
+
+def _netbios(domain: str) -> str:
+    first = str(domain or "").strip().split(".", 1)[0]
+    return first.upper()
+
+
+def _trustee_principal(detail: dict, domain: str) -> tuple[str, str]:
+    """``(DOMAIN\\\\name, name)`` of the principal an added ACE names.
+
+    A trustee recorded only as a SID is the executing principal on every write
+    seam (``run_exploit_write_dacl`` grants to its own SID), so the executor's
+    name is the account the client looks for.
+    """
+    trustee = str(detail.get("trustee_name") or detail.get("trustee") or "").strip()
+    if not trustee or trustee.upper().startswith("S-1-"):
+        trustee = str(
+            detail.get("executor_username") or detail.get("exec_username") or trustee
+        ).strip()
+    name = _bare_name(trustee)
+    if not name:
+        return "", ""
+    if name.upper().startswith("S-1-"):
+        return name, name
+    netbios = _netbios(domain)
+    return (f"{netbios}\\{name}" if netbios else name), name
+
+
+def _trustee_sid(detail: dict) -> str:
+    """The SID of the principal an added ACE names, when the record holds it."""
+    for key in ("trustee_sid", "trustee"):
+        value = str(detail.get(key) or "").strip()
+        if value.upper().startswith("S-1-"):
+            return value
+    return ""
+
+
+def _dacl_ace_instruction(entry_target: str, object_dn: str, detail: dict, domain: str) -> str:
+    principal, name = _trustee_principal(detail, domain)
+    rights = str(detail.get("rights_type") or "").strip().lower()
+    rights_label = {
+        "dcsync": "directory-replication (DCSync)",
+        "writedacl": "write-DACL",
+        "genericall": "full-control (GenericAll)",
+    }.get(rights, rights)
+    granted = f" It granted {rights_label} rights." if rights_label else ""
+    target_label = _bare_name(entry_target) or entry_target or "the object"
+    who = principal or "the trustee"
+    sid = _trustee_sid(detail)
+    if sid:
+        # Read back by SID, explicit entries only: exactly what ``dsacls /R``
+        # removes, and still correct when the account name no longer resolves.
+        check = (
+            "  @((Get-Acl \"AD:$dn\").GetAccessRules($true, $false, "
+            "[System.Security.Principal.SecurityIdentifier]) | "
+            f"Where-Object {{ $_.IdentityReference.Value -eq {_ps_quote(sid)} }}).Count"
+        )
+    else:
+        check = (
+            "  @((Get-Acl \"AD:$dn\").Access | Where-Object { $_.IdentityReference -like "
+            f"{_ps_quote('*' + (name or 'trustee') + '*')} }}).Count"
+        )
+    return (
+        f"An access control entry for {who} was added to {target_label} during the "
+        f"engagement.{granted} The command below removes every entry that account holds "
+        "on the object, so confirm it has no legitimate rights there before running it.\n"
+        "  Import-Module ActiveDirectory\n"
+        f"  $dn = {_dn_expression(entry_target, object_dn)}\n"
+        f"  dsacls $dn /R {_ps_quote(who)}\n"
+        "Then confirm the entries are gone. The check counts the entries that account "
+        "still holds on the object and should print 0.\n"
+        f"{check}"
+    )
+
+
+def _key_credential_instruction(entry_target: str, object_dn: str, detail: dict) -> str:
+    value = str(detail.get("added_key_credential_value") or "").strip()
+    target_label = _bare_name(entry_target) or entry_target or "the object"
+    if not value:
+        # The exact value was not recorded: read the attribute, then remove the
+        # one value added during the engagement (never clear the attribute).
+        dn_expr = _dn_expression(entry_target, object_dn)
+        return (
+            f"{MANUAL_SHADOW_CREDS} Read the values on {target_label}:\n"
+            f"  $dn = {dn_expr}\n"
+            "  (Get-ADObject -Identity $dn -Properties msDS-KeyCredentialLink)"
+            ".'msDS-KeyCredentialLink'\n"
+            "Then remove the one added during the engagement, by its exact value:\n"
+            "  Set-ADObject -Identity $dn -Remove "
+            "@{'msDS-KeyCredentialLink'='<value added during the engagement>'}"
+        )
+    # A DN-with-binary value ends with the DN of the object that holds it.
+    holder_dn = value.rsplit(":", 1)[-1] if value.count(":") >= 3 else ""
+    dn_expr = _dn_expression(entry_target, object_dn or holder_dn)
+    return (
+        f"A key credential (msDS-KeyCredentialLink) was added to {target_label} during "
+        "the engagement. Remove that one value, and only that one, so any Windows Hello "
+        "for Business or other key the object legitimately holds stays in place:\n"
+        f"  $dn = {dn_expr}\n"
+        f"  Set-ADObject -Identity $dn -Remove @{{'msDS-KeyCredentialLink'={_ps_quote(value)}}}\n"
+        "Then confirm the value is gone:\n"
+        "  (Get-ADObject -Identity $dn -Properties msDS-KeyCredentialLink)"
+        ".'msDS-KeyCredentialLink'"
+    )
+
+
+def _rbcd_instruction(entry_target: str, object_dn: str, detail: dict) -> str:
+    target_label = _bare_name(entry_target) or entry_target or "the computer"
+    dn_expr = _dn_expression(entry_target, object_dn or str(detail.get("target_dn") or ""))
+    if detail.get("prior_attribute_empty") is True:
+        return (
+            f"Resource-based constrained delegation was configured on {target_label} "
+            "during the engagement, and the attribute was empty before. Clear it:\n"
+            f"  Set-ADObject -Identity {dn_expr} "
+            "-Clear 'msDS-AllowedToActOnBehalfOfOtherIdentity'\n"
+            "Then confirm it is empty:\n"
+            f"  Get-ADObject -Identity {dn_expr} "
+            "-Properties msDS-AllowedToActOnBehalfOfOtherIdentity"
+        )
+    return (
+        f"Resource-based constrained delegation was configured on {target_label} "
+        "during the engagement. Review who may delegate to it and remove the account "
+        "added during the engagement, keeping any delegation that was there before:\n"
+        f"  Get-ADComputer -Identity {_ps_quote(target_label)} "
+        "-Properties PrincipalsAllowedToDelegateToAccount\n"
+        "If the attribute was empty before the engagement, clear it:\n"
+        f"  Set-ADObject -Identity {dn_expr} "
+        "-Clear 'msDS-AllowedToActOnBehalfOfOtherIdentity'"
+    )
+
+
+def _template_fill(template: str, *, target: str, detail: dict) -> str:
+    """Fill the generic tokens of a raw template from the record."""
+    target_name = _bare_name(target) or target
+    gpo_dn = str(detail.get("gpo_dn") or "")
+    gpo_guid = ""
+    if "{" in gpo_dn and "}" in gpo_dn:
+        gpo_guid = gpo_dn[gpo_dn.index("{") + 1 : gpo_dn.index("}")]
+    replacements = (
+        ("ORIGINAL_OWNER", str(detail.get("original_owner") or "the original account")),
+        ("ORIGINAL_UPN", str(detail.get("original_upn") or detail.get("prior_upn") or "<previous value>")),
+        ("ORIGINAL_VALUE", str(detail.get("original_run_value") if detail.get("original_run_value") is not None else "0")),
+        ("ORIGINAL_SCRIPT", str(detail.get("original_script_path") or "<previous value>")),
+        ("MAPPING", str(detail.get("mapping") or detail.get("altsecurityidentities_value") or "<value added during the engagement>")),
+        ("ASSEMBLY", str(detail.get("assembly") or "<assembly>")),
+        ("OPTION", str(detail.get("option") or ("xp_cmdshell" if detail.get("host") else "<option>"))),
+        ("GPO_GUID", gpo_guid or "<policy GUID>"),
+        ("SPN", str(detail.get("spn") or detail.get("vehicle_spn") or "<service principal name>")),
+        ("TARGET", str(detail.get("host") or detail.get("account") or target_name) if template in (MANUAL_MSSQL_CONFIGURATION, MANUAL_MSSQL_ASSEMBLY, MANUAL_MSSQL_ACCOUNT) else target_name),
+    )
+    out = template
+    for token, value in replacements:
+        out = out.replace(token, value)
+    return out
+
+
+def stored_remediation_is_superseded(entry: dict) -> bool:
+    """Whether the instruction stored on a record is a known non-working form.
+
+    A record carrying one is re-rendered from its own values, so a report built
+    from an older workspace never hands the client a command that runs cleanly
+    and changes nothing. The marker table is shared with the web CTEM
+    (``adscan_core.reporting.cleanup_commands``).
+    """
+    return _cleanup_commands.stored_instruction_is_superseded(entry)
+
+
+def remediation_for_entry(entry: dict) -> str:
+    """The client-facing instruction that removes ONE recorded change.
+
+    Returns the instruction the writer already stored when it has one, and
+    otherwise builds it from the record's own values. Never empty: every kind
+    resolves to a native procedure, so a change left in place is never listed
+    without a way to remove it.
+
+    Args:
+        entry: A ledger record (``kind``, ``target``, ``domain``, ``detail``,
+            optional ``remediation_command`` / ``remediation_object_dn``).
+
+    Returns:
+        A client-safe instruction: prose lines before command lines, no comments.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    stored = str(
+        entry.get("remediation_command") or entry.get("manual_cleanup_instructions") or ""
+    ).strip()
+    if stored and not stored_remediation_is_superseded(entry):
+        return stored
+    kind = str(entry.get("kind") or "").strip()
+    target = str(entry.get("target") or "").strip()
+    domain = str(entry.get("domain") or "").strip()
+    detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+    detail = dict(detail or {})
+    object_dn = str(entry.get("remediation_object_dn") or detail.get("target_dn") or "").strip()
+    target_domain = str(detail.get("target_domain") or domain).strip()
+    reason = str(entry.get("manual_reason") or "").strip().lower()
+
+    # The trustee of an added ACE is the executing principal, whose account
+    # lives in the executor's domain (cross-domain writes differ from the
+    # object's domain).
+    trustee_domain = str(
+        detail.get("executor_auth_domain") or detail.get("credential_lookup_domain") or target_domain
+    ).strip()
+    if kind == "dacl_ace_added":
+        return _dacl_ace_instruction(
+            str(detail.get("target_object") or target), object_dn, detail, trustee_domain
+        )
+    if kind == "dacl_grant_dcsync":
+        principal, name = _trustee_principal(detail, trustee_domain)
+        return (
+            MANUAL_DCSYNC_GRANT.replace("TRUSTEE_NAME", name or "trustee")
+            .replace("TRUSTEE", principal or "the trustee")
+        )
+    if kind == "owner_changed":
+        return _cleanup_commands.owner_restore_instruction(
+            str(detail.get("target_object") or target), object_dn, detail, target_domain
+        )
+    if kind in ("shadow_credentials_added", "keycredentiallink_added"):
+        return _key_credential_instruction(
+            str(detail.get("target_object") or detail.get("target_user") or target),
+            object_dn,
+            detail,
+        )
+    if kind == "rbcd_delegation_added":
+        return _rbcd_instruction(target, object_dn, detail)
+    if kind in ("group_membership_added", "group_membership_changed"):
+        group = str(detail.get("target_group") or detail.get("group") or "").strip()
+        member = str(detail.get("added_user") or detail.get("username") or "").strip()
+        if (not group or not member) and "->" in target:
+            left, right = (part.strip() for part in target.split("->", 1))
+            member = member or left
+            group = group or right
+        return (
+            MANUAL_GROUP_MEMBERSHIP.replace("GROUP", group or "<group>")
+            .replace("MEMBER", _bare_name(member) or "<member>")
+        )
+    if kind == KIND_PASSWORD_CHANGED:
+        account = str(detail.get("target_user") or detail.get("target_object") or target)
+        template = (
+            MANUAL_PASSWORD_RESTORED_FROM_HASH
+            if reason == MANUAL_REASON_PASSWORD_RESTORED_FROM_HASH
+            else MANUAL_PASSWORD
+        )
+        return template.replace("TARGET", _bare_name(account) or account)
+    if kind == KIND_OBJECT_RESTORED:
+        return object_restored_remediation(object_dn or target)
+    if kind in HOST_ARTIFACT_KINDS:
+        return remote_artifact_remediation(
+            remote_path=str(detail.get("remote_path") or detail.get("path") or "") or None,
+            host=str(detail.get("host") or "") or None,
+        )
+    if kind == KIND_ISSUED_CERTIFICATE:
+        return issued_certificate_remediation(
+            serial=str(detail.get("serial") or "") or None,
+            request_id=detail.get("request_id"),
+            ca_name=str(detail.get("ca_name") or "") or None,
+            ca_host=str(detail.get("ca_host") or "") or None,
+            template=str(detail.get("template") or "") or None,
+            principal=str(detail.get("principal") or "") or None,
+        )
+    if kind == KIND_FORGED_CERTIFICATE:
+        return forged_certificate_remediation(
+            principal=str(detail.get("principal") or detail.get("upn") or "") or None,
+            serial=str(detail.get("serial") or "") or None,
+            not_after=str(detail.get("not_after") or "") or None,
+        )
+    if kind == KIND_CA_PRIVATE_KEY_EXFILTRATED:
+        return ca_private_key_remediation(
+            ca_subject=str(detail.get("ca_subject") or "") or None,
+            ca_name=str(detail.get("ca_name") or "") or None,
+            ca_host=str(detail.get("ca_host") or "") or None,
+        )
+    if kind == KIND_CA_BACKUP_SERVICE:
+        return ca_backup_service_remediation(
+            service_name=str(detail.get("service_name") or "") or None,
+            ca_host=str(detail.get("ca_host") or "") or None,
+        )
+    if kind == KIND_CA_BACKUP_TEMP_PFX:
+        return ca_backup_temp_pfx_remediation(
+            unc_path=str(detail.get("unc_path") or detail.get("path") or "") or None
+        )
+    template = KIND_REMEDIATION_TEMPLATE.get(kind)
+    if template is None:
+        label = kind_display(kind) or "change"
+        return (
+            f"A change of type '{label}' was made to {target or 'an object'} during the "
+            "engagement and is still in place. Review the object with its owner and "
+            "restore its previous state:\n"
+            f"  Get-ADObject -Identity {_dn_expression(target, object_dn)} -Properties *"
+        )
+    return _template_fill(template, target=target, detail=detail)
+
+
 __all__ = [
+    "REVERT_ROLE_PERFORMED_AS",
+    "TEMPLATE_TOKENS",
+    "remediation_for_entry",
+    "stored_remediation_is_superseded",
+    "MANUAL_REASON_ORIGINAL_SECRET_UNKNOWN",
+    "MANUAL_REASON_PASSWORD_RESTORED_FROM_HASH",
+    "MANUAL_PASSWORD_RESTORED_FROM_HASH",
+    "revert_performed_as",
     "STATUS_PENDING",
     "STATUS_REVERT_IN_PROGRESS",
     "STATUS_REVERT_FAILED_RETRYING",
@@ -773,6 +1437,9 @@ __all__ = [
     "MANUAL_REASON_MISSING_METADATA",
     "MANUAL_REASON_ACCESS_DENIED",
     "MANUAL_REASON_OPERATOR_DECLINED",
+    "MANUAL_REASON_REVERT_UNCONFIRMED",
+    "RETRYABLE_REVERT_REASONS",
+    "MANUAL_REASON_NO_PRIVILEGED_CREDENTIAL",
     "manual_reason_label",
     "cleanup_bucket",
     "status_label",
@@ -786,6 +1453,12 @@ __all__ = [
     "MANUAL_OWNER",
     "MANUAL_SPN",
     "MANUAL_PASSWORD",
+    "MANUAL_PASSWORD_PENDING_LOGON",
+    "KIND_PASSWORD_CHANGED",
+    "KIND_SPN_ADDED",
+    "KIND_DACL_ACE_ADDED",
+    "KIND_OWNER_CHANGED",
+    "KIND_GROUP_MEMBERSHIP_ADDED",
     "MANUAL_GROUP_MEMBERSHIP",
     "MANUAL_RBCD",
     "MANUAL_KEYCREDENTIALLINK",

@@ -35,6 +35,14 @@ This module is the SSOT for both halves, mirroring
   every surface consumes, so two documents cannot word the same gap
   differently.
 
+The same fact has a third reader. The Enterprise platform lists a kit's
+documents for download from the kit MANIFEST, not from the PDFs, so a degraded
+document could be offered there with no indicator at all: the client opened a
+document that presented itself as complete. :func:`manifest_completeness` writes
+the per-document record into the manifest and :func:`completeness_view` reads it
+back for the download list, in this same vocabulary, so the in-document
+declaration and the platform cannot word one gap two ways.
+
 :func:`operator_warning` carries the matching terminal line, which is
 operator-facing rather than client-facing: the client sentence never names an
 internal reason, and the operator one always says there is one to go read.
@@ -166,6 +174,118 @@ def section_gap_view(gap: Any) -> dict[str, Any]:
     }
 
 
+#: Completeness of ONE kit document, as the kit recorded it at build time. The
+#: manifest is the only place a download list can learn this from, so the three
+#: values below are the vocabulary the platform reads. They are a projection of
+#: the causes above, not a second taxonomy: ``CAUSE_BOUND`` and
+#: ``CAUSE_NO_CLIENT_DATA`` are both complete documents (an empty workspace has
+#: nothing missing to declare), and ``CAUSE_BUILD_FAILED`` is the one that is
+#: not.
+COMPLETENESS_COMPLETE = "complete"
+
+#: A section the document was meant to carry could not be produced. The document
+#: is downloadable and still worth reading, and it says so about itself.
+COMPLETENESS_INCOMPLETE = "incomplete"
+
+#: The kit never recorded a completeness for this document, so nothing is known
+#: either way. Reached by a manifest written before this field existed, and by a
+#: kit that is still rendering. It is deliberately NOT a synonym for
+#: :data:`COMPLETENESS_COMPLETE`: a document nobody measured must not present
+#: itself as whole, which is the same distinction compliance draws between an
+#: observed-good control and one that was never assessed. It renders as no
+#: indicator at all, exactly as before this field existed, so it never
+#: manufactures a verdict in either direction.
+COMPLETENESS_UNDECLARED = "undeclared"
+
+#: Short label for a degraded document in a list of files, where the full
+#: in-document declaration does not fit.
+COMPLETENESS_LABEL = "Incomplete"
+
+#: The one-line form of the in-document declaration, for the same list. Shorter
+#: wording, same fact and same consequence, composed here so the document and
+#: the platform cannot describe one degraded document two ways.
+COMPLETENESS_NOTICE = (
+    "One section of this document could not be generated, so it carries only "
+    "its general reference content. Ask for a regenerated copy before relying "
+    "on it."
+)
+
+
+def manifest_completeness(gap: Any = None) -> dict[str, Any]:
+    """Return the completeness record a kit manifest carries for ONE document.
+
+    Called once per manifest file entry by the kit's manifest writer. ``gap`` is
+    that document's gap block or its view (:func:`section_gap_view` accepts
+    either), or ``None`` for a document that has no client-specific section to
+    lose. ``None`` resolves to :data:`COMPLETENESS_COMPLETE` rather than to
+    :data:`COMPLETENESS_UNDECLARED`, and that is the deliberate asymmetry with
+    the reader below: the WRITER knows there was nothing that could be missing,
+    so it can state completeness; a READER facing an absent field knows only
+    that nobody recorded one.
+
+    Every entry a manifest writes therefore carries a value, so an absent field
+    on a current manifest means a hop in the chain dropped it, never that a
+    document declined to answer.
+
+    Returns:
+        A mapping with ``completeness``, the client-facing ``notice`` (empty for
+        a complete document) and the ``section`` that is missing (empty likewise),
+        ready to be merged into the manifest's per-file dict.
+    """
+    view = section_gap_view(gap)
+    if not view["build_failed"]:
+        return {
+            "completeness": COMPLETENESS_COMPLETE,
+            "notice": "",
+            "missing_section": "",
+        }
+    return {
+        "completeness": COMPLETENESS_INCOMPLETE,
+        "notice": COMPLETENESS_NOTICE,
+        "missing_section": view["section"],
+    }
+
+
+def completeness_view(entry: Any) -> dict[str, Any]:
+    """Return the render-ready completeness view for one manifest file entry.
+
+    The reader half of :func:`manifest_completeness`, consumed by the platform's
+    download list so the list and the document itself word the same gap
+    identically.
+
+    ``entry`` is the manifest's per-file mapping. An absent, unreadable or
+    unrecognised ``completeness`` resolves to :data:`COMPLETENESS_UNDECLARED`
+    with nothing to render, which is how a kit built before this field existed
+    keeps behaving exactly as it did: no indicator, and no claim that the
+    document is whole.
+
+    Returns a mapping with:
+      * ``completeness`` one of the three values;
+      * ``is_incomplete`` whether to draw the indicator;
+      * ``label`` / ``notice`` the client-facing text, empty unless incomplete;
+      * ``missing_section`` the section that is absent, empty unless incomplete.
+    """
+    completeness = COMPLETENESS_UNDECLARED
+    notice = ""
+    missing_section = ""
+    if isinstance(entry, Mapping):
+        raw = str(entry.get("completeness") or "").strip().lower()
+        if raw in {COMPLETENESS_COMPLETE, COMPLETENESS_INCOMPLETE}:
+            completeness = raw
+        notice = str(entry.get("notice") or "").strip()
+        missing_section = str(entry.get("missing_section") or "").strip()
+    is_incomplete = completeness == COMPLETENESS_INCOMPLETE
+    return {
+        "completeness": completeness,
+        "is_incomplete": is_incomplete,
+        "label": COMPLETENESS_LABEL if is_incomplete else "",
+        # Fall back to the canonical sentence rather than rendering an indicator
+        # with no explanation, for a row whose notice was lost in transit.
+        "notice": (notice or COMPLETENESS_NOTICE) if is_incomplete else "",
+        "missing_section": missing_section if is_incomplete else "",
+    }
+
+
 def operator_warning(gap: Any) -> str:
     """Return the terminal line for the operator, or ``""`` when there is none.
 
@@ -191,9 +311,16 @@ __all__ = [
     "CAUSE_BOUND",
     "CAUSE_BUILD_FAILED",
     "CAUSE_NO_CLIENT_DATA",
+    "COMPLETENESS_COMPLETE",
+    "COMPLETENESS_INCOMPLETE",
+    "COMPLETENESS_LABEL",
+    "COMPLETENESS_NOTICE",
+    "COMPLETENESS_UNDECLARED",
     "GAP_HEADING",
     "SECTION_GAP_KEY",
     "build_section_gap",
+    "completeness_view",
+    "manifest_completeness",
     "operator_warning",
     "section_gap_view",
 ]

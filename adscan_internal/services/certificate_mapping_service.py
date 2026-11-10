@@ -60,16 +60,30 @@ class CertificateMappingService(BaseService):
         use_kerberos: bool,
         kdc_host: str | None = None,
         timeout_seconds: int = 10,
+        target_domain: str | None = None,
+        target_kdc_host: str | None = None,
     ) -> CertificateBindingState:
-        """Return the binding posture for one DC, or ``success=False`` when unknown."""
+        """Return the binding posture for one DC, or ``success=False`` when unknown.
+
+        ``auth_domain`` / ``kdc_host`` are the credential's domain and its KDC;
+        ``target_domain`` is the DC's own domain (default ``auth_domain``) and
+        ``target_kdc_host`` its KDC. When the two domains differ the session
+        follows the cross-realm referral instead of presenting the referral TGT
+        to the DC, which refuses it as ``STATUS_WRONG_PASSWORD``.
+        """
         auth_mode = "kerberos" if use_kerberos else "password"
 
         is_hash = _looks_like_nt_hash(credential)
+        host_domain = str(target_domain or auth_domain or "").strip()
+        cross_realm = bool(
+            host_domain and auth_domain and host_domain.casefold() != str(auth_domain).casefold()
+        )
         config = SMBConfig(
             target_ip=target_host,
             target_hostname=target_host,
-            domain=auth_domain,
+            domain=host_domain or auth_domain,
             auth_domain=auth_domain,
+            target_kdc_ip=(str(target_kdc_host or "").strip() or None) if cross_realm else None,
             username=username,
             password=None if is_hash else credential,
             nt_hash=credential if is_hash else None,

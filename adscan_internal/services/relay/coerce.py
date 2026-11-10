@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import dataclasses
 from dataclasses import dataclass
+from typing import Any
 
 from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.services.listener_ip import report_callback_outcome
 from adscan_internal.services.coercion.runner import (
     NativeCoercionRunConfig,
     run_native_coercion,
@@ -24,6 +26,10 @@ class NativeCoerceRelayConfig:
     relay: NativeRelayRunConfig
     coercion: NativeCoercionRunConfig
     listener_ready_delay_seconds: float = 1.0
+    # Active shell, used only to record/advise on the callback outcome for the
+    # advertised ``listener_host`` (see ``listener_ip.report_callback_outcome``).
+    # ``None`` (tests, non-shell callers) disables that and changes nothing else.
+    shell: Any = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,32 @@ class NativeCoerceRelayResult:
         """Return whether the relay target succeeded."""
 
         return self.relay_result.success
+
+
+def _report_callback_outcome(
+    config: NativeCoerceRelayConfig,
+    *,
+    target: str,
+    relay_result: RelayRunResult,
+) -> None:
+    """Record an arrival (or advise on its absence) for the advertised address.
+
+    The relay listener counted the authentications, so ``authentications_seen``
+    is the arrival signal. Best-effort: this must never break the relay result.
+    """
+
+    if config.shell is None:
+        return
+    try:
+        report_callback_outcome(
+            config.shell,
+            advertised_ip=config.listener_host,
+            target=target,
+            arrived=relay_result.authentications_seen > 0,
+            listener_error=relay_result.listener_error,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must never fail the chain
+        print_info_debug(f"callback outcome not recorded: {type(exc).__name__}")
 
 
 async def run_native_coerce_and_relay(
@@ -115,6 +147,11 @@ async def run_native_coerce_and_relay(
             print_info_debug(
                 "relay-teardown coercion task settled; returning coerce-and-relay result"
             )
+            _report_callback_outcome(
+                config,
+                target=coercion_target_name or coercion_target_host,
+                relay_result=relay_result,
+            )
             return NativeCoerceRelayResult(
                 relay_result=relay_result,
                 coercion_success=coercion_result.success
@@ -127,6 +164,11 @@ async def run_native_coerce_and_relay(
 
         coercion_result = await coercion_task
         relay_result = await relay_task
+        _report_callback_outcome(
+            config,
+            target=coercion_target_name or coercion_target_host,
+            relay_result=relay_result,
+        )
         return NativeCoerceRelayResult(
             relay_result=relay_result,
             coercion_success=coercion_result.success,

@@ -20,6 +20,14 @@ NodeKind = Literal[
 ]
 
 
+
+#: What the scan's objective asks the collector to analyse (the scan policy's
+#: ``objective`` setting, ``adscan_core.scan_policy.settings``). A full
+#: assessment adds the directory-hygiene analysis; a domain-compromise run only
+#: collects what the attack graph needs.
+COLLECTION_SCOPE_FULL_ASSESSMENT = "full_assessment"
+COLLECTION_SCOPE_DOMAIN_COMPROMISE = "domain_compromise"
+
 @dataclass(frozen=True)
 class ForeignNodeRef:
     """A reference to a node that lives in ANOTHER collected domain's graph.
@@ -292,6 +300,23 @@ class PasswordComplianceReport:
     entries: tuple[UserPasswordCompliance, ...] = ()
 
 
+@dataclass(frozen=True)
+class CollectionStageFailure:
+    """A collection stage that could not finish reading its part of the directory.
+
+    Recorded by the collectors instead of being swallowed, so the run can say
+    the collection is incomplete rather than presenting a partial graph as the
+    whole directory. ``stage`` is the collector stage id (``objects_acls``,
+    ``adcs.enterprise_cas``...), ``reason`` one of the tokens in
+    ``collector.collection_integrity`` and ``detail`` the exception type name
+    only (never the message, which can carry identifiers).
+    """
+
+    stage: str
+    reason: str
+    detail: str = ""
+
+
 @dataclass
 class CollectionResult:
     """All collected data for one domain."""
@@ -301,6 +326,9 @@ class CollectionResult:
     edges: list[CollectorEdge] = field(default_factory=list)
     fsp_placeholders: dict[str, str] = field(default_factory=dict)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Stages that could not finish (see ``collector.collection_integrity``).
+    # Empty means every stage the scope asked for read its part to the end.
+    stage_failures: list[CollectionStageFailure] = field(default_factory=list)
     domain_policy: DomainPolicy | None = None
     psos: list[PasswordSettingsObject] = field(default_factory=list)
     shadow_credential_findings: list[ShadowCredentialFinding] = field(
@@ -322,11 +350,40 @@ class CollectionResult:
     # with the other finding lists.
     http_spn_findings: list[Any] = field(default_factory=list)
     password_compliance: "PasswordComplianceReport | None" = None
-    collection_scope: str = "ctf"
+    collection_scope: str = COLLECTION_SCOPE_DOMAIN_COMPROMISE
+    # ACL/ACE enumeration census, adopted verbatim from the ONE ``ACLParser``
+    # instance that served the run. These are the denominator of the
+    # delegated-rights positive control: a green over that surface is only
+    # honest when the count of security descriptors actually read is known (see
+    # ``adscan_core.reporting.enumerated_surface_evidence``). Zero means the ACL
+    # phase did not run, which resolves to not_assessed and never to a pass.
+    security_descriptors_parsed: int = 0
+    access_control_entries_examined: int = 0
+    security_descriptors_without_dacl: int = 0
+    # Per-surface enumeration census, keyed by catalogue ``category``, written at
+    # persistence (the pass that holds both the stamped privilege tiers and the
+    # derived rights) and consumed by the positive-evidence emitter.
+    enumerated_surfaces: dict[str, Any] = field(default_factory=dict)
     adcs_elapsed: float = 0.0
+    # AD CS CAs whose registry probe (ESC6 / ESC11 / Certighost) found no
+    # CA-host administrator during the LDAP pass
+    # (``adcs_collector.PendingCARegistryProbe``). The collection orchestrator
+    # re-runs them once the persisted graph resolves roles and records each
+    # outcome exactly once. Empty unless the caller asked for the deferral.
+    adcs_registry_pending: list[Any] = field(default_factory=list)
     # Machine-account password rotation policy recovered from GPO SYSVOL templates
     # (set by the orchestrator in audit scope). None = not inspected / unavailable.
     machine_password_policy: Any | None = None
+
+    def record_stage_failure(self, stage: str, reason: str, detail: str = "") -> None:
+        """Record that ``stage`` could not finish (deduplicated on stage + reason)."""
+        failure = CollectionStageFailure(str(stage), str(reason), str(detail or ""))
+        if any(
+            f.stage == failure.stage and f.reason == failure.reason
+            for f in self.stage_failures
+        ):
+            return
+        self.stage_failures.append(failure)
 
     def add_node(self, node: CollectorNode) -> None:
         if node.object_id:

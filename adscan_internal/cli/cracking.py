@@ -13,6 +13,8 @@ results; this module:
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 from pathlib import Path
@@ -635,6 +637,7 @@ class HashCrackingShell(Protocol):
 
 
 def _cracking_wordlist_option_rows(workspace_type: str) -> list[tuple[str, str]]:
+    # ``workspace_type`` is the wordlist profile (the policy's cracking_wordlist).
     """Return the ``(key, label)`` rows offered by the wordlist selector.
 
     Only the wordlists the image actually ships standalone are offered, so an
@@ -647,12 +650,16 @@ def _cracking_wordlist_option_rows(workspace_type: str) -> list[tuple[str, str]]
     and an "Other" custom-path escape hatch. Audit workspaces lead with the
     combined base; every other workspace leads with rockyou (the CTF default).
     """
+    from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
+        wordlist_profile,
+    )
+
     targeted_row = (
         "custom_targeted",
         "Targeted custom wordlist (mined from this environment)",
     )
     other_row = ("other", "Other (custom path)")
-    if str(workspace_type or "").strip().lower() == "audit":
+    if wordlist_profile(workspace_type) == policy_settings.CRACKING_WORDLIST_REAL_WORLD:
         return [
             (
                 "combined_audit",
@@ -689,10 +696,14 @@ def choose_cracking_wordlist(
     """
     from adscan_internal import print_instruction
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
+    from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
+        shell_wordlist_profile,
+    )
+
+    workspace_type = shell_wordlist_profile(shell)
     default_wordlist = (
         os.path.join(wordlists_dir, "combined_audit_base.txt")
-        if workspace_type == "audit"
+        if workspace_type == policy_settings.CRACKING_WORDLIST_REAL_WORLD
         else os.path.join(wordlists_dir, "rockyou.txt")
     )
     # The audit default (combined_audit_base.txt) is a Linux build-time artifact
@@ -985,7 +996,11 @@ def choose_cracking_effort(
     """
     from adscan_internal import print_instruction  # noqa: PLC0415
 
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
+    from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
+        shell_wordlist_profile,
+    )
+
+    workspace_type = shell_wordlist_profile(shell)
     benchmark = load_cached_benchmark()
     # Achieved rates already measured on this box, read instantly off the cache.
     # The live probe seam is deliberately NOT wired into the selector: the
@@ -1102,9 +1117,13 @@ def _primary_user_for_hash_file(hash_file: str, mode: str, domain: str) -> str:
     ``user::domain`` (NetNTLM) line, and is not fooled by the colons inside an
     AS-REP body the way a naive ``split(":")`` would be. Only when no mode
     extractor matches does it fall back to the first ``user:hash`` colon-field
-    (an already-prepended file). Falls back to the domain (or ``"captured"``)
-    when nothing can be resolved. Never raises.
+    (an already-prepended file). Falls back to the domain, or to the reserved
+    unattributed-credentials bucket name when there is not even one. Never raises.
     """
+    from adscan_core.workspace_domain_buckets import (  # noqa: PLC0415
+        UNATTRIBUTED_CREDENTIALS_BUCKET,
+    )
+
     try:
         if os.path.exists(hash_file):
             with open(hash_file, "r", encoding="utf-8", errors="ignore") as handle:
@@ -1121,7 +1140,10 @@ def _primary_user_for_hash_file(hash_file: str, mode: str, domain: str) -> str:
     users = _extract_hash_users(hash_file)
     if users:
         return users[0]
-    return domain or "captured"
+    # Routed through the shared reserved-bucket name so there is exactly one
+    # placeholder token in the product. A bare literal here reads as a domain
+    # wherever a job scope is rendered, and nothing would filter it.
+    return domain or UNATTRIBUTED_CREDENTIALS_BUCKET
 
 
 def _maybe_dispatch_audit_effort(
@@ -1144,8 +1166,10 @@ def _maybe_dispatch_audit_effort(
     ``run_cracking`` (a background job now owns the crack); ``wordlist`` (+
     optional ``rules_path``/``runtime_seconds``) drives an inline crack.
     """
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    if workspace_type != "audit":
+    if (
+        policy_settings.policy_setting(shell, policy_settings.CRACKING_WORDLIST)
+        != policy_settings.CRACKING_WORDLIST_REAL_WORLD
+    ):
         return None
     if not hashcat_mode or hashcat_mode == "Unknown":
         return None
@@ -2674,8 +2698,6 @@ def _maybe_run_john_cpu_fallback(
     from adscan_internal.services.cracking.john_engine import JohnEngine
     from adscan_internal.services.cracking_wordlist_policy import (
         EffortTier,
-        default_effort_for_workspace,
-        resolve_configured_effort,
         resolve_effort,
     )
 
@@ -2693,10 +2715,13 @@ def _maybe_run_john_cpu_fallback(
     # path, a missing base file is warned-but-not-filtered — John runs against it
     # and honestly recovers nothing — so behaviour matches the old single-wordlist
     # fallback. No tiers at all -> honest degrade (return False).
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower() or "audit"
-    effort = resolve_configured_effort(shell) or default_effort_for_workspace(
-        workspace_type
+    from adscan_internal.services.cracking_wordlist_policy import (  # noqa: PLC0415
+        resolve_effort_or_default,
+        shell_wordlist_profile,
     )
+
+    workspace_type = shell_wordlist_profile(shell)
+    effort = resolve_effort_or_default(shell)
     tiers = resolve_effort(
         effort,
         workspace_type=workspace_type,
@@ -3173,15 +3198,18 @@ def resolve_cracking_wordlist(
     guard), so the effort selector and the legacy prompt share ONE resolution
     tail.
     """
-    workspace_type = str(getattr(shell, "type", "") or "").strip().lower()
-    should_prompt_wordlist_selector = failed or workspace_type == "audit"
+    real_world = (
+        policy_settings.policy_setting(shell, policy_settings.CRACKING_WORDLIST)
+        == policy_settings.CRACKING_WORDLIST_REAL_WORLD
+    )
+    should_prompt_wordlist_selector = failed or real_world
 
     if preselected_wordlist is not None:
         wordlist = preselected_wordlist
     elif should_prompt_wordlist_selector:
-        if workspace_type == "audit" and not failed:
+        if real_world and not failed:
             print_info(
-                "Audit workspace detected: select a cracking wordlist (rockyou is not forced by default)."
+                "The scan policy uses the real-world wordlists: select a cracking wordlist (rockyou is not forced by default)."
             )
         wordlist = choose_cracking_wordlist(
             shell, hash_type, wordlists_dir, domain=domain
@@ -4842,7 +4870,8 @@ def execute_cracking(
                     telemetry.capture_exception(e)
                     print_exception(exception=e)
                 try:
-                    if str(getattr(shell, "type", "") or "").strip().lower() == "audit":
+                    # Telemetry for real-environment cracking (genuinely environment).
+                    if policy_settings.policy_environment(shell) == "real":
                         audit_properties = {
                             "hash_type": normalize_hash_type_for_telemetry(hash_type),
                             "wordlist": _wordlist_telemetry_label(wordlist_name),

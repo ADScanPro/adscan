@@ -16,6 +16,8 @@ It uses:
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from collections.abc import Callable
 import os
 import re
@@ -1394,7 +1396,7 @@ def finalize_roast_results(
 
             if shell.auto:
                 default_choice = (
-                    "all" if getattr(shell, "type", "") == "ctf" else "recommended"
+                    "all" if policy_settings.reaches_wide(shell) else "recommended"
                 )
             else:
                 default_choice = "recommended"
@@ -1528,6 +1530,14 @@ def run_kerberoast(
     """
     from adscan_internal import print_operation_header
 
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "kerberoasting"):
+        return None
+
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
         print_error(
@@ -1541,21 +1551,23 @@ def run_kerberoast(
     )
     os.makedirs(cracking_path, exist_ok=True)
 
-    domain_credentials = shell.domains_data.get(target_domain, {})
-    username = domain_credentials.get("username") or shell.domains_data.get(
-        shell.domain or "", {}
-    ).get("username")
-    password = domain_credentials.get("password") or shell.domains_data.get(
-        shell.domain or "", {}
-    ).get("password")
-
-    # Determine the auth domain: if target_domain has its own credentials use it;
-    # otherwise we are using cross-domain trust credentials from shell.domain.
-    auth_domain: str = (
-        target_domain
-        if domain_credentials.get("username") and domain_credentials.get("password")
-        else (shell.domain or target_domain)
+    # Take the WHOLE pair from one domain: the target domain's own credential
+    # when it is complete, otherwise the cross-domain trust credential of
+    # shell.domain. Mixing a username from one with a password from the other
+    # sends a wrong password for a real account (an account-lockout hazard).
+    from adscan_internal.services.credential_store_service import (  # noqa: PLC0415
+        resolve_principal_secret_pair,
     )
+
+    auth_domain: str = target_domain
+    username, password = resolve_principal_secret_pair(
+        shell.domains_data, domain=target_domain
+    )
+    if not (username and password) and shell.domain and shell.domain != target_domain:
+        auth_domain = shell.domain
+        username, password = resolve_principal_secret_pair(
+            shell.domains_data, domain=shell.domain
+        )
 
     if not username or not password:
         print_error(
@@ -1642,6 +1654,14 @@ def run_asreproast(
         Relative path to hashes file if successful, None otherwise.
     """
     from adscan_internal import print_operation_header
+
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "asreproasting"):
+        return None
 
     if target_domain not in shell.domains:
         marked_target_domain = mark_sensitive(target_domain, "domain")
@@ -2542,6 +2562,14 @@ def run_dcsync(
     from adscan_internal.rich_output import print_operation_header
     from adscan import _resolve_domain_key, _normalize_interactive_text
 
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "dcsync"):
+        return None
+
     resolved_auth = _resolve_domain_key(shell.domains_data, domain)
     if not resolved_auth:
         print_error(
@@ -2805,6 +2833,14 @@ def run_kerberoast_preauth(shell: KerberosShell, domain: str, user: str) -> None
         domain: Target domain name.
         user: Username for authentication.
     """
+    from adscan_internal.services.scan_policy_enforcement import (  # noqa: PLC0415
+        gate_relation_runner,
+    )
+
+    # Scan policy (spec 2026-11-04 § 7.2 S6): refuse before any network I/O.
+    if not gate_relation_runner(shell, "kerberoasting"):
+        return
+
     workspace_cwd = shell.current_workspace_dir or shell._get_workspace_cwd()
     cracking_path = domain_subpath(
         workspace_cwd, shell.domains_dir, domain, shell.cracking_dir

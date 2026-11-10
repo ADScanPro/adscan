@@ -5,6 +5,8 @@ This module handles ACE enumeration and other BloodHound operations.
 
 from __future__ import annotations
 
+from adscan_core.scan_policy import settings as policy_settings
+
 from typing import TYPE_CHECKING, Any, Protocol
 from collections import defaultdict
 import os
@@ -48,8 +50,12 @@ from adscan_internal.cli.compromise_render import (
     render_tiering_legend,
 )
 from adscan_internal.reporting_compat import handle_optional_report_service_exception
-from adscan_internal.rich_output import mark_sensitive, print_panel
+from adscan_internal.rich_output import mark_sensitive, print_panel, strip_sensitive_markers
 from adscan_core.output._state import _get_console
+from adscan_internal.services.directory_change_consent import (
+    CHANGE_CLASS_ACCOUNT_ENABLED,
+    confirm_directory_change,
+)
 from adscan_internal.services.high_value import (
     UserRiskFlags,
     classify_users_tier0_high_value,
@@ -2203,6 +2209,7 @@ def run_show_attack_paths(
     keep_longest: bool = False,
     seen_path_keys: set[tuple[Any, ...]] | None = None,
     target_labels: tuple[str, ...] = (),
+    terminal_relations: tuple[str, ...] = (),
 ) -> None:
     """Show attack paths and optionally a detailed path.
 
@@ -2224,6 +2231,12 @@ def run_show_attack_paths(
     It is a POST-compute label filter over the identical ``target``-class compute
     — the returned set is a strict subset. Empty (the default) leaves the compute
     byte-identical.
+
+    ``terminal_relations`` keeps only paths whose last real step uses one of the
+    given relations (lower-case keys). It goes through the same summary filter
+    as ``target_labels``, and that filter is applied by the one ``_compute_paths``
+    closure used both for the first listing and for every post-execution refresh,
+    so the execution loop can never be handed a path outside the filter.
     """
     from adscan_internal.services.attack_graph_service import (
         AttackPathSummaryFilters,
@@ -2283,6 +2296,8 @@ def run_show_attack_paths(
         # migration — share rows no longer appear in the attack-paths menu.
 
         def _path_type_tag(path: dict[str, Any]) -> str:
+            if str(path.get("compromise_class") or "").strip().lower() == "tier0_control":
+                return "T0 Control"
             cls = (
                 str(
                     path.get("outcome_class")
@@ -2374,7 +2389,7 @@ def run_show_attack_paths(
                 .lower()
                 == "pwned"
             )
-            if _now_pwned and getattr(shell, "type", None) in ("ctf", "audit"):
+            if _now_pwned and policy_settings.policy_environment(shell) is not None:
                 return
             if not executed:
                 # No execution and no pivot probe persisted anything the sort
@@ -2544,7 +2559,7 @@ def run_show_attack_paths(
                         .lower()
                         == "pwned"
                     )
-                    if _pwned_after and getattr(shell, "type", None) in ("ctf", "audit"):
+                    if _pwned_after and policy_settings.policy_environment(shell) is not None:
                         return
                     continue
 
@@ -2577,7 +2592,7 @@ def run_show_attack_paths(
                             .lower()
                             == "pwned"
                         )
-                        if _pwned_after and getattr(shell, "type", None) in ("ctf", "audit"):
+                        if _pwned_after and policy_settings.policy_environment(shell) is not None:
                             return
                     continue
 
@@ -2688,9 +2703,17 @@ def run_show_attack_paths(
         _compute_progress.record_ordering(time.monotonic() - _order_t0)
         return ordered
 
+    _terminal_relations = tuple(
+        str(relation or "").strip().lower()
+        for relation in (terminal_relations or ())
+        if str(relation or "").strip()
+    )
     _summary_filters = (
-        AttackPathSummaryFilters(target_labels=tuple(target_labels))
-        if target_labels
+        AttackPathSummaryFilters(
+            target_labels=tuple(target_labels),
+            terminal_relations=_terminal_relations,
+        )
+        if target_labels or _terminal_relations
         else None
     )
 
@@ -2710,7 +2733,7 @@ def run_show_attack_paths(
                 target_domain,
                 scope="owned",
                 max_depth=max_depth,
-                max_paths=max_paths_compute,
+                enumeration_cap=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
                 summary_filters=_summary_filters,
@@ -2737,7 +2760,7 @@ def run_show_attack_paths(
                 scope="principals",
                 principals=start_users,
                 max_depth=max_depth,
-                max_paths=max_paths_compute,
+                enumeration_cap=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
                 summary_filters=_summary_filters,
@@ -2755,7 +2778,7 @@ def run_show_attack_paths(
                 scope="user",
                 username=start_user,
                 max_depth=max_depth,
-                max_paths=max_paths_compute,
+                enumeration_cap=max_paths_compute,
                 target=target,
                 target_mode=target_mode,
                 summary_filters=_summary_filters,
@@ -2768,7 +2791,7 @@ def run_show_attack_paths(
             target_domain,
             scope="domain",
             max_depth=max_depth,
-            max_paths=max_paths_compute,
+            enumeration_cap=max_paths_compute,
             target=target,
             target_mode=target_mode,
             summary_filters=_summary_filters,
@@ -2895,6 +2918,15 @@ def run_show_attack_paths(
             seen_path_keys.add(_k)
             deduped.append(_path)
         path_refs = deduped
+
+    if not path_refs and _terminal_relations:
+        # The filter emptied the listing. Say so instead of the domain-wide
+        # reachability panel, which would describe routes the filter excluded.
+        print_warning(
+            "No attack path in this scope ends with "
+            f"{', '.join(_terminal_relations)}. Nothing was executed."
+        )
+        return
 
     if not path_refs:
         # A control-mega-hub sampled materialization can return 0 concrete routes
@@ -3420,7 +3452,15 @@ def _process_aces_for_exploitation(
     *,
     cross_domain: bool | None = None,
 ) -> None:
-    """Process ACEs and offer exploitation options (legacy parity)."""
+    """Process ACEs and offer exploitation options (legacy parity).
+
+    Every option that writes to the client's directory asks through
+    ``confirm_directory_change`` (default no in an assessment workspace, yes in a
+    disposable-lab one), so an unattended run never auto-approves a write. The
+    writes themselves are recorded by the seams this menu calls
+    (``cli/exploits.py``), the same seams the attack-path step uses, so each
+    change reaches the environment-change ledger and the exit cleanup once.
+    """
     exchange_ace = None
     for ace in aces_to_process:
         if (
@@ -3445,10 +3485,11 @@ def _process_aces_for_exploitation(
                 password = shell.domains_data[domain]["credentials"][username]
 
             if "forcechangepassword" in acl:
-                respuesta = Confirm.ask(
+                respuesta = confirm_directory_change(
+                    shell,
                     "Do you want to exploit the ForceChangePassword privilege on "
                     f"{display_name}?",
-                    default=True,
+                    check_id="step:forcechangepassword",
                 )
                 if respuesta:
                     shell.exploit_force_change_password(
@@ -3466,10 +3507,11 @@ def _process_aces_for_exploitation(
                         f"WriteSPN exploitation is only supported for user/computer targets (got {target_type})."
                     )
                 else:
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit WriteSPN (Targeted Kerberoast) on "
                         f"{display_name}?",
-                        default=True,
+                        check_id="step:writespn",
                     )
                     if respuesta:
                         shell.exploit_write_spn(
@@ -3488,9 +3530,9 @@ def _process_aces_for_exploitation(
                 if target_type in ("user", "computer"):
                     if not ace.get("target_enabled", True):
                         print_warning(f"Target user {display_name} is disabled.")
-                        enable_respuesta = Confirm.ask(
-                            "Do you want to try to enable the account first?",
-                            default=True,
+                        enable_respuesta = confirm_directory_change(
+                            shell, "Do you want to try to enable the account first?",
+                            change_class=CHANGE_CLASS_ACCOUNT_ENABLED,
                         )
                         if enable_respuesta:
                             if not shell.enable_user(
@@ -3506,10 +3548,11 @@ def _process_aces_for_exploitation(
                             )
                             continue
 
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit the GenericAll/GenericWrite "
                         f"privilege on {display_name}?",
-                        default=True,
+                        check_id="step:genericall",
                     )
                     if respuesta:
                         shell.exploit_generic_all_user(
@@ -3520,10 +3563,11 @@ def _process_aces_for_exploitation(
                             target_domain,
                         )
                 elif target_type == "ou":
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit the GenericAll/GenericWrite "
                         f"privilege on {display_name}?",
-                        default=True,
+                        check_id="step:genericall",
                     )
                     if respuesta:
                         shell.exploit_generic_all_ou(
@@ -3534,17 +3578,20 @@ def _process_aces_for_exploitation(
                             target_domain,
                         )
                 elif target_type == "group":
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit the GenericAll/GenericWrite "
                         f"privilege on {display_name}?",
-                        default=True,
+                        check_id="step:genericall",
                     )
                     if respuesta:
                         marked_username = mark_sensitive(username, "user")
-                        changed_username = Prompt.ask(
-                            "Enter the user you want to add: ",
-                            default=marked_username,
-                        )
+                        changed_username = strip_sensitive_markers(
+                            Prompt.ask(
+                                "Enter the user you want to add: ",
+                                default=marked_username,
+                            )
+                        ).strip()
                         shell.exploit_add_member(
                             domain,
                             username,
@@ -3555,9 +3602,10 @@ def _process_aces_for_exploitation(
                         )
 
             if "addself" in acl:
-                respuesta = Confirm.ask(
+                respuesta = confirm_directory_change(
+                    shell,
                     f"Do you want to exploit the AddSelf privilege on {display_name}?",
-                    default=True,
+                    check_id="step:addself",
                 )
                 if respuesta:
                     shell.exploit_add_member(
@@ -3570,16 +3618,19 @@ def _process_aces_for_exploitation(
                     )
 
             if "addmember" in acl:
-                respuesta = Confirm.ask(
+                respuesta = confirm_directory_change(
+                    shell,
                     f"Do you want to exploit the AddMember privilege on {display_name}?",
-                    default=True,
+                    check_id="step:addmember",
                 )
                 if respuesta:
                     marked_username = mark_sensitive(username, "user")
-                    changed_username = Prompt.ask(
-                        "Enter the user you want to add: ",
-                        default=marked_username,
-                    )
+                    changed_username = strip_sensitive_markers(
+                        Prompt.ask(
+                            "Enter the user you want to add: ",
+                            default=marked_username,
+                        )
+                    ).strip()
                     shell.exploit_add_member(
                         domain,
                         username,
@@ -3618,10 +3669,11 @@ def _process_aces_for_exploitation(
                     marked_destino = mark_sensitive(
                         target_username, "domain" if target_type == "domain" else "user"
                     )
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit the WriteDacl privilege on "
                         f"{marked_destino}?",
-                        default=True,
+                        check_id="step:writedacl",
                     )
                     if respuesta:
                         writedacl_ok = bool(
@@ -3634,9 +3686,22 @@ def _process_aces_for_exploitation(
                                 target_type,
                             )
                         )
+                        # The follow-up is a technique of its own (GenericAll on
+                        # the user, AddMember on the group), so it passes its own
+                        # consent: an unattended run performs it only when the
+                        # scan policy enables that technique too.
                         if writedacl_ok and target_type == "domain":
                             shell.ask_for_dcsync(domain, username, password)
-                        elif writedacl_ok and target_type == "user":
+                        elif (
+                            writedacl_ok
+                            and target_type == "user"
+                            and confirm_directory_change(
+                                shell,
+                                "WriteDacl applied. Do you want to exploit GenericAll on "
+                                f"{marked_destino} now?",
+                                check_id="step:genericall",
+                            )
+                        ):
                             shell.exploit_generic_all_user(
                                 domain,
                                 username,
@@ -3645,12 +3710,23 @@ def _process_aces_for_exploitation(
                                 target_domain,
                                 prompt_for_user_privs_after=True,
                             )
-                        elif writedacl_ok and target_type == "group":
-                            marked_username = mark_sensitive(username, "user")
-                            changed_username = Prompt.ask(
-                                "Enter the user you want to add: ",
-                                default=marked_username,
+                        elif (
+                            writedacl_ok
+                            and target_type == "group"
+                            and confirm_directory_change(
+                                shell,
+                                "WriteDacl applied. Do you want to add a member to "
+                                f"{marked_destino} now?",
+                                check_id="step:addmember",
                             )
+                        ):
+                            marked_username = mark_sensitive(username, "user")
+                            changed_username = strip_sensitive_markers(
+                                Prompt.ask(
+                                    "Enter the user you want to add: ",
+                                    default=marked_username,
+                                )
+                            ).strip()
                             shell.exploit_add_member(
                                 domain,
                                 username,
@@ -3663,10 +3739,11 @@ def _process_aces_for_exploitation(
             if "writeowner" in acl:
                 target_type = ace.get("tipodestino", "").lower()
                 if target_type in ("group", "user"):
-                    respuesta = Confirm.ask(
+                    respuesta = confirm_directory_change(
+                        shell,
                         "Do you want to exploit the WriteOwner privilege on "
                         f"{display_name}?",
-                        default=True,
+                        check_id="step:writeowner",
                     )
                     if respuesta:
                         writeowner_ok = bool(
@@ -3681,10 +3758,11 @@ def _process_aces_for_exploitation(
                         )
                         if writeowner_ok:
                             marked_destino = mark_sensitive(target_username, "user")
-                            writedacl_respuesta = Confirm.ask(
+                            writedacl_respuesta = confirm_directory_change(
+                                shell,
                                 "WriteOwner applied successfully. Do you want to "
                                 f"try WriteDacl on {marked_destino} now?",
-                                default=True,
+                                check_id="step:writedacl",
                             )
                             if writedacl_respuesta:
                                 shell.exploit_write_dacl(
@@ -5062,7 +5140,7 @@ def execute_stale_enabled_users(
                 evidence=[
                     {
                         "type": "artifact",
-                        "summary": "BloodHound stale enabled users list",
+                        "summary": "Stale enabled user accounts",
                         "artifact_path": domain_relpath(
                             shell.domains_dir, domain, file
                         ),
@@ -5948,7 +6026,7 @@ def run_computers(shell: BloodHoundShell, target_domain: str) -> None:
         return
     run_computers_all(shell, target_domain)
     persist_bloodhound_membership_snapshot(shell, target_domain)
-    if shell.type == "ctf":
+    if policy_settings.aims_at_domain_compromise(shell):
         return
     if shell.auto:
         run_computers_with_laps(shell, target_domain)

@@ -14,7 +14,7 @@
 
 **Free Active Directory pentesting tool. Replace your AD pentest toolchain with one CLI.**
 
-ADscan is a free CLI for pentesters, red teamers, and security consultants. It covers 107 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. It runs on Linux and macOS through Docker, and natively on Windows as a self-contained bundle with no Docker and no Python install.
+ADscan is a free CLI for pentesters, red teamers, and security consultants. It covers 108 Active Directory attack techniques in a single workflow: enumeration, Kerberoasting, AS-REP roasting, ADCS/ESC exploitation, DCSync, credential harvesting, and native attack-path analysis. It runs on Linux and macOS through Docker, and natively on Windows as a self-contained bundle with no Docker and no Python install.
 
 **[Docs](https://adscanpro.com/docs?utm_source=github&utm_medium=readme&utm_campaign=docs_cta)** | [Discord](https://discord.com/invite/fXBR3P8H74) | [Website](https://adscanpro.com)
 
@@ -76,15 +76,15 @@ This discovers domain controllers, SMB exposure, null sessions, and roastable ac
 `adscan ci` runs the whole pipeline non-interactively: preflight, recon, enumeration, exploitation, reporting, no prompts. Same engine, no shell. It is a **PRO** capability — automation and unattended runs are what you're paying for; the free LITE tier gives you the full interactive `adscan start` shell on every platform.
 
 ```bash
-# Authenticated scan of a domain
-adscan ci auth --type audit --interface eth0 \
+# Authenticated scan of a domain, under the Audit built-in policy
+adscan ci auth --policy audit --interface eth0 \
   --domain corp.local --dc-ip 10.0.0.1 -u alice -p 'S3cr3t!'
 
-# Unauthenticated sweep
-adscan ci unauth --type audit --interface eth0 --dc-ip 10.0.0.1
+# Unauthenticated sweep of a lab
+adscan ci unauth --policy lab_ctf --interface eth0 --dc-ip 10.0.0.1
 ```
 
-`--type`, `--interface` and the `auth`/`unauth` positional are required. `adscan ci --help` lists the rest.
+The `auth`/`unauth` positional and `--policy` are required. The scan policy decides what runs and the scan pace: `lab_ctf`, `audit`, `production_sensitive`, or one you saved (`adscan policy list`, `adscan policy create`). `--pacing` and `--pace-profile` are optional; without them the run uses the policy's own pace. `adscan ci --help` lists the rest.
 
 `adscan ci` makes every decision the interactive shell would ask you about, so it's built for pipelines, lab automation, and unattended engagement runs. For client work where you want to review each decision, the interactive `adscan start` shell (free on LITE) is the supported path.
 
@@ -111,7 +111,7 @@ ADscan is not a replacement for every tool in every scenario. It is the fastest 
 
 ## Kerberoasting, ADCS and AD Attack Coverage
 
-ADscan covers 107 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
+ADscan covers 108 Active Directory attack techniques across the kill chain — see the [full technique coverage table](COVERAGE.md), generated from the product catalog and mapped to MITRE ATT&CK:
 
 <table>
 <tr>

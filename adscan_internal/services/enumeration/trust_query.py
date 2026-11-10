@@ -1,62 +1,54 @@
 """Native badldap query for ``trustedDomain`` objects.
 
-This module is the single source of truth for trust enumeration in ADscan.
+This module is the single source of truth for trust ENUMERATION in ADscan.
 Both the recursive trust enumerator (``DomainService.enumerate_trusts``) and
 the attack-graph LDAP collector (``LDAPCollector._collect_trusts``) call into
 :func:`query_trusted_domains` so decoding logic stays consistent.
+
+The DECODING of the values it reads lives one layer down, in
+``adscan_core.ad_trust``, because the web backend needs the same answers and
+cannot import this module (it lazily imports ``winacl`` and ``badldap``, which
+the appliance backend image is barred from carrying). Everything below
+delegates there; the public names and labels are unchanged, so the CLI table,
+the attack graph and the report findings read exactly as before.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from adscan_core import telemetry
+from adscan_core.ad_trust import (
+    TRUST_ATTRIBUTE_BITS,
+    TRUST_ATTR_CROSS_ORG_TGT_DELEGATION as _CORE_TGT_DELEGATION_BIT,
+    TRUST_ATTR_QUARANTINED_DOMAIN,
+    TRUST_DIRECTION_OPERATOR_LABELS,
+    TRUST_SID_FILTERING_FINDING_KEY as _CORE_SID_FILTERING_KEY,
+    TRUST_TGT_DELEGATION_FINDING_KEY as _CORE_TGT_DELEGATION_KEY,
+    classify_trust_kind,
+    decode_trust_attribute_flags,
+    decode_trust_facts,
+    legacy_trust_type_label,
+    normalize_trust_direction,
+)
 from adscan_core.rich_output import print_info_debug
 from adscan_core.rich_output import print_exception
 
 
 # trustAttributes bits (Microsoft [MS-ADTS] 6.1.6.7.9).
 #
-# CANONICAL SOURCE: the vendored badldap enum
-# ``vendor/badldap/badldap/ldap_objects/adtrust.py`` (``TrustAttributes``),
-# which mirrors MS-ADTS 6.1.6.7.9 verbatim. Keep this table byte-identical to
-# it. The bits at/above 0x100 were previously mis-mapped (0x100/0x200/0x800 all
-# shifted), which is *not* cosmetic: a 2019+ forest trust with
+# CANONICAL SOURCE: ``adscan_core.ad_trust.TRUST_ATTRIBUTE_BITS``, itself kept
+# byte-identical to the vendored badldap enum
+# ``vendor/badldap/badldap/ldap_objects/adtrust.py`` (``TrustAttributes``). The
+# bits at/above 0x100 were once mis-mapped (0x100/0x200/0x800 all shifted),
+# which is *not* cosmetic: a 2019+ forest trust with
 # CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION (0x800) set — the exact
 # misconfiguration that makes cross-trust unconstrained-delegation abuse viable —
 # was decoded and reported to the client as ``TRUST_USES_AES_KEYS``, i.e. a
 # hardening signal with the OPPOSITE meaning. Locked by
 # ``tests/unit/services/enumeration/test_trust_query.py``.
-_TRUST_ATTR_BITS: list[tuple[int, str]] = [
-    (0x00000001, "NON_TRANSITIVE"),
-    (0x00000002, "UPLEVEL_ONLY"),
-    (0x00000004, "QUARANTINED_DOMAIN"),
-    (0x00000008, "FOREST_TRANSITIVE"),
-    (0x00000010, "CROSS_ORGANIZATION"),
-    (0x00000020, "WITHIN_FOREST"),
-    (0x00000040, "TREAT_AS_EXTERNAL"),
-    (0x00000080, "USES_RC4_ENCRYPTION"),
-    (0x00000100, "TRUST_USES_AES_KEYS"),
-    (0x00000200, "CROSS_ORGANIZATION_NO_TGT_DELEGATION"),
-    (0x00000400, "PIM_TRUST"),
-    (0x00000800, "CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION"),
-    (0x00001000, "DISABLE_AUTH_TARGET_VALIDATION"),
-]
-
-_TRUST_DIRECTION_MAP: dict[int, str] = {
-    0: "Disabled",
-    1: "Inbound",
-    2: "Outbound",
-    3: "Bidirectional",
-}
-
-_TRUST_TYPE_FALLBACK: dict[int, str] = {
-    1: "Windows NT",
-    2: "External",
-    3: "MIT",
-    4: "DCE",
-}
+_TRUST_ATTR_BITS: list[tuple[int, str]] = list(TRUST_ATTRIBUTE_BITS)
 
 
 @dataclass
@@ -66,11 +58,15 @@ class TrustedDomainEntry:
     Attributes:
         partner: FQDN of the partner domain (lowercased).
         direction: Human-readable trust direction.
+        direction_raw: Raw ``trustDirection`` integer when it was readable.
         trust_type: Human-readable trust classification derived from
             ``trustAttributes`` first, then ``trustType``.
+        trust_type_raw: Raw ``trustType`` integer when it was readable.
         trust_attributes: Raw ``trustAttributes`` bitmask.
         attribute_flags: Decoded list of ``trustAttributes`` bit names.
         sid: Partner domain SID (``S-1-5-21-…``) when available.
+        local_domain: Dotted name of the domain whose ``trustedDomain`` object
+            this is, when the search base allowed deriving it.
     """
 
     partner: str
@@ -79,13 +75,14 @@ class TrustedDomainEntry:
     trust_attributes: int = 0
     attribute_flags: list[str] = field(default_factory=list)
     sid: str | None = None
+    direction_raw: int | None = None
+    trust_type_raw: int | None = None
+    local_domain: str = ""
 
 
 def decode_trust_attributes(value: int | None) -> list[str]:
     """Return the list of bit-names set on ``trustAttributes``."""
-    if not value:
-        return []
-    return [name for bit, name in _TRUST_ATTR_BITS if value & bit]
+    return decode_trust_attribute_flags(value)
 
 
 #: ``trustAttributes`` bit for cross-organization TGT-delegation forwarding
@@ -93,7 +90,7 @@ def decode_trust_attributes(value: int | None) -> list[str]:
 #: enum. When set on a forest trust, Kerberos TGTs are forwarded across the
 #: forest boundary — the misconfiguration that turns a cross-forest trust into a
 #: cross-forest unconstrained-delegation escalation path.
-TRUST_ATTR_CROSS_ORG_TGT_DELEGATION: int = 0x00000800
+TRUST_ATTR_CROSS_ORG_TGT_DELEGATION: int = _CORE_TGT_DELEGATION_BIT
 
 
 def cross_org_tgt_delegation_enabled(trust_attributes: int | None) -> bool:
@@ -118,26 +115,33 @@ def cross_org_tgt_delegation_enabled(trust_attributes: int | None) -> bool:
         return bool(int(trust_attributes) & TRUST_ATTR_CROSS_ORG_TGT_DELEGATION)
 
 
-def classify_trust_type(trust_attributes: int | None, trust_type: int | None) -> str:
-    """Pick a human label for the trust based on attributes/type bits."""
-    flags = set(decode_trust_attributes(trust_attributes))
-    if "WITHIN_FOREST" in flags:
-        return "Parent-Child"
-    if "FOREST_TRANSITIVE" in flags:
-        return "Forest"
-    if "TREAT_AS_EXTERNAL" in flags:
-        return "External"
-    if "CROSS_ORGANIZATION" in flags:
-        return "External"
-    if trust_type is not None and trust_type in _TRUST_TYPE_FALLBACK:
-        return _TRUST_TYPE_FALLBACK[trust_type]
-    return "Unknown"
+def classify_trust_type(
+    trust_attributes: int | None,
+    trust_type: int | None,
+    *,
+    local_domain: str | None = None,
+    partner_domain: str | None = None,
+) -> str:
+    """Pick a human label for the trust based on attributes/type bits.
+
+    Passing both domain names refines a same-forest trust into a parent-child
+    relation or a second domain tree; without them the parent-child reading is
+    kept, which is the answer this function has always given.
+    """
+    return legacy_trust_type_label(
+        classify_trust_kind(
+            trust_attributes,
+            trust_type,
+            local_domain=local_domain,
+            partner_domain=partner_domain,
+        )
+    )
 
 
 def decode_trust_direction(value: int | None) -> str:
-    if value is None:
-        return "Unknown"
-    return _TRUST_DIRECTION_MAP.get(int(value), "Unknown")
+    """Return the operator-facing label for a raw ``trustDirection`` value."""
+    direction, _raw = normalize_trust_direction(value)
+    return TRUST_DIRECTION_OPERATOR_LABELS.get(direction, "Unknown")
 
 
 # ── Trust posture judging ─────────────────────────────────────────────────
@@ -153,8 +157,8 @@ def decode_trust_direction(value: int | None) -> str:
 #: prose) and the LITE-safe ``adscan_core/reporting/vuln_catalog_meta.py``
 #: slice (severity/title/mitre). The web CTEM gates ingestion on the meta
 #: slice, so these keys reach both the PDF and the web automatically.
-TRUST_TGT_DELEGATION_FINDING_KEY = "trust_tgt_delegation_enabled"
-TRUST_SID_FILTERING_FINDING_KEY = "trust_sid_filtering_disabled"
+TRUST_TGT_DELEGATION_FINDING_KEY = _CORE_TGT_DELEGATION_KEY
+TRUST_SID_FILTERING_FINDING_KEY = _CORE_SID_FILTERING_KEY
 
 
 @dataclass(frozen=True)
@@ -209,16 +213,14 @@ def sid_filtering_quarantined(trust_attributes: int | None) -> bool:
 
         return TrustAttributes.QUARANTINED_DOMAIN in TrustAttributes(trust_attributes)
     except Exception:  # noqa: BLE001 — a vendor enum quirk must not break enum
-        return bool(int(trust_attributes) & 0x00000004)
+        return bool(int(trust_attributes) & TRUST_ATTR_QUARANTINED_DOMAIN)
 
 
 def evaluate_trust_posture(entry: TrustedDomainEntry) -> list[TrustPostureIssue]:
     """Judge one decoded trust and return the weaknesses ADscan reports.
 
-    Pure logic over the flags already decoded by
-    :func:`decode_trust_attributes` (``entry.attribute_flags``) plus the raw
-    ``entry.trust_attributes`` for the vendored SID-filtering check. No LDAP
-    round-trip, no re-decode.
+    Pure logic over the raw ``entry.trust_attributes``, resolved by the shared
+    decoder :func:`adscan_core.ad_trust.decode_trust_facts`. No LDAP round-trip.
 
     Conditions judged:
 
@@ -242,82 +244,25 @@ def evaluate_trust_posture(entry: TrustedDomainEntry) -> list[TrustPostureIssue]
     Returns:
         Zero or more :class:`TrustPostureIssue` for the trust.
     """
-    flags = set(entry.attribute_flags)
-    issues: list[TrustPostureIssue] = []
-
-    is_within_forest = "WITHIN_FOREST" in flags
-    if is_within_forest:
-        # Intra-forest (parent-child / tree-root) trust: not a cross-boundary
-        # SID-filtering or TGT-delegation exposure. Nothing to judge.
-        return issues
-
-    is_forest_transitive = "FOREST_TRANSITIVE" in flags
-    treat_as_external = "TREAT_AS_EXTERNAL" in flags
-    is_external_trust = (not is_forest_transitive) and (
-        "CROSS_ORGANIZATION" in flags or entry.trust_type == "External"
+    facts = decode_trust_facts(
+        trust_attributes=entry.trust_attributes,
+        trust_direction=entry.direction,
+        partner_domain=entry.partner,
     )
-
-    # Condition 1 — TGT delegation enabled across a forest trust (headline).
-    if is_forest_transitive and "CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION" in flags:
-        issues.append(
-            TrustPostureIssue(
-                finding_key=TRUST_TGT_DELEGATION_FINDING_KEY,
-                partner=entry.partner,
-                trust_type=entry.trust_type,
-                direction=entry.direction,
-                reason=(
-                    "The forest trust is configured to forward Kerberos "
-                    "ticket-granting tickets across the trust boundary "
-                    "(CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION is set), which "
-                    "permits unconstrained-delegation abuse to reach across the "
-                    "trust."
-                ),
-                attribute_flags=tuple(entry.attribute_flags),
-            )
+    # The two weakenings and their client-facing sentences are resolved by the
+    # shared decoder, so this finding and the web trust panel state the same
+    # sentence about the same condition instead of two drifting copies.
+    return [
+        TrustPostureIssue(
+            finding_key=key,
+            partner=entry.partner,
+            trust_type=entry.trust_type,
+            direction=entry.direction,
+            reason=note,
+            attribute_flags=tuple(entry.attribute_flags),
         )
-
-    # Condition 2 — SID filtering not enforced on a cross-boundary trust.
-    #   * TREAT_AS_EXTERNAL explicitly relaxes a forest trust's SID filtering
-    #     to the weaker external level — an observed weakening → always flag.
-    #   * An external trust with no QUARANTINED_DOMAIN quarantine is not
-    #     applying SID filtering → flag. (A plain forest trust without the
-    #     quarantine bit still enforces default forest-wide SID filtering, so
-    #     it is deliberately NOT flagged — avoiding a finding on every healthy
-    #     forest trust.)
-    quarantined = sid_filtering_quarantined(entry.trust_attributes)
-    if treat_as_external:
-        issues.append(
-            TrustPostureIssue(
-                finding_key=TRUST_SID_FILTERING_FINDING_KEY,
-                partner=entry.partner,
-                trust_type=entry.trust_type,
-                direction=entry.direction,
-                reason=(
-                    "The cross-forest trust is relaxed to external-level SID "
-                    "filtering (TREAT_AS_EXTERNAL is set), weakening the SID "
-                    "filtering that normally protects the forest boundary."
-                ),
-                attribute_flags=tuple(entry.attribute_flags),
-            )
-        )
-    elif is_external_trust and not quarantined:
-        issues.append(
-            TrustPostureIssue(
-                finding_key=TRUST_SID_FILTERING_FINDING_KEY,
-                partner=entry.partner,
-                trust_type=entry.trust_type,
-                direction=entry.direction,
-                reason=(
-                    "The external trust does not apply domain quarantine / SID "
-                    "filtering (QUARANTINED_DOMAIN is not set), so SID-History "
-                    "values from the trusted domain are honoured across the "
-                    "boundary."
-                ),
-                attribute_flags=tuple(entry.attribute_flags),
-            )
-        )
-
-    return issues
+        for key, note in zip(facts.finding_keys, facts.exposure_notes)
+    ]
 
 
 def _decode_sid(raw: Any) -> str | None:
@@ -398,7 +343,38 @@ def _parent_dn(dn: str) -> str:
     return text.split(",", 1)[1].strip()
 
 
-def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainControllerEntry]:
+def _is_no_such_object(exc: BaseException) -> bool:
+    """True when an LDAP error is the benign ``noSuchObject`` search result."""
+    text = str(exc).lower()
+    return "nosuchobject" in text or "no such object" in text
+
+
+def _dsa_hosts_domain(attrs: dict[str, list[Any]], domain_dn: str) -> bool | None:
+    """Whether an nTDSDSA hosts ``domain_dn`` as its domain NC (``None``: unknown).
+
+    ``msDS-HasDomainNCs`` names the one domain a DC serves; ``hasMasterNCs``
+    (the older attribute) lists its writable NCs, the domain NC among the
+    Configuration and Schema NCs. Neither readable means unknown.
+    """
+    wanted = str(domain_dn or "").strip().casefold()
+    if not wanted:
+        return None
+    for name in ("msDS-HasDomainNCs", "hasMasterNCs", "msDS-hasMasterNCs"):
+        values = [
+            str(v).strip().casefold()
+            for key, vals in attrs.items()
+            if key.casefold() == name.casefold()
+            for v in (vals or [])
+            if str(v).strip()
+        ]
+        if values:
+            return wanted in values
+    return None
+
+
+def query_domain_controllers(
+    conn: Any, config_dn: str, *, domain_dn: str | None = None
+) -> list[DomainControllerEntry]:
     """Enumerate a domain's full DC set from its own Configuration NC.
 
     Discovers every domain controller by locating the ``nTDSDSA`` objects (each
@@ -419,6 +395,13 @@ def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainController
         config_dn: The forest Configuration NC DN, e.g.
             ``CN=Configuration,DC=corp,DC=local``.
 
+    The Sites container is FOREST-wide: it lists every DC of every domain in
+    the forest. Pass ``domain_dn`` to keep only the DCs that host that domain's
+    naming context (``msDS-HasDomainNCs`` / ``hasMasterNCs`` on the DSA);
+    without it, a child domain recorded its parent's DCs as its own, and the
+    collection of the child then contacted them. A DSA whose NC attributes are
+    unreadable is kept (the count must not shrink on a read gap).
+
     Returns:
         One :class:`DomainControllerEntry` per discovered DC. On any search
         failure returns an empty list (telemetry records the exception); the
@@ -436,10 +419,22 @@ def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainController
         conn.search(
             search_base=sites_base,
             search_filter="(objectCategory=nTDSDSA)",
-            attributes=["distinguishedName"],
+            attributes=[
+                "distinguishedName",
+                "msDS-HasDomainNCs",
+                "hasMasterNCs",
+                "msDS-hasMasterNCs",
+            ],
             search_scope="SUBTREE",
         )
     except Exception as exc:  # noqa: BLE001
+        if _is_no_such_object(exc):
+            # Expected outcome (container not visible from this vantage): the
+            # caller degrades to the PDC-only view. Not a defect, no traceback.
+            print_info_debug(
+                f"trust_query: {sites_base} not found; using PDC-only view"
+            )
+            return []
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(
@@ -450,6 +445,8 @@ def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainController
     for entry in getattr(conn, "entries", []) or []:
         try:
             parent = _parent_dn(getattr(entry, "dn", "") or "")
+            if domain_dn and _dsa_hosts_domain(_attrs(entry), domain_dn) is False:
+                continue
             key = parent.casefold()
             if parent and key not in seen_server_dns:
                 seen_server_dns.add(key)
@@ -505,13 +502,38 @@ def query_domain_controllers(conn: Any, config_dn: str) -> list[DomainController
     ]
 
 
-def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]:
+def domain_from_dn(domain_dn: str) -> str:
+    """Return the dotted DNS name of a domain root DN.
+
+    ``DC=north,DC=sevenkingdoms,DC=local`` becomes
+    ``north.sevenkingdoms.local``. Needed so a same-forest trust can be told
+    apart by name containment: a partner under the local domain is a
+    parent-child relation, a partner beside it is a second domain tree.
+    Returns an empty string for anything that is not a domain root DN.
+    """
+    labels = [
+        part.split("=", 1)[1].strip()
+        for part in str(domain_dn or "").split(",")
+        if part.strip().lower().startswith("dc=") and "=" in part
+    ]
+    return ".".join(label for label in labels if label).lower()
+
+
+def query_trusted_domains(
+    conn: Any,
+    domain_dn: str,
+    *,
+    on_error: Callable[[BaseException], Any] | None = None,
+) -> list[TrustedDomainEntry]:
     """Enumerate ``trustedDomain`` objects under ``CN=System,<domain_dn>``.
 
     Args:
         conn: An active :class:`ADscanLDAPConnection` (or anything exposing
             ``search()`` and ``entries`` like ldap3).
         domain_dn: The domain root DN, e.g. ``DC=corp,DC=local``.
+        on_error: Called with the search exception before the empty return, so
+            a caller that must tell "no trusts" from "the read failed" (the
+            collector's integrity record) can.
 
     Returns:
         Decoded entries. On search failure returns an empty list (telemetry
@@ -540,7 +562,14 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"trust_query: search failed under {base}: {exc}")
+        if on_error is not None:
+            try:
+                on_error(exc)
+            except Exception:  # noqa: BLE001 - a callback never breaks the query
+                pass
         return []
+
+    local_domain = domain_from_dn(domain_dn)
 
     decoded: list[TrustedDomainEntry] = []
     for entry in getattr(conn, "entries", []) or []:
@@ -558,10 +587,18 @@ def query_trusted_domains(conn: Any, domain_dn: str) -> list[TrustedDomainEntry]
                 TrustedDomainEntry(
                     partner=partner,
                     direction=decode_trust_direction(direction_raw),
-                    trust_type=classify_trust_type(attrs_raw, type_raw),
+                    direction_raw=direction_raw,
+                    trust_type=classify_trust_type(
+                        attrs_raw,
+                        type_raw,
+                        local_domain=local_domain,
+                        partner_domain=partner,
+                    ),
+                    trust_type_raw=type_raw,
                     trust_attributes=attrs_raw,
                     attribute_flags=decode_trust_attributes(attrs_raw),
                     sid=_decode_sid(sid_raw),
+                    local_domain=local_domain,
                 )
             )
         except Exception as exc:  # noqa: BLE001

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,11 +57,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 from adscan_core import telemetry
+from adscan_core.reporting.client_secret_redaction import redact_report_secrets
 from adscan_core.cvss.calculator import (
+    baseline_score_for_band,
     compute_finding_severity,
     extract_context_from_details,
 )
-from adscan_core.cvss.severity_mapper import score_to_severity, severity_to_min_score
 from adscan_core.reporting.adscan_severity import (
     ADSCAN_BASELINE_SCORE_FIELD,
     ADSCAN_PRIORITY_SCORE_FIELD,
@@ -70,6 +72,7 @@ from adscan_core.reporting.adscan_severity import (
     ADSCAN_SEVERITY_FIELDS,  # noqa: F401  (re-exported for existing importers)
     reported_finding_severity,
 )
+from adscan_core.reporting.engagement_timeline import ENGAGEMENT_TIMELINE_KEY
 from adscan_core.reporting.finding_aliases import (
     collapse_finding_aliases,
     normalize_technical_report,
@@ -132,6 +135,22 @@ _FINDING_CATALOG_SNAPSHOT_PROVIDER: Optional[
     Callable[[], dict[str, dict[str, Any]]]
 ] = None
 
+# Per-thread "the provider is building right now" flag. The PRO provider builds
+# the catalog by asking the CVSS calculator for each key's base, and the
+# calculator reads the authored band back through ``finding_catalog()``. Before
+# the snapshot exists, that nested lookup re-entered the provider, which asked
+# the calculator again, down to the interpreter's recursion limit: one lookup
+# cost 356 provider builds and ran the stack to 993 of 1000 frames, the
+# calculator's broad ``except`` swallowed the ``RecursionError``, and a garbage
+# collection triggered at that depth printed "Exception ignored in __del__ ...
+# RecursionError" for unrelated objects (release gate 14.0.0, build 11). The
+# flag is thread-local so a concurrent first lookup on another thread still
+# builds normally instead of being served the meta slice.
+_FINDING_CATALOG_BUILD_STATE = threading.local()
+
+# The LITE-safe meta catalog, built once: ``VULN_CATALOG_META`` is static.
+_META_FINDING_CATALOG: Optional[dict[str, dict[str, Any]]] = None
+
 
 def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, Any]]:
     """Build the LITE-safe finding catalog from the meta slice.
@@ -149,6 +168,14 @@ def _build_technical_finding_catalog_from_meta() -> dict[str, dict[str, Any]]:
             "category": str(entry.get("category") or "General"),
         }
     return catalog
+
+
+def _meta_finding_catalog() -> dict[str, dict[str, Any]]:
+    """Return the memoized LITE-safe meta catalog (read-only, shared)."""
+    global _META_FINDING_CATALOG
+    if _META_FINDING_CATALOG is None:
+        _META_FINDING_CATALOG = _build_technical_finding_catalog_from_meta()
+    return _META_FINDING_CATALOG
 
 
 def set_finding_catalog_provider(
@@ -192,14 +219,25 @@ def finding_catalog() -> dict[str, dict[str, Any]]:
         and _FINDING_CATALOG_SNAPSHOT_PROVIDER is _FINDING_CATALOG_PROVIDER
     ):
         return _FINDING_CATALOG_SNAPSHOT
+    if getattr(_FINDING_CATALOG_BUILD_STATE, "building", False):
+        # A lookup made WHILE this thread's provider is building the catalog
+        # (the PRO provider computes each key's CVSS base through the
+        # calculator, which reads the authored band from here). Re-entering the
+        # provider would recurse to the interpreter's limit. The band is all
+        # such a caller reads, and the meta slice carries it drift-locked to
+        # the PRO catalog, so answer with that slice and do not memoize it.
+        return _meta_finding_catalog()
     catalog: dict[str, dict[str, Any]] | None = None
     if _FINDING_CATALOG_PROVIDER is not None:
+        _FINDING_CATALOG_BUILD_STATE.building = True
         try:
             catalog = _FINDING_CATALOG_PROVIDER()
         except Exception as exc:  # noqa: BLE001 - fall back to LITE-safe default
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             catalog = None
+        finally:
+            _FINDING_CATALOG_BUILD_STATE.building = False
     if not isinstance(catalog, dict):
         catalog = _build_technical_finding_catalog_from_meta()
     _FINDING_CATALOG_SNAPSHOT = catalog
@@ -356,44 +394,27 @@ def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
 def _baseline_score_for_band(key: str, band: str) -> float:
     """Return the numeric baseline for a finding whose authored band is *band*.
 
-    The BAND is authoritative, not the numeric, for two independent reasons.
+    The BAND is authoritative and the baseline is its floor, through the one
+    helper every surface uses (:func:`adscan_core.cvss.calculator.baseline_score_for_band`).
 
-    It is the only one of the two that resolves in every deployment. The catalog
-    numeric lives in the PRO catalog under ``adscan_internal/pro/``, which the
-    LITE image strips wholesale and the appliance backend never ships, so the
-    lookup returns ``0.0`` there for all 93 keys — and ``0.0`` maps to ``info``,
-    which is how a real finding came to read "Informational" on a paid surface.
-    The band ships in the LITE meta catalog and so survives the strip.
-
-    And where the two disagree the band is the one the product already counts on:
-    measured on this catalog, 12 of 93 keys carry a numeric whose band is LOWER
-    than the authored one (every ADCS ESC key is authored ``critical`` with an
-    8.5, i.e. ``high``), so deriving the band from the numeric would silently
-    downgrade eleven ADCS findings.
-
-    So the numeric is used only as a within-band refinement — when it reproduces
-    the authored band — and otherwise the band's own floor is used, which
-    reproduces the band by construction and never inflates inside it.
+    It used to take the catalog's ``cvss`` scalar instead whenever that number
+    fell inside the band. That scalar is CVSS-shaped (most keys carry it with no
+    vector, and most of those that have one contradict it), and it only resolves
+    where the PRO catalog is loaded, so the same finding stamped ``7.0`` in one
+    process and ``8.8`` in another, and the paid report printed catalog CVSS
+    numbers under the label "ADscan Priority". A client surface prints no CVSS,
+    so the scalar never reaches a priority.
 
     Args:
-        key: The finding's catalog key.
+        key: The finding's catalog key (kept for call-site stability).
         band: The finding's recorded severity band (already lower-cased and
             known to be a published band).
 
     Returns:
         A numeric baseline whose band equals *band*.
     """
-    floor = severity_to_min_score(band)
-    catalog = finding_catalog().get(key)
-    if isinstance(catalog, dict):
-        raw = catalog.get("cvss")
-        try:
-            numeric = float(str(raw).strip().split()[0].strip("()"))
-        except (TypeError, ValueError, IndexError, AttributeError):
-            numeric = 0.0
-        if numeric > 0.0 and score_to_severity(numeric) == band:
-            return numeric
-    return floor
+    del key
+    return baseline_score_for_band(band)
 
 
 def stamp_adscan_severity(finding: dict[str, Any]) -> bool:
@@ -491,6 +512,33 @@ def stamp_adscan_severity_report(report: dict[str, Any]) -> bool:
     return changed
 
 
+def _stamp_coverage_run_id(shell: Any, doc: dict[str, Any]) -> None:
+    """Record which recorded run wrote ``doc`` (or clear a stale id).
+
+    The run's ``coverage.json`` is only trusted for an artifact carrying its run
+    id (``adscan_core.engagement.coverage_io``). Outside a recorded run the id is
+    REMOVED, so a later rewrite cannot re-bind an old coverage record to new
+    content.
+
+    The run is resolved from the WORKSPACE, not only from the writer's object:
+    the report's last writer in a scan is a render-time enrichment pass that
+    takes a workspace directory and builds a stub shell for the report IO, so a
+    writer-object lookup cleared the id on the final write and the run could
+    judge nothing. The shell's own recorder still wins when it has one (read
+    duck-typed; this module must not import the engine).
+    """
+    from adscan_core.engagement.coverage_io import (
+        active_run_id_for_workspace,
+        stamp_artifact_run_id,
+    )
+
+    recorder = getattr(shell, "_coverage_recorder", None)
+    run_id = str(getattr(recorder, "run_id", "") or "") or active_run_id_for_workspace(
+        getattr(shell, "current_workspace_dir", "")
+    )
+    stamp_artifact_run_id(doc, run_id)
+
+
 def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
     """Persist the technical report JSON to disk atomically.
 
@@ -509,30 +557,86 @@ def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
     details on disk imply — see :func:`stamp_adscan_severity_report`.
     """
     report_path = _get_technical_report_path(shell)
+    from adscan_core.workspace_freeze import write_blocked
+
+    if write_blocked(report_path):
+        # A frozen workspace (a recheck) keeps the scan's report byte-identical.
+        return
+    _stamp_coverage_run_id(shell, report)
+    # The artifact feeds the deliverable kit and the web platform, so no
+    # recovered secret value is ever written into it: the credential store
+    # holds the values, the report holds a reference (account + kind).
+    redact_report_secrets(report)
     try:
         stamp_adscan_severity_report(report)
     except Exception as exc:  # noqa: BLE001  (rating never blocks the write)
         telemetry.capture_exception(exc)
         print_exception(show_locals=False, exception=exc)
     try:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = report_path.with_name(report_path.name + ".tmp")
-        try:
-            with tmp_path.open("w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, report_path)
-        except Exception:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            raise
+        _write_report_atomically(report_path, report)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Error saving technical report.")
         print_exception(show_locals=False, exception=exc)
+
+
+def _write_report_atomically(report_path: Path, report: dict[str, Any]) -> None:
+    """Write *report* to *report_path* via a sibling temp file + ``os.replace``."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = report_path.with_name(report_path.name + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, report_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+#: Where :func:`scrub_technical_report_secrets` keeps the original bytes of a
+#: report an older build wrote with inline secret values. The name carries
+#: ``secret`` so the node-link egress classes it ``secret`` (never leaves the
+#: node), the same retention shape as ``attack_graph.json.pre_migration``.
+PRE_REDACTION_BACKUP_SUFFIX = ".pre_secret_redaction"
+
+
+def scrub_technical_report_secrets(shell: ReportShell) -> bool:
+    """Remove recovered secret values from the on-disk report, once, in place.
+
+    The pre-render backstop for a report an older build wrote: every renderer of
+    the kit and the LITE report reads ``technical_report.json`` after this runs,
+    so none of them can be handed a value regardless of how it reads the file.
+    The original bytes are retained beside it (mode 0600, egress class
+    ``secret``), never discarded. Writes nothing when the file is already clean.
+    Best-effort: never raises.
+
+    Returns:
+        ``True`` when the file held a value and was rewritten without it.
+    """
+    try:
+        report_path = _get_technical_report_path(shell)
+        if not report_path.is_file():
+            return False
+        raw = report_path.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or not redact_report_secrets(data):
+            return False
+        backup = report_path.with_name(report_path.name + PRE_REDACTION_BACKUP_SUFFIX)
+        if not backup.exists():
+            fd = os.open(str(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw)
+        _write_report_atomically(report_path, data)
+        return True
+    except Exception as exc:  # noqa: BLE001 - a render must never break on this
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return False
 
 
 def _ensure_technical_domain(report: dict[str, Any], domain: str) -> dict[str, Any]:
@@ -622,6 +726,11 @@ def record_technical_finding(
     """
     report = _load_technical_report(shell)
     domain_entry = _ensure_technical_domain(report, domain)
+    # S7: a detection the scan policy excluded was not evaluated by this run,
+    # so it is never recorded as a finding. The scope section lists it as
+    # excluded, which is how its absence reads as a boundary and not as clean.
+    if _finding_excluded_by_scan_policy(shell, domain_entry, key):
+        return
     findings = domain_entry["findings"]
 
     finding = next((item for item in findings if item.get("key") == key), None)
@@ -820,6 +929,31 @@ def record_technical_event(
     _save_technical_report(shell, report)
 
 
+#: Callables told about every control-evidence write, as
+#: ``(shell, domain, key, status, details)``. The engine registers one at run
+#: start so its per-run observation record (``adscan_core.engagement``) learns
+#: every positive the run records, whichever producer wrote it. Injected rather
+#: than imported: this module is shared by every tier and the web backend.
+ControlEvidenceObserver = Callable[[Any, str, str, str, dict[str, Any]], None]
+_CONTROL_EVIDENCE_OBSERVERS: list[ControlEvidenceObserver] = []
+
+
+def register_control_evidence_observer(observer: ControlEvidenceObserver) -> None:
+    """Register ``observer`` for every later :func:`record_control_evidence` call (once)."""
+    if observer not in _CONTROL_EVIDENCE_OBSERVERS:
+        _CONTROL_EVIDENCE_OBSERVERS.append(observer)
+
+
+def _notify_control_evidence(
+    shell: Any, domain: str, key: str, status: str, details: dict[str, Any]
+) -> None:
+    for observer in list(_CONTROL_EVIDENCE_OBSERVERS):
+        try:
+            observer(shell, domain, key, status, dict(details))
+        except Exception as exc:  # noqa: BLE001 - an observer never breaks a write
+            telemetry.capture_exception(exc)
+
+
 def record_control_evidence(
     shell: ReportShell,
     domain: str,
@@ -874,6 +1008,7 @@ def record_control_evidence(
             _append_unique(entry["evidence"], item)
 
     _save_technical_report(shell, report)
+    _notify_control_evidence(shell, domain, key, status, details or {})
 
 
 def record_collection_coverage(
@@ -1166,6 +1301,39 @@ def record_host_enrichment_coverage(
     _save_technical_report(shell, report)
 
 
+def record_host_reach_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the network-reach coverage statement for *domain*.
+
+    Write-side single source of truth for the honest answer to "which enabled
+    computers did the assessment actually reach over the network". A computer
+    the scanning host could not reach is absent from every host-level section,
+    and an absent computer must never read as a clean one: that is a DATA GAP in
+    the family of ``unsupported`` (see
+    :mod:`adscan_core.reporting.host_reach_coverage`).
+
+    The block is built by ``build_host_reach_coverage`` from the engine's own
+    reachability measurement and REPLACES any earlier block for the domain (each
+    stamp re-derives from the latest measurement, so a pivot that widened reach
+    is reflected rather than merged with the narrower view). Stamped onto
+    ``domains[<domain>]["host_reach_coverage"]`` so the PDF report, the LITE
+    report AND ``adscan_web`` render the SAME statement. Best-effort: ignores a
+    missing/invalid payload.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    from adscan_core.reporting.host_reach_coverage import HOST_REACH_COVERAGE_KEY
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[HOST_REACH_COVERAGE_KEY] = coverage
+    _save_technical_report(shell, report)
+
+
 def record_vantage_coverage(
     shell: ReportShell,
     domain: str,
@@ -1234,6 +1402,103 @@ def read_vantage_coverage(
     except Exception as exc:  # noqa: BLE001 - a coverage read is best-effort
         telemetry.capture_exception(exc)
         return None
+
+
+def record_scan_policy_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    block: dict[str, Any],
+) -> None:
+    """Persist the scan-policy coverage block for *domain*.
+
+    Write-side single source of truth for "which checks did this assessment's
+    policy leave out". A check the policy excluded did not run, so the area it
+    covers is a boundary of the assessment and must never read as clean. The
+    block is built by
+    :func:`adscan_core.scan_policy.coverage.build_scan_policy_coverage` and is
+    the same for every domain of the run; the PDF report, the LITE report and
+    ``adscan_web`` render it through ``scan_policy_coverage_view``. It is also
+    what keeps an excluded detection out of the findings (see
+    :func:`record_technical_finding`) when the writer holds no live policy.
+
+    Best-effort: ignores a missing/invalid payload and never raises into the
+    caller. Mirrors :func:`record_cracking_coverage`.
+    """
+    if not domain or not isinstance(block, dict) or "statement" not in block:
+        return
+    from adscan_core.scan_policy.coverage import SCAN_POLICY_COVERAGE_KEY
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[SCAN_POLICY_COVERAGE_KEY] = block
+    _save_technical_report(shell, report)
+
+
+def record_scan_pacing(
+    shell: ReportShell,
+    domain: str,
+    *,
+    block: dict[str, Any],
+) -> None:
+    """Persist the assessment-pace disclosure block for *domain*.
+
+    Written at scan end so the strain safeguard's slowdowns and paused servers
+    are included. Built by
+    :func:`adscan_core.reporting.scan_pacing_disclosure.build_scan_pacing_disclosure`
+    and rendered through ``scan_pacing_disclosure_view`` by the PDF report, the
+    LITE report and ``adscan_web``. Best-effort; mirrors
+    :func:`record_cracking_coverage`.
+    """
+    if not domain or not isinstance(block, dict) or "statement" not in block:
+        return
+    from adscan_core.reporting.scan_pacing_disclosure import SCAN_PACING_KEY
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[SCAN_PACING_KEY] = block
+    _save_technical_report(shell, report)
+
+
+def _finding_excluded_by_scan_policy(
+    shell: ReportShell, domain_entry: dict[str, Any], key: str
+) -> bool:
+    """S7: True when the run's scan policy excluded the detection behind *key*.
+
+    The live policy on the shell answers first (a scan in progress). A writer
+    with no live policy (a report-time pass over a workspace directory) reads the
+    persisted coverage block instead, so the same detection cannot reappear just
+    because the writer is a stub. Fails open only when neither is present, which
+    is today's behaviour for a run without a policy.
+    """
+    try:
+        from adscan_core.scan_policy import gate
+
+        if gate.active_policy(shell) is not None:
+            return not gate.finding_allowed(shell, key)
+        from adscan_core.scan_policy.coverage import SCAN_POLICY_COVERAGE_KEY
+
+        block = domain_entry.get(SCAN_POLICY_COVERAGE_KEY)
+        if isinstance(block, dict):
+            excluded = block.get("excluded_finding_keys") or ()
+            return str(key) in {str(k) for k in excluded}
+    except Exception as exc:  # noqa: BLE001 - the gate itself fails closed above
+        telemetry.capture_exception(exc)
+    return False
+
+
+def finding_excluded_by_scan_policy(
+    shell: ReportShell, domain_entry: dict[str, Any], key: str
+) -> bool:
+    """Public name of the S7 gate, for every writer of a finding.
+
+    The attack-graph finding derivation records findings without going through
+    :func:`record_technical_finding`, so it asks this gate itself; a policy that
+    leaves a weakness unchecked must leave it unreported on every path. Under the
+    two-group model a paired detection whose attack step is switched off is still
+    mapped, so this returns False for it and it is reported.
+    """
+    return _finding_excluded_by_scan_policy(shell, domain_entry, key)
 
 
 def record_domain_assessment(
@@ -1325,6 +1590,74 @@ def record_attack_fanout_rollup(
     _save_technical_report(shell, report)
 
 
+def record_workspace_remediation(
+    shell: ReportShell,
+    *,
+    block: dict[str, Any],
+) -> None:
+    """Persist the workspace-wide "Start here" remediation block.
+
+    A WORKSPACE-scoped TOP-LEVEL key
+    (``report[remediation_scope_view.WORKSPACE_REMEDIATION_KEY]``), like
+    ``attack_fanout_rollup``: the Security Assessment Report ranks the remediation
+    once across every assessed domain, so the paid web CTEM needs that one ranking
+    stamped by the scan, not a per-domain block it would have to combine. Built by
+    ``scan_headline_blocks.stamp_workspace_remediation``. A block whose model is
+    ``None`` is still written, so a re-run clears a stale ranking and an empty
+    workspace reads as the honest "nothing to rank". Best-effort: ignores a
+    payload that is not a mapping and never raises into the caller.
+
+    Args:
+        shell: Shell object with report paths.
+        block: ``{schema_version, domains, attack_paths_considered,
+            remediation_start_here, user_exposure}``.
+    """
+    from adscan_core.reporting.remediation_scope_view import (  # noqa: PLC0415
+        WORKSPACE_REMEDIATION_KEY,
+    )
+
+    if not isinstance(block, dict):
+        return
+    report = _load_technical_report(shell)
+    report[WORKSPACE_REMEDIATION_KEY] = block
+    _save_technical_report(shell, report)
+
+
+def record_engagement_timeline(
+    shell: ReportShell,
+    *,
+    timeline: dict[str, Any],
+) -> None:
+    """Persist the engagement timeline: what the assessment did, and when.
+
+    Write-side single source of truth for the record a regulated client needs in
+    order to reconcile its own alerts against the assessment and to show a
+    supervisor that the privileged-logon spike was the authorised test. Built by
+    :func:`adscan_core.reporting.engagement_timeline.build_engagement_timeline`,
+    whose own docstring carries the three honesty rules the content obeys.
+
+    Like ``attack_fanout_rollup`` this is a WORKSPACE-scoped TOP-LEVEL key
+    (``report[\"engagement_timeline\"]``), not a per-domain one: one engagement
+    ran once, from one host, inside one window, even when it crossed three
+    domains. Persisting it is what lets a LATER process render it, which matters
+    here more than for most blocks, because the clock each instant came from is
+    resolved from in-scan state the renderer no longer has.
+
+    Best-effort: ignores a payload that is not a mapping and never raises into
+    the caller. A block with no entries and no window is still written, so a
+    re-render clears a stale record rather than showing the previous scan's.
+
+    Args:
+        shell: Shell object with report paths.
+        timeline: The built block (may be empty).
+    """
+    if not isinstance(timeline, dict):
+        return
+    report = _load_technical_report(shell)
+    report[ENGAGEMENT_TIMELINE_KEY] = timeline
+    _save_technical_report(shell, report)
+
+
 def record_exposure_kpis(
     shell: ReportShell,
     domain: str,
@@ -1371,6 +1704,40 @@ def record_compliance(
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["compliance"] = compliance
     _save_technical_report(shell, report)
+
+
+def clear_compliance(shell: ReportShell, domains: list[str] | None = None) -> bool:
+    """Drop the compliance block of *domains* (every domain when ``None``).
+
+    The scan's finalization seam calls this when the scan selected no framework
+    (or the tier carries no compliance engine). A block an earlier run or an
+    earlier render left behind maps findings this scan no longer reports, so
+    keeping it would show the web a conformance verdict nobody scoped for this
+    data. Absent is the honest state: the web renders "no framework selected".
+    Writes only when a block was actually removed. Best-effort: never raises.
+
+    Returns:
+        ``True`` when a block was removed.
+    """
+    try:
+        report = _load_technical_report(shell)
+        entries = report.get("domains") if isinstance(report, dict) else None
+        if not isinstance(entries, dict):
+            return False
+        wanted = set(domains) if domains is not None else None
+        removed = False
+        for name, entry in entries.items():
+            if wanted is not None and name not in wanted:
+                continue
+            if isinstance(entry, dict) and entry.pop("compliance", None) is not None:
+                removed = True
+        if removed:
+            _save_technical_report(shell, report)
+        return removed
+    except Exception as exc:  # noqa: BLE001 - a stale-block sweep never breaks a scan
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return False
 
 
 # --- Read-side findings bucket (LITE-safe) ----------------------------------

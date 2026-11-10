@@ -508,7 +508,7 @@ async def harvest_gpp_across_targets(
     domain: str = "",
     shares: Sequence[str] = DEFAULT_GPP_SHARES,
     timeout_per_target: int = 120,
-    max_concurrent: int = 4,
+    max_concurrent: int | None = None,
 ) -> GPPHarvestResult:
     """Harvest GPP credentials across a list of DCs in parallel.
 
@@ -527,7 +527,14 @@ async def harvest_gpp_across_targets(
         aggregate.error = "no targets supplied"
         return aggregate
 
-    semaphore = asyncio.Semaphore(max(1, max_concurrent))
+    if max_concurrent is None:
+        # Scan pacing (``sweep.gpp``): 4 hosts at the default level.
+        from adscan_core.scan_pacing import active_pacing, component_pacing  # noqa: PLC0415
+
+        max_concurrent = int(component_pacing(active_pacing(), "sweep.gpp")["max_concurrent"])
+    from adscan_core.scan_pacing.pacing_runtime import active_runtime  # noqa: PLC0415
+
+    semaphore = active_runtime().semaphore(max(1, max_concurrent))
 
     async def _one(target: str) -> GPPHarvestResult:
         async with semaphore:

@@ -51,6 +51,10 @@ _TERMINUS_STYLE: str = f"bold {COLOR_CRIMSON}"
 # Privileged Escalator = amber. Compromise Enabler = cyan.
 _CLASS_STYLE: dict[CompromiseClass, str] = {
     CompromiseClass.DOMAIN_BREAKER: f"bold {COLOR_CRIMSON}",
+    # Tier 0 Control sits in the direct band beside Domain Breaker; a plain
+    # (non-bold) crimson keeps it readable as the same severity without
+    # claiming the domain-compromise star.
+    CompromiseClass.TIER0_CONTROL: COLOR_CRIMSON,
     # Tier 0 Foothold: distinct from amber (Privileged Escalator) and
     # crimson (Domain Breaker). Bright magenta reads as urgent without
     # colliding with either neighbour on the severity ramp.
@@ -92,6 +96,7 @@ def render_kpi_panel(
     privileged_escalator: tuple[int, int],
     compromise_enabler: tuple[int, int],
     tier0_foothold: tuple[int, int] = (0, 0),
+    tier0_control: tuple[int, int] = (0, 0),
     audience: Audience = "technical",
     title: str = "Compromise Exposure",
 ) -> Panel:
@@ -111,6 +116,10 @@ def render_kpi_panel(
             new auth-edge-to-Tier0 bucket. Defaults to ``(0, 0)`` so
             existing call sites that have not yet wired the foothold
             data keep working without breakage.
+        tier0_control: Tuple of ``(account_count, path_count)`` for routes
+            that control a direct Tier 0 principal without reaching the
+            domain object. Normally empty, so the row is shown only when it
+            carries something.
         audience: Selects badge style. Default ``"technical"``.
         title: Panel title. Defaults to "Compromise Exposure".
     """
@@ -132,6 +141,11 @@ def render_kpi_panel(
 
     rows: Sequence[tuple[CompromiseClass, tuple[int, int]]] = (
         (CompromiseClass.DOMAIN_BREAKER, domain_breaker),
+        *(
+            ((CompromiseClass.TIER0_CONTROL, tier0_control),)
+            if any(tier0_control)
+            else ()
+        ),
         (CompromiseClass.TIER0_FOOTHOLD, tier0_foothold),
         (CompromiseClass.PRIVILEGED_ESCALATOR, privileged_escalator),
         (CompromiseClass.COMPROMISE_ENABLER, compromise_enabler),

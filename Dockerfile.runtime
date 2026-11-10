@@ -589,25 +589,6 @@ COPY --from=freerdp_source /opt/adscan/tools/freerdp/install /opt/adscan/tools/f
 # Wordlists layer below tarball-fetches it only when this dir is empty.
 COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/share/wordlists/statistically-likely-usernames
 
-# Our maintained aardwolf (0.2.13) — needed EARLY (before the tool-venv layer)
-# so NetExec's ``aardwolf>=0.2.8`` requirement is satisfied by THIS copy instead
-# of a PyPI source build. debian:trixie ships Python 3.13, and upstream aardwolf
-# has no cp313 wheel, so a PyPI install source-builds it — whose Rust extension
-# (`librlers`) is FATAL there. Our vendor setup.py marks that RustExtension
-# ``optional=True`` (skelsec fork), so it installs pure-Python when no Rust
-# compiler is present (exactly how the main venv at the bottom already installs
-# it). Pre-seeding it into the NetExec venv is what makes this layer build cold
-# (the failure only surfaced in CI because the warm local layer cache hid it).
-# Vendored skelsec auth chain needed to build the NetExec tool venv below.
-# Forcing our vendor aardwolf (Rust-optional wheel) pulls its badauth dep, which
-# in turn pulls asysocks>=0.2.18 + kerbad — a set PyPI does not always have
-# published consistently at build time. We wheel all four from vendored source so
-# the netexec venv resolves without depending on PyPI's skelsec publishing state.
-COPY vendor/aardwolf /opt/adscan-src/vendor/aardwolf
-COPY vendor/asysocks /opt/adscan-src/vendor/asysocks
-COPY vendor/badauth /opt/adscan-src/vendor/badauth
-COPY vendor/kerbad /opt/adscan-src/vendor/kerbad
-
 # Install Python tool environments (mirrors `PipToolsConfig` from adscan.py)
 # BuildKit cache mount persists pip's wheel cache ACROSS builds (in the builder
 # cache, NOT the image — image stays small), so when this layer is invalidated
@@ -618,8 +599,7 @@ COPY vendor/kerbad /opt/adscan-src/vendor/kerbad
 RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   set -eux; \
   export PIP_CACHE_DIR=/var/cache/adscan-pip; \
-  # Several tool deps are git+https clones from GitHub (NetExec,
-  # MANSPIDER). This layer runs BEFORE the External-tools layer that sets the
+  # Several tool deps are git+https clones from GitHub (MANSPIDER). This layer runs BEFORE the External-tools layer that sets the
   # global git HTTP/1.1 config, so without this its clones default to HTTP/2 and
   # hit the same "curl 92 stream CANCEL" / pack-corruption failures under GitHub
   # throttle that plagued the John fetch — failing the layer so it never caches.
@@ -644,44 +624,6 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   python3 -m venv /opt/adscan/tool_venvs/impacket/venv; \
   pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python "impacket==0.13.1" "pycryptodome==3.23.0"; \
-  \
-  python3 -m venv /opt/adscan/tool_venvs/netexec/venv; \
-  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python -U pip; \
-  # NetExec pulls ``aardwolf>=0.2.8``. On this Python 3.13 base (debian:trixie)
-  # upstream aardwolf has no cp313 wheel, so a plain install source-builds it and
-  # its librlers Rust extension is FATAL (no Rust compiler in this layer). Our
-  # vendor aardwolf 0.2.13 marks that RustExtension ``optional=True``, so it
-  # builds a pure-Python wheel with no Rust. Build that wheel ONCE, install it,
-  # then install NetExec with ``--find-links`` + ``--only-binary=aardwolf`` pointed
-  # at it so pip is FORCED to take aardwolf from THIS wheel and can NEVER
-  # source-build the Rust-fatal PyPI sdist (if no aardwolf wheel is found it errors
-  # loudly instead of silently building). ``--only-binary`` is scoped to aardwolf
-  # ONLY, so NetExec's own git deps (certipy, impacket, ...) still build normally.
-  # A plain pre-seed install is NOT enough: pip re-resolves aardwolf during the
-  # NetExec install and rebuilds the PyPI sdist across every retry — forcing
-  # binary-only for aardwolf is what actually prevents that.
-  # Vendor aardwolf depends on badauth, and badauth pulls asysocks>=0.2.18 +
-  # kerbad — a skelsec set PyPI does NOT always have published consistently at
-  # build time (badauth 0.1.6 shipped requiring an asysocks that lagged on PyPI,
-  # so FRESH CI builds hit ResolutionImpossible while warm local caches passed).
-  # Build the WHOLE forced chain (asysocks, kerbad, badauth, aardwolf) as wheels
-  # from our vendored source and install from those --find-links, so the netexec
-  # venv resolution is INDEPENDENT of PyPI's skelsec publishing state. Pre-install
-  # the chain first so the NetExec resolve finds it satisfied instead of re-
-  # fetching from PyPI. --only-binary stays scoped to aardwolf (only its sdist is
-  # Rust-fatal); asysocks/kerbad/badauth are pure Python.
-  mkdir -p /tmp/skelsec-wheels; \
-  for _skelsec_lib in asysocks kerbad badauth aardwolf; do \
-    /opt/adscan/tool_venvs/netexec/venv/bin/python -m pip wheel --no-deps \
-      --wheel-dir /tmp/skelsec-wheels "/opt/adscan-src/vendor/${_skelsec_lib}"; \
-  done; \
-  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
-    --find-links /tmp/skelsec-wheels --only-binary=aardwolf \
-    asysocks kerbad badauth aardwolf; \
-  pip_retry /opt/adscan/tool_venvs/netexec/venv/bin/python \
-    --find-links /tmp/skelsec-wheels --only-binary=aardwolf \
-    "git+https://github.com/Pennyw0rth/NetExec.git@73ccf0d"; \
-  rm -rf /tmp/skelsec-wheels; \
   \
   # TODO(arm64-extractous-cache): MANSPIDER pulls extractous>=0.3.0,<0.4.0, which
   # has NO linux/aarch64 wheel on PyPI for any version — so on the arm64 leg pip
@@ -1230,10 +1172,27 @@ ARG ADSCAN_RUNTIME_VERSION=""
 ARG ADSCAN_BUILD_COMMIT="unknown"
 ARG ADSCAN_BUILD_DESCRIBE="unknown"
 ARG ADSCAN_BUILD_TIMESTAMP="unknown"
+# Release channel the image is built for (dev|stable); read at runtime by
+# adscan_core.runtime_channel to gate development-only capabilities.
+ARG ADSCAN_IMAGE_CHANNEL="stable"
+# Enterprise edition marker + the binary's PyArmor expiry (both set by
+# `build_docker_pro_image.sh --enterprise`; empty for PRO). The marker is a FILE,
+# not an ENV, so `docker run -e` cannot turn an Enterprise image back into PRO:
+# with it the engine requires a signed license before any new assessment
+# (adscan_core/enterprise_license.py). ADSCAN_BINARY_EXPIRES is informational:
+# the engine records it beside the license so the web panel can warn when the
+# image would stop before the license does.
+ARG ADSCAN_IMAGE_EDITION=""
+ARG ADSCAN_BINARY_EXPIRES=""
 RUN set -eux; \
   chmod +x /usr/local/bin/adscan; \
   if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
     printf '%s\n' "${ADSCAN_RUNTIME_VERSION}" > /opt/adscan/version; \
+  fi; \
+  if [[ "${ADSCAN_IMAGE_EDITION}" == "enterprise" ]]; then \
+    mkdir -p /usr/local/share/adscan; \
+    printf 'enterprise\n' > /usr/local/share/adscan/edition; \
+    chmod 0444 /usr/local/share/adscan/edition; \
   fi
 
 # Bake build-time ARGs into the image ENV only at the end, after every
@@ -1244,6 +1203,8 @@ ENV ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
 ENV ADSCAN_BUILD_COMMIT=${ADSCAN_BUILD_COMMIT}
 ENV ADSCAN_BUILD_DESCRIBE=${ADSCAN_BUILD_DESCRIBE}
 ENV ADSCAN_BUILD_TIMESTAMP=${ADSCAN_BUILD_TIMESTAMP}
+ENV ADSCAN_IMAGE_CHANNEL=${ADSCAN_IMAGE_CHANNEL}
+ENV ADSCAN_BINARY_EXPIRES=${ADSCAN_BINARY_EXPIRES}
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]
 
@@ -1404,6 +1365,9 @@ ARG ADSCAN_RUNTIME_VERSION=""
 ARG ADSCAN_BUILD_COMMIT="unknown"
 ARG ADSCAN_BUILD_DESCRIBE="unknown"
 ARG ADSCAN_BUILD_TIMESTAMP="unknown"
+# Release channel the image is built for (dev|stable); read at runtime by
+# adscan_core.runtime_channel to gate development-only capabilities.
+ARG ADSCAN_IMAGE_CHANNEL="stable"
 RUN set -eux; \
   if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
     printf '%s\n' "${ADSCAN_RUNTIME_VERSION}" > /opt/adscan/version; \
@@ -1416,5 +1380,6 @@ ENV ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
 ENV ADSCAN_BUILD_COMMIT=${ADSCAN_BUILD_COMMIT}
 ENV ADSCAN_BUILD_DESCRIBE=${ADSCAN_BUILD_DESCRIBE}
 ENV ADSCAN_BUILD_TIMESTAMP=${ADSCAN_BUILD_TIMESTAMP}
+ENV ADSCAN_IMAGE_CHANNEL=${ADSCAN_IMAGE_CHANNEL}
 
 ENTRYPOINT ["/usr/local/bin/adscan-entrypoint"]

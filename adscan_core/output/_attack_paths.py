@@ -12,6 +12,7 @@ from rich.table import Table
 import adscan_core.output._state as _state
 from adscan_core.theme import ADSCAN_PRIMARY
 from adscan_core.output._state import mark_sensitive
+from adscan_core.graph_secret_refs import referenced_secret_display, secret_for_display
 from adscan_core.output._log import (
     BRAND_COLORS,
     print_info,
@@ -762,24 +763,25 @@ def _canonical_attack_path_sort_key(
         path_length if isinstance(path_length, int) and path_length >= 0 else 0
     )
     base = build_path_execution_priority_key(path)
-    # The viability_rank field was inserted at base[4]; downstream indices
-    # shifted +1.  The outer ``*base[:5]`` slice still groups paths by
-    # (priority_class, terminal_class, followup, priority_rank), and the
-    # newly-added viability_rank (now at base[4]) becomes the 5th outer
-    # factor so reachable targets always surface before unreachable ones
-    # within the same Tier-0/high-value/pivot bucket.
+    # Positions in the execution key: 0 priority class, 1 terminal class,
+    # 2 cut short by the scan policy (0 without a policy), 3 domain object,
+    # 4 follow-up status, 5 priority rank, then the display key's tail. The
+    # outer ``*base[:6]`` groups paths by everything through the priority rank,
+    # so "the policy lets this run end to end" ranks right after the target
+    # criticality and terminal class, before choke-point severity. Every later
+    # position is the same field as before the policy term was added.
     return (
-        *base[:5],
+        *base[:6],
         -choke_presence,
         -severity_rank,
         -blast_radius,
-        base[5],   # status_order (was base[4])
-        base[6],   # agg_effort_score (was base[5])
-        base[7],   # terminal_semantics (was base[6])
-        base[8],   # terminal_effort (was base[7])
+        base[6],   # target viability rank
+        base[7],   # status order
+        base[8],   # aggregate effort
+        base[9],   # terminal semantics
         path_length_rank,
-        base[10],  # source (was base[9])
-        base[11],  # target (was base[10])
+        base[11],  # executable length
+        base[12],  # source
     )
 
 
@@ -849,6 +851,7 @@ def print_attack_paths_summary(
         DISPLAY_TIER_LATERAL_PIVOT,
         DISPLAY_TIER_ORDER,
         DISPLAY_TIER_STYLES,
+        DISPLAY_TIER_TIER0_CONTROL,
         DISPLAY_TIER_TIER0_FOOTHOLD,
         describe_path_target_outcome,
         get_path_display_tier,
@@ -1380,7 +1383,8 @@ def print_attack_paths_summary(
         row_style = "dim" if display_tier == DISPLAY_TIER_LATERAL_PIVOT else ""
         idx_style = (
             BRAND_COLORS["error"]
-            if display_tier == DISPLAY_TIER_DOMAIN_COMPROMISE
+            if display_tier
+            in (DISPLAY_TIER_DOMAIN_COMPROMISE, DISPLAY_TIER_TIER0_CONTROL)
             else BRAND_COLORS["warning"]
             if display_tier
             in (DISPLAY_TIER_TIER0_FOOTHOLD, DISPLAY_TIER_COMPROMISE_ENABLER)
@@ -1570,7 +1574,7 @@ def _fallback_format_attack_path_source_context(
     if relation_key == "userdescription":
         source_username = str(details.get("source_username") or "").strip()
         auth_mechanism = str(details.get("auth_mechanism") or "").strip().lower()
-        secret = str(details.get("secret") or "").strip()
+        secret, secret_recovered = secret_for_display(details, "secret")
         context_parts: list[str] = []
         if source_username:
             context_parts.append(f"description of {source_username}")
@@ -1580,6 +1584,8 @@ def _fallback_format_attack_path_source_context(
             context_parts.append("via authenticated LDAP query")
         if secret:
             context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        elif secret_recovered:
+            context_parts.append(f"secret {referenced_secret_display(details)}")
         return " ".join(context_parts).strip()
 
     if relation_key in {"passwordinshare", "passwordinfile", "gpppassword"}:
@@ -1587,7 +1593,7 @@ def _fallback_format_attack_path_source_context(
         share_hint = ""
         artifact_hint = str(details.get("artifact") or "").strip().replace("\\", "/")
         artifact_kind = str(details.get("artifact_kind") or "").strip().lower()
-        secret = str(details.get("secret") or details.get("password") or "").strip()
+        secret, secret_recovered = secret_for_display(details, "secret", "password")
         for value in details.get("hosts_list"), details.get("hosts"):
             if isinstance(value, list) and value:
                 host_hint = str(value[0] or "").strip()
@@ -1616,12 +1622,14 @@ def _fallback_format_attack_path_source_context(
                 context_parts.append(f"artifact {artifact_hint}")
         if secret:
             context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        elif secret_recovered:
+            context_parts.append(f"secret {referenced_secret_display(details)}")
         return " | ".join(context_parts)
 
     if relation_key in {"dumplsa", "dumpdpapi", "dumplsass"}:
         target_host = str(details.get("target_host") or "").strip()
         credential_username = str(details.get("credential_username") or "").strip()
-        secret = str(details.get("secret") or "").strip()
+        secret, secret_recovered = secret_for_display(details, "secret")
         context_parts: list[str] = []
         if target_host:
             context_parts.append(f"host {target_host}")
@@ -1629,21 +1637,25 @@ def _fallback_format_attack_path_source_context(
             context_parts.append(f"credential {credential_username}")
         if secret:
             context_parts.append(f"secret {mark_sensitive(secret, 'password')}")
+        elif secret_recovered:
+            context_parts.append(f"secret {referenced_secret_display(details)}")
         return " | ".join(context_parts)
 
     if relation_key == "passwordspray":
         spray_type = str(details.get("spray_type") or "").strip()
-        password = str(details.get("password") or "").strip()
+        password, password_recovered = secret_for_display(details, "password")
         context_parts: list[str] = []
         if spray_type:
             context_parts.append(f"mode {spray_type}")
         if password:
             context_parts.append(f"password {mark_sensitive(password, 'password')}")
+        elif password_recovered:
+            context_parts.append(f"password {referenced_secret_display(details)}")
         return " | ".join(context_parts)
 
     if relation_key in {"domainpassreuse", "domainpassreusesource"}:
         credential_type = str(details.get("credential_type") or "").strip().lower()
-        credential = str(details.get("credential") or "").strip()
+        credential, credential_recovered = secret_for_display(details, "credential")
         evidence_source = str(details.get("evidence_source") or "").strip()
         context_parts: list[str] = []
         if credential:
@@ -1653,6 +1665,8 @@ def _fallback_format_attack_path_source_context(
             context_parts.append(
                 f"{secret_label} {mark_sensitive(credential, 'password')}"
             )
+        elif credential_recovered:
+            context_parts.append(f"credential {referenced_secret_display(details)}")
         if evidence_source:
             context_parts.append(f"evidence {evidence_source}")
         return " | ".join(context_parts)
@@ -1663,7 +1677,7 @@ def _fallback_format_attack_path_source_context(
         "localcredtodomainreuse",
     }:
         credential_type = str(details.get("credential_type") or "").strip().lower()
-        credential = str(details.get("credential") or "").strip()
+        credential, credential_recovered = secret_for_display(details, "credential")
         source = str(details.get("source") or "").strip()
         context_parts: list[str] = []
         if credential:
@@ -1673,6 +1687,8 @@ def _fallback_format_attack_path_source_context(
             context_parts.append(
                 f"{secret_label} {mark_sensitive(credential, 'password')}"
             )
+        elif credential_recovered:
+            context_parts.append(f"credential {referenced_secret_display(details)}")
         if source:
             context_parts.append(f"evidence {source}")
         return " | ".join(context_parts)

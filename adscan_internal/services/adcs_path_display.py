@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from adscan_core.adcs_relations import is_adcs_relation
 from adscan_internal.services.compromise_class import is_direct_domain_breaker_target
 
 
@@ -106,31 +107,11 @@ def is_meaningful_esc_source(
     return True
 
 
-_ADCS_RELATIONS = {
-    "adcsesc1",
-    "adcsesc2",
-    "adcsesc3",
-    "adcsesc4",
-    "adcsesc6",
-    "adcsesc6a",
-    "adcsesc6b",
-    "adcsesc7",
-    "adcsesc8",
-    "adcsesc9",
-    "adcsesc9a",
-    "adcsesc9b",
-    "adcsesc10",
-    "adcsesc10a",
-    "adcsesc10b",
-    "adcsesc11",
-    "adcsesc13",
-    "adcsesc14",
-    "adcsesc15",
-    "adcsesc16",
-    "adcsesc17",
-    "adcsesc5",
-    "coerceandrelayntlmtoadcs",
-}
+# The relation set and ``is_adcs_relation`` live in
+# ``adscan_core.adcs_relations`` — the one definition both tiers import (the web
+# backend cannot import ``adscan_internal``). ``_CA_FIRST_RELATIONS`` below is a
+# different question (which relations abuse the authority rather than a
+# template) and stays local.
 _CA_FIRST_RELATIONS = {
     "adcsesc5",
     "adcsesc6",
@@ -138,14 +119,10 @@ _CA_FIRST_RELATIONS = {
     "adcsesc6b",
     "adcsesc8",
     "adcsesc11",
+    "adcsesc12",
     "adcsesc16",
     "coerceandrelayntlmtoadcs",
 }
-
-
-def is_adcs_relation(relation: object) -> bool:
-    """Return ``True`` when the relation is ADCS-related."""
-    return str(relation or "").strip().lower() in _ADCS_RELATIONS
 
 
 def extract_adcs_template_names(details: Mapping[str, Any] | None) -> list[str]:

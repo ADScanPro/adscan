@@ -69,7 +69,7 @@ module is a second, instance-level predicate beside it, not a replacement for it
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final
@@ -79,9 +79,14 @@ __all__ = [
     "PrincipalFacts",
     "Remediability",
     "RemediationKind",
+    "HOST_SCOPED_RELATIONS",
+    "chain_execution_host",
+    "chain_host_for_step",
     "classify_edge_remediability",
     "principal_facts_from_node",
+    "refine_chain_remediability",
     "remediability_for_step",
+    "remediability_in_chain",
 ]
 
 
@@ -123,20 +128,38 @@ class Remediability:
         why_not: Why the client cannot change it. Set only when
             :attr:`kind` is ``NOT_REMEDIABLE``; this is the sentence a report
             prints instead of a fix, so it is written for the client.
+        inherent: True when the edge is how Active Directory works for THIS
+            holder (a domain controller's replication right, a child domain's
+            reach into its forest root, a built-in nesting), so a report may
+            tell the client "no change needed, by design". False for a
+            non-remediable edge whose fix lives on another step (a logon
+            session), which is not by design.
     """
 
     kind: RemediationKind
     verb: str = ""
     why_not: str = ""
+    inherent: bool = False
 
     @property
     def is_remediable(self) -> bool:
         """Return True when this edge may be offered to the client as a fix."""
         return self.kind is not RemediationKind.NOT_REMEDIABLE
 
-    def as_dict(self) -> dict[str, str]:
-        """Return the JSON-safe form stamped onto an attack-path step."""
-        return {"kind": self.kind.value, "verb": self.verb, "why_not": self.why_not}
+    def as_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe form stamped onto an attack-path step.
+
+        ``inherent`` is written only when set, so every stamp that is not a
+        by-design verdict keeps the shape it always had.
+        """
+        stamped: dict[str, Any] = {
+            "kind": self.kind.value,
+            "verb": self.verb,
+            "why_not": self.why_not,
+        }
+        if self.inherent:
+            stamped["inherent"] = True
+        return stamped
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "Remediability | None":
@@ -154,6 +177,7 @@ class Remediability:
             kind=kind,
             verb=str(raw.get("verb") or ""),
             why_not=str(raw.get("why_not") or ""),
+            inherent=bool(raw.get("inherent")),
         )
 
 
@@ -230,6 +254,30 @@ class PrincipalFacts:
     #: Enterprise Admins, BUILTIN\\Administrators, Domain Controllers, RID
     #: 500/502, the domain object itself).
     is_direct_tier0: bool = False
+    #: True when the graph stamped this node's compromise class in the direct
+    #: band (``domain_breaker`` / ``tier0_control``): a member of Domain Admins,
+    #: for one. This is the signal the severity grade reads for its "source
+    #: already controls the domain" rule, read here through the same predicate
+    #: (:func:`~adscan_internal.services.compromise_class.is_direct_tier0_control_class`).
+    stamped_domain_control: bool = False
+    #: True when the principal sits anywhere inside the Tier 0 boundary: direct,
+    #: or escalation-capable (the Operators, DnsAdmins, Cert Publishers, the
+    #: Exchange groups), from the stamped ``privilege_tier`` or its own identity.
+    is_tier0: bool = False
+    #: True for one of the Exchange security groups (the ``compromise_class``
+    #: list, never a copy of it).
+    is_exchange_group: bool = False
+    #: True for the organisational unit Exchange setup creates for its groups.
+    is_exchange_container: bool = False
+    #: True when AdminSDHolder protects the object: ``adminCount`` is set, or its
+    #: own SID is one of the protected accounts and groups. Default delegations
+    #: (Account Operators) do not reach these objects.
+    is_adminsdholder_protected: bool = False
+    #: True when a computer is a member of Cert Publishers, which is how a host
+    #: running an enterprise certification authority is recorded.
+    hosts_certificate_authority: bool = False
+    #: Lower-cased DNS domain the object belongs to, when the node records it.
+    domain: str = ""
 
     @property
     def has_sid(self) -> bool:
@@ -348,6 +396,118 @@ def _node_is_domain_controller(node: Mapping[str, Any], facts_kind: str) -> bool
         return False
 
 
+#: RIDs of the accounts and groups AdminSDHolder protects (Windows Server 2016
+#: and later): Administrator, krbtgt, Domain Admins, Domain Controllers, Schema
+#: Admins, Enterprise Admins, Read-only Domain Controllers, Key Admins,
+#: Enterprise Key Admins, and the BUILTIN Administrators, Account / Server /
+#: Print / Backup Operators and Replicator aliases.
+_ADMINSDHOLDER_PROTECTED_RIDS: Final[frozenset[int]] = frozenset(
+    {500, 502, 512, 516, 518, 519, 521, 526, 527, 544, 548, 549, 550, 551, 552}
+)
+
+#: Account Operators (BUILTIN). By default it holds full control over every user,
+#: group and computer object AdminSDHolder does not protect.
+_ACCOUNT_OPERATORS_SID: Final[str] = "S-1-5-32-548"
+
+#: Inheritance placeholders. An ACE for CREATOR OWNER is copied to the object's
+#: real owner when a child object is created, and SELF stands for the object
+#: itself; neither is a principal anyone can hold or be removed from.
+_INHERITANCE_PLACEHOLDER_SIDS: Final[frozenset[str]] = frozenset({"S-1-3-0", "S-1-5-10"})
+
+#: The organisational unit Exchange setup creates for its security groups. Its
+#: name is not localised.
+_EXCHANGE_CONTAINER_DN_PREFIX: Final[str] = "ou=microsoft exchange security groups,"
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def _node_is_tier0_any(
+    node: Mapping[str, Any],
+    props: Mapping[str, Any],
+    kind: str,
+    sid: str,
+    names: Sequence[str],
+) -> bool:
+    """Return True when the node sits anywhere inside the Tier 0 boundary.
+
+    The stamped ``privilege_tier`` wins when the graph carries it (membership-
+    and ACL-aware, the authoritative tier). Without it, the principal's own
+    identity is classified by the Privilege-Tier SSOT: its SID, and for a group
+    its own name (the Exchange groups and DnsAdmins carry no well-known RID).
+    """
+    stamped = str(props.get("privilege_tier") or node.get("privilege_tier") or "").strip().lower()
+    if stamped:
+        return stamped.startswith("tier0")
+    if kind == "domain":
+        return True
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            privilege_tier_for_principal,
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+    tokens = [sid] if sid.upper().startswith("S-1-") else []
+    if kind == "group":
+        tokens.extend(name for name in names if name)
+    if not tokens:
+        return False
+    try:
+        return privilege_tier_for_principal(tokens, sid=sid or None).is_tier0
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _node_is_exchange_group(kind: str, names: Sequence[str]) -> bool:
+    """True for an Exchange security group, by the ``compromise_class`` list."""
+    if kind != "group":
+        return False
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            is_exchange_security_group_name,
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return any(is_exchange_security_group_name(name) for name in names if name)
+
+
+def _node_stamped_domain_control(node: Mapping[str, Any], props: Mapping[str, Any]) -> bool:
+    """True when the node's stamped compromise class is in the direct band."""
+    token = node.get("compromise_class") or props.get("compromise_class")
+    if not token:
+        return False
+    try:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            is_direct_tier0_control_class,
+        )
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return is_direct_tier0_control_class(token)
+
+
+def _node_hosts_certificate_authority(kind: str, props: Mapping[str, Any]) -> bool:
+    """True when a computer is recorded as a Cert Publishers member (a CA host)."""
+    if kind != "computer":
+        return False
+    keys = props.get("tier0_membership_keys")
+    if isinstance(keys, (list, tuple, set, frozenset)):
+        return any(str(key).strip().lower() == "cert_publishers" for key in keys)
+    return False
+
+
+def _node_domain(props: Mapping[str, Any], label: str) -> str:
+    """The object's DNS domain, from the node or its ``name@domain`` label."""
+    domain = str(props.get("domain") or "").strip().lower()
+    if domain:
+        return domain
+    if "@" in label:
+        return label.rsplit("@", 1)[-1].strip().lower()
+    return ""
+
+
 def principal_facts_from_node(node: Mapping[str, Any] | None) -> PrincipalFacts | None:
     """Read the structural identity off one attack-graph node.
 
@@ -370,18 +530,32 @@ def principal_facts_from_node(node: Mapping[str, Any] | None) -> PrincipalFacts 
     label = str(node.get("label") or props.get("name") or "").strip()
 
     synthetic = bool(props.get("well_known_sid")) or sid.upper() in _SYNTHETIC_WELL_KNOWN_SIDS
+    samaccountname = str(props.get("samaccountname") or props.get("sAMAccountName") or "").strip()
+    names = (samaccountname, label, str(props.get("name") or ""))
+    rid = _rid_of(sid)
+    dn = str(props.get("distinguishedname") or props.get("distinguishedName") or "").strip().lower()
+    protected = _truthy(props.get("admincount") or props.get("adminCount")) or (
+        rid is not None and rid in _ADMINSDHOLDER_PROTECTED_RIDS
+    )
 
     return PrincipalFacts(
         label=label,
-        samaccountname=str(props.get("samaccountname") or props.get("sAMAccountName") or "").strip(),
+        samaccountname=samaccountname,
         object_id=sid,
         kind=kind,
-        rid=_rid_of(sid),
+        rid=rid,
         primary_group_id=_int_or_none(props.get("primarygroupid") or props.get("primaryGroupID")),
         is_builtin_alias=sid.upper().startswith("S-1-5-32-"),
         is_synthetic_well_known=synthetic,
         is_domain_controller=_node_is_domain_controller(node, kind),
         is_direct_tier0=_node_is_direct_tier0(node, kind, sid),
+        stamped_domain_control=_node_stamped_domain_control(node, props),
+        is_tier0=_node_is_tier0_any(node, props, kind, sid, names),
+        is_exchange_group=_node_is_exchange_group(kind, names),
+        is_exchange_container=kind == "ou" and dn.startswith(_EXCHANGE_CONTAINER_DN_PREFIX),
+        is_adminsdholder_protected=protected,
+        hosts_certificate_authority=_node_hosts_certificate_authority(kind, props),
+        domain=_node_domain(props, label),
     )
 
 
@@ -677,11 +851,6 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "channel binding so the captured response cannot be relayed.",
         "Refuse NTLMv1 and require LDAP signing and channel binding.",
     ),
-    "ntlmreflection": _f(
-        RemediationKind.CONFIG_CHANGE,
-        "Require SMB signing and LDAP channel binding on {target}.",
-        "Require SMB signing and LDAP channel binding.",
-    ),
     "coerceandrelayntlmtoadcs": _f(
         RemediationKind.CONFIG_CHANGE,
         "Require channel binding and HTTPS on the certificate enrolment endpoint, "
@@ -739,6 +908,18 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "Apply the SMBv3 compression security update.",
     ),
     "dropthemic": _f(
+        RemediationKind.PATCH,
+        "Apply the NTLM message-integrity security update on {target}.",
+        "Apply the NTLM message-integrity security update.",
+    ),
+    "dropthemic2": _f(
+        RemediationKind.PATCH,
+        "Apply the NTLM message-integrity security update on {target}.",
+        "Apply the NTLM message-integrity security update.",
+    ),
+    # Legacy relation name of the CVE-2019-1040 (Drop the MIC) edge in graphs
+    # written before the rename; same flaw, same fix.
+    "ntlmreflection": _f(
         RemediationKind.PATCH,
         "Apply the NTLM message-integrity security update on {target}.",
         "Apply the NTLM message-integrity security update.",
@@ -839,28 +1020,44 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "Reset the krbtgt account password twice.",
     ),
     # ── Credential material read from a compromised host ─────────────────────
+    # These name the HOST the step runs on ({host}), never the step's target:
+    # the graph draws a session-borne dump as ``user -> user`` (the signed-in
+    # account's own material), so "{target}" printed "Enable Credential Guard on
+    # robb.stark", a user. The host is the target when the directory says the
+    # target IS a computer, else it comes from the chain
+    # (:func:`refine_chain_remediability`). With no host the verb is empty, so no
+    # surface prints a change aimed at an object that is not a host.
     "dumplsa": _f(
         RemediationKind.CONFIG_CHANGE,
-        "Enable Credential Guard on {target} and stop privileged accounts from "
+        "Enable Credential Guard on {host} and stop privileged accounts from "
         "logging on to it interactively.",
         "Enable Credential Guard and stop privileged interactive logons.",
     ),
     "dumplsass": _f(
         RemediationKind.CONFIG_CHANGE,
-        "Enable Credential Guard on {target} and stop privileged accounts from "
+        "Enable Credential Guard on {host} and stop privileged accounts from "
         "logging on to it interactively.",
         "Enable Credential Guard and stop privileged interactive logons.",
     ),
     "dumpsam": _f(
         RemediationKind.CONFIG_CHANGE,
-        "Deploy managed local administrator passwords on {target} so the local "
+        "Deploy managed local administrator passwords on {host} so the local "
         "account database yields nothing reusable.",
         "Deploy managed, per-host local administrator passwords.",
     ),
     "dumpdpapi": _f(
         RemediationKind.CONFIG_CHANGE,
-        "Stop storing reusable secrets in user credential vaults on {target}.",
+        "Stop storing reusable secrets in user credential vaults on {host}.",
         "Stop storing reusable secrets in user credential vaults.",
+    ),
+    # Borrowing a signed-in account's session through the Task Scheduler. The
+    # change that closes it is keeping that account off the host, so the sentence
+    # names both: the account ({source}) and the host it signs in to ({host}).
+    "scheduledtask": _f(
+        RemediationKind.CONFIG_CHANGE,
+        "Stop {source} from signing in interactively to {host}, so an "
+        "administrator of that host cannot run a task in its session.",
+        "Keep privileged accounts from signing in to hosts of a lower tier.",
     ),
     "dumpedhashof": _f(
         RemediationKind.CREDENTIAL_ROTATION,
@@ -936,10 +1133,17 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "irreversible.",
         "Empty the schema administrators group of standing members.",
     ),
+    # The fix is one change for every Exchange group that holds it, so the
+    # sentence names the domain and not the group: identical sentences merge into
+    # one action on the ranked row.
     "exchangeaclescalation": _f(
         RemediationKind.ACL_REVOCATION,
-        "Remove the inherited Exchange permissions {source} holds on {target}.",
-        "Remove the inherited Exchange permissions from the domain object.",
+        "Remove the Exchange permission inherited from the root of {target}. "
+        "Install the current Exchange cumulative update and run Setup "
+        "/PrepareAD, or move Exchange to the split permissions model.",
+        "Remove the Exchange permission inherited from the domain root. Install "
+        "the current Exchange cumulative update and run Setup /PrepareAD, or "
+        "move Exchange to the split permissions model.",
     ),
     "privilegedgroupcontrol": _REVOKE_ACE,
     # ── Not remediable ───────────────────────────────────────────────────────
@@ -954,6 +1158,17 @@ _FAMILY_BY_RELATION: Final[dict[str, _Family]] = {
         "",
     ),
     "gplink": _f(
+        RemediationKind.NOT_REMEDIABLE,
+        "",
+        "",
+    ),
+    # Inside one forest a compromised child domain can always take over the
+    # forest root: the domains share the trust key and SID filtering cannot apply
+    # within a forest. The catalog says so (``can_fully_mitigate`` is False, and
+    # the finding states it is not a misconfiguration), yet the generic fallback
+    # put "Remove the configuration on <root> that lets <child> reach it" in a
+    # client's work order.
+    "raisechild": _f(
         RemediationKind.NOT_REMEDIABLE,
         "",
         "",
@@ -975,7 +1190,30 @@ _WHY_NOT_BY_RELATION: Final[dict[str, str]] = {
         "The policy link itself grants nothing. The change that closes it is on "
         "the permissions of the linked Group Policy object."
     ),
+    "raisechild": (
+        "Inside one forest, whoever controls a child domain can take over the "
+        "forest root. The domains share a trust key, and SID filtering cannot "
+        "apply within a forest, so no setting closes this step. Protect each "
+        "child domain to the same standard as the forest root."
+    ),
 }
+
+#: Relations whose change is made ON A HOST. Their sentence names ``{host}``,
+#: which is the step's target only when the directory says the target is a
+#: computer; a session-borne step is drawn ``user -> user`` and takes its host
+#: from the chain (:func:`refine_chain_remediability`).
+_HOST_SCOPED_RELATIONS: Final[frozenset[str]] = frozenset(
+    {"dumplsa", "dumplsass", "dumpsam", "dumpdpapi", "scheduledtask"}
+)
+#: Public name, read by the step catalog so its narrative ``{target}`` names the
+#: same host the remediation does.
+HOST_SCOPED_RELATIONS: Final[frozenset[str]] = _HOST_SCOPED_RELATIONS
+
+#: Relations whose "no change closes this" is a property of how Active Directory
+#: works, not an observation that happens to carry no permission. Only these
+#: are offered to a client as "by design" (``Remediability.inherent``); a logon
+#: session (``hassession``) is not by design, its fix lives on another step.
+_INHERENT_RELATIONS: Final[frozenset[str]] = frozenset({"raisechild"})
 
 #: Families whose privilege FOLLOWS from the source already controlling the
 #: domain, so the edge is a fact of the hierarchy rather than a separate
@@ -1010,8 +1248,7 @@ def _family_for(relation: str) -> _Family:
         )
 
     # An unmapped relation stays REMEDIABLE. Dropping a technique row because the
-    # catalog has not caught up would silently shrink the client's fix list; the
-    # generic sentence is honest about carrying no detail.
+    # catalog has not caught up would silently shrink the client's fix list.
     kind_token = ""
     try:
         from adscan_internal.services.edge_kind import classify_edge_kind  # noqa: PLC0415
@@ -1023,23 +1260,75 @@ def _family_for(relation: str) -> _Family:
         return _REMOVE_MEMBERSHIP
     if kind_token == "control":
         return _REVOKE_ACE
-    return _f(
-        RemediationKind.CONFIG_CHANGE,
-        "Remove the configuration on {target} that lets {source} reach it.",
-        "Remove the configuration that enables this step.",
-    )
+    # No sentence. The old fallback composed one from the endpoint names ("Remove
+    # the configuration on robb.stark that lets robb.stark reach it"), which names
+    # nothing a client can change, and it reached a paid work order. An empty verb
+    # lets each surface fall back to the technique's own catalog guidance.
+    return _f(RemediationKind.CONFIG_CHANGE, "", "")
 
 
-def _sentence(family: _Family, source: PrincipalFacts | None, target: PrincipalFacts | None) -> str:
-    """Render the family's template with whatever names resolved."""
+def _host_display(target: PrincipalFacts | None, host: PrincipalFacts | str | None) -> str:
+    """The host a host-scoped change is made on, or ``""`` when none is known.
+
+    An explicit ``host`` wins (the chain resolved it). Otherwise the target is the
+    host only when the directory says it is a computer: the node kind, read from
+    collected data, never inferred from the shape of a name.
+    """
+    if isinstance(host, PrincipalFacts):
+        return host.display
+    if isinstance(host, str) and host.strip():
+        return PrincipalFacts(label=host.strip(), kind="computer").display
+    if target is not None and target.kind == "computer":
+        return target.display
+    return ""
+
+
+def _sentence(
+    family: _Family,
+    source: PrincipalFacts | None,
+    target: PrincipalFacts | None,
+    host: PrincipalFacts | str | None = None,
+) -> str:
+    """Render the family's template with whatever names resolved.
+
+    A template naming ``{host}`` renders only when a host is known. Without one
+    it returns ``""`` rather than aiming the change at the step's target, which
+    on a session-borne step is a user. A family with no template (the unmapped
+    fallback) has no sentence at all.
+    """
+    if not family.template:
+        return ""
     src = source.display if source else ""
     dst = target.display if target else ""
+    if "{host}" in family.template:
+        host_name = _host_display(target, host)
+        if not host_name:
+            return ""
+        try:
+            return family.template.format(
+                source=src or "the signed-in account",
+                target=dst or "the target object",
+                host=host_name,
+            )
+        except (KeyError, IndexError):  # pragma: no cover - defensive
+            return ""
     if not src and not dst:
         return family.generic
     try:
         return family.template.format(source=src or "the source principal", target=dst or "the target object")
     except (KeyError, IndexError):  # pragma: no cover - defensive
         return family.generic
+
+
+#: A membership INTO a group that already controls the domain is the
+#: administrative role itself, so the sentence asks the client to confirm it
+#: before removing it. "Remove robb.stark from Administrators" reads as advice to
+#: dismantle an intended administrator; whether that account should hold the role
+#: is the client's call, and the attack path is the reason to ask.
+_TIER0_MEMBERSHIP_TEMPLATE: Final[str] = (
+    "Confirm that {source} needs to be in {target}, and remove it if not. Every "
+    "member of {target} controls the domain."
+)
 
 
 def _memberof_verdict(
@@ -1075,6 +1364,7 @@ def _memberof_verdict(
                 "Windows evaluates membership of this built-in identity at logon. "
                 "It has no member list to edit."
             ),
+            inherent=True,
         )
     if (
         target.rid in _PRIMARY_GROUP_RIDS
@@ -1087,6 +1377,7 @@ def _memberof_verdict(
                 "This is the account's primary group. Active Directory will not "
                 "remove an account from its own primary group."
             ),
+            inherent=True,
         )
     if source is not None and source.has_sid and source.is_builtin and target.is_builtin:
         return Remediability(
@@ -1095,21 +1386,229 @@ def _memberof_verdict(
                 "Windows creates and maintains this nesting between two built-in "
                 "groups. It cannot be removed."
             ),
+            inherent=True,
         )
     return None
 
 
+def holds_domain_control(source: PrincipalFacts | Mapping[str, Any] | None) -> bool:
+    """Return True when a principal already controls its domain.
+
+    The single predicate behind "this edge follows from a role, it is not a
+    finding". True for any of:
+
+    * the graph stamped its compromise class in the direct band
+      (``domain_breaker`` / ``tier0_control``), read through
+      :func:`~adscan_internal.services.compromise_class.is_direct_tier0_control_class`,
+      the same predicate :func:`~adscan_internal.services.severity.compute_edge_severity`
+      uses to grade such a source INFO. That shared predicate is what keeps the
+      severity grade and the "Start here" list from disagreeing: an edge graded
+      INFO for its source is never offered as a fix;
+    * its own SID is Tier 0 direct (Domain Admins, Enterprise Admins,
+      BUILTIN\\\\Administrators, RID 500/502, the domain object);
+    * it is a domain controller.
+
+    The last two are structural signals the severity grade does not read (a DC
+    node carries no stamped compromise class), so on those edges this side
+    answers "by design" while severity may still grade the edge on its target.
+    """
+    facts = _coerce(source)
+    if facts is None:
+        return False
+    return facts.stamped_domain_control or facts.is_direct_tier0 or facts.is_domain_controller
+
+
 def _holds_by_design(source: PrincipalFacts | None) -> bool:
     """True when the source already controls the domain, so the edge follows."""
+    return holds_domain_control(source)
+
+
+def _principal_holds_domain_control(source: PrincipalFacts | None) -> bool:
+    """:func:`holds_domain_control` without the domain-controller signal.
+
+    The severity grade's own signal (the stamped direct-band class) plus a Tier 0
+    direct SID. Used for the families outside ACL and membership changes, where
+    a DC node on the graph often stands for a service running on it rather than
+    for the DC's machine account.
+    """
     if source is None:
         return False
-    return source.is_direct_tier0 or source.is_domain_controller
+    return source.stamped_domain_control or source.is_direct_tier0
+
+
+def _is_direct_tier0_target(target: PrincipalFacts) -> bool:
+    """True when the target is Tier 0 direct by its own SID OR by its stamped class.
+
+    The stamped class is what the severity grade reads for a target in the
+    direct band, so a target severity treats as a domain breaker (Cloneable
+    Domain Controllers, for one) is never filed under a by-design default here.
+    """
+    return target.is_direct_tier0 or target.stamped_domain_control
+
+
+def _crosses_domain(source: PrincipalFacts | None, target: PrincipalFacts | None) -> bool:
+    """True when both endpoints record a domain and the domains differ."""
+    if source is None or target is None:
+        return False
+    return bool(source.domain and target.domain and source.domain != target.domain)
+
+
+#: Relations that grant rights over a share or its files. They are ACL changes on
+#: a host, not directory delegations, so a default directory delegation (Account
+#: Operators) never explains them.
+_SHARE_RELATIONS: Final[frozenset[str]] = frozenset({"readshare", "writeshare", "fullcontrolshare"})
+
+#: Directory object kinds Account Operators administers by default.
+_ACCOUNT_OBJECT_KINDS: Final[frozenset[str]] = frozenset({"user", "group", "computer"})
+
+_ACCOUNT_OPERATORS_TEMPLATE: Final[str] = (
+    "Keep {source} empty; by default it has full control over every account and "
+    "group that AdminSDHolder does not protect."
+)
+
+#: Shown in place of a fix on every Exchange-internal edge, so one sentence
+#: covers the whole family wherever it appears.
+_EXCHANGE_BY_DESIGN_WHY_NOT: Final[str] = (
+    "Exchange grants this to its own security groups, and removing it breaks "
+    "Exchange. Treat the Exchange servers and the Exchange security groups as "
+    "Tier 0."
+)
+
+_SOURCE_CONTROLS_DOMAIN_WHY_NOT: Final[str] = (
+    "The source already controls the domain, so this step adds no exposure of "
+    "its own. Reduce who holds that control instead."
+)
+
+_DC_HOST_WHY_NOT: Final[str] = (
+    "This step runs with administrative access to a domain controller, which "
+    "already means control of the domain. Nothing on the domain controller "
+    "itself closes it. The change is upstream, on whatever granted that access."
+)
+
+_DC_HOST_CREDENTIAL_GUARD_NOTE: Final[str] = (
+    " Microsoft does not recommend Credential Guard on domain controllers."
+)
+
+#: Host-scoped relations whose usual fix is Credential Guard on the host.
+_CREDENTIAL_GUARD_RELATIONS: Final[frozenset[str]] = frozenset({"dumplsa", "dumplsass"})
+
+_CA_HOST_WHY_NOT: Final[str] = (
+    "This domain controller also hosts the certification authority, so it "
+    "controls the authority by design. It already controls the domain, and the "
+    "change is upstream, on whatever gives control of it."
+)
+
+
+def _dc_host_verdict(relation: str) -> Remediability:
+    """The verdict for a host-scoped step whose host is a domain controller."""
+    why_not = _DC_HOST_WHY_NOT
+    if relation in _CREDENTIAL_GUARD_RELATIONS:
+        why_not += _DC_HOST_CREDENTIAL_GUARD_NOTE
+    return Remediability(kind=RemediationKind.NOT_REMEDIABLE, why_not=why_not)
+
+
+def _host_is_domain_controller(
+    target: PrincipalFacts | None, host: PrincipalFacts | str | None
+) -> bool:
+    """True when the host a host-scoped step runs on is a domain controller.
+
+    Same resolution as :func:`_host_display`: an explicit host wins, else the
+    target when the directory says it is a computer. A bare host name carries no
+    role, so it never reads as a domain controller.
+    """
+    if isinstance(host, PrincipalFacts):
+        return host.is_domain_controller
+    if isinstance(host, str) and host.strip():
+        return False
+    return target is not None and target.kind == "computer" and target.is_domain_controller
+
+
+def _account_operators_default(
+    relation: str,
+    family: _Family,
+    source: PrincipalFacts | None,
+    target: PrincipalFacts | None,
+) -> bool:
+    """True when the edge is Account Operators' default full control.
+
+    Account Operators holds full control over every user, group and computer
+    object AdminSDHolder does not protect, out of the box. An edge it holds on
+    such an object is that default, and the fix is the group's membership, not a
+    per-object ACE. An edge onto a protected object, a domain controller or a
+    Tier 0 direct principal is NOT the default and stays a per-object finding.
+    """
+    if source is None or target is None:
+        return False
+    if source.object_id.upper() != _ACCOUNT_OPERATORS_SID:
+        return False
+    if family.kind is not RemediationKind.ACL_REVOCATION:
+        return False
+    if relation in _SHARE_RELATIONS or relation in _REPLICATION_RELATIONS:
+        return False
+    if target.kind not in _ACCOUNT_OBJECT_KINDS:
+        return False
+    return not (
+        target.is_adminsdholder_protected
+        or _is_direct_tier0_target(target)
+        or target.is_domain_controller
+    )
+
+
+def _exchange_internal_verdict(
+    relation: str,
+    family: _Family,
+    source: PrincipalFacts | None,
+    target: PrincipalFacts | None,
+) -> Remediability | None:
+    """The verdict for an edge an Exchange security group holds, or ``None``.
+
+    Exchange setup nests its groups and delegates them broad rights over
+    mailbox users and groups; removing either breaks Exchange. So:
+
+    * a membership of an Exchange group into another Exchange group, or into a
+      group outside Tier 0 (Managed Availability Servers), is by design;
+    * a permission it holds on the domain object is the real finding (the
+      inherited domain-root ACE), with the cumulative update and /PrepareAD, or
+      split permissions, as the fix;
+    * a permission on an Exchange group, the Exchange organisational unit, or
+      any object outside Tier 0 is by design.
+
+    A membership or permission reaching a non-Exchange Tier 0 object (Domain
+    Admins, DnsAdmins) is not something Exchange needs, so it stays a per-object
+    finding and this returns ``None``.
+    """
+    if source is None or target is None or not source.is_exchange_group:
+        return None
+    by_design = Remediability(
+        kind=RemediationKind.NOT_REMEDIABLE,
+        why_not=_EXCHANGE_BY_DESIGN_WHY_NOT,
+        inherent=True,
+    )
+    if relation == "memberof":
+        if _is_direct_tier0_target(target):
+            return None
+        if target.is_exchange_group or not target.is_tier0:
+            return by_design
+        return None
+    if family.kind is not RemediationKind.ACL_REVOCATION or relation in _SHARE_RELATIONS:
+        return None
+    if target.kind == "domain":
+        return Remediability(
+            kind=RemediationKind.ACL_REVOCATION,
+            verb=_sentence(_FAMILY_BY_RELATION["exchangeaclescalation"], source, target),
+        )
+    if _is_direct_tier0_target(target):
+        return None
+    if target.is_exchange_group or target.is_exchange_container or not target.is_tier0:
+        return by_design
+    return None
 
 
 def classify_edge_remediability(
     relation: str | None,
     source: PrincipalFacts | Mapping[str, Any] | None = None,
     target: PrincipalFacts | Mapping[str, Any] | None = None,
+    host: PrincipalFacts | Mapping[str, Any] | str | None = None,
 ) -> Remediability:
     """Return whether ONE edge instance can be changed, and the change if so.
 
@@ -1120,6 +1619,11 @@ def classify_edge_remediability(
             attack-graph node. ``None`` when the caller has no node — the
             verdict then falls back to what the relation alone can support.
         target: The edge's target, same shapes.
+        host: For a host-scoped relation (:data:`_HOST_SCOPED_RELATIONS`), the
+            computer the step runs on when the target is not that computer: a
+            :class:`PrincipalFacts`, a raw node, or a host name. ``None`` uses
+            the target when the directory says it is a computer and otherwise
+            leaves the verb empty.
 
     Returns:
         A :class:`Remediability`. With no endpoint facts, an instance-dependent
@@ -1137,15 +1641,28 @@ def classify_edge_remediability(
 
     src = _coerce(source)
     dst = _coerce(target)
+    host_facts: PrincipalFacts | str | None = host if isinstance(host, str) else _coerce(host)
     family = _family_for(rel)
 
     if family.kind is RemediationKind.NOT_REMEDIABLE:
         return Remediability(
             kind=RemediationKind.NOT_REMEDIABLE,
             why_not=_WHY_NOT_BY_RELATION.get(rel, "There is no client-side change that closes this."),
+            inherent=rel in _INHERENT_RELATIONS,
         )
 
     # ── Instance rules ───────────────────────────────────────────────────────
+    if src is not None and src.object_id.upper() in _INHERITANCE_PLACEHOLDER_SIDS:
+        return Remediability(
+            kind=RemediationKind.NOT_REMEDIABLE,
+            why_not=(
+                "This entry is an inheritance placeholder, not a principal. Windows "
+                "applies it to the object's owner or to the object itself. Review "
+                "who owns the object instead."
+            ),
+            inherent=True,
+        )
+
     if rel == "memberof":
         verdict = _memberof_verdict(src, dst)
         if verdict is not None:
@@ -1163,9 +1680,19 @@ def classify_edge_remediability(
                 "design. They cannot be revoked from these holders. What is worth "
                 "reviewing is any OTHER principal holding them."
             ),
+            inherent=True,
         )
 
-    if family.kind in _BY_DESIGN_KINDS and _holds_by_design(src):
+    # A group membership is never excused by the member's STAMPED class: that
+    # class is usually derived from this very membership (a user is a domain
+    # breaker BECAUSE it is in Domain Admins), and removing it is the fix. Only
+    # the structural signals count there. Severity never grades a membership on
+    # its source either (membership is STRUCTURAL before its source rule).
+    if rel == "memberof":
+        source_holds_domain = src is not None and (src.is_direct_tier0 or src.is_domain_controller)
+    else:
+        source_holds_domain = _holds_by_design(src)
+    if family.kind in _BY_DESIGN_KINDS and source_holds_domain:
         return Remediability(
             kind=RemediationKind.NOT_REMEDIABLE,
             why_not=(
@@ -1173,9 +1700,253 @@ def classify_edge_remediability(
                 "this access follows from that role rather than from a separate "
                 "misconfiguration. Reduce who holds the role instead."
             ),
+            inherent=True,
         )
 
-    return Remediability(kind=family.kind, verb=_sentence(family, src, dst))
+    # Any other step taken by a PRINCIPAL that already controls its domain (a
+    # member of Domain Admins, the built-in Administrator) adds no exposure of
+    # its own inside that domain: it is exactly what the severity grade calls
+    # INFO for the same source. A step into ANOTHER domain is kept.
+    #
+    # A domain controller is deliberately not a source here. The graph draws a
+    # host-local step on a DC as the DC's own node (``dc02 -XpCmdshell-> dc02``
+    # runs as the SQL service account, not as the domain controller), and
+    # disabling xp_cmdshell on that host is a real fix on a cross-forest chain.
+    if (
+        rel != "memberof"
+        and _principal_holds_domain_control(src)
+        and not _crosses_domain(src, dst)
+    ):
+        return Remediability(
+            kind=RemediationKind.NOT_REMEDIABLE,
+            why_not=_SOURCE_CONTROLS_DOMAIN_WHY_NOT,
+            inherent=True,
+        )
+
+    # A domain controller that hosts the certification authority controls the
+    # authority by design (ESC5 / ESC7 from the DC onto its own CA).
+    if (
+        rel.startswith("adcsesc")
+        and src is not None
+        and src.is_domain_controller
+        and src.hosts_certificate_authority
+        and not _crosses_domain(src, dst)
+    ):
+        return Remediability(
+            kind=RemediationKind.NOT_REMEDIABLE,
+            why_not=_CA_HOST_WHY_NOT,
+            inherent=True,
+        )
+
+    if rel in _HOST_SCOPED_RELATIONS and _host_is_domain_controller(dst, host_facts):
+        return _dc_host_verdict(rel)
+
+    if _account_operators_default(rel, family, src, dst):
+        account_operators = _Family(
+            RemediationKind.MEMBERSHIP_REMOVAL, _ACCOUNT_OPERATORS_TEMPLATE, family.generic
+        )
+        return Remediability(
+            kind=RemediationKind.MEMBERSHIP_REMOVAL,
+            verb=_sentence(account_operators, src, dst),
+        )
+
+    exchange_verdict = _exchange_internal_verdict(rel, family, src, dst)
+    if exchange_verdict is not None:
+        return exchange_verdict
+
+    if (
+        rel == "memberof"
+        and dst is not None
+        and dst.is_direct_tier0
+        and src is not None
+        and src.kind in {"user", "computer", "group"}
+    ):
+        tier0_family = _Family(family.kind, _TIER0_MEMBERSHIP_TEMPLATE, family.generic)
+        return Remediability(kind=family.kind, verb=_sentence(tier0_family, src, dst))
+
+    return Remediability(kind=family.kind, verb=_sentence(family, src, dst, host_facts))
+
+
+# ── Chain context ─────────────────────────────────────────────────────────────
+#
+# One edge cannot always name the object its change is made on. A session-borne
+# dump or task is drawn ``robb.stark -> robb.stark`` (the signed-in account's own
+# material), and the HOST it happens on is the computer one step back, where the
+# session was observed. The stamp seam classifies one edge at a time, so the
+# chain pass below resolves that host from the finished step list and rewrites
+# the verb. It reads only stamped step details (``source_kind`` from the
+# directory, never the shape of a name), so it is idempotent and safe to run on
+# a record that was stamped before it existed.
+
+
+def _details(step: Mapping[str, Any]) -> Mapping[str, Any]:
+    details = step.get("details")
+    return details if isinstance(details, Mapping) else {}
+
+
+def _step_relation(step: Mapping[str, Any]) -> str:
+    for key in ("action", "relation", "type"):
+        value = step.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+def _same_principal(left: Any, right: Any) -> bool:
+    a = str(left or "").strip().casefold()
+    b = str(right or "").strip().casefold()
+    return bool(a) and a == b
+
+
+def _facts_from_details(details: Mapping[str, Any], side: str) -> PrincipalFacts | None:
+    """Build display facts for one endpoint from a stamped step's details."""
+    label = str(details.get("from" if side == "source" else "to") or "").strip()
+    sam = str(details.get(f"{side}_samaccountname") or "").strip()
+    kind = str(details.get(f"{side}_kind") or "").strip().lower()
+    if not label and not sam:
+        return None
+    # A computer the engine stamped Tier 0 direct is a domain controller: Domain
+    # Controllers membership is what puts a computer in that tier. The step
+    # details carry the stamped tier, not the node's primaryGroupID.
+    tier = str(details.get(f"{side}_privilege_tier") or "").strip().lower()
+    return PrincipalFacts(
+        label=label or sam,
+        samaccountname=sam,
+        kind=kind,
+        is_domain_controller=kind == "computer" and tier == "tier0_direct",
+    )
+
+
+def chain_host_for_step(steps: Sequence[Any], index: int) -> PrincipalFacts | str | None:
+    """Return the computer a host-scoped step at ``index`` runs on, or ``None``.
+
+    Resolution, most authoritative first:
+
+    1. The step's own target, when the directory says it is a computer.
+    2. Walking back along the chain: the step that delivered this step's source
+       principal (its ``to`` is this step's ``from``). If that step starts at a
+       computer, the session lives on it (``castelblack$ -HasSession-> robb``). A
+       self-loop on the same principal (a task followed by a dump) is skipped.
+    3. The ``target_host`` the engine folded into the step's notes.
+    """
+    if not (0 <= index < len(steps)) or not isinstance(steps[index], Mapping):
+        return None
+    details = _details(steps[index])
+    if str(details.get("target_kind") or "").strip().lower() == "computer":
+        return _facts_from_details(details, "target")
+    principal = details.get("from")
+    for back in range(index - 1, -1, -1):
+        prev = steps[back]
+        if not isinstance(prev, Mapping):
+            break
+        prev_details = _details(prev)
+        if not _same_principal(prev_details.get("to"), principal):
+            break
+        if str(prev_details.get("source_kind") or "").strip().lower() == "computer":
+            return _facts_from_details(prev_details, "source")
+        if not _same_principal(prev_details.get("from"), principal):
+            break
+    target_host = str(details.get("target_host") or "").strip()
+    return target_host or None
+
+
+def chain_execution_host(steps: Sequence[Any], index: int) -> dict[str, str]:
+    """The host a host-scoped step runs on, as the identity a renderer needs.
+
+    ``{}`` when the step is not host-scoped, its target is already a computer
+    (the step names its own host), or no host resolves. Otherwise
+    ``{"execution_host", "execution_host_samaccountname",
+    "execution_host_dnshostname"}``: the display name for prose, and the account
+    and DNS names for commands. Same resolution as the remediation verb
+    (:func:`chain_host_for_step`), so the narrative, the commands and the fix
+    name one host.
+    """
+    if not (0 <= index < len(steps)) or not isinstance(steps[index], Mapping):
+        return {}
+    step = steps[index]
+    if _step_relation(step) not in _HOST_SCOPED_RELATIONS:
+        return {}
+    details = _details(step)
+    if str(details.get("target_kind") or "").strip().lower() == "computer":
+        return {}
+    host = chain_host_for_step(steps, index)
+    if isinstance(host, PrincipalFacts):
+        sam = host.samaccountname
+        dns = ""
+        # The step that supplied the host carries its DNS name beside it.
+        for back in range(index - 1, -1, -1):
+            prev_details = _details(steps[back]) if isinstance(steps[back], Mapping) else {}
+            if str(prev_details.get("source_samaccountname") or "") == sam and sam:
+                dns = str(prev_details.get("source_dnshostname") or "").strip()
+                break
+        if not dns:
+            dns = str(details.get("target_host") or "").strip()
+        return {
+            "execution_host": host.display,
+            "execution_host_samaccountname": sam,
+            "execution_host_dnshostname": dns,
+        }
+    fqdn = str(host).strip() if isinstance(host, str) else ""
+    if fqdn:
+        return {
+            "execution_host": PrincipalFacts(label=fqdn, kind="computer").display,
+            "execution_host_samaccountname": "",
+            "execution_host_dnshostname": fqdn,
+        }
+    return {}
+
+
+def remediability_in_chain(steps: Sequence[Any], index: int) -> Remediability | None:
+    """Return the verdict of the step at ``index``, completed with chain context.
+
+    The stamped verdict, except that a host-scoped relation whose stamp could not
+    name its host (the edge alone did not carry it) gets its verb re-rendered
+    against the host the chain resolves, or an empty verb when none resolves.
+    Never mutates ``steps``.
+    """
+    if not (0 <= index < len(steps)) or not isinstance(steps[index], Mapping):
+        return None
+    step = steps[index]
+    verdict = remediability_for_step(step)
+    rel = _step_relation(step)
+    if verdict is None or not verdict.is_remediable or rel not in _HOST_SCOPED_RELATIONS:
+        return verdict
+    details = _details(step)
+    host = chain_host_for_step(steps, index)
+    if isinstance(host, PrincipalFacts) and host.is_domain_controller:
+        return _dc_host_verdict(rel)
+    verb = _sentence(
+        _family_for(rel),
+        _facts_from_details(details, "source"),
+        _facts_from_details(details, "target"),
+        host if host is not None else "",
+    )
+    return Remediability(kind=verdict.kind, verb=verb, why_not=verdict.why_not)
+
+
+def refine_chain_remediability(steps: Sequence[Any]) -> None:
+    """Rewrite each host-scoped step's stamped verb with its chain's host, in place.
+
+    Called by the engine wherever it finalises a display record's step list,
+    after the per-edge stamp, so every consumer (the remediation ranking, the
+    web's step panel, the persisted snapshot) reads a verb that names the host
+    the change is made on. Idempotent.
+    """
+    for index, step in enumerate(steps or ()):
+        if not isinstance(step, dict) or not isinstance(step.get("remediability"), Mapping):
+            continue
+        if _step_relation(step) not in _HOST_SCOPED_RELATIONS:
+            continue
+        refined = remediability_in_chain(steps, index)
+        if refined is not None:
+            step["remediability"] = refined.as_dict()
+        # The same host, recorded on the step so a single-step renderer (the
+        # narrative, the verification commands) names it too. Without it the
+        # narrative read "reaches SYSTEM on robb.stark", a user.
+        host = chain_execution_host(steps, index)
+        details = step.get("details")
+        if host and isinstance(details, dict):
+            details.update(host)
 
 
 def remediability_for_step(step: Mapping[str, Any] | None) -> Remediability | None:

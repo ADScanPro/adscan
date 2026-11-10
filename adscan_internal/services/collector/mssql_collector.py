@@ -41,23 +41,28 @@ from __future__ import annotations
 
 import asyncio
 import binascii
-import os
+import dataclasses
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from adscan_core import telemetry
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 from adscan_core.rich_output import print_info, print_info_debug, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_core.rich_output import print_exception
 
 
 # ---------------------------------------------------------------------------
-# Tuning (env-overridable; grounded in AD-constraints §10, not lab-tuned)
+# Tuning (scan-pacing SSOT ``collector.mssql``; grounded in AD-constraints §10)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MSSQL_PORT = 1433
-_DEFAULT_PER_INSTANCE_TIMEOUT = 30  # seconds, per TDS login + query (socket timeout)
+_MSSQL_PACING = _pacing_consumer("collector.mssql")
+# Default-level values, kept as names; the live values resolve through the pacing.
+_DEFAULT_PER_INSTANCE_TIMEOUT = _MSSQL_PACING.param("per_instance_timeout_s").default  # 30 s
 # Per-instance WALL budget for the whole enumeration (auth sweep + linked-server
 # discovery + best-effort enrichment probes), enforced by the outer
 # ``asyncio.wait_for``. This is a HUNG-INSTANCE safety net, NOT a per-query budget
@@ -74,8 +79,8 @@ _DEFAULT_PER_INSTANCE_TIMEOUT = 30  # seconds, per TDS login + query (socket tim
 # output. A generous wall budget + fast queries means a working instance never
 # trips it; only a genuinely hung instance is killed (each query already bounded
 # by the per-query socket timeout).
-_DEFAULT_INSTANCE_WALL_BUDGET = 120  # seconds, whole-instance enumeration ceiling
-_DEFAULT_CONCURRENCY = 8  # few instances; keep the login fan-out gentle for EDR
+_DEFAULT_INSTANCE_WALL_BUDGET = _MSSQL_PACING.param("instance_wall_budget_s").default  # 120 s
+_DEFAULT_CONCURRENCY = _MSSQL_PACING.param("concurrency").default  # 8: gentle login fan-out for EDR
 
 # Fixed server role whose membership (direct OR transitive) is sysadmin-equivalent.
 _SYSADMIN_ROLE = "sysadmin"
@@ -99,15 +104,9 @@ _AD_BACKED_PRINCIPAL_TYPES = frozenset({"U", "G"})  # Windows user / Windows gro
 _GROUP_PRINCIPAL_TYPES = frozenset({"G"})
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-        return value if value > 0 else default
-    except ValueError:
-        return default
+def _pacing() -> Any:
+    """The MSSQL collector's resolved pacing parameters."""
+    return component_pacing(active_pacing(), "collector.mssql")
 
 
 # ---------------------------------------------------------------------------
@@ -134,23 +133,20 @@ class MSSQLCollectorConfig:
     ntlm_fallback_secret: str | None = None
     port: int = DEFAULT_MSSQL_PORT
     per_instance_timeout: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_MSSQL_COLLECTOR_TIMEOUT", _DEFAULT_PER_INSTANCE_TIMEOUT
-        )
+        default_factory=lambda: _pacing()["per_instance_timeout_s"]
     )
     # Whole-instance enumeration ceiling (hung-instance safety net) — decoupled
     # from and much larger than the per-query socket timeout above. See
     # ``_DEFAULT_INSTANCE_WALL_BUDGET``.
     instance_wall_budget: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_MSSQL_COLLECTOR_WALL_BUDGET", _DEFAULT_INSTANCE_WALL_BUDGET
-        )
+        default_factory=lambda: _pacing()["instance_wall_budget_s"]
     )
-    concurrency: int = field(
-        default_factory=lambda: _env_int(
-            "ADSCAN_MSSQL_COLLECTOR_CONCURRENCY", _DEFAULT_CONCURRENCY
-        )
-    )
+    concurrency: int = field(default_factory=lambda: _pacing()["concurrency"])
+    # Decides whether a linked server's far side may be probed from this
+    # collection (``engagement_scope.linked_server_target_verdict`` bound to the
+    # shell, with the collecting domain's inventory resolving a bare name or
+    # IP). ``None``: no engagement context, probe.
+    link_gate: Callable[[Any], Any] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -200,6 +196,11 @@ class MSSQLInstanceAuthorization:
     # the collector emits theoretical ``MssqlLinkedServerLateral`` edges.
     linked_servers: list[Any] = field(default_factory=list)
     error: str | None = None
+    #: ``(stage, reason)`` for each query on a connected instance that never ran
+    #: (``collection_integrity.cut_off_read_reason``: a lost connection or an
+    #: unrecovered Kerberos clock skew). A refusal is not listed: it is the
+    #: login's visibility, which the roster already degrades to.
+    query_failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -213,6 +214,9 @@ class MSSQLCollectionSummary:
     linked_server_edges: int = 0
     negative_facts: int = 0
     errors: int = 0
+    #: Queries that never ran on a connected instance (see
+    #: ``MSSQLInstanceAuthorization.query_failures``); counted in ``errors`` too.
+    incomplete_reads: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +511,32 @@ def _spn_hosts_from_graph(graph: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def _instances_owned_by_domain(
+    shell: object, domain: str, instances: list[MSSQLInstance]
+) -> list[MSSQLInstance]:
+    """Keep the instances whose host ``domain`` owns (engagement-scope SSOT).
+
+    An ``MSSQLSvc`` SPN on one of this domain's accounts can name a host of
+    another domain. That host is collected with its own domain, and only when
+    that domain is in scope; this collection never connects to it.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        collection_host_verdict,
+        note_collection_host_skipped,
+    )
+
+    kept: list[MSSQLInstance] = []
+    for instance in instances:
+        verdict = collection_host_verdict(
+            shell, host=instance.fqdn or instance.host, collecting_domain=domain
+        )
+        if verdict.allowed:
+            kept.append(instance)
+            continue
+        note_collection_host_skipped(shell, verdict, what="MSSQL authorization collection")
+    return kept
+
+
 def discover_mssql_instances(
     shell: object,
     domain: str,
@@ -560,6 +590,7 @@ def discover_mssql_instances(
         MSSQLInstance(host=target.host, fqdn=target.fqdn, spn=target.spn)
         for target in resolution.targets
     ]
+    instances = _instances_owned_by_domain(shell, domain_clean, instances)
 
     if not instances:
         print_info_debug(
@@ -627,8 +658,18 @@ def _enumerate_one_instance(
             ntlm_fallback_secret=config.ntlm_fallback_secret,
         )
 
+        from adscan_internal.services.collector.collection_integrity import (  # noqa: PLC0415
+            cut_off_read_reason,
+        )
+
+        query_stages = {
+            queries.COLLECT_SERVER_PRINCIPALS: "mssql.server_principals",
+            queries.COLLECT_SERVER_ROLE_MEMBERS: "mssql.server_role_members",
+            queries.COLLECT_SERVER_PERMISSIONS: "mssql.server_permissions",
+        }
+
         def _run(query: str):
-            return backend.execute_query(
+            result = backend.execute_query(
                 domain=config.domain,
                 username=config.username,
                 secret=config.secret,
@@ -637,6 +678,15 @@ def _enumerate_one_instance(
                 use_kerberos=config.use_kerberos,
                 allow_ntlm_fallback=True,
             )
+            # Once connected, a query that never ran is recorded rather than
+            # read as an empty answer (the login gate itself maps onto ``error``).
+            if out.connected and not getattr(result, "success", False):
+                reason = cut_off_read_reason(getattr(result, "error_message", "") or "")
+                if reason:
+                    entry = (query_stages.get(query, "mssql.linked_servers"), reason)
+                    if entry not in out.query_failures:
+                        out.query_failures.append(entry)
+            return result
 
         # Login + own-sysadmin probe (also our connectivity gate).
         sysadmin_result = _run(queries.IS_SYSADMIN)
@@ -700,7 +750,7 @@ def _enumerate_one_instance(
         # sp_help* — they enumerate configured linked servers + their login
         # mappings; they NEVER enable xp_cmdshell or configure anything. Degrades
         # gracefully: a non-sysadmin login may see an empty login map.
-        out.linked_servers = _collect_linked_servers(_run, queries)
+        out.linked_servers = _collect_linked_servers(_run, queries, link_gate=config.link_gate)
         return out
     except Exception as exc:  # noqa: BLE001 — enumeration must never raise
         telemetry.capture_exception(exc)
@@ -709,12 +759,44 @@ def _enumerate_one_instance(
         return out
 
 
-def _collect_linked_servers(run_query: Any, queries: Any) -> list[Any]:
+def _announce_unprobed_links(shell: object, domain: str, results: list[Any]) -> None:
+    """One operator line per linked host the collection did not probe."""
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        linked_server_target_verdict,
+        note_collection_host_skipped,
+    )
+
+    for result in results:
+        for linked in getattr(result, "linked_servers", None) or ():
+            if not getattr(linked, "remote_probe_skip_reason", ""):
+                continue
+            verdict = linked_server_target_verdict(
+                shell, data_source=linked.data_source, collecting_domain=domain
+            )
+            if verdict.allowed:
+                continue
+            if not verdict.host:
+                verdict = dataclasses.replace(verdict, host=str(linked.name or ""))
+            note_collection_host_skipped(
+                shell, verdict, what=f"Queries through linked server {linked.name}"
+            )
+
+
+def _collect_linked_servers(
+    run_query: Any, queries: Any, *, link_gate: Callable[[Any], Any] | None = None
+) -> list[Any]:
     """Run the READ-ONLY linked-server queries and return merged ``LinkedServer``s.
 
     ``run_query`` is the per-instance ``_run`` closure (already bound to the
     sticky-fallback backend). Both queries are ``SELECT`` / ``EXEC sp_help*`` —
     no enable/escalation. Never raises; a query failure yields no linked servers.
+
+    Listing the links is a local read, like reading a trust. Probing a link's
+    FAR side (sysadmin, xp_cmdshell state, bulk operations) runs on the linked
+    host, so it happens only when ``link_gate`` allows that host: its domain
+    must be in the engagement scope, whichever domain owns it (a linked server
+    is reachable only through this instance, so no other collection probes it).
+    A link it refuses stays mapped with the reason and unknown remote facts.
     """
     from adscan_internal.integrations.mssql import parsers
     from adscan_internal.integrations.mssql.helpers import is_self_linked_server
@@ -746,11 +828,29 @@ def _collect_linked_servers(run_query: Any, queries: Any) -> list[Any]:
                 list(login_result.rows or [])
             )
         merged = parsers.merge_linked_servers_with_login_map(servers, login_map)
-        return [_probe_linked_server_remote_sysadmin(run_query, queries, ls) for ls in merged]
+        return [_probe_linked_server_if_allowed(run_query, queries, ls, link_gate) for ls in merged]
     except Exception as exc:  # noqa: BLE001 — linked-server discovery is best-effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return []
+
+
+def _probe_linked_server_if_allowed(
+    run_query: Any, queries: Any, linked_server: Any, link_gate: Callable[[Any], Any] | None
+) -> Any:
+    """Probe a link's far side only when the collection may contact its host."""
+    import dataclasses  # noqa: PLC0415
+
+    if link_gate is not None:
+        verdict = link_gate(linked_server)
+        if verdict is not None and not getattr(verdict, "allowed", True):
+            print_info_debug(
+                "[mssql-collector] linked server far side not probed: "
+                f"link={mark_sensitive(linked_server.name, 'hostname')} "
+                f"reason={verdict.reason}"
+            )
+            return dataclasses.replace(linked_server, remote_probe_skip_reason=verdict.reason)
+    return _probe_linked_server_remote_sysadmin(run_query, queries, linked_server)
 
 
 def _probe_linked_server_remote_sysadmin(run_query: Any, queries: Any, linked_server: Any) -> Any:
@@ -874,10 +974,15 @@ async def _enumerate_instances(
     if not instances:
         return []
     worker_count = max(1, min(config.concurrency, len(instances)))
-    semaphore = asyncio.Semaphore(worker_count)
+    runtime = active_runtime()
+    semaphore = runtime.semaphore(worker_count)
 
     async def _bounded(instance: MSSQLInstance) -> MSSQLInstanceAuthorization:
         async with semaphore:
+            if not await runtime.before_op(instance.host):
+                skipped = MSSQLInstanceAuthorization(instance=instance, connected=False)
+                skipped.error = "paused_by_safeguard"
+                return skipped
             try:
                 # Generous WALL budget (hung-instance safety net), never smaller
                 # than a single query + margin. NOT the per-query timeout — the
@@ -890,6 +995,7 @@ async def _enumerate_instances(
                     timeout=wall_budget,
                 )
             except (asyncio.TimeoutError, TimeoutError):
+                runtime.record(instance.host, Outcome.TIMEOUT)
                 result = MSSQLInstanceAuthorization(instance=instance, connected=False)
                 result.error = "timeout"
                 return result
@@ -1285,6 +1391,14 @@ def _linked_server_edge_notes(
             else {}
         ),
         "login_mappings": mappings,
+        # The far side was not probed from this collection (outside the
+        # engagement scope, or no determinable domain): its remote facts are
+        # unknown, never negative.
+        **(
+            {"remote_probe_not_checked": linked_server.remote_probe_skip_reason}
+            if getattr(linked_server, "remote_probe_skip_reason", "")
+            else {}
+        ),
     }
 
 
@@ -1489,6 +1603,18 @@ async def collect_mssql_authorization(
     if not domain_clean:
         return summary
 
+    from adscan_internal.services.collector.collection_integrity import (  # noqa: PLC0415
+        REASON_CLOCK_SKEW,
+        begin_mssql_collection_attempt,
+        cut_off_read_reason,
+        declare_mssql_collection_integrity,
+    )
+    from adscan_internal.services.collector.models import (  # noqa: PLC0415
+        CollectionStageFailure,
+    )
+
+    # This pass is judged on its own reads.
+    begin_mssql_collection_attempt(shell, domain_clean)
     try:
         if instances is None:
             instances = discover_mssql_instances(shell, domain_clean)
@@ -1496,7 +1622,24 @@ async def collect_mssql_authorization(
         if not instances:
             return summary
 
-        results = await _enumerate_instances(instances, config)
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            collecting_domain_context,
+            linked_server_target_verdict,
+        )
+
+        if config.link_gate is None:
+
+            def _link_gate(linked_server: Any) -> Any:
+                return linked_server_target_verdict(
+                    shell,
+                    data_source=getattr(linked_server, "data_source", ""),
+                    collecting_domain=domain_clean,
+                )
+
+            config = dataclasses.replace(config, link_gate=_link_gate)
+        with collecting_domain_context(domain_clean):
+            results = await _enumerate_instances(instances, config)
+        _announce_unprobed_links(shell, domain_clean, results)
 
         # Load the graph ONCE, upsert all instances, save ONCE — avoids re-reading
         # a potentially large attack_graph.json per instance.
@@ -1507,9 +1650,22 @@ async def collect_mssql_authorization(
 
         graph = load_attack_graph(shell, domain_clean)
         any_edges = False
+        cut_off: list[Any] = []
         for result in results:
             if result.error:
                 summary.errors += 1
+                if (
+                    not result.connected
+                    and cut_off_read_reason(result.error) == REASON_CLOCK_SKEW
+                ):
+                    # The login itself was refused for clock skew the recovery
+                    # layer could not correct: the instance was never read. A
+                    # host that does not answer stays a reachability gap.
+                    cut_off.append(CollectionStageFailure("mssql.login", REASON_CLOCK_SKEW))
+            for stage, reason in getattr(result, "query_failures", None) or ():
+                summary.errors += 1
+                summary.incomplete_reads += 1
+                cut_off.append(CollectionStageFailure(stage, reason))
             if not result.connected:
                 continue
             summary.instances_connected += 1
@@ -1533,6 +1689,8 @@ async def collect_mssql_authorization(
         # longer modelled as a MssqlOpenRowsetBulkRead attack edge. Reads the
         # per-principal facts populated by the upsert above (matched_label set).
         _record_bulk_operations_overprivilege_finding(shell, domain_clean, results)
+        if cut_off:
+            declare_mssql_collection_integrity(shell, domain_clean, cut_off)
     except Exception as exc:  # noqa: BLE001 — collection must never raise upward
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -1545,7 +1703,7 @@ async def collect_mssql_authorization(
         f"connected={summary.instances_connected} "
         f"SQLAccess={summary.sqlaccess_edges} SQLAdmin={summary.sqladmin_edges} "
         f"LinkedServer={summary.linked_server_edges} "
-        f"errors={summary.errors}"
+        f"errors={summary.errors} incomplete_reads={summary.incomplete_reads}"
     )
     return summary
 

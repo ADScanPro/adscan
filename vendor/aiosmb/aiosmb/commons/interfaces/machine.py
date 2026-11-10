@@ -255,7 +255,10 @@ class SMBMachine:
 		try:
 			async with samrrpc_from_smb(self.connection, auth_level=self.force_rpc_auth) as samrpc:
 				async with samrpc.get_user_handle(domain_name, user_name) as uhandle:
-					return await samrpc.disable_account(uhandle)
+					# SamrDeleteUser. Upstream only disabled the account here, so a
+					# "delete" left a disabled account behind (ADscan fix,
+					# locked by tests/unit/vendor/test_aiosmb_machine_delete_user.py).
+					return await samrpc.delete_account(uhandle)
 
 		except Exception as e:
 			return None, e
@@ -288,11 +291,11 @@ class SMBMachine:
 			return None, e
 
 
-	async def change_user_password_internal(self, domain_name:str, user_name:str, new_password:str) -> Awaitable[Tuple[str, Union[Exception, None]]]:
+	async def change_user_password_internal(self, domain_name:str, user_name:str, new_password:str, nt_hash:str = '') -> Awaitable[Tuple[str, Union[Exception, None]]]:
 		try:
 			async with samrrpc_from_smb(self.connection, auth_level=self.force_rpc_auth) as samrpc:
 				async with samrpc.get_user_handle(domain_name, user_name) as uhandle:
-					return await samrpc.change_account_password_internal(uhandle, new_password)
+					return await samrpc.change_account_password_internal(uhandle, new_password, nt_hash)
 
 		except Exception as e:
 			return None, e
@@ -1654,6 +1657,40 @@ class SMBMachine:
 				async with ICertAdminD(iInterface) as cert_admin:
 					disposition = await cert_admin.resubmit_request(ca_name, request_id)
 					return disposition, None
+		except Exception as e:
+			return None, e
+
+	async def revoke_cert_dcom(self, ca_name: str, serial_number: str, reason: int = 1) -> Tuple[int, Union[Exception, None]]:
+		"""
+		Revoke an issued certificate via DCOM (ICertAdminD RevokeCertificate).
+
+		MS-CSRA write (opnum 10, ICertAdminD). Requires the ManageCertificates
+		(officer) right on the CA. Kerberos-native. Relying parties stop
+		accepting the certificate once the CA publishes its next CRL.
+
+		Args:
+			ca_name: CA name (e.g., "CORP-CA")
+			serial_number: Hex serial number as the CA database stores it.
+			reason: CRL reason code (1 = key compromise).
+
+		Returns:
+			(0, None) when the CA accepted the revocation AND a re-read of its
+			database shows the certificate revoked; (nonzero, None) when the CA
+			returned an error code or the re-read did not show it revoked
+			(negative = the disposition read back); (None, Exception) on failure.
+		"""
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdminD, IID_ICertAdminD)
+				if err is not None:
+					raise err
+				async with ICertAdminD(iInterface) as cert_admin:
+					error_code = await cert_admin.revoke_certificate(ca_name, serial_number, reason)
+					if error_code:
+						return error_code, None
+					# Confirm by re-reading the CA database (verify-the-undo).
+					disposition = await cert_admin.certificate_disposition(ca_name, serial_number)
+					return (0 if disposition == 2 else -disposition or -1), None
 		except Exception as e:
 			return None, e
 

@@ -101,6 +101,11 @@ def _looks_like_ccache(value: str | None) -> bool:
     return bool((value or "").strip().lower().endswith(".ccache"))
 
 
+#: Fragment of the ``AuthAttemptRefused`` message; ``ensure_user_ccache`` hands the
+#: refusal back as text, so the abort classifier recognises it by this marker.
+LOCKOUT_REFUSAL_MARKER = "withheld to protect the account from lockout"
+
+
 def _classify_premint_failure(exc: Exception | None, note: str) -> str | None:
     """Classify a pre-mint failure into a non-credential root cause, if any.
 
@@ -141,6 +146,19 @@ def _classify_premint_failure(exc: Exception | None, note: str) -> str | None:
         return "the Kerberos KDC (Domain Controller) was unreachable"
 
     return None
+
+
+def _premint_rejected_by_kdc(exc: Exception | None, note: str) -> bool:
+    """Return ``True`` when the pre-mint failed because the KDC rejected the secret."""
+    haystack = f"{note} {exc or ''}".lower()
+    return any(
+        marker in haystack
+        for marker in (
+            "kdc_err_preauth_failed",
+            "kdc_err_client_revoked",
+            "kdc rejected the credential",
+        )
+    )
 
 
 def resolve_sweep_credential(
@@ -326,7 +344,32 @@ def resolve_sweep_credential(
     # problem and is NOT a lockout risk — so don't tell the operator to "verify
     # the credential". Only fall back to that wording when the cause is unknown.
     classified_cause = _classify_premint_failure(mint_exc, mint_note)
-    if classified_cause:
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+
+    if refusal_in_chain(mint_exc) is not None or LOCKOUT_REFUSAL_MARKER in mint_note:
+        # The guard withheld the sign-in and already told the operator why. The
+        # credential was not judged, so do not tell them to verify it.
+        notes.append("pre-mint withheld by the account-lockout guard")
+        return SweepCredential(
+            aborted=True,
+            abort_reason=(
+                "Skipped for account-lockout safety: the sweep needs one Kerberos "
+                "sign-in and the lockout guard withheld it, so no host was "
+                "contacted. The credential was not tested."
+            ),
+            notes=tuple(notes),
+        )
+    if _premint_rejected_by_kdc(mint_exc, mint_note):
+        # The KDC judged the secret itself. Checked FIRST: a later local error
+        # in a fallback client (e.g. writing a krb5.conf) must never mask it.
+        abort_reason = (
+            "Kerberos TGT pre-mint failed: the domain controller rejected the "
+            f"credential for {masked_user} (KDC_ERR_PREAUTH_FAILED or the account "
+            "is disabled / locked). The secret does not belong to this account or "
+            "has changed. Aborting the sweep after that single attempt; no host "
+            "was contacted."
+        )
+    elif classified_cause:
         abort_reason = (
             f"Kerberos TGT pre-mint failed because {classified_cause}; aborting "
             "the sweep before any host is contacted (no credential reached the "

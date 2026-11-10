@@ -20,7 +20,6 @@ and a TCP pre-filter on the MSSQL port performed by the caller.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Iterable, Optional
 
 from adscan_internal import print_info_debug, telemetry
@@ -29,10 +28,14 @@ from adscan_internal.integrations.mssql.native_backend import ImpacketMSSQLBacke
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.service_access_results import ServiceAccessFinding
 from adscan_core.rich_output import print_exception
+from adscan_core.scan_pacing import active_pacing, component_pacing
+from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
+from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 
 
 MSSQL_ACCESS_PROBE_BACKEND = "mssql-native"
-DEFAULT_MSSQL_PROBE_WORKERS = 30
+#: Default-level worker count (scan-pacing consumer ``sweep.mssql_access``).
+DEFAULT_MSSQL_PROBE_WORKERS = _pacing_consumer("sweep.mssql_access").param("workers").default
 DEFAULT_MSSQL_PORT = 1433
 
 # Substrings that indicate a transport / infrastructure failure rather than a
@@ -52,14 +55,8 @@ _TRANSPORT_MARKERS = (
 
 
 def get_mssql_probe_worker_count() -> int:
-    """Return operator-configurable MSSQL probe concurrency (clamped 1-128)."""
-    raw_value = os.getenv("ADSCAN_MSSQL_PROBE_WORKERS", "").strip()
-    if not raw_value:
-        return DEFAULT_MSSQL_PROBE_WORKERS
-    try:
-        return max(1, min(int(raw_value), 128))
-    except ValueError:
-        return DEFAULT_MSSQL_PROBE_WORKERS
+    """Return the MSSQL probe concurrency from the scan pacing."""
+    return int(component_pacing(active_pacing(), "sweep.mssql_access")["workers"])
 
 
 def _normalize_target(value: object) -> str:
@@ -199,7 +196,7 @@ async def run_mssql_access_probe_sweep(
     use_kerberos: bool = False,
     target_hostnames: Optional[dict[str, str]] = None,
     kdc_host: str | None = None,
-    timeout: int = 30,
+    timeout: int | None = None,
     max_workers: int | None = None,
     ntlm_fallback_secret: str | None = None,
 ) -> list[ServiceAccessFinding]:
@@ -266,10 +263,23 @@ async def run_mssql_access_probe_sweep(
         f"ntlm_fallback={bool(ntlm_fallback_secret)}"
     )
 
-    semaphore = asyncio.Semaphore(worker_count)
+    if timeout is None:
+        timeout = int(component_pacing(active_pacing(), "sweep.mssql_access")["timeout_s"])
+    runtime = active_runtime()
+    semaphore = runtime.semaphore(worker_count)
 
     async def _bounded(host: str) -> ServiceAccessFinding:
         async with semaphore:
+            if not await runtime.before_op(host):
+                return ServiceAccessFinding(
+                    service="mssql",
+                    host=host,
+                    username=username,
+                    category="transport",
+                    reason="paused_by_safeguard",
+                    status="Not tested: the host stopped responding earlier in the assessment",
+                    backend=MSSQL_ACCESS_PROBE_BACKEND,
+                )
             try:
                 return await asyncio.wait_for(
                     asyncio.to_thread(
@@ -290,6 +300,7 @@ async def run_mssql_access_probe_sweep(
                     timeout=timeout + 15,
                 )
             except (asyncio.TimeoutError, TimeoutError):
+                runtime.record(host, Outcome.TIMEOUT)
                 return ServiceAccessFinding(
                     service="mssql",
                     host=host,

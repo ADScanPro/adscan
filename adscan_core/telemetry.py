@@ -1,6 +1,7 @@
 """Telemetry helpers for ADscan."""
 
 import base64
+import contextvars
 import binascii
 import functools
 import gzip
@@ -37,6 +38,7 @@ from adscan_core.lab_context import (
     build_lab_slug,
     build_lab_telemetry_fields,
     build_workspace_telemetry_fields,
+    scan_policy_base_of,
     normalize_workspace_type,
 )
 from adscan_core.embedded_telemetry_config import (
@@ -1037,6 +1039,7 @@ _SESSION_TRACE_ID_ENV = "ADSCAN_SESSION_TRACE_ID"
 _SESSION_WORKSPACE_CONTEXT_FIELDS = frozenset(
     {
         "workspace_type",
+        "scan_policy_base",
         "compromise_status",
         "user_compromised",
         "domain_compromised",
@@ -1784,17 +1787,51 @@ def set_workspace_users(
     _KNOWN_USERS_LOADED = True
 
 
+#: Secrets registered at runtime that no workspace file carries in a form the
+#: refresh below can read (the client's cleanup-only account, which may arrive by
+#: environment reference and never touch disk). Every replacement of the known
+#: set merges them back, so a workspace refresh can never drop one.
+_PINNED_KNOWN_PASSWORDS: list[str] = []
+
+
+def add_known_password(*passwords: Optional[str]) -> None:
+    """Register secrets for buffer-wide sanitization, and keep them registered.
+
+    Unlike :func:`set_workspace_passwords`, which REPLACES the known set from the
+    workspace files on every refresh, a value registered here is pinned: each
+    later replacement merges it back. Because sanitization runs at export time
+    over the whole buffer, registering a secret also masks every occurrence
+    recorded before this call.
+
+    Args:
+        *passwords: Secrets to add. Empty, non-string, duplicate and
+            below-floor values are ignored.
+    """
+    global _KNOWN_PASSWORDS
+    for password in passwords:
+        if not isinstance(password, str):
+            continue
+        cleaned = password.strip()
+        if len(cleaned) < _MIN_KNOWN_PASSWORD_LEN:
+            continue
+        if cleaned not in _PINNED_KNOWN_PASSWORDS:
+            _PINNED_KNOWN_PASSWORDS.append(cleaned)
+        if cleaned not in _KNOWN_PASSWORDS:
+            # In place, so the redaction-state cache (identity + length) rebuilds.
+            _KNOWN_PASSWORDS.append(cleaned)
+
+
 def set_workspace_passwords(
     passwords: Optional[list[str]] | tuple[str, ...] | set[str] | None,
 ) -> None:
     """Set known workspace passwords/hashes for targeted sanitization."""
     global _KNOWN_PASSWORDS, _KNOWN_PASSWORDS_LOADED
     if not passwords:
-        _KNOWN_PASSWORDS = []
+        _KNOWN_PASSWORDS = list(_PINNED_KNOWN_PASSWORDS)
         _KNOWN_PASSWORDS_LOADED = True
         return
     normalized: list[str] = []
-    for password in passwords:
+    for password in [*passwords, *_PINNED_KNOWN_PASSWORDS]:
         if not isinstance(password, str):
             continue
         cleaned = password.strip()
@@ -1967,6 +2004,26 @@ def _load_workspace_users_from_dir(
     return users
 
 
+#: Top-level ``variables.json`` key of the client's saved cleanup-only account.
+#: Mirrors ``cleanup_credential_store.WORKSPACE_VARIABLES_KEY`` (adscan_core cannot
+#: import adscan_internal); a test pins the two together. The sanitizer reads the
+#: secret ONLY to mask it, the same way it learns the assessment credentials.
+_CLEANUP_CREDENTIALS_KEY = "cleanup_credentials"
+
+
+def _cleanup_account_secrets(variables: dict[str, Any]) -> list[str]:
+    section = variables.get(_CLEANUP_CREDENTIALS_KEY)
+    accounts = section.get("accounts") if isinstance(section, dict) else None
+    if not isinstance(accounts, dict):
+        return []
+    found: list[str] = []
+    for account in accounts.values():
+        secret = account.get("secret") if isinstance(account, dict) else None
+        if isinstance(secret, str) and secret:
+            found.append(secret)
+    return found
+
+
 def _load_workspace_passwords_from_dir(
     workspace_dir: Path, domains: list[str]
 ) -> list[str]:
@@ -1994,6 +2051,7 @@ def _load_workspace_passwords_from_dir(
                 for cred_value in credentials.values():
                     if isinstance(cred_value, str) and cred_value:
                         passwords.append(cred_value)
+    passwords.extend(_cleanup_account_secrets(variables))
     spraying_history = variables.get("password_spraying_history")
     if isinstance(spraying_history, dict):
         for domain_hist in spraying_history.values():
@@ -2270,6 +2328,40 @@ def _get_known_netbios() -> list[str]:
     except Exception:
         pass
     return _KNOWN_NETBIOS
+
+
+def register_home_workspace_names() -> list[str]:
+    """Add every workspace under the ADscan home to the known workspace names.
+
+    The known names normally come from the current directory, which for the
+    host launcher, or for a process whose workspace was already deleted, is not
+    a workspace. The outside-workspace log calls this before it sanitizes, so a
+    workspace name (often the client's name) is pseudonymized there like any
+    other identifier. Execution workspaces contribute their logical name.
+
+    Returns:
+        The names added (for tests); never raises.
+    """
+    try:
+        from adscan_core.execution_workspace import (  # noqa: PLC0415
+            resolve_logical_workspace_name,
+        )
+        from adscan_core.paths import get_adscan_home_dir  # noqa: PLC0415
+
+        _refresh_workspace_cache_if_needed()
+        root = get_adscan_home_dir() / "workspaces"
+        found: list[str] = []
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            name = resolve_logical_workspace_name(entry.name)
+            if name and not name.startswith("."):
+                found.append(name)
+        if found:
+            set_workspace_names(list(_KNOWN_WORKSPACES) + found)
+        return found
+    except Exception:  # noqa: BLE001 — best effort; the flag pass still applies
+        return []
 
 
 def _get_known_workspaces() -> list[str]:
@@ -2633,6 +2725,9 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "domain_discovered",
         "domain_inference",
         "domain_not_discovered",
+        "enterprise_environment_admission",
+        "enterprise_environment_declared_inline",
+        "enterprise_license_checked",
         "environment_enumerated",
         "execute_start",
         "exposure_report_generated",
@@ -2652,6 +2747,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "kerberoast_started",
         "kerberoast_users_found",
         "kerberos_ccache_principal_mismatch",
+        "environment_ledger_missing",
         "launcher_low_memory_gate",
         "ldap_computers_enumerated",
         "local_credential_host_identifier_username",
@@ -2661,6 +2757,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "mssql_seimpersonate_checked",
         "myip_auto_configured",
         "myip_auto_updated",
+        "myip_virtual_interface_skipped",
         "native_collection_performance",
         "native_collection_progress",
         "operator_role",
@@ -2676,6 +2773,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "post_ex_menu_viewed",
         "post_ex_technique_selected",
         "poisoning_capture",
+        "poisoning_skipped_no_interface",
         "post_scan_report_moment",
         "rdp_scan_started",
         "reinstall",
@@ -2962,6 +3060,9 @@ _SAFE_TELEMETRY_STRING_FIELDS: frozenset[str] = frozenset(
         "trace_id",
         "version_context_mode",
         "workspace_type",
+        # The scan policy's base id (lab_ctf / audit / production_sensitive):
+        # a product constant, never a user-chosen name.
+        "scan_policy_base",
     }
 )
 
@@ -3610,18 +3711,51 @@ def _sanitizer_trace_enabled() -> bool:
     return _SANITIZER_TRACE_RESOLVED
 
 
-def _sanitizer_trace_path() -> Path:
-    home = Path(os.getenv("ADSCAN_HOME") or (Path.home() / ".adscan"))
-    return home / "logs" / "sanitizer-trace.log"
+def _sanitizer_trace_path() -> Optional[Path]:
+    """``<active workspace>/logs/sanitizer-trace.log``, or None with no workspace.
+
+    The trace holds pre-redaction text (domains, users, passwords), so it lives
+    in the workspace it describes and leaves with it. With no active workspace
+    nothing is traced.
+    """
+    try:
+        from adscan_core import logging_config  # noqa: PLC0415
+
+        workspace_dir = logging_config._active_workspace_dir
+    except Exception:
+        return None
+    if not workspace_dir:
+        return None
+    return Path(workspace_dir) / "logs" / "sanitizer-trace.log"
+
+
+_SANITIZER_TRACE_FH_PATH: Optional[Path] = None
+
+
+def close_sanitizer_trace() -> None:
+    """Close the trace file (workspace switch or detach, before a delete)."""
+    global _SANITIZER_TRACE_FH, _SANITIZER_TRACE_FH_PATH
+    fh = _SANITIZER_TRACE_FH
+    _SANITIZER_TRACE_FH = None
+    _SANITIZER_TRACE_FH_PATH = None
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 
 def _sanitizer_trace_fh() -> Optional[Any]:
     """Lazily open the trace log file. Returns None on any I/O error."""
-    global _SANITIZER_TRACE_FH
-    if _SANITIZER_TRACE_FH is not None:
+    global _SANITIZER_TRACE_FH, _SANITIZER_TRACE_FH_PATH
+    path = _sanitizer_trace_path()
+    if path is None:
+        close_sanitizer_trace()
+        return None
+    if _SANITIZER_TRACE_FH is not None and _SANITIZER_TRACE_FH_PATH == path:
         return _SANITIZER_TRACE_FH
+    close_sanitizer_trace()
     try:
-        path = _sanitizer_trace_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         # Rotate if file exceeds 4 MiB so we always have a fresh tail
         # to read after reproducing the bug.
@@ -3636,6 +3770,7 @@ def _sanitizer_trace_fh() -> Optional[Any]:
         except OSError:
             pass
         _SANITIZER_TRACE_FH = path.open("a", encoding="utf-8")
+        _SANITIZER_TRACE_FH_PATH = path
         _SANITIZER_TRACE_FH.write(
             f"\n\n=== sanitizer-trace session opened "
             f"pid={os.getpid()} at {datetime.now(timezone.utc).isoformat()} ===\n"
@@ -3643,6 +3778,7 @@ def _sanitizer_trace_fh() -> Optional[Any]:
         _SANITIZER_TRACE_FH.flush()
     except Exception:
         _SANITIZER_TRACE_FH = None
+        _SANITIZER_TRACE_FH_PATH = None
     return _SANITIZER_TRACE_FH
 
 
@@ -3656,9 +3792,17 @@ def _sanitizer_trace_session_open(content: str) -> None:
         return
     _SANITIZER_TRACE_COUNT = 0
     try:
-        known_workspaces = _get_known_workspaces()
+        # Only the names this pass actually contains. The full list is every
+        # sibling workspace on the machine, and this file lives inside ONE
+        # workspace: listing the others would copy each engagement's name into
+        # every other engagement, where deleting that workspace cannot reach it.
+        _all_workspaces = _get_known_workspaces()
+        _lowered = content.casefold()
+        known_workspaces = [w for w in _all_workspaces if w.casefold() in _lowered]
+        known_workspaces_total = len(_all_workspaces)
     except Exception as exc:
-        known_workspaces = [f"<error: {exc}>"]
+        known_workspaces = [f"<error: {type(exc).__name__}>"]
+        known_workspaces_total = -1
     try:
         known_domains = _get_known_domains() if "_get_known_domains" in globals() else []
     except Exception:
@@ -3675,13 +3819,21 @@ def _sanitizer_trace_session_open(content: str) -> None:
         known_pw_count = len(_get_known_passwords()) if "_get_known_passwords" in globals() else 0
     except Exception:
         known_pw_count = -1
+    # The known lists are process-wide and survive a workspace switch: a shell
+    # that had another engagement loaded still holds its domains and users.
+    # Write only the values present in the text traced, never the lists.
+    _lowered_content = content.casefold()
+
+    def _in_pass(values: list[str]) -> list[str]:
+        return [v for v in values if str(v).casefold() in _lowered_content]
+
     try:
         fh.write(
             f"\n--- sanitize pass: content_len={len(content)} chars ---\n"
-            f"known_workspaces ({len(known_workspaces)}): {known_workspaces!r}\n"
-            f"known_domains    ({len(known_domains)}): {known_domains!r}\n"
-            f"known_hosts      ({len(known_hosts)}): {known_hosts!r}\n"
-            f"known_users      ({len(known_users)}): {known_users!r}\n"
+            f"known_workspaces ({known_workspaces_total}), in this pass: {known_workspaces!r}\n"
+            f"known_domains    ({len(known_domains)}), in this pass: {_in_pass(known_domains)!r}\n"
+            f"known_hosts      ({len(known_hosts)}), in this pass: {_in_pass(known_hosts)!r}\n"
+            f"known_users      ({len(known_users)}), in this pass: {_in_pass(known_users)!r}\n"
             f"known_passwords  count={known_pw_count}\n"
         )
         # First and last 800 chars of the pre-sanitize content, so the
@@ -3728,6 +3880,7 @@ def _sanitizer_trace_event(
         stack_str = "\n".join(frames)
     except Exception:
         stack_str = "  <stack unavailable>"
+    value = _mask_removed_workspaces(str(value))
     try:
         fh.write(
             f"\n[{_SANITIZER_TRACE_COUNT:04d}] {kind} "
@@ -3737,6 +3890,36 @@ def _sanitizer_trace_event(
         fh.flush()
     except Exception:
         pass
+
+
+# Replacement policy for ``_record_pseudonym``. ``None`` (the default, and the
+# only value telemetry ever runs with) means "pseudonymize as always". The
+# local-log secrets layer (``mask_secrets``) installs ``_mask_secret_only`` for
+# the duration of one call, so the SAME detectors decide what is a secret while
+# identifiers pass through untouched. A ContextVar keeps a log write on one
+# thread from ever changing what a concurrent telemetry export produces.
+_REPLACEMENT_POLICY: "contextvars.ContextVar[Optional[Callable[[str, str], str]]]" = (
+    contextvars.ContextVar("adscan_sanitizer_replacement_policy", default=None)
+)
+
+# Data types the detectors use for credential material. Everything else
+# (user, domain, hostname, ip, sid, path, share, workspace, service, "redacted"
+# user lists, ...) is an identifier the operator needs in their own logs.
+SECRET_DATA_TYPES: frozenset[str] = frozenset({"password", "hash"})
+
+
+def _mask_secret_only(value: str, data_type: str) -> str:
+    """Replacement policy of ``mask_secrets``: mask secrets, keep identifiers.
+
+    The mask is length-preserving asterisks: the wrapped-hex detector only
+    rewrites a hash split across lines when the replacement keeps the length,
+    and table cells keep their alignment.
+    """
+    if str(data_type or "").lower() not in SECRET_DATA_TYPES:
+        return value
+    if not value or is_attack_technique_name(value) or _is_reserved_structural_token(value):
+        return value
+    return "*" * len(value)
 
 
 def _record_pseudonym(value: str, data_type: str, *, force: bool = False) -> str:
@@ -3753,6 +3936,13 @@ def _record_pseudonym(value: str, data_type: str, *, force: bool = False) -> str
             log-level structural backstop is NEVER bypassed -- a log level can
             never be a real secret.
     """
+    # A replacement policy installed by ``mask_secrets`` (the local-log,
+    # secrets-only layer) takes over the whole decision: the detectors that
+    # called us are shared with telemetry, but what happens to a match is the
+    # policy's call. It never touches the telemetry registry or the trace.
+    policy = _REPLACEMENT_POLICY.get()
+    if policy is not None:
+        return policy(value, data_type)
     if value in _SANITIZED_VALUES:
         return value
     # Never pseudonymize a known public technique / edge name, on EVERY path
@@ -4836,6 +5026,545 @@ class _StreamingSanitizer:
         return full
 
 
+def _sanitize_domain_user_combos(content: str) -> str:
+    """Pseudonymize ``DOMAIN/USER[:PASSWORD]`` combos (the password half is a secret)."""
+    def _replace_domain_user(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if _is_already_sanitized(token):
+            return token
+        domain_raw = match.group("domain") or ""
+        user_raw = match.group("user") or ""
+        pwd = match.group("pwd")
+        domain = domain_raw.strip("'\"")
+        user = user_raw.strip("'\"")
+        pwd = pwd.strip("'\"") if pwd else None
+        if not _looks_like_ad_domain_token(domain, has_password=bool(pwd)):
+            # Ordinary prose ("install/update", "DC/PDC", "and/or"), not a
+            # DOMAIN/USER credential pair. See _looks_like_ad_domain_token.
+            return token
+        domain_repl = _apply_quote_wrapped(
+            domain_raw, _record_pseudonym(domain, "domain")
+        )
+        # Preserve a public well-known principal NAME in the user slot; the
+        # domain slot is always sanitized (customer-identifying).
+        if _is_well_known_principal(user):
+            user_repl = _apply_quote_wrapped(user_raw, user)
+        else:
+            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
+        replacement = f"{domain_repl}/{user_repl}"
+        if pwd:
+            pwd_repl = _apply_quote_wrapped(
+                match.group("pwd") or "", _record_pseudonym(pwd, "password")
+            )
+            replacement += f":{pwd_repl}"
+        return replacement
+
+    # Domain token:
+    # - Support both legacy `{DOMAIN}` placeholders and current `[DOMAIN]`
+    # - Require at least one alphabetic character to avoid matching phase
+    #   counters like ``1/3`` as a fake ``DOMAIN/USER`` combo.
+    domain_token = (
+        r"(?:\[DOMAIN\]|\{DOMAIN\}|"
+        r"[A-Za-z0-9._-]*[A-Za-z][A-Za-z0-9._-]*)"
+    )
+    # User token:
+    # - Support both legacy `{USER}` placeholders and current `[USER]`
+    user_token = r"(?:\[USER\]|\{USER\}|[a-z0-9._$-]+)"
+
+    # Replace domain/user combos before general domain redaction.
+    # The separators are TIGHT (no surrounding whitespace): a real
+    # ``DOMAIN/USER:PASSWORD`` token never has spaces around its slash or
+    # colon, while ``\s*/\s*`` let the pattern swallow across a spaced slash
+    # and eat two unrelated words of prose.
+    combo_pattern = re.compile(
+        rf"""
+        (?<![A-Za-z0-9_./~-])
+        (?P<domain>["']?{domain_token}["']?)
+        /
+        (?P<user>["']?{user_token}["']?)
+        (?:
+            :
+            (?P<pwd>
+                (?:"[^"]*"|'[^']*')
+                |
+                [^\s"'@:]+
+            )
+        )?
+        (?=$|\s|@|:)
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+    content = combo_pattern.sub(_replace_domain_user, content)
+    return content
+
+
+def _mask_explicit_credential_disclosures(content: str) -> str:
+    """Mask the value of ``password added for user X: <v>`` / ``credential for X: <v>``."""
+    password_added_pattern = re.compile(
+        r"(?i)(password\s+added\s+for\s+user\s+[^\n:]+:\s*)([^\s<>\n]+)"
+    )
+    content = password_added_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+
+    credential_for_pattern = re.compile(
+        r"(?i)(credential\s+for\s+[^\n:]+:\s*)([^\s<>\n]+)"
+    )
+    content = credential_for_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+
+    # Three tool-output shapes that disclose a secret with no keyword the
+    # passes below anchor on: a LAPS read ("LAPS password for HOST: <v>"), a
+    # crack result ("Cracked: user:<v>") and a NetExec success line
+    # ("[+] corp.local\\alice:<v> (Pwn3d!)", password or LM:NT).
+    laps_pattern = re.compile(r"(?i)(\blaps\s+password\s+for\s+[^\n:]+:\s*)([^\s<>\n]+)")
+    content = laps_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+    cracked_pattern = re.compile(r"(?i)(\bcracked\s*:\s*[^\s:]+:)([^\s<>\n]+)")
+    content = cracked_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+    nxc_success_pattern = re.compile(
+        r"(\[\+\]\s+[A-Za-z0-9._-]+\\[^\s:\\]+:)([^\s<>\n]+)"
+    )
+    content = nxc_success_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+    # print_exception's generic line hides "/..." runs as "[path hidden]",
+    # which turns an impacket-style "corp.local/alice:<v>" target string into
+    # "corp.local[path hidden]:<v>" that the combo pass no longer recognises.
+    path_hidden_secret_pattern = re.compile(r"(\[path hidden\]:)([^\s<>\n]+)")
+    content = path_hidden_secret_pattern.sub(
+        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+        content,
+    )
+    return content
+
+
+def _is_password_context(match: re.Match[str], text: str) -> bool:
+    """Return whether a USER@DOMAIN match sits in a credential context (flag, label, table)."""
+    start = match.start()
+    window = text[max(0, start - 80) : start].lower()
+    if any(
+        flag in window
+        for flag in (
+            "--credential",
+            "--credentials",
+            "--cred",
+            "--password",
+            "--pass",
+            "--pwd",
+            "-pl",
+            "-p",
+        )
+    ):
+        return True
+    if re.search(r"(credential|password|pwd|pass)\b[^\n]{0,40}[:=]\s*$", window):
+        return True
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", start)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    if "│" in line:
+        prev_end = line_start - 1
+        for _ in range(4):
+            if prev_end <= 0:
+                break
+            prev_start = text.rfind("\n", 0, prev_end) + 1
+            candidate = text[prev_start:prev_end].strip()
+            prev_end = prev_start - 1
+            if not candidate:
+                continue
+            if any(ch in candidate for ch in "┌┬└┴├┼┤─"):
+                continue
+            candidate_lower = candidate.lower()
+            if "credential" in candidate_lower or "password" in candidate_lower:
+                return True
+            break
+    return False
+
+
+def _sanitize_user_at_domain_password(content: str) -> str:
+    """Pseudonymize ``USER@DOMAIN[:PASSWORD]`` (the password half is a secret)."""
+    # Sanitize USER@DOMAIN:PASSWORD pattern (handles placeholders, real values, and quotes)
+    def _replace_user_at_domain_password(match: re.Match[str]) -> str:
+        """Replace USER@DOMAIN:PASSWORD pattern with pseudonyms."""
+        if _is_password_context(match, match.string):
+            return match.group(0)
+        user_raw = match.group("user") or ""
+        domain_raw = match.group("domain") or ""
+        pwd = match.group("pwd")
+        # Strip quotes from all parts
+        user = user_raw.strip("'\"")
+        domain = domain_raw.strip("'\"")
+        pwd = pwd.strip("'\"") if pwd else None
+        # Preserve a public well-known principal NAME in the user slot; the
+        # domain slot is always sanitized (customer-identifying).
+        if _is_well_known_principal(user):
+            user_repl = _apply_quote_wrapped(user_raw, user)
+        else:
+            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
+        domain_repl = _apply_quote_wrapped(
+            domain_raw, _record_pseudonym(domain, "domain")
+        )
+        replacement = f"{user_repl}@{domain_repl}"
+        if pwd:
+            pwd_repl = _apply_quote_wrapped(
+                match.group("pwd") or "", _record_pseudonym(pwd, "password")
+            )
+            replacement += f":{pwd_repl}"
+        return replacement
+
+    # Pattern for USER@DOMAIN:PASSWORD format
+    # Handles: [USER]@[DOMAIN]:PASSWORD, user@domain:password, "user"@"domain":"password", etc.
+    user_at_domain_pattern = re.compile(
+        r"""
+        (?<![A-Za-z0-9_./~-])
+        (?P<user>
+            ["']?\[USER\]["']?
+            |
+            ["']?\{USER\}["']?
+            |
+            ["']?[a-z0-9._$-]+["']?
+        )
+        @
+        (?P<domain>
+            ["']?\[DOMAIN\]["']?
+            |
+            ["']?\{DOMAIN\}["']?
+            |
+            ["']?[A-Za-z0-9._-]*[A-Za-z][A-Za-z0-9._-]*["']?
+        )
+        (?:
+            \s*:\s*
+            (?P<pwd>
+                (?:"[^"]*"|'[^']*')
+                |
+                [^\s"'@:]+
+            )
+        )?
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+    content = user_at_domain_pattern.sub(_replace_user_at_domain_password, content)
+    return content
+
+
+#: ``NAME=value`` where NAME is an upper-case environment-variable identifier
+#: that names a secret. Group 3 is the value (quotes kept outside it).
+_SECRET_ENV_ASSIGNMENT_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSPHRASE|API_?KEY|PRIVATE_?KEY|LICEN[CS]E_?KEY)"
+    r"[A-Z0-9_]*=)([\"']?)([^\"'\s<>]+)"
+)
+
+
+#: ``NAME=value`` where NAME is an upper-case environment-variable identifier
+#: naming an account (``ADSCAN_CLEANUP_USERNAME``). Telemetry only: a user is an
+#: identifier, which local logs keep readable.
+_ACCOUNT_ENV_ASSIGNMENT_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*(?:USERNAME|_USER)=)([\"']?)([^\"'\s<>]+)"
+)
+
+
+def _mask_password_assignments(content: str) -> str:
+    """Mask ``password=`` / ``pass:`` / ``pwd=`` assignments and the ``-p``/``-pl``/``--password`` flags."""
+    # Redact passwords (common patterns)
+    password_patterns = [
+        r'(password["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
+        r'(pass["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
+        r'(pwd["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
+    ]
+    for pattern in password_patterns:
+        content = re.sub(
+            pattern,
+            lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
+            content,
+            flags=re.IGNORECASE,
+        )
+    # An environment-variable assignment whose NAME says it is a secret
+    # (``ADSCAN_CLEANUP_SECRET=...``, ``*_TOKEN=...``), as a logged ``docker run
+    # -e`` argv carries it. Upper-case names only, so prose is never touched.
+    content = _SECRET_ENV_ASSIGNMENT_RE.sub(
+        lambda m: m.group(1)
+        + m.group(2)
+        + (
+            m.group(3)
+            if _is_already_sanitized(m.group(3)) or m.group(3) == "[REDACTED]"
+            else _record_pseudonym(m.group(3), "password")
+        ),
+        content,
+    )
+
+    content = _sanitize_cli_flag(content, "-p", "password")
+    content = _sanitize_cli_flag(content, "-pl", "password")
+    content = _sanitize_cli_flag(content, "--password", "password")
+    return content
+
+
+def _sanitize_url_credentials(content: str) -> str:
+    """Pseudonymize ``scheme://user:password@`` credentials (the password is a secret)."""
+    # Redact credentials in URLs
+    def _replace_url_credentials(match: re.Match[str]) -> str:
+        user = match.group("user")
+        pwd = match.group("pwd")
+        user_repl = _record_pseudonym(user, "user")
+        pwd_repl = _record_pseudonym(pwd, "password")
+        return f"://{user_repl}:{pwd_repl}@"
+
+    content = re.sub(
+        r"://(?P<user>[^:]+):(?P<pwd>[^@]+)@",
+        _replace_url_credentials,
+        content,
+    )
+    return content
+
+
+def _mask_hash_material(content: str) -> str:
+    """Mask NT/LM hashes, LM:NT pairs, line-wrapped hex and 33-128 hex key material."""
+    # Redact hashes (NTLM / LM:NTLM combinations)
+    def _replace_hash_argument(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        hash_value = match.group(2)
+        replacement = _record_pseudonym(hash_value, "hash")
+        return prefix + replacement
+
+    content = re.sub(
+        r"(?i)(--hashes\s*:?\s*)([0-9a-f]{32})",
+        _replace_hash_argument,
+        content,
+    )
+
+    # LINE-WRAPPED key material. Rich wraps at terminal width, so on a narrow
+    # terminal a 32-hex NT hash arrives as two hex fragments split by a newline
+    # (plus whatever indentation the renderable carries). Neither hex net below
+    # can anchor a fragment, so BOTH halves used to reach the recording verbatim
+    # and reassembling the two lines recovered the complete hash -- contradicting
+    # the invariant that a raw hash cannot survive export. The primary defence
+    # (``mark_sensitive``) is span-based and already survives a wrap; this is the
+    # BACKSTOP, and it is what an unmarked hash in vendor output, tool stdout, a
+    # command echo or a table cell relies on.
+    #
+    # The joined run is pseudonymized as ONE value and redistributed across the
+    # original fragment lengths, so the wrapped layout is preserved AND the
+    # pseudonym matches the one the same hash gets when it is not wrapped
+    # (keeping hash-reuse correlation intact for a reviewer).
+    def _replace_wrapped_hex(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        fragments = re.split(r"(\s+)", raw)
+        joined = "".join(part for part in fragments if not part.isspace())
+        if not (len(joined) == 32 or 33 <= len(joined) <= 128):
+            return raw
+        if _is_already_sanitized(joined):
+            return raw
+        replacement = _record_pseudonym(joined, "hash")
+        if len(replacement) != len(joined):
+            return raw
+        rebuilt: list[str] = []
+        cursor = 0
+        for part in fragments:
+            if part.isspace():
+                rebuilt.append(part)
+                continue
+            rebuilt.append(replacement[cursor : cursor + len(part)])
+            cursor += len(part)
+        return "".join(rebuilt)
+
+    content = re.sub(
+        r"(?<![0-9A-Za-z])[0-9a-fA-F]+(?:\n[ \t]*[0-9a-fA-F]+)+(?![0-9A-Za-z])",
+        _replace_wrapped_hex,
+        content,
+    )
+    content = re.sub(
+        r"\b[0-9a-f]{32}:[0-9a-f]{32}\b",
+        lambda m: _record_pseudonym(m.group(0), "hash"),
+        content,
+    )
+    # Generic long-hex net (defence-in-depth for Kerberos key material). A
+    # 64-hex AES256 key has no internal word boundary, so the {32} net below
+    # cannot anchor it; this net catches it before upload. The window is bounded
+    # 33..128 hex: the floor sits one above the 32-hex NT-hash net's dedicated
+    # handling below and never matches short hex (flags, etypes, seq numbers);
+    # the ceiling (128) covers AES256 (64) and a concatenated key pair while
+    # leaving absurdly long runs to the runaway-value guards (a 1024-char blob is
+    # not a key and the keyword sanitizer deliberately preserves it).
+    #
+    # The floor was 40 until a certificate serial of 38 hex characters travelled
+    # verbatim: every length in 33..39 fell between the two nets and matched
+    # neither. Nothing legitimate lives in that window — a 33+ character hex run
+    # is key material, a serial, or a thumbprint, all of which identify the
+    # customer's environment.
+    content = re.sub(
+        r"(?i)\b[0-9a-f]{33,128}\b",
+        lambda m: _record_pseudonym(m.group(0), "hash"),
+        content,
+    )
+    content = re.sub(
+        r"(?i)\b[0-9a-f]{32}\b",
+        lambda m: _record_pseudonym(m.group(0), "hash"),
+        content,
+    )
+    return content
+
+
+def _mask_credential_cli_flags(content: str) -> str:
+    """Mask the values of the ``--credential`` / ``--credentials`` / ``--cred`` flags."""
+    content = _sanitize_cli_flag(content, "--credential", "password")
+    content = _sanitize_cli_flag(content, "--credentials", "password")
+    content = _sanitize_cli_flag(content, "--cred", "password")
+    return content
+
+
+def _mask_secret_keyword_values(content: str) -> str:
+    """Mask values that follow a password / credential keyword."""
+    content = _sanitize_keyword_value(
+        content,
+        keywords=["password", "pass", "pwd"],
+        data_type="password",
+        # An ASSIGNMENT ("password: x", "password=x", "│ Password │ x │") is
+        # taken at face value. Bare ADJACENCY ("password x") additionally has
+        # to look like a disclosed secret, because the positional rule used to
+        # pseudonymize whatever word merely FOLLOWED the noun: "password or
+        # NTLM hash" arrived as "password bo NTLM hash" and "the password is
+        # secret" as "the password qt secret".
+        bare_adjacency_guard=_looks_like_disclosed_secret,
+    )
+    content = _sanitize_keyword_value(
+        content,
+        keywords=[
+            "cred",
+            "creds",
+            "credential",
+            "credentials",
+            "display_credential",
+            "current_credential",
+            "current_cred",
+        ],
+        data_type="password",
+        separator_pattern=r"(?:\s*[:=]\s+)",
+    )
+    return content
+
+
+def _mask_known_passwords(content: str, _rx: dict, _fb: dict) -> str:
+    """Mask every password/hash already known for the workspace (precomputed regex)."""
+    # Passwords -- CASE-SENSITIVE (no ``(?i)``): password casing is significant,
+    # and the boundaries stop a value matching inside an unrelated word.
+    if _rx["password"] is not None:
+        content = _rx["password"].sub(
+            lambda m: _record_pseudonym(m.group(1), "password"), content
+        )
+    elif _fb["password"]:
+        for password in _fb["password"]:
+            content = _cached_pattern(
+                rf"(?<![A-Za-z0-9._@/-])({re.escape(password)})(?![A-Za-z0-9._@/-])"
+            ).sub(lambda m: _record_pseudonym(m.group(1), "password"), content)
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Workspaces being deleted: their names never reach a log again in this process
+# ---------------------------------------------------------------------------
+#
+# The shell refuses to delete the workspace that is open, so ``workspace delete
+# <name>`` always runs inside ANOTHER workspace, whose logs outlive the delete.
+# Every line the delete path writes would otherwise carry the deleted name
+# (often the client's) into that other engagement's logs, the dev sanitizer
+# trace, and the outside-workspace log. Registering the name makes every log
+# sink of this process write a keyed token instead: the same keyed,
+# length-preserving pseudonym the sanitizer gives a workspace name, so it is
+# not reversible and stays consistent within the session. The screen is not a
+# log sink: the operator still sees the name they typed.
+
+_REMOVED_WORKSPACE_NAMES: list[str] = []
+
+
+def removed_workspace_token(name: str) -> str:
+    """The token a deleted workspace's name is written as in every log."""
+    return _pseudonymize_value(str(name), "workspace")
+
+
+def forget_workspace_name(name: str) -> str:
+    """Never write ``name`` to a log, the trace or telemetry again in this process.
+
+    Called when a workspace is about to be deleted. Idempotent. Returns the
+    token written instead.
+    """
+    cleaned = str(name or "").strip()
+    if cleaned and cleaned.casefold() not in {n.casefold() for n in _REMOVED_WORKSPACE_NAMES}:
+        _REMOVED_WORKSPACE_NAMES.append(cleaned)
+    return removed_workspace_token(cleaned) if cleaned else cleaned
+
+
+def _mask_removed_workspaces(content: str) -> str:
+    """Replace every deleted workspace's name in ``content`` with its token."""
+    if not content or not _REMOVED_WORKSPACE_NAMES:
+        return content
+    for name in _REMOVED_WORKSPACE_NAMES:
+        pattern = _cached_pattern(
+            rf"(?i)(?<![A-Za-z0-9._-]){re.escape(name)}(?![A-Za-z0-9._-])"
+        )
+        token = removed_workspace_token(name)
+        content = pattern.sub(lambda _m, _t=token: _t, content)
+    return content
+
+
+def mask_secrets(content: str) -> str:
+    """Mask credential material in ``content`` and leave every identifier intact.
+
+    This is the secrets-only layer of the telemetry sanitizer, for the operator's
+    LOCAL log files. It runs the same secret detectors ``_sanitize_rich_output``
+    runs (marked passwords and hashes, ``-p``/``--password`` flags, password and
+    credential keywords, ``DOMAIN/USER:PASSWORD`` and ``USER@DOMAIN:PASSWORD``
+    combos, URL credentials, NT/LM hashes and key material, the workspace's known
+    passwords, credential tables, and the native-stack scrub for NTLM messages and
+    Kerberos blobs), in the same relative order, under a replacement policy that
+    masks only ``SECRET_DATA_TYPES``. Users, domains, hosts, IPs and paths stay in
+    clear: they are what a local log is for, and they leave with the workspace.
+
+    Telemetry does not call this: its output is pinned byte-for-byte by
+    ``tests/unit/core/test_telemetry_sanitizer_golden.py``.
+
+    Args:
+        content: A rendered log line or block (may carry sensitivity markers).
+
+    Returns:
+        The text with secrets replaced by asterisks and every marker removed.
+    """
+    if not content:
+        return content
+    content = _mask_removed_workspaces(content)
+    token = _REPLACEMENT_POLICY.set(_mask_secret_only)
+    try:
+        content = _sanitize_by_markers(content, data_types=set(SECRET_DATA_TYPES))
+        content = _strip_sensitive_markers(content)
+        content = _mask_explicit_credential_disclosures(content)
+        content = _sanitize_domain_user_combos(content)
+        content = _sanitize_user_at_domain_password(content)
+        content = _mask_password_assignments(content)
+        content = _sanitize_url_credentials(content)
+        content = scrub_native_secrets_buffer(content)
+        content = _mask_hash_material(content)
+        content = _mask_credential_cli_flags(content)
+        content = _mask_secret_keyword_values(content)
+        _rs = _redaction_state()
+        content = _mask_known_passwords(content, _rs["rx"], _rs["fb"])
+        content = _mask_credential_sections(content)
+        content = _sanitize_gpp_tables(content)
+        content = _sanitize_detected_credential_tables(content)
+        content = scrub_native_secrets_buffer(content)
+        return content
+    finally:
+        _REPLACEMENT_POLICY.reset(token)
+
+
 def _sanitize_rich_output(content: str) -> str:
     """Sanitize Rich HTML/text output before sending to telemetry.
 
@@ -4851,6 +5580,7 @@ def _sanitize_rich_output(content: str) -> str:
         Sanitized content with sensitive data redacted
     """
     content = _prepare_rich_content_for_processing(content)
+    content = _mask_removed_workspaces(content)
     content, passthrough_mapping = _extract_passthrough_segments(content)
     _SANITIZED_VALUES.clear()
     _sanitizer_trace_session_open(content)
@@ -5004,21 +5734,7 @@ def _sanitize_rich_output(content: str) -> str:
     )
 
     # Redact explicit credential disclosures in log messages early to avoid false positives.
-    password_added_pattern = re.compile(
-        r"(?i)(password\s+added\s+for\s+user\s+[^\n:]+:\s*)([^\s<>\n]+)"
-    )
-    content = password_added_pattern.sub(
-        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
-        content,
-    )
-
-    credential_for_pattern = re.compile(
-        r"(?i)(credential\s+for\s+[^\n:]+:\s*)([^\s<>\n]+)"
-    )
-    content = credential_for_pattern.sub(
-        lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
-        content,
-    )
+    content = _mask_explicit_credential_disclosures(content)
 
     # Redact CN values inside LDAP distinguished names (CN=...).
     content = re.sub(
@@ -5036,13 +5752,13 @@ def _sanitize_rich_output(content: str) -> str:
     # Redact the DOMAIN identity carried in the DC= components of a DN.
     #
     # A distinguished name splits the domain across DC= RDNs
-    # (DC=cmm,DC=mx == the domain cmm.mx). The bare-domain scrubber matches a
+    # (DC=contoso,DC=local == the domain contoso.local). The bare-domain scrubber matches a
     # dotted token, so it never sees the split form, and a real customer domain
     # (and, via a CA name, a DC hostname) reached uploaded recordings verbatim
     # inside DNs and the environment-changes panel while the co-located sysvol
     # UNC path WAS sanitized. This net reassembles the DC= run into the dotted
     # domain, pseudonymizes it through the SAME keyed transform the domain
-    # scrubber uses -- so DC=cmm,DC=mx and a bare cmm.mx elsewhere in the buffer
+    # scrubber uses -- so DC=contoso,DC=local and a bare contoso.local elsewhere in the buffer
     # map to the identical pseudonym -- then writes the pseudonymized labels
     # back into the DC= components. Requires >=2 DC= components so a lone
     # "DC=x" is not touched, and the "=" is mandatory, so "DC/PDC" (no equals)
@@ -5072,7 +5788,7 @@ def _sanitize_rich_output(content: str) -> str:
     # Redact Active Directory Certificate Services CA common names.
     #
     # A CA CN follows the <ORG>-<DCHOST>-CA convention (e.g.
-    # CMM-SERVERMEXICODC2-CA), so it discloses both the customer org and a real
+    # CONTOSO-DC01-CA), so it discloses both the customer org and a real
     # DC hostname. The ADCS call sites mark the CA name at source, but a CA name
     # that surfaces on an unmarked path (a GetCASecurity FAILURE line, an
     # environment-change panel) reached the recording verbatim. Anchored to at
@@ -5087,73 +5803,7 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
-    def _replace_domain_user(match: re.Match[str]) -> str:
-        token = match.group(0)
-        if _is_already_sanitized(token):
-            return token
-        domain_raw = match.group("domain") or ""
-        user_raw = match.group("user") or ""
-        pwd = match.group("pwd")
-        domain = domain_raw.strip("'\"")
-        user = user_raw.strip("'\"")
-        pwd = pwd.strip("'\"") if pwd else None
-        if not _looks_like_ad_domain_token(domain, has_password=bool(pwd)):
-            # Ordinary prose ("install/update", "DC/PDC", "and/or"), not a
-            # DOMAIN/USER credential pair. See _looks_like_ad_domain_token.
-            return token
-        domain_repl = _apply_quote_wrapped(
-            domain_raw, _record_pseudonym(domain, "domain")
-        )
-        # Preserve a public well-known principal NAME in the user slot; the
-        # domain slot is always sanitized (customer-identifying).
-        if _is_well_known_principal(user):
-            user_repl = _apply_quote_wrapped(user_raw, user)
-        else:
-            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
-        replacement = f"{domain_repl}/{user_repl}"
-        if pwd:
-            pwd_repl = _apply_quote_wrapped(
-                match.group("pwd") or "", _record_pseudonym(pwd, "password")
-            )
-            replacement += f":{pwd_repl}"
-        return replacement
-
-    # Domain token:
-    # - Support both legacy `{DOMAIN}` placeholders and current `[DOMAIN]`
-    # - Require at least one alphabetic character to avoid matching phase
-    #   counters like ``1/3`` as a fake ``DOMAIN/USER`` combo.
-    domain_token = (
-        r"(?:\[DOMAIN\]|\{DOMAIN\}|"
-        r"[A-Za-z0-9._-]*[A-Za-z][A-Za-z0-9._-]*)"
-    )
-    # User token:
-    # - Support both legacy `{USER}` placeholders and current `[USER]`
-    user_token = r"(?:\[USER\]|\{USER\}|[a-z0-9._$-]+)"
-
-    # Replace domain/user combos before general domain redaction.
-    # The separators are TIGHT (no surrounding whitespace): a real
-    # ``DOMAIN/USER:PASSWORD`` token never has spaces around its slash or
-    # colon, while ``\s*/\s*`` let the pattern swallow across a spaced slash
-    # and eat two unrelated words of prose.
-    combo_pattern = re.compile(
-        rf"""
-        (?<![A-Za-z0-9_./~-])
-        (?P<domain>["']?{domain_token}["']?)
-        /
-        (?P<user>["']?{user_token}["']?)
-        (?:
-            :
-            (?P<pwd>
-                (?:"[^"]*"|'[^']*')
-                |
-                [^\s"'@:]+
-            )
-        )?
-        (?=$|\s|@|:)
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    )
-    content = combo_pattern.sub(_replace_domain_user, content)
+    content = _sanitize_domain_user_combos(content)
 
     # Replace DOMAIN\\USER (e.g., NETBIOS\\username), avoiding Windows drive paths.
     #
@@ -5253,109 +5903,7 @@ def _sanitize_rich_output(content: str) -> str:
 
     content = instance_backslash_pattern.sub(_replace_instance_backslash, content)
 
-    # Sanitize USER@DOMAIN:PASSWORD pattern (handles placeholders, real values, and quotes)
-    def _is_password_context(match: re.Match[str], text: str) -> bool:
-        start = match.start()
-        window = text[max(0, start - 80) : start].lower()
-        if any(
-            flag in window
-            for flag in (
-                "--credential",
-                "--credentials",
-                "--cred",
-                "--password",
-                "--pass",
-                "--pwd",
-                "-pl",
-                "-p",
-            )
-        ):
-            return True
-        if re.search(r"(credential|password|pwd|pass)\b[^\n]{0,40}[:=]\s*$", window):
-            return True
-        line_start = text.rfind("\n", 0, start) + 1
-        line_end = text.find("\n", start)
-        if line_end == -1:
-            line_end = len(text)
-        line = text[line_start:line_end]
-        if "│" in line:
-            prev_end = line_start - 1
-            for _ in range(4):
-                if prev_end <= 0:
-                    break
-                prev_start = text.rfind("\n", 0, prev_end) + 1
-                candidate = text[prev_start:prev_end].strip()
-                prev_end = prev_start - 1
-                if not candidate:
-                    continue
-                if any(ch in candidate for ch in "┌┬└┴├┼┤─"):
-                    continue
-                candidate_lower = candidate.lower()
-                if "credential" in candidate_lower or "password" in candidate_lower:
-                    return True
-                break
-        return False
-
-    def _replace_user_at_domain_password(match: re.Match[str]) -> str:
-        """Replace USER@DOMAIN:PASSWORD pattern with pseudonyms."""
-        if _is_password_context(match, content):
-            return match.group(0)
-        user_raw = match.group("user") or ""
-        domain_raw = match.group("domain") or ""
-        pwd = match.group("pwd")
-        # Strip quotes from all parts
-        user = user_raw.strip("'\"")
-        domain = domain_raw.strip("'\"")
-        pwd = pwd.strip("'\"") if pwd else None
-        # Preserve a public well-known principal NAME in the user slot; the
-        # domain slot is always sanitized (customer-identifying).
-        if _is_well_known_principal(user):
-            user_repl = _apply_quote_wrapped(user_raw, user)
-        else:
-            user_repl = _apply_quote_wrapped(user_raw, _record_pseudonym(user, "user"))
-        domain_repl = _apply_quote_wrapped(
-            domain_raw, _record_pseudonym(domain, "domain")
-        )
-        replacement = f"{user_repl}@{domain_repl}"
-        if pwd:
-            pwd_repl = _apply_quote_wrapped(
-                match.group("pwd") or "", _record_pseudonym(pwd, "password")
-            )
-            replacement += f":{pwd_repl}"
-        return replacement
-
-    # Pattern for USER@DOMAIN:PASSWORD format
-    # Handles: [USER]@[DOMAIN]:PASSWORD, user@domain:password, "user"@"domain":"password", etc.
-    user_at_domain_pattern = re.compile(
-        r"""
-        (?<![A-Za-z0-9_./~-])
-        (?P<user>
-            ["']?\[USER\]["']?
-            |
-            ["']?\{USER\}["']?
-            |
-            ["']?[a-z0-9._$-]+["']?
-        )
-        @
-        (?P<domain>
-            ["']?\[DOMAIN\]["']?
-            |
-            ["']?\{DOMAIN\}["']?
-            |
-            ["']?[A-Za-z0-9._-]*[A-Za-z][A-Za-z0-9._-]*["']?
-        )
-        (?:
-            \s*:\s*
-            (?P<pwd>
-                (?:"[^"]*"|'[^']*')
-                |
-                [^\s"'@:]+
-            )
-        )?
-        """,
-        re.IGNORECASE | re.VERBOSE,
-    )
-    content = user_at_domain_pattern.sub(_replace_user_at_domain_password, content)
+    content = _sanitize_user_at_domain_password(content)
 
     # Fallback: handle cases where placeholders were already substituted before matching
     leftover_combo_pattern = re.compile(
@@ -5689,37 +6237,9 @@ def _sanitize_rich_output(content: str) -> str:
         content,
     )
 
-    # Redact passwords (common patterns)
-    password_patterns = [
-        r'(password["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
-        r'(pass["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
-        r'(pwd["\']?\s*[:=]\s*["\']?)([^"\'\s<>]+)',
-    ]
-    for pattern in password_patterns:
-        content = re.sub(
-            pattern,
-            lambda m: m.group(1) + _record_pseudonym(m.group(2), "password"),
-            content,
-            flags=re.IGNORECASE,
-        )
+    content = _mask_password_assignments(content)
 
-    content = _sanitize_cli_flag(content, "-p", "password")
-    content = _sanitize_cli_flag(content, "-pl", "password")
-    content = _sanitize_cli_flag(content, "--password", "password")
-
-    # Redact credentials in URLs
-    def _replace_url_credentials(match: re.Match[str]) -> str:
-        user = match.group("user")
-        pwd = match.group("pwd")
-        user_repl = _record_pseudonym(user, "user")
-        pwd_repl = _record_pseudonym(pwd, "password")
-        return f"://{user_repl}:{pwd_repl}@"
-
-    content = re.sub(
-        r"://(?P<user>[^:]+):(?P<pwd>[^@]+)@",
-        _replace_url_credentials,
-        content,
-    )
+    content = _sanitize_url_credentials(content)
 
     # Redact hostname values following explicit labels
     content = re.sub(
@@ -5802,88 +6322,7 @@ def _sanitize_rich_output(content: str) -> str:
     # no-op on already-redacted text.
     content = scrub_native_secrets_buffer(content)
 
-    # Redact hashes (NTLM / LM:NTLM combinations)
-    def _replace_hash_argument(match: re.Match[str]) -> str:
-        prefix = match.group(1)
-        hash_value = match.group(2)
-        replacement = _record_pseudonym(hash_value, "hash")
-        return prefix + replacement
-
-    content = re.sub(
-        r"(?i)(--hashes\s*:?\s*)([0-9a-f]{32})",
-        _replace_hash_argument,
-        content,
-    )
-
-    # LINE-WRAPPED key material. Rich wraps at terminal width, so on a narrow
-    # terminal a 32-hex NT hash arrives as two hex fragments split by a newline
-    # (plus whatever indentation the renderable carries). Neither hex net below
-    # can anchor a fragment, so BOTH halves used to reach the recording verbatim
-    # and reassembling the two lines recovered the complete hash -- contradicting
-    # the invariant that a raw hash cannot survive export. The primary defence
-    # (``mark_sensitive``) is span-based and already survives a wrap; this is the
-    # BACKSTOP, and it is what an unmarked hash in vendor output, tool stdout, a
-    # command echo or a table cell relies on.
-    #
-    # The joined run is pseudonymized as ONE value and redistributed across the
-    # original fragment lengths, so the wrapped layout is preserved AND the
-    # pseudonym matches the one the same hash gets when it is not wrapped
-    # (keeping hash-reuse correlation intact for a reviewer).
-    def _replace_wrapped_hex(match: re.Match[str]) -> str:
-        raw = match.group(0)
-        fragments = re.split(r"(\s+)", raw)
-        joined = "".join(part for part in fragments if not part.isspace())
-        if not (len(joined) == 32 or 33 <= len(joined) <= 128):
-            return raw
-        if _is_already_sanitized(joined):
-            return raw
-        replacement = _record_pseudonym(joined, "hash")
-        if len(replacement) != len(joined):
-            return raw
-        rebuilt: list[str] = []
-        cursor = 0
-        for part in fragments:
-            if part.isspace():
-                rebuilt.append(part)
-                continue
-            rebuilt.append(replacement[cursor : cursor + len(part)])
-            cursor += len(part)
-        return "".join(rebuilt)
-
-    content = re.sub(
-        r"(?<![0-9A-Za-z])[0-9a-fA-F]+(?:\n[ \t]*[0-9a-fA-F]+)+(?![0-9A-Za-z])",
-        _replace_wrapped_hex,
-        content,
-    )
-    content = re.sub(
-        r"\b[0-9a-f]{32}:[0-9a-f]{32}\b",
-        lambda m: _record_pseudonym(m.group(0), "hash"),
-        content,
-    )
-    # Generic long-hex net (defence-in-depth for Kerberos key material). A
-    # 64-hex AES256 key has no internal word boundary, so the {32} net below
-    # cannot anchor it; this net catches it before upload. The window is bounded
-    # 33..128 hex: the floor sits one above the 32-hex NT-hash net's dedicated
-    # handling below and never matches short hex (flags, etypes, seq numbers);
-    # the ceiling (128) covers AES256 (64) and a concatenated key pair while
-    # leaving absurdly long runs to the runaway-value guards (a 1024-char blob is
-    # not a key and the keyword sanitizer deliberately preserves it).
-    #
-    # The floor was 40 until a certificate serial of 38 hex characters travelled
-    # verbatim: every length in 33..39 fell between the two nets and matched
-    # neither. Nothing legitimate lives in that window — a 33+ character hex run
-    # is key material, a serial, or a thumbprint, all of which identify the
-    # customer's environment.
-    content = re.sub(
-        r"(?i)\b[0-9a-f]{33,128}\b",
-        lambda m: _record_pseudonym(m.group(0), "hash"),
-        content,
-    )
-    content = re.sub(
-        r"(?i)\b[0-9a-f]{32}\b",
-        lambda m: _record_pseudonym(m.group(0), "hash"),
-        content,
-    )
+    content = _mask_hash_material(content)
 
     # Redact usernames in CLI flags
     content = _sanitize_cli_flag(content, "--username", "user")
@@ -5896,9 +6335,7 @@ def _sanitize_rich_output(content: str) -> str:
     content = _sanitize_cli_domain_flag(content, "--domain", "domain")
     content = _sanitize_cli_domain_flag(content, "--target-domain", "domain")
     content = _sanitize_cli_domain_flag(content, "-target-domain", "domain")
-    content = _sanitize_cli_flag(content, "--credential", "password")
-    content = _sanitize_cli_flag(content, "--credentials", "password")
-    content = _sanitize_cli_flag(content, "--cred", "password")
+    content = _mask_credential_cli_flags(content)
     content = _sanitize_cli_flag(content, "--log", "path")
     content = _sanitize_cli_flag(content, "--log-file", "path")
     content = _sanitize_cli_flag(content, "--path", "path")
@@ -5911,32 +6348,7 @@ def _sanitize_rich_output(content: str) -> str:
         keywords=["user", "username", "target user", "principal"],
         data_type="user",
     )
-    content = _sanitize_keyword_value(
-        content,
-        keywords=["password", "pass", "pwd"],
-        data_type="password",
-        # An ASSIGNMENT ("password: x", "password=x", "│ Password │ x │") is
-        # taken at face value. Bare ADJACENCY ("password x") additionally has
-        # to look like a disclosed secret, because the positional rule used to
-        # pseudonymize whatever word merely FOLLOWED the noun: "password or
-        # NTLM hash" arrived as "password bo NTLM hash" and "the password is
-        # secret" as "the password qt secret".
-        bare_adjacency_guard=_looks_like_disclosed_secret,
-    )
-    content = _sanitize_keyword_value(
-        content,
-        keywords=[
-            "cred",
-            "creds",
-            "credential",
-            "credentials",
-            "display_credential",
-            "current_credential",
-            "current_cred",
-        ],
-        data_type="password",
-        separator_pattern=r"(?:\s*[:=]\s+)",
-    )
+    content = _mask_secret_keyword_values(content)
     content = _sanitize_keyword_value(
         content,
         keywords=["source", "target"],
@@ -6125,17 +6537,7 @@ def _sanitize_rich_output(content: str) -> str:
                 lambda m: _record_pseudonym(m.group(1), "domain"), content
             )
 
-    # Passwords -- CASE-SENSITIVE (no ``(?i)``): password casing is significant,
-    # and the boundaries stop a value matching inside an unrelated word.
-    if _rx["password"] is not None:
-        content = _rx["password"].sub(
-            lambda m: _record_pseudonym(m.group(1), "password"), content
-        )
-    elif _fb["password"]:
-        for password in _fb["password"]:
-            content = _cached_pattern(
-                rf"(?<![A-Za-z0-9._@/-])({re.escape(password)})(?![A-Za-z0-9._@/-])"
-            ).sub(lambda m: _record_pseudonym(m.group(1), "password"), content)
+    content = _mask_known_passwords(content, _rx, _fb)
 
     # Workspaces (current workspace and sibling workspaces).
     if _rx["workspace"] is not None:
@@ -6147,6 +6549,18 @@ def _sanitize_rich_output(content: str) -> str:
             content = _cached_pattern(
                 rf"(?i)(?<![A-Za-z0-9._-])({re.escape(workspace)})(?![A-Za-z0-9._-])"
             ).sub(lambda m: _record_pseudonym(m.group(1), "workspace"), content)
+    # A ``--workspace NAME`` argument names the engagement even when the
+    # workspace is not (or no longer) on disk: the launcher, whose cwd is not a
+    # workspace, and every line written after the workspace was deleted.
+    content = _sanitize_cli_flag(content, "--workspace", "workspace")
+    # ``ADSCAN_CLEANUP_USERNAME=svc_x``: the launcher forwards the client's
+    # cleanup account by name, and the launcher knows no workspace users.
+    content = _ACCOUNT_ENV_ASSIGNMENT_RE.sub(
+        lambda m: m.group(1)
+        + m.group(2)
+        + (m.group(3) if _is_already_sanitized(m.group(3)) else _record_pseudonym(m.group(3), "user")),
+        content,
+    )
 
     # Apply structured redaction for credential tables and lists
     content = _mask_credential_sections(content)
@@ -8245,6 +8659,7 @@ def _build_session_metadata(shell=None) -> Optional[dict]:
 
     metadata = build_workspace_telemetry_fields(
         workspace_type=getattr(shell, "type", None),
+        scan_policy_base=scan_policy_base_of(shell),
     )
     metadata.update(
         build_lab_telemetry_fields(
@@ -8650,6 +9065,14 @@ def capture_installation_failed(e: Exception):
 
 def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None):
     """Capture an exception in both Sentry and PostHog via n8n proxies when telemetry is enabled."""
+    # A lockout-guard refusal is a deliberate safety skip, not a fault to report.
+    try:
+        from adscan_core.auth_attempt_guard import refusal_in_chain
+
+        if refusal_in_chain(e) is not None:
+            return
+    except Exception:  # noqa: BLE001 - never break error reporting
+        pass
     # Send exception to Sentry (via n8n proxy using custom transport)
     if _is_telemetry_enabled():
         try:

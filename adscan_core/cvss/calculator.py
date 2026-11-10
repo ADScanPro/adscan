@@ -47,7 +47,7 @@ from adscan_core.cvss.models import (
     CvssElevationRule,
     FindingType,
 )
-from adscan_core.cvss.severity_mapper import score_to_severity
+from adscan_core.cvss.severity_mapper import score_to_severity, severity_to_min_score
 from adscan_core.cvss.vector_score import score_from_vector
 from adscan_core.reporting.affected_assets_contract import (
     AFFECTED_ASSETS_STRUCT_KEY,
@@ -192,45 +192,77 @@ class FindingSeverityResult:
 # Internal fallback catalog lookup
 # ---------------------------------------------------------------------------
 
-def _base_score_from_catalog(vuln_key: str) -> tuple[float, str]:
-    """Return (numeric base score, source label) from the vulnerability catalog.
+def _authored_catalog_band(vuln_key: str) -> str:
+    """Return the severity band the finding catalog AUTHORS for *vuln_key*.
 
-    Tries both the CLI catalog and the web-service catalog. Falls back to
-    ``0.0`` when the key is not found in either.
+    Reads the active catalog (the PRO catalog when its provider is installed,
+    the LITE-safe meta slice otherwise), so it resolves in every deployment,
+    the web backend included. Returns ``""`` for a key no catalog knows.
+    """
+    try:
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            finding_catalog,
+        )
+
+        entry = finding_catalog().get(vuln_key)
+    except Exception:  # noqa: BLE001 - an unloadable catalog falls back below
+        entry = None
+    if not isinstance(entry, Mapping):
+        try:
+            from adscan_core.reporting.vuln_catalog_meta import (  # noqa: PLC0415
+                VULN_CATALOG_META,
+            )
+
+            entry = VULN_CATALOG_META.get(vuln_key)
+        except Exception:  # noqa: BLE001
+            entry = None
+    if not isinstance(entry, Mapping):
+        return ""
+    band = str(entry.get("severity") or "").strip().lower()
+    return band if band in _PUBLISHED_BANDS else ""
+
+
+_PUBLISHED_BANDS = frozenset({"critical", "high", "medium", "low", "info"})
+
+
+def baseline_score_for_band(band: str) -> float:
+    """Return ADscan's numeric baseline for a finding authored in *band*.
+
+    The ONE baseline the contextual priority overlay builds on, used by the
+    scan's stamp and by every surface that scores a finding. It is the floor of
+    the band, never the catalog's ``cvss`` scalar: that scalar is a CVSS-shaped
+    number (76 of the 93 keys carry it with no vector, and 14 of the 17 that do
+    contradict their own vector), and a client surface does not print a CVSS
+    score. Reading it as the baseline is what made the paid report print
+    ``8.8`` where the scan itself, the platform and the free report printed
+    ``7.0`` for the same finding: the PRO image loads the catalog that carries
+    the scalar and the others do not.
+
+    Args:
+        band: A published severity band.
+
+    Returns:
+        The band's floor, or ``0.0`` for an unknown band.
+    """
+    normalized = str(band or "").strip().lower()
+    if normalized not in _PUBLISHED_BANDS:
+        return 0.0
+    return severity_to_min_score(normalized)
+
+
+def _base_score_from_catalog(vuln_key: str) -> tuple[float, str]:
+    """Return (numeric baseline, source label) for a finding key.
+
+    The baseline is the floor of the band the catalog AUTHORS for the key
+    (:func:`baseline_score_for_band`). It never reads the catalog ``cvss``
+    scalar. Falls back to ``0.0`` when no catalog knows the key.
 
     Returns:
         (score, source)
     """
-    try:
-        from adscan_internal.pro.reporting.vuln_catalog import get_vuln_cvss_value
-
-        score = float(get_vuln_cvss_value(vuln_key))
-        if score > 0.0:
-            return score, "cli_catalog"
-    except (ImportError, Exception):
-        pass
-
-    try:
-        from app.services.vuln_catalog import VULN_CATALOG as _WEB_CATALOG
-
-        entry = _WEB_CATALOG.get(vuln_key, {})
-        raw = entry.get("cvss")
-        if isinstance(raw, (int, float)):
-            score = float(raw)
-            if score > 0.0:
-                return score, "web_catalog"
-
-        raw_str = str(raw or "").strip()
-        for token in raw_str.replace("(", " ").replace(")", " ").split():
-            try:
-                score = float(token)
-                if score >= 0.0:
-                    return score, "web_catalog_legacy_parse"
-            except ValueError:
-                continue
-    except (ImportError, Exception):
-        pass
-
+    band = _authored_catalog_band(vuln_key)
+    if band:
+        return baseline_score_for_band(band), "authored_band"
     return 0.0, "fallback_0.0"
 
 
@@ -306,8 +338,28 @@ def _recovered_password_context(details: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reversible_encryption_context(details: dict[str, Any]) -> dict[str, Any]:
+    """Grade reversible password storage on the scope of the policy that sets it.
+
+    The finding is domain-wide, so its affected asset is the domain itself, which
+    carries no privilege tier, and nothing else would ever raise it. What
+    separates the cases is WHICH policy enables the setting. The Default Domain
+    Password Policy covers privileged accounts (unless a fine-grained policy
+    overrides it for them), so it puts Tier 0 passwords in recoverable form; a
+    fine-grained policy alone applies only to the principals it targets, and the
+    workspace does not show those are privileged, so it stays at its baseline.
+    """
+    observed = details.get("observed")
+    if not isinstance(observed, Mapping):
+        return {}
+    if _boolish(observed.get("default_domain_policy")):
+        return {"has_tier_zero_targets": True}
+    return {}
+
+
 _CONTEXT_EXTRACTORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "recovered_account_passwords": _recovered_password_context,
+    "reversible_encryption_enabled": _reversible_encryption_context,
 }
 
 
@@ -735,7 +787,62 @@ def finding_severity_for_record(
     context = extract_context_from_details(
         vuln_key, dict(details) if isinstance(details, Mapping) else None
     )
-    return compute_finding_severity(vuln_key, context)
+    recorded_band = ""
+    if isinstance(details, Mapping):
+        recorded_band = str(details.get(RECORDED_BASELINE_BAND_KEY) or "").strip().lower()
+    catalog_base_score = (
+        baseline_score_for_band(recorded_band)
+        if recorded_band in _PUBLISHED_BANDS
+        else None
+    )
+    result = compute_finding_severity(
+        vuln_key, context, catalog_base_score=catalog_base_score
+    )
+    return _with_authored_priority(result, details)
+
+
+#: Key under which a report's vulnerability map carries the finding's RECORDED
+#: baseline band (the band the scan's stamp built on).
+RECORDED_BASELINE_BAND_KEY = "_severity"
+#: Key under which a report's vulnerability map carries the ADscan Priority the
+#: scan STAMPED onto the finding (``technical_report.stamp_adscan_severity``).
+AUTHORED_PRIORITY_SCORE_KEY = "_adscan_priority_score"
+#: Key under which it carries the stamped contextual band.
+AUTHORED_SEVERITY_KEY = "_adscan_severity"
+
+
+def _with_authored_priority(
+    result: FindingSeverityResult, details: Any
+) -> FindingSeverityResult:
+    """Return *result* carrying the priority the SCAN stamped, when it has one.
+
+    The scan computes the ADscan Priority once and persists it on the finding;
+    every surface prints THAT number. A render that recomputes may hold a
+    slightly different context (a later affected-asset stamp), and two numbers
+    for one finding in one kit is the defect this closes. So when the record
+    carries the stamped score, the display value is the stamp.
+    """
+    if not isinstance(details, Mapping):
+        return result
+    raw = details.get(AUTHORED_PRIORITY_SCORE_KEY)
+    if raw is None or isinstance(raw, bool):
+        return result
+    try:
+        score = round(float(raw), 1)
+    except (TypeError, ValueError):
+        return result
+    band = str(details.get(AUTHORED_SEVERITY_KEY) or "").strip().lower()
+    if band not in _PUBLISHED_BANDS:
+        band = score_to_severity(score)
+    from dataclasses import replace  # noqa: PLC0415
+
+    adscan = replace(
+        result.adscan,
+        score=score,
+        severity=band,
+        is_elevated=bool(result.adscan.is_elevated) and score > result.base.score,
+    )
+    return replace(result, adscan=adscan, display_score=score, display_severity=band)
 
 
 # ---------------------------------------------------------------------------

@@ -643,10 +643,29 @@ def fanout_input_from_edge(
         target_compromise_class=_reconcile_target_compromise_class(
             target_tier, _coerce_compromise_class(to_node.get("compromise_class"))
         ),
-        path_compromise_class=derive_compromise_class_from_path([dict(edge)], to_node),
+        path_compromise_class=_spoke_reach_class(edge, to_node),
         target_is_domain=target_is_domain,
         proven_unauthenticated_reachable=edge_proven_unauthenticated_reachable(edge),
     )
+
+
+def _spoke_reach_class(
+    edge: Mapping[str, Any], to_node: Mapping[str, Any] | None
+) -> CompromiseClass:
+    """Return the reach class of one fan-out spoke (a one-edge capability).
+
+    The path classifier separates full domain compromise (a ROUTE that reaches
+    the domain object) from Tier 0 control (a materialized route that stopped
+    on a direct Tier 0 principal). A spoke is not a route: it is one capability
+    edge, and it never claims the onward step was looked for and not found. So
+    control of a direct Tier 0 object keeps the direct-band class it always
+    had here, and the Tier 0 control class stays reserved for the routes it
+    describes.
+    """
+    derived = derive_compromise_class_from_path([dict(edge)], to_node)
+    if derived is CompromiseClass.TIER0_CONTROL:
+        return CompromiseClass.DOMAIN_BREAKER
+    return derived
 
 
 # ---------------------------------------------------------------------------

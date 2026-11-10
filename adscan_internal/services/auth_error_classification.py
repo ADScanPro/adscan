@@ -206,6 +206,71 @@ def is_impacket_tds_transport_error(exc_or_msg: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Transport loss — the connection to the server dropped or never completed,
+# whatever the protocol (LDAP over badldap, SMB over aiosmb, raw sockets). A
+# stage that hits one of these did not read its part of the directory: it was
+# cut off, which is neither "nothing there" nor "access denied".
+# ---------------------------------------------------------------------------
+TRANSPORT_LOSS_ERROR_MARKERS: tuple[str, ...] = (
+    # badldap (vendor/badldap/badldap/connection.py): the reader task saw the
+    # socket close, then every later operation on the connection refuses.
+    "CONNECTION CLOSED!",
+    "CONNECTION NOT RUNNING",
+    # Raw socket / OS failures, as str(OSError) renders them.
+    "CONNECTION RESET",
+    "CONNECTION ABORTED",
+    "CONNECTION REFUSED",
+    "CONNECT CALL FAILED",
+    "BROKEN PIPE",
+    "NO ROUTE TO HOST",
+    "HOST IS UNREACHABLE",
+    "NETWORK IS UNREACHABLE",
+    "TIMED OUT",
+)
+
+
+def is_transport_loss_error(exc_or_msg: Any) -> bool:
+    """Return True when the failure is a lost or failed connection, not a refusal.
+
+    Typed first (``ConnectionError``, ``TimeoutError`` and an ``OSError`` whose
+    errno is a network one, anywhere in the cause chain), then the marker
+    catalogue, which covers libraries that raise a bare ``Exception`` with a
+    message (badldap's ``Connection closed!``). A local file error
+    (``FileNotFoundError``, ``PermissionError``) is not a transport loss.
+    """
+    import asyncio  # noqa: PLC0415 - keep the module import-light
+    import errno  # noqa: PLC0415
+
+    network_errnos = {
+        getattr(errno, name)
+        for name in (
+            "ECONNRESET",
+            "ECONNREFUSED",
+            "ECONNABORTED",
+            "EHOSTUNREACH",
+            "EHOSTDOWN",
+            "ENETUNREACH",
+            "ENETDOWN",
+            "ENETRESET",
+            "ETIMEDOUT",
+            "EPIPE",
+            "ENOTCONN",
+        )
+        if hasattr(errno, name)
+    }
+    current: Any = exc_or_msg
+    seen: set[int] = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
+            return True
+        if isinstance(current, OSError) and getattr(current, "errno", None) in network_errnos:
+            return True
+        current = current.__cause__ or current.__context__
+    return _matches_any_marker(exc_or_msg, TRANSPORT_LOSS_ERROR_MARKERS)
+
+
+# ---------------------------------------------------------------------------
 # Kerberos soft errors — KDC reachable but cannot authenticate this principal
 # for account-level reasons. Kerberos cannot proceed, but NTLM with the same
 # credential might still work, so these trigger the same NTLM fallback path
