@@ -22,9 +22,14 @@ words:
 * :attr:`ClientPathTotals.paths_full_domain_compromise` — the ``domain_breaker``
   open-exposure count. The ONLY figure a "you have N routes to full domain
   compromise" headline may use.
+* :attr:`ClientPathTotals.paths_full_domain_compromise_proven` — of those
+  ``domain_breaker`` routes, the ones walked end to end. The ONLY proven figure
+  a "full domain compromise" / "DA paths" / "PWNED" claim may use.
 * :attr:`ClientPathTotals.paths_proven` / :attr:`~ClientPathTotals.paths_partial`
-  — the evidence split, through the ``_PROVEN_STATUSES`` SSOT (never a bare
-  ``status == "exploited"`` literal).
+  — the evidence split over EVERY reach class, through the ``_PROVEN_STATUSES``
+  SSOT (never a bare ``status == "exploited"`` literal). A walked Tier 0
+  foothold (access to a Tier 0 host, control pending) counts here, so this is
+  "any route walked end to end", never "domain compromise proven".
 * :attr:`ClientPathTotals.paths_closed_by_configuration` — the POSITIVE bucket.
   Counted, never presented as exposure.
 * :attr:`ClientPathTotals.paths_not_assessed` — ADscan had no surface to walk
@@ -56,6 +61,11 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from adscan_core.reporting.folded_route_count import (
+    FoldedRouteCount,
+    folded_route_count,
+    folded_route_count_phrase,
+)
 from adscan_core.rich_output import print_exception, print_info_debug
 from adscan_internal.services.compromise_class import (
     COMPROMISE_REACH_ORDER,
@@ -133,6 +143,8 @@ class ClientPathTotals:
 
         paths_total >= paths_open_exposure >= paths_full_domain_compromise
         paths_open_exposure >= paths_proven + paths_partial
+        paths_proven >= paths_full_domain_compromise_proven
+        paths_full_domain_compromise >= paths_full_domain_compromise_proven
 
     ``paths_total`` is the inventory (it keeps the positive
     ``closed_by_configuration`` bucket visible); ``paths_open_exposure`` is the
@@ -150,6 +162,12 @@ class ClientPathTotals:
     paths_total: int = 0
     paths_open_exposure: int = 0
     paths_full_domain_compromise: int = 0
+    #: ``domain_breaker`` routes walked end to end. Distinct from
+    #: :attr:`paths_proven`, which sums every reach class: a walked
+    #: ``tier0_foothold`` route (a session on a Tier 0 host, control pending) is
+    #: proven evidence but NOT a proven domain compromise, and the compromise
+    #: ladder forbids saying "domain compromise" about it.
+    paths_full_domain_compromise_proven: int = 0
     paths_proven: int = 0
     paths_partial: int = 0
     paths_closed_by_configuration: int = 0
@@ -304,17 +322,46 @@ class ClientPathTotals:
 
     @property
     def effective_proven_full_domain_compromise(self) -> int:
-        """The end-to-end ``exploited`` count, snapshot-sourced under fallback.
+        """Routes to FULL DOMAIN COMPROMISE walked end to end.
 
-        Under sampled coverage ``path_axis`` is empty, so ``paths_proven`` is 0;
-        the persisted snapshot's ``exploited`` count (the override) preserves the
-        proven figure that k lost.
+        The ``domain_breaker`` proven count only, under every coverage mode: the
+        figure behind a "DA paths" / "PWNED" / "full domain compromise proven"
+        claim. Under sampled coverage ``path_axis`` may have lost the walked
+        routes, so the persisted snapshot's ``domain_breaker`` proven count (the
+        override, itself domain_breaker-only) preserves the figure.
+
+        It used to return :attr:`paths_proven` under complete coverage, which is
+        summed over EVERY reach class, so a walked Tier 0 foothold (a session on
+        a domain controller, control pending) was counted as a proven route to
+        domain compromise next to the PWNED banner, and the figure changed units
+        with the coverage mode. A surface that means "any route walked" reads
+        :attr:`effective_paths_proven` instead.
         """
         if (
             self.effective_reach_is_sampled
             and self.proven_full_domain_compromise_override > 0
         ):
             return self.proven_full_domain_compromise_override
+        return self.paths_full_domain_compromise_proven
+
+    @property
+    def effective_paths_proven(self) -> int:
+        """Routes of ANY reach class walked end to end, coverage-aware.
+
+        The executed-route figure an all-class denominator pairs with (the
+        report's "N of M validated attack paths ADscan executed", the scan
+        verdict's validated-vs-unvalidated split). Never a domain-compromise
+        claim: that is :attr:`effective_proven_full_domain_compromise`.
+
+        Under sampled coverage ``path_axis`` may be empty, so the snapshot
+        override (domain_breaker routes walked) stands in as a floor rather than
+        letting the executed figure read 0 on a run that walked a route.
+        """
+        if (
+            self.effective_reach_is_sampled
+            and self.proven_full_domain_compromise_override > 0
+        ):
+            return max(self.paths_proven, self.proven_full_domain_compromise_override)
         return self.paths_proven
 
     def render_headline(self, domain_compromised: bool) -> "PathHeadline":
@@ -415,6 +462,10 @@ class ClientPathTotals:
             paths_full_domain_compromise=(
                 self.paths_full_domain_compromise + other.paths_full_domain_compromise
             ),
+            paths_full_domain_compromise_proven=(
+                self.paths_full_domain_compromise_proven
+                + other.paths_full_domain_compromise_proven
+            ),
             paths_proven=self.paths_proven + other.paths_proven,
             paths_partial=self.paths_partial + other.paths_partial,
             paths_closed_by_configuration=(
@@ -474,6 +525,9 @@ class ClientPathTotals:
             "paths_total": self.paths_total,
             "paths_open_exposure": self.paths_open_exposure,
             "paths_full_domain_compromise": self.paths_full_domain_compromise,
+            "paths_full_domain_compromise_proven": (
+                self.paths_full_domain_compromise_proven
+            ),
             "paths_proven": self.paths_proven,
             "paths_partial": self.paths_partial,
             "paths_closed_by_configuration": self.paths_closed_by_configuration,
@@ -594,6 +648,11 @@ def client_path_totals_from_kpis(
         paths_full_domain_compromise=by_class.get(
             CompromiseClass.DOMAIN_BREAKER.value, 0
         ),
+        # The SAME split the reports print for the domain_breaker bucket, so the
+        # loot card's "DA paths" and the PDF's "N validated" cannot disagree.
+        paths_full_domain_compromise_proven=full_domain_compromise_split_from_kpis(
+            exposure_kpis
+        ).proven,
         paths_proven=proven,
         paths_partial=partial,
         paths_closed_by_configuration=closed_by_configuration,
@@ -1081,6 +1140,12 @@ def aggregate_full_domain_compromise_split(
 
 __all__ = [
     "ClientPathTotals",
+    # Re-exported: the folded-listing wording lives in ``adscan_core`` so the
+    # console renderer and the web backend (neither may import this module)
+    # share the one sentence.
+    "FoldedRouteCount",
+    "folded_route_count",
+    "folded_route_count_phrase",
     "FullDomainCompromiseSplit",
     "aggregate_full_domain_compromise_split",
     "full_domain_compromise_split_from_kpis",

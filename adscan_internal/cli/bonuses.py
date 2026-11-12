@@ -85,8 +85,8 @@ BONUSES: dict[str, dict[str, Any]] = {
         "template": "cheatsheet/cheatsheet.html",
         # Themeless ON PURPOSE. The cheatsheet ships a complete, self-contained
         # DARK operator palette in its own ``:root`` (``--bg-0:#070b14``, cyan
-        # accent). Injecting any shared theme is actively harmful: the light
-        # ``premium_dark`` theme defines ``--surface``/``--accent``/``--line``
+        # accent). Injecting any shared theme is actively harmful: a light
+        # theme defines ``--surface``/``--accent``/``--line``
         # with the SAME names, lands AFTER the template's ``:root`` in the
         # cascade, and would override the cards to cream + the accent to ember
         # while the page background (``--bg-0``, not defined by the theme)
@@ -95,15 +95,6 @@ BONUSES: dict[str, dict[str, Any]] = {
         # (The cheatsheet is a standalone LITE lead magnet — it is NOT part of
         # the ``adscan deliver`` kit, so no ``--theme`` is ever forced on it.)
         "theme": "",
-    },
-    "checklist": {
-        "filename": "MITRE_Remediation_Checklist.pdf",
-        "title": "MITRE Remediation Checklist",
-        "value": 297,
-        "subtitle": "Auditor-grade remediation worksheet for every tracked ATT&CK technique.",
-        "template": "checklist/checklist.html",
-        # Unified editorial skin — see the playbook entry above.
-        "theme": "editorial",
     },
     # The Coverage Matrix bonus was folded into the AD Control Coverage Report:
     # the verified-clear coverage view (sourced from the scan's
@@ -195,7 +186,7 @@ def _load_theme(theme_name: str) -> str:
 
     Honors ``ADSCAN_THEME_OVERRIDE_DIR`` — same opt-in mechanism as
     ``_load_template``. The override dir holds theme files named
-    ``<theme>.css`` (e.g. ``premium_dark.css``). When the override is
+    ``<theme>.css`` (e.g. ``editorial.css``). When the override is
     unset or the file is not found, falls back to the bundled
     ``adscan_internal.pro.reporting.themes`` loader.
     """
@@ -276,7 +267,7 @@ def _wordmark_variant_for_theme(theme: str | None) -> str:
     given theme.
 
     Args:
-        theme: Resolved theme name (e.g. ``"premium_dark"``,
+        theme: Resolved theme name (e.g. ``"editorial"``,
             ``"corporate_light"``), or ``None`` to assume the light default.
 
     Returns:
@@ -290,7 +281,9 @@ def _wordmark_variant_for_theme(theme: str | None) -> str:
 
 def _render_html(template_source: str, context: dict[str, Any], theme_css: str) -> str:
     """Render a bonus template with theme CSS injected into ``<head>``."""
-    env = Environment(loader=BaseLoader(), autoescape=select_autoescape(["html"]))
+    from adscan_internal.services.report_design.terminal import install_terminal  # noqa: PLC0415
+
+    env = install_terminal(Environment(loader=BaseLoader(), autoescape=select_autoescape(["html"])))
     rendered = env.from_string(template_source).render(**context)
     if theme_css:
         inject = f"<style data-adscan-theme>\n{theme_css}\n</style>"
@@ -621,160 +614,6 @@ def _ctx_cheatsheet() -> dict[str, Any]:
     return build_cheatsheet_context()
 
 
-# Severity heuristic for the checklist — picked once per technique using the
-# tactic + technique-id as a tiebreak. Keeps the catalog deterministic and
-# aligned with the rest of the report engine. Workspace-observed techniques
-# are surfaced separately at render time via the ``observed`` argument to
-# :func:`_ctx_checklist`.
-_CHECKLIST_SEVERITY: dict[str, str] = {
-    # Critical — direct breakage of the domain or NTLM/Kerberos pillars.
-    "T1003": "critical",
-    "T1003.001": "critical",
-    "T1003.006": "critical",
-    "T1558.003": "critical",
-    "T1558.004": "critical",
-    "T1558": "critical",
-    "T1550.002": "critical",
-    "T1550.003": "critical",
-    "T1078": "critical",
-    "T1078.002": "critical",
-    "T1486": "critical",
-    # High — prerequisite or amplifier paths.
-    "T1110.003": "high",
-    "T1187": "high",
-    "T1552.006": "high",
-    "T1557.001": "high",
-    "T1649": "high",
-    "T1098": "high",
-    "T1136": "high",
-    "T1556.007": "high",
-    "T1133": "high",
-    "T1190": "high",
-    "T1068": "high",
-    "T1021.001": "high",
-    "T1021.002": "high",
-    # Medium — discovery and lateral helpers.
-    "T1110.001": "medium",
-    "T1552.001": "medium",
-    "T1555": "medium",
-    "T1018": "medium",
-    "T1069": "medium",
-    "T1087": "medium",
-    "T1087.002": "medium",
-    "T1482": "medium",
-    "T1570": "medium",
-    "T1027": "medium",
-    "T1070": "medium",
-}
-
-
-def _ctx_checklist(
-    *,
-    observed: set[str] | None = None,
-    has_workspace_signal: bool = False,
-    workspace_dir: Path | None = None,
-    frameworks: list[str] | None = None,
-) -> dict[str, Any]:
-    """Build the Jinja context for the MITRE Remediation Checklist.
-
-    The template renders ``observed_groups`` (techniques actually surfaced
-    by the scan, grouped by tactic) and ``reference_groups`` (the rest of
-    the catalog, for coverage / audit completeness). When no workspace
-    signal is available, ``observed_groups`` is empty and the template
-    falls back to rendering ``reference_groups`` only.
-
-    When ``workspace_dir`` is supplied, the per-finding **remediation
-    tracker** (the actionable client-specific section that distinguishes
-    this deliverable from the Coverage Matrix) is bound via
-    ``checklist_databinding.build_checklist_databinding``. ``client`` is
-    ``None`` and ``has_client_data`` is ``False`` when no usable findings
-    exist — the template then renders the generic reference checklist.
-    """
-    from adscan_internal.pro.reporting.checklist_content import (
-        TECHNIQUE_MITIGATIONS,
-    )
-    from adscan_internal.pro.reporting.mitre_data import (
-        TACTICS_ORDER,
-        TECHNIQUES,
-    )
-
-    observed = observed or set()
-    sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-
-    def _row(tid: str, name: str) -> dict[str, Any]:
-        return {
-            "id": tid,
-            "name": name,
-            "severity": _CHECKLIST_SEVERITY.get(tid, "low"),
-            "mitigation": TECHNIQUE_MITIGATIONS.get(
-                tid, "Document the mitigation in the next sprint."
-            ),
-            "observed": _is_observed(tid, observed),
-        }
-
-    by_tactic_obs: dict[str, list[dict[str, Any]]] = {t: [] for t in TACTICS_ORDER}
-    by_tactic_ref: dict[str, list[dict[str, Any]]] = {t: [] for t in TACTICS_ORDER}
-    for tid, meta in TECHNIQUES.items():
-        tactic = meta["tactic"]
-        if tactic not in by_tactic_obs:
-            continue
-        row = _row(tid, meta["name"])
-        if row["observed"]:
-            by_tactic_obs[tactic].append(row)
-        else:
-            by_tactic_ref[tactic].append(row)
-
-    def _make_groups(
-        by_tactic: dict[str, list[dict[str, Any]]],
-    ) -> list[dict[str, Any]]:
-        groups: list[dict[str, Any]] = []
-        for tactic in TACTICS_ORDER:
-            items = by_tactic.get(tactic) or []
-            if not items:
-                continue
-            items.sort(key=lambda it: (-sev_rank.get(it["severity"], 0), it["id"]))
-            groups.append({"tactic": tactic, "techniques": items})
-        return groups
-
-    observed_groups = _make_groups(by_tactic_obs) if has_workspace_signal else []
-    reference_groups = _make_groups(by_tactic_ref)
-
-    # When there is no workspace signal we still expose ``tactic_groups``
-    # in the legacy shape so any external override of the template keeps
-    # working. With signal, ``tactic_groups`` mirrors ``observed_groups``
-    # for the same reason.
-    tactic_groups = observed_groups if has_workspace_signal else reference_groups
-
-    # Bind the per-finding remediation tracker (Tier-2/3 client section).
-    # A binding failure must never break the reference checklist render, and
-    # must never be indistinguishable from an empty workspace either — the
-    # shared seam below is what separates the two.
-    from adscan_internal.pro.reporting.checklist_databinding import (
-        build_checklist_databinding,
-    )
-
-    client, client_section_gap = _bind_client_section(
-        build_checklist_databinding,
-        document=BONUSES["checklist"]["title"],
-        section="remediation worksheet built from your own findings",
-        workspace_dir=workspace_dir,
-        frameworks=frameworks,
-    )
-
-    return {
-        "tactic_groups": tactic_groups,
-        "observed_groups": observed_groups,
-        "reference_groups": reference_groups,
-        "has_workspace_signal": has_workspace_signal,
-        "observed_count_total": sum(len(g["techniques"]) for g in observed_groups),
-        "report_date": time.strftime("%B %d, %Y"),
-        "client": client,
-        "has_client_data": client is not None,
-        # See ``_ctx_playbook`` — same gap contract, same two template reads.
-        "client_section_gap": client_section_gap,
-    }
-
-
 def _ctx_coverage_matrix(
     *,
     observed: set[str] | None = None,
@@ -844,7 +683,6 @@ _CONTEXT_BUILDERS_STATIC: dict[str, Callable[[], dict[str, Any]]] = {
 
 _CONTEXT_BUILDERS_DYNAMIC: dict[str, Callable[..., dict[str, Any]]] = {
     "playbook": _ctx_playbook,
-    "checklist": _ctx_checklist,
     "coverage-matrix": _ctx_coverage_matrix,
     "password-hygiene": _ctx_password_hygiene,
 }
@@ -1011,14 +849,13 @@ def _build_context(
         "observed": observed,
         "has_workspace_signal": has_signal,
     }
-    if bonus_key in ("playbook", "checklist", "coverage-matrix", "password-hygiene"):
+    if bonus_key in ("playbook", "coverage-matrix", "password-hygiene"):
         kwargs["workspace_dir"] = workspace_dir
         kwargs["frameworks"] = frameworks
     # Only the playbook / coverage-matrix / password-hygiene databinding builders
     # accept ``branding`` (playbook / coverage-matrix compute the debranded
     # ``adscan_priority_label`` themselves; password-hygiene only needs it for the
-    # page-furniture wordmark). The checklist builder does not, so it is left to
-    # the ``_with_score_labels`` fallback above.
+    # page-furniture wordmark).
     if bonus_key in ("playbook", "coverage-matrix", "password-hygiene"):
         kwargs["branding"] = branding
     return _with_brand(builder(**kwargs))
@@ -1067,10 +904,11 @@ def render_bonus(
             falls back to the historical static behaviour with a visible
             warning.
         theme: Override the per-bonus default theme.  When non-empty,
-            ``"premium_dark"`` / ``"dark"`` → dark operator aesthetic;
-            ``"corporate_light"`` / ``"light"`` → white corporate theme
-            suitable for printing or board presentations.  Empty string or
-            ``None`` → use the theme catalogued in ``BONUSES[bonus_key]``.
+            ``"corporate_light"`` / ``"light"`` → white corporate theme;
+            ``"editorial"`` / ``"warm"`` → the warm editorial theme. The
+            retired ``"premium_dark"`` / ``"dark"`` render as
+            ``corporate_light``. Empty string or ``None`` → use the theme
+            catalogued in ``BONUSES[bonus_key]``.
         frameworks: The compliance regimes the operator selected (via
             ``adscan deliver --frameworks`` / the REPL / ``adscan ci``). The
             playbook and checklist render ONLY these frameworks' controls, so a
@@ -1116,12 +954,18 @@ def render_bonus(
     Real customer flows (``adscan deliver``, web Celery
     ``generate_deliverable_kit``) MUST NOT pass ``is_sample=True``.
     """
-    _THEME_ALIASES = {"dark": "premium_dark", "light": "corporate_light"}
+    from adscan_core.report_options import REPORT_THEME_ALIASES, RETIRED_REPORT_THEMES
+
     if bonus_key not in BONUSES:
         raise KeyError(f"Unknown bonus '{bonus_key}'")
 
     meta = BONUSES[bonus_key]
-    resolved_theme = _THEME_ALIASES.get(theme or "", theme or "") or meta["theme"]
+    # Aliases and retired themes resolve through the theme SSOT. Any other name
+    # passes through untouched, so an ADSCAN_THEME_OVERRIDE_DIR skin still loads.
+    requested = (theme or "").strip()
+    key = requested.lower()
+    requested = RETIRED_REPORT_THEMES.get(key) or REPORT_THEME_ALIASES.get(key) or requested
+    resolved_theme = requested or meta["theme"]
     template_source = _load_template(meta["template"])
     theme_css = _load_theme(resolved_theme)
 

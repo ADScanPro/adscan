@@ -13,7 +13,6 @@ upstream via ``dns_resolver.resolve_computer_nodes``.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import os
 import threading
 import time
@@ -2116,8 +2115,8 @@ async def _gate_reachable_445(
 # ``is_non_interactive`` Ctrl+C is a no-op — the platform stops via the
 # sentinel — so showing the hint would be misleading).
 _STOP_AFFORDANCE_LINE = (
-    "Ctrl+C  ·  stop enrichment here and continue the scan with the hosts "
-    "collected so far"
+    "Ctrl+C for options  ·  stop enrichment here and continue the scan with "
+    "the hosts collected so far"
 )
 
 
@@ -2135,10 +2134,9 @@ def _build_stop_footer_provider(
       stops the enrichment here and continues the scan (Gap 1: make the
       early-stop discoverable).
     * Requested — an immediate, reassuring "stopping…" line naming how many
-      hosts are still draining, so the operator sees their first Ctrl+C took
-      effect and does NOT mash it into the double-tap hard abort (Gap 2). It
-      still states that a fresh Ctrl+C aborts the whole scan, so the escape
-      hatch stays discoverable.
+      hosts are still draining, so the operator sees their stop took effect
+      (Gap 2). A fresh Ctrl+C reopens the operator menu (skip the phase, stop
+      the scan), so those choices stay discoverable.
 
     The provider reads the thread-safe ``cancellation`` token (flipped on the
     MAIN thread by the SIGINT handler) and the live in-flight count; it renders
@@ -2164,7 +2162,7 @@ def _build_stop_footer_provider(
             f"{in_flight}, a few seconds more.  ",
             style=COLOR_AMBER,
         )
-        line.append("Ctrl+C again aborts the whole scan.", style=COLOR_MUTED)
+        line.append("Ctrl+C for more options.", style=COLOR_MUTED)
         return line
 
     return _provider
@@ -2929,20 +2927,6 @@ def collect_domain_hosts(
     Creates a fresh event loop in a worker thread (matches the legacy SMB/Share
     collectors' pattern so the orchestrator can keep being synchronous).
     """
-    timing_holder: dict[str, HostPhaseTiming] = {}
+    from adscan_core.async_bridge import run_in_worker_thread  # noqa: PLC0415
 
-    def _run_in_thread() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            timing_holder["t"] = loop.run_until_complete(
-                _collect_domain_hosts_async(result, config)
-            )
-        finally:
-            loop.close()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(_run_in_thread)
-        fut.result()
-
-    return timing_holder.get("t", HostPhaseTiming())
+    return run_in_worker_thread(_collect_domain_hosts_async(result, config))

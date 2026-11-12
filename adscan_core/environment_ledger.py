@@ -591,8 +591,9 @@ def _open_lock_file(lock_path: Path):
 
     POSIX opens it READ-ONLY: ``flock`` takes an exclusive lock on any open
     descriptor of a local file, so the lock works whichever user created the
-    file and whatever its mode. On the appliance the root web backend creates it
-    first and the engine, running as the host user, must still lock it; an
+    file and whatever its mode. On the appliance a web backend that ran as root
+    (before 14.0.1) created it first and the engine, running as the host user,
+    must still lock it; an
     ``"a+b"`` open needed write access and failed with EACCES there, which
     refused every assessment with exit 78 on a valid license. A file this call
     creates (or finds) as root takes the directory's owner.

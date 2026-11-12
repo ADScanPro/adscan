@@ -13,8 +13,8 @@ by the cascade fallback inside
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from typing import Any
-import asyncio
 import json
 import os
 import re
@@ -410,12 +410,9 @@ def execute_get_flags(
                 nt_hash=password if secret_kind == "nt_hash" else None,
                 password=password if secret_kind == "password" else None,
             )
-            try:
-                _ccache_bytes = asyncio.run(_get_tgs(_krb, _spn))
-            except RuntimeError:
-                import concurrent.futures as _cf
-                with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
-                    _ccache_bytes = _pool.submit(asyncio.run, _get_tgs(_krb, _spn)).result(timeout=30)
+            from adscan_core.async_bridge import run_async_sync  # noqa: PLC0415
+
+            _ccache_bytes = run_async_sync(_get_tgs(_krb, _spn), timeout=30)
             _tmp = _tf.NamedTemporaryFile(suffix=".ccache", prefix="adscan_smb_tgt_", delete=False)
             _tmp.write(_ccache_bytes)
             _tmp.close()
@@ -449,7 +446,7 @@ def execute_get_flags(
     )
 
     try:
-        result: FlagCollectionResult = asyncio.run(
+        result: FlagCollectionResult = run_on_new_loop(
             collect_ctf_flags(
                 shell=shell,
                 domain=domain,

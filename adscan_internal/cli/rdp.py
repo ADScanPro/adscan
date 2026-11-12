@@ -7,7 +7,7 @@ behaviour stable for the current CLI.
 
 from __future__ import annotations
 
-import asyncio
+from adscan_core.async_bridge import run_on_new_loop
 import os
 import re
 import shutil
@@ -511,7 +511,7 @@ def run_rdp_service_access_sweep(
         host_list = list(rdp_reach.reachable)
 
     try:
-        rdp_results = asyncio.run(
+        rdp_results = run_on_new_loop(
             scan_rdp_hosts(
                 host_list,
                 domain=domain,

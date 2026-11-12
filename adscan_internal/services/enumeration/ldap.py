@@ -4,10 +4,10 @@ This module provides LDAP-specific enumeration operations including
 user enumeration, group enumeration, and computer enumeration.
 """
 
+from adscan_core.async_bridge import run_on_new_loop
 from collections.abc import Callable
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
-import asyncio
 import subprocess
 
 from adscan_internal.core import AuthMode
@@ -631,7 +631,7 @@ class LDAPEnumerationMixin:
                 _probe_ldap_anonymous,
             )
 
-            probe_result = asyncio.run(_probe_ldap_anonymous(pdc, timeout))
+            probe_result = run_on_new_loop(_probe_ldap_anonymous(pdc, timeout))
 
             accessible = probe_result.status == "open"
 

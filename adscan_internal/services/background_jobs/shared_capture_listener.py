@@ -1,54 +1,43 @@
-"""Shared :445 NTLM-capture listener broker.
+"""Shared NTLM capture on :445, fanned out to every capture consumer.
 
-One process-wide owner of the :445 ``NativeListenerCapture`` socket(s), so every
-coercion vector (broadcast poisoning, the write-share bait job, the NTLM
-auth-type sweep, a single coercion probe) CONSUMES a shared listener instead of
-each trying to ``bind()`` :445 independently, which collides with
-``[Errno 98] address already in use`` (the prod bug where poisoning held :445 and
-the NTLM auth-type sweep was silently dropped from an audit).
+Every capture vector (broadcast poisoning, the write-share bait job, the NTLM
+auth-type sweep, a single coercion probe, the share-drop capture) CONSUMES one
+shared capture instead of running its own. Each ``NativeListenerCapture`` this
+module starts is a CAPTURE claim on the listener broker
+(``services/listener_broker.py``), the single owner of the port: the broker binds
+the socket and routes to the capture every connection that no relay or Kerberos
+capture claims. So a relay step and the background capture run AT THE SAME TIME
+on one port: the coerced target reaches the relay, a poisoned victim reaches the
+capture, and nothing has to stop or go silent.
 
-**Bind is the broker's decision, advertise is the consumer's.** A consumer hands
-the broker the LOCAL address its callback will land on (``bind_ip``, or a
-wildcard when it has no single one). That is a statement about where the target
-connects, not an instruction for the socket. The broker binds the WILDCARD of
-that address family first, which serves every local address at once. On a
-multi-NIC appliance (one NIC per client segment) that is what lets a coercion
-toward segment A and one toward segment B share one listener: the old broker
-bound the first consumer's concrete address and refused every other address, so
-a coercion toward the second segment had no listener and the refusal was a debug
-line. The relay listeners already bind the wildcard for the same reason
-(``esc_relay``, ``relay_rbcd``).
-
-**Contention fallback.** When the wildcard bind is refused with ``EADDRINUSE``
-(a local SMB service already holds :445 on one address), the broker binds the
-consumer's own concrete address instead, one listener per address, so each
-segment still gets served on the address its targets call. A consumer that asked
+**Bind is the listener broker's decision, advertise is the consumer's.** A
+consumer hands this broker the LOCAL address its callback lands on (``bind_ip``,
+or a wildcard when it has no single one). The listener broker binds the wildcard
+whenever it can, so one capture serves every segment of a multi-NIC appliance;
+when a local SMB service holds the wildcard it binds the callback address itself,
+and this module then runs one capture per served address. A consumer that asked
 for the wildcard cannot be served by one address and is refused. Every refusal
-is recorded with a classified reason (:meth:`last_refusal`) so the caller can
-tell the operator why, instead of the capture vanishing.
+is recorded with a classified reason (:meth:`last_refusal`).
 
-**Refcounted.** A listener starts on the first ``acquire`` that needs it and
-stops only when the last consumer it serves releases, so stopping one consumer
-(``stop_poisoning``) never tears :445 down while another (the write-share bait)
-still needs it, in any launch/stop ordering.
+**Refcounted.** A capture starts on the first ``acquire`` that needs it and stops
+only when the last consumer it serves releases, so stopping one consumer
+(``stop_poisoning``) never stops the capture while another still needs it.
 
-**Fan-out.** One poll thread per listener drains its capture queue
-(``wait_for_capture`` with no username filter) and dispatches each capture to
-EVERY registered sink. Each sink applies its own relevance filter and
-de-duplication; the broker itself is capture-agnostic.
+**Fan-out.** One poll thread per capture drains its queue (``wait_for_capture``
+with no username filter) and dispatches each capture to EVERY registered sink.
+Each sink applies its own relevance filter and de-duplication.
 
 The broker NEVER prints user-facing output and NEVER raises into its callers: a
 sink that throws is captured to telemetry and the other sinks still run. It lives
-on the shell (one broker per session) via :func:`get_or_create_capture_broker`,
-mirroring ``get_or_create_registry``. Cross-platform: binding ``0.0.0.0`` is the
-same stdlib call on Windows, and the classified errno codes come from
-``NativeListenerCapture.describe_start_error``, which reads portable ``errno``
-names.
+on the shell (one per session) via :func:`get_or_create_capture_broker`,
+mirroring ``get_or_create_registry``.
 """
 from __future__ import annotations
 
 import ipaddress
+import queue as _queue
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -67,10 +56,6 @@ _POLL_TIMEOUT_SECONDS = 2
 _IPV4_WILDCARD = "0.0.0.0"  # noqa: S104 - a capture listener serves every segment
 _IPV6_WILDCARD = "::"
 
-#: ``describe_start_error`` code for "another socket already holds the port".
-_CONTENDED_CODE = "eaddrinuse"
-
-
 def _normalize(address: object) -> str:
     """Return ``address`` as a canonical IP literal, or ``""`` when not an IP."""
     text = str(address or "").strip()
@@ -87,10 +72,6 @@ def _wildcard_for(address: str) -> str:
     return _IPV6_WILDCARD if ":" in address else _IPV4_WILDCARD
 
 
-def _is_wildcard(address: str) -> bool:
-    return address in (_IPV4_WILDCARD, _IPV6_WILDCARD)
-
-
 @dataclass
 class _Served:
     """One bound listener and the consumers it serves."""
@@ -102,7 +83,7 @@ class _Served:
 
 
 class SharedCaptureListenerBroker:
-    """Refcounted owner of the :445 capture listener(s) with sink fan-out."""
+    """Refcounted shared capture(s) on one port with sink fan-out."""
 
     def __init__(self, *, port: int = 445) -> None:
         self._lock = threading.RLock()
@@ -111,6 +92,11 @@ class SharedCaptureListenerBroker:
         self._consumer_bind: dict[str, str] = {}  # consumer -> bound address
         self._sinks: dict[str, CaptureSink] = {}
         self._refusals: dict[str, tuple[str, str]] = {}
+
+    @property
+    def port(self) -> int:
+        """The port this capture listens on."""
+        return self._port
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -142,33 +128,46 @@ class SharedCaptureListenerBroker:
                     f"no valid local callback address was given ({bind_ip!r})",
                 )
             return False
-        to_stop: Optional[tuple[_Served, str]] = None
         with self._lock:
-            address = self._serving_address_locked(requested)
-            if address is None:
-                address, refusal = self._bind_for_locked(requested)
-                if address is None:
-                    self._refusals[cid] = refusal
-                    print_info_debug(
-                        f"capture-broker: consumer {cid} refused for {requested}: "
-                        f"{refusal[0]}"
-                    )
-                    return False
-
-            previous = self._consumer_bind.get(cid)
-            if previous is not None and previous != address:
-                to_stop = self._detach_locked(cid)
-            self._served[address].consumers.add(cid)
-            self._consumer_bind[cid] = address
-            self._sinks[cid] = on_capture
-            self._refusals.pop(cid, None)
-            print_info_debug(
-                f"capture-broker: consumer {cid} acquired on {address} "
-                f"(callback address {requested}, refcount={len(self._sinks)})"
-            )
-        if to_stop is not None:
+            to_stop = self._acquire_locked(cid, requested, on_capture)
+            if to_stop is False:
+                return False
+        if isinstance(to_stop, tuple):
             self._shutdown(*to_stop)
         return True
+
+    def _acquire_locked(
+        self, cid: str, requested: str, on_capture: CaptureSink
+    ) -> "Optional[tuple[_Served, str]] | bool":
+        """Bind or reuse a listener for ``cid`` (caller holds the lock).
+
+        Returns ``False`` when refused (the refusal is recorded), else the
+        listener to stop after the lock is released (``None`` when none).
+        """
+        to_stop: Optional[tuple[_Served, str]] = None
+        address = self._serving_address_locked(requested)
+        if address is None:
+            address, refusal = self._bind_for_locked(requested)
+            if address is None:
+                self._refusals[cid] = refusal
+                print_info_debug(
+                    f"capture-broker: consumer {cid} refused for {requested}: "
+                    f"{refusal[0]}"
+                )
+                return False
+
+        previous = self._consumer_bind.get(cid)
+        if previous is not None and previous != address:
+            to_stop = self._detach_locked(cid)
+        self._served[address].consumers.add(cid)
+        self._consumer_bind[cid] = address
+        self._sinks[cid] = on_capture
+        self._refusals.pop(cid, None)
+        print_info_debug(
+            f"capture-broker: consumer {cid} acquired on {address} "
+            f"(callback address {requested}, refcount={len(self._sinks)})"
+        )
+        return to_stop
 
     def release(self, consumer_id: str) -> None:
         """Unregister ``consumer_id``; stop a listener once it serves nobody."""
@@ -263,28 +262,26 @@ class SharedCaptureListenerBroker:
         return None
 
     def _bind_for_locked(self, requested: str) -> tuple[Optional[str], tuple[str, str]]:
-        """Bind a listener that serves ``requested``: wildcard first, then itself."""
-        wildcard = _wildcard_for(requested)
-        ok, refusal = self._start_locked(wildcard)
-        if ok:
-            return wildcard, ("none", "")
-        if refusal[0] != _CONTENDED_CODE or _is_wildcard(requested):
-            return None, refusal
-        print_info_debug(
-            f"capture-broker: {wildcard}:{self._port} is held by another local "
-            f"service; binding the callback address {requested} only"
-        )
-        ok, concrete_refusal = self._start_locked(requested)
-        if ok:
-            return requested, ("none", "")
-        return None, concrete_refusal
+        """Start a capture that serves ``requested``; return the address serving it.
 
-    def _start_locked(self, address: str) -> tuple[bool, tuple[str, str]]:
-        listener = self._make_listener(address)
+        The listener broker decides the socket (wildcard first, the callback
+        address when a local service holds the wildcard), so the served address
+        is read back from the started capture.
+        """
+        listener = self._make_listener(requested)
         if listener is None:
-            return False, ("other", "the capture listener could not be constructed")
+            return None, ("other", "the capture listener could not be constructed")
         if not self._start_listener(listener):
-            return False, self._describe_failure(listener, address)
+            return None, self._describe_failure(listener, requested)
+        address = _normalize(getattr(listener, "served_address", None)) or _normalize(
+            getattr(listener, "listen_host", None)
+        ) or requested
+        existing = self._served.get(address)
+        if existing is not None:
+            # Another capture already serves that socket (a race on the served
+            # address): keep the existing one, stop the duplicate.
+            self._stop_listener_quietly(listener)
+            return address, ("none", "")
         served = _Served(listener=listener)
         self._served[address] = served
         served.poll_thread = threading.Thread(
@@ -294,8 +291,16 @@ class SharedCaptureListenerBroker:
             daemon=True,
         )
         served.poll_thread.start()
-        print_info_debug(f"capture-broker: shared :{self._port} listener started on {address}")
-        return True, ("none", "")
+        print_info_debug(f"capture-broker: shared :{self._port} capture started on {address}")
+        return address, ("none", "")
+
+    @staticmethod
+    def _stop_listener_quietly(listener: Any) -> None:
+        try:
+            listener.stop()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc, visible=False)
 
     def _describe_failure(self, listener: Any, address: str) -> tuple[str, str]:
         describe = getattr(listener, "describe_start_error", None)
@@ -416,3 +421,86 @@ def _module_fallback_broker() -> SharedCaptureListenerBroker:
         if _FALLBACK_BROKER is None:
             _FALLBACK_BROKER = SharedCaptureListenerBroker()
         return _FALLBACK_BROKER
+
+
+# ── A consumer with the single-listener call shape ───────────────────────────
+
+
+class BrokeredCaptureListener:
+    """A shared-capture consumer with the ``NativeListenerCapture`` call shape.
+
+    For flows written against one private listener (``start`` / ``stop`` /
+    ``wait_for_capture``), such as the operator share-drop capture. Each capture
+    the shared broker fans out lands in this adapter's own queue, so a blocking
+    ``wait_for_capture`` here never drains the shared listener (which would race
+    the broker's fan-out). The port itself stays with the listener broker.
+    """
+
+    def __init__(
+        self,
+        broker: SharedCaptureListenerBroker,
+        *,
+        consumer_id: str,
+        bind_ip: str,
+    ) -> None:
+        self._broker = broker
+        self.consumer_id = str(consumer_id or "").strip() or "capture"
+        self.listen_host = bind_ip
+        self.listen_port = broker.port
+        self._queue: "_queue.Queue[Any]" = _queue.Queue()
+        self._observed_lock = threading.Lock()
+        self._observed: list[Any] = []
+        self._acquired = False
+
+    def _sink(self, observation: Any) -> None:
+        with self._observed_lock:
+            self._observed.append(observation)
+        self._queue.put(observation)
+
+    def start(self) -> bool:
+        """Join the shared capture; ``False`` when it cannot listen."""
+        self._acquired = bool(
+            self._broker.acquire(self.consumer_id, bind_ip=self.listen_host, on_capture=self._sink)
+        )
+        return self._acquired
+
+    def describe_start_error(self) -> tuple[str, str]:
+        return self._broker.last_refusal(self.consumer_id) or ("none", "")
+
+    def stop(self) -> None:
+        if self._acquired:
+            self._acquired = False
+            self._broker.release(self.consumer_id)
+
+    def drain_observations(self) -> list[Any]:
+        with self._observed_lock:
+            return list(self._observed)
+
+    def wait_for_capture(
+        self,
+        *,
+        timeout_seconds: int,
+        expected_usernames: Optional[Any] = None,
+        poll_interval_seconds: float = 1.0,
+    ) -> Any:
+        """Return the first capture for one of ``expected_usernames`` (any when empty)."""
+        expected = {
+            str(name or "").strip().casefold()
+            for name in (expected_usernames or ())
+            if str(name or "").strip()
+        }
+        # monotonic: the host wall clock is stepped mid-scan for DC sync.
+        deadline = time.monotonic() + max(int(timeout_seconds), 1)
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                observation = self._queue.get(
+                    timeout=min(poll_interval_seconds, max(remaining, 0.01))
+                )
+            except _queue.Empty:
+                continue
+            user = str(getattr(observation, "clean_user", "") or "").casefold()
+            if expected and user not in expected:
+                continue
+            return observation
+        return None

@@ -71,6 +71,10 @@ The schema (all keys optional)::
       level: polite                        # fragile | polite | normal (default) | fast
       overrides: {max_parallel_hosts: 4}   # any knob of adscan_core.scan_pacing
       ceiling: {level: polite}             # written by the web from a saved policy
+    agreed_policy:            # the policy agreed with the client (disclosure only): the
+      name: "Corp example"    # report states whether this run's digest matches it
+      revision: 3
+      digest: "sha256:<64 hex>"
 
 The ``checks`` section is validated for shape and selector syntax by
 :func:`adscan_core.scan_policy.policy.parse_policy_definition`; registry-aware
@@ -199,8 +203,10 @@ _TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "checks",
         "pacing",
         "cleanup_credential",
+        "agreed_policy",
     }
 )
+_AGREED_POLICY_KEYS: frozenset[str] = frozenset({"name", "revision", "digest"})
 _PHASES_KEYS: frozenset[str] = frozenset({"disabled", "steps"})
 _TRUST_KEYS: frozenset[str] = frozenset({"policy", "domains"})
 _ATTACK_PATH_KEYS: frozenset[str] = frozenset({"policy", "selected"})
@@ -526,6 +532,10 @@ class ScanConfig:
     # variable holding its secret). Never the secret itself: this file is
     # written to the run workspace. ``None`` = no cleanup account.
     cleanup_credential: Optional[CleanupCredentialReference] = None
+    # The scan policy agreed with the client for the engagement
+    # (``{name, revision, digest}``), so the report can state whether this run
+    # used it. Disclosure only: it never changes which checks run.
+    agreed_policy: Optional[dict[str, Any]] = None
 
     # -- convenience predicates used by the gated decision points -----------
 
@@ -549,6 +559,7 @@ class ScanConfig:
             and self.durable_changes.auto_revert is None
             and self.durable_changes.machine_account_policy is None
             and self.cleanup_credential is None
+            and self.agreed_policy is None
             and self.checks.is_default
             and self.pacing.is_default
         )
@@ -807,6 +818,22 @@ def _parse_cleanup_credential(raw: Any) -> Optional[CleanupCredentialReference]:
         raise ScanConfigError(str(exc)) from exc
 
 
+def _parse_agreed_policy(raw: Any) -> Optional[dict[str, Any]]:
+    """Parse the ``agreed_policy`` section (disclosure only, never a control)."""
+    if raw is None:
+        return None
+    from adscan_core.scan_policy.agreed import normalize_agreed_policy
+
+    mapping = _require_mapping(raw, where="agreed_policy")
+    _reject_unknown_keys(mapping, _AGREED_POLICY_KEYS, where="agreed_policy")
+    normalized = normalize_agreed_policy(mapping)
+    if normalized is None:
+        raise ScanConfigError(
+            "'agreed_policy.digest' must be the policy digest ('sha256:<hex>')."
+        )
+    return normalized
+
+
 def _parse_checks(raw: Any) -> ChecksConfig:
     """Parse the ``checks`` section through the scan-policy SSOT validator."""
     if raw is None:
@@ -907,6 +934,7 @@ def parse_scan_config(data: Any) -> ScanConfig:
         checks=_parse_checks(mapping.get("checks")),
         pacing=_parse_pacing(mapping.get("pacing")),
         cleanup_credential=_parse_cleanup_credential(mapping.get("cleanup_credential")),
+        agreed_policy=_parse_agreed_policy(mapping.get("agreed_policy")),
     )
 
 

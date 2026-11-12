@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.attack_paths_snapshot/1",
+  "title": "ADscan attack paths snapshot v1",
+  "description": "domains/<domain>/attack_paths_snapshot.json: the attack paths the engine computed for one domain at the end of a scan, each with its steps and the status ADscan proved for it. Written by one writer (persist_attack_path_snapshot in adscan_internal/cli/attack_path_execution.py). Version marker: schema_version, '1.<minor>'. Declared objects may gain fields within a major; do not reject unknown keys. Step details, knowledge and remediability are opaque.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "domain", "scope", "target", "target_mode", "search_mode_label", "path_count", "paths"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 255},
+    "scope": {"type": "string", "$comment": "Which sources the search started from (domain, owned, principal, ...)."},
+    "target": {"type": "string"},
+    "target_mode": {"type": "string"},
+    "search_mode_label": {"type": ["string", "null"]},
+    "path_count": {"type": "integer", "minimum": 0, "$comment": "Equals the length of paths."},
+    "paths": {"type": "array", "items": {"$ref": "#/$defs/path"}}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "string_list": {"type": "array", "items": {"type": "string"}},
+    "path": {
+      "type": "object",
+      "required": ["id", "index", "source", "target", "length", "status", "nodes", "relations", "steps"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "$comment": "Listing-local token, not stable across runs. Use path_id to refer to a route."},
+        "path_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "$comment": "Since 1.1. The path id: the ordered-route fingerprint, stable across runs. The web platform keys its attack-path records on it, the report prints its first 12 characters, and adscan recheck --path takes any unambiguous prefix of 8 or more."},
+        "index": {"type": "integer", "minimum": 1},
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "length": {"type": "integer", "minimum": 0},
+        "status": {"type": "string", "$comment": "theoretical, attempted, partial, exploited, blocked, closed_by_configuration, unsupported (open vocabulary). Only exploited means every step was executed."},
+        "path_state": {"type": ["string", "null"], "$comment": "Lifecycle state of a proven path (domain_compromised, ...); null when not proven."},
+        "is_high_value": {"type": "boolean"},
+        "is_tier_zero": {"type": "boolean"},
+        "target_priority_class": {"type": "string"},
+        "compromise_class": {"type": ["string", "null"], "$comment": "domain_breaker, tier0_control, tier0_foothold, privileged_escalator, compromise_enabler, unauthenticated_principal or none."},
+        "nodes": {"$ref": "#/$defs/string_list"},
+        "node_kinds": {"$ref": "#/$defs/string_list", "$comment": "Directory object class per node, parallel to nodes."},
+        "relations": {"$ref": "#/$defs/string_list"},
+        "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+        "also_reaches_domains": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["step", "action", "status"],
+      "properties": {
+        "step": {"type": "integer", "minimum": 1},
+        "action": {"type": "string"},
+        "status": {"type": "string", "$comment": "success, attempted, blocked, theoretical, structural, discovered, closed_by_configuration, unsupported (open vocabulary)."},
+        "details": {"type": "object"},
+        "knowledge": {"type": "object"},
+        "remediability": {"type": "object"}
+      }
+    }
+  }
+}

@@ -36,6 +36,11 @@ from adscan_core.scan_policy.execution import (
     MAP_ONLY_STATEMENT,
     MAP_ONLY_STEP_LABEL,
 )
+from adscan_core.scan_policy.agreed import (
+    AGREED_POLICY_KEY,
+    agreed_policy_line,
+    compare_to_agreed,
+)
 from adscan_core.scan_policy.families import FAMILIES, FAMILIES_BY_ID
 from adscan_core.scan_policy.model import (
     EXECUTION_ACTIVE,
@@ -262,6 +267,8 @@ def build_scan_policy_coverage(
     execution_decision: str = "",
     password_attempts: Mapping[str, Any] | None = None,
     revert_verdicts: Iterable[Mapping[str, Any]] = (),
+    reversal_capability: Mapping[str, Any] | None = None,
+    agreed_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the persisted coverage block for one run.
 
@@ -290,6 +297,14 @@ def build_scan_policy_coverage(
         revert_verdicts: What the run established, per domain, about the cleanup
             account (``RevertPermissionVerdict.to_dict()``), for the statement of
             which steps ran or did not because of it.
+        reversal_capability: The cleanup-account capability block
+            (``adscan_core.reporting.reversal_capability``), so the report states
+            per forest, domain and CA what the account could undo. ``None`` when
+            the run did not check one.
+        agreed_policy: The policy agreed with the client for the engagement
+            (``{name, revision, digest}``, from the scan config's
+            ``agreed_policy``), or ``None``. Stamped with whether this run's
+            digest matches it (``adscan_core.scan_policy.agreed``).
 
     Returns:
         A JSON-safe block. Always carries ``statement``.
@@ -438,6 +453,16 @@ def build_scan_policy_coverage(
             "verdicts": [dict(v) for v in (revert_verdicts or ()) if isinstance(v, Mapping)],
         },
     }
+    if isinstance(reversal_capability, Mapping) and reversal_capability.get("forests"):
+        block["reversal_capability"] = dict(reversal_capability)
+    comparison = compare_to_agreed(
+        agreed_policy,
+        ran_name=block["policy"]["name"],
+        ran_revision=block["policy"]["revision"],
+        ran_digest=resolved.digest,
+    )
+    if comparison is not None:
+        block[AGREED_POLICY_KEY] = comparison
     block["statement"] = _statement(block)
     return block
 
@@ -662,7 +687,41 @@ def scan_policy_coverage_view(block: Any) -> dict[str, Any]:
         ),
         "settings_line": changed_settings_line(block.get("changed_settings")),
         "revert_permission_line": revert_permission_line(block),
+        # What the cleanup account could undo, per forest, domain and CA: the
+        # same derivation as the pre-scan checklist (one view, every surface).
+        "reversal_capability": _reversal_capability_view(block),
+        # Whether the run used the policy agreed for the engagement, and one
+        # sentence when it did not (adscan_core.scan_policy.agreed).
+        "agreed_policy_matches": _agreed_matches(block),
+        "agreed_policy_line": agreed_policy_line(
+            block.get(AGREED_POLICY_KEY),
+            ran_name=str(policy.get("name") or ""),
+            ran_revision=int(policy.get("revision") or 0),
+            ran_digest=digest,
+        ),
     }
+
+
+def _agreed_matches(block: Mapping[str, Any]) -> bool | None:
+    """True/False against the agreed policy; ``None`` when none was agreed."""
+    agreed = block.get(AGREED_POLICY_KEY)
+    if not isinstance(agreed, Mapping) or not isinstance(agreed.get("matches"), bool):
+        return None
+    return bool(agreed["matches"])
+
+
+def _reversal_capability_view(block: Mapping[str, Any]) -> dict[str, Any]:
+    from adscan_core.reporting.reversal_capability import (  # noqa: PLC0415
+        checklist_text_lines,
+        reversal_capability_view,
+    )
+
+    raw = block.get("reversal_capability")
+    if not isinstance(raw, Mapping):
+        return {"present": False, "forests": [], "nobody_rows": [], "lines": [], "text_lines": []}
+    view = reversal_capability_view(raw)
+    view["text_lines"] = checklist_text_lines(view)
+    return view
 
 
 def revert_permission_line(block: Any) -> str:

@@ -31,6 +31,7 @@ from adscan_internal.rich_output import (
     print_attack_paths_summary_debug,
 )
 from adscan_core.rich_output import strip_sensitive_markers
+from adscan_core.engagement.output_formats import output_marker
 from adscan_core.reporting.attack_path_execution_events import (
     NOT_EXECUTED_REASON_KEY,
     not_needed_reason,
@@ -167,8 +168,10 @@ from adscan_internal.services.ldap_transport_service import (
 # Schema 1.2 (Phase 2 attack-graph refactor, 2026-05-02): every edge now
 # carries a top-level "kind" field set from EdgeKind. Schema 1.1 graphs
 # load transparently — load_attack_graph backfills kinds in memory and
-# the next save_attack_graph rewrites the JSON at 1.2.
-ATTACK_GRAPH_SCHEMA_VERSION = "1.2"
+# the next save_attack_graph rewrites the JSON at 1.2. The value is owned by
+# the output contract (adscan_core/engagement/output_formats.py, schema
+# attack_graph.v1.json): bump it there, never here.
+ATTACK_GRAPH_SCHEMA_VERSION = output_marker("attack_graph")
 _ATTACK_GRAPH_MAINTENANCE_VERSION = 2
 _CONTEXT_RELATIONS_LOWER = {
     str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
@@ -11874,12 +11877,20 @@ def update_edge_status_by_labels(
     Every step outcome of an attack-path run is persisted through here, so this
     is also where the active run (if any) observes it. The observation happens
     before node resolution, so a status the graph cannot place still reaches
-    the operator's run view.
+    the operator's run view. An attempted status also gets its reason category
+    stamped here (``stamp_failure_reason_code``).
     """
+    from adscan_core.reporting.execution_failure_explanations import (  # noqa: PLC0415
+        stamp_failure_reason_code,
+    )
     from adscan_internal.services.attack_path_execution_run import (  # noqa: PLC0415
         notify_edge_status,
     )
 
+    # An attempted step records the reason category of THIS attempt on the
+    # edge, so the reports and the web CTEM state it without re-deriving it
+    # from free text. One seam: every branch persists its outcome here.
+    notes = stamp_failure_reason_code(status, notes, relation=relation)
     notify_edge_status(
         shell,
         relation=relation,

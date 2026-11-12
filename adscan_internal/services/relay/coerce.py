@@ -18,6 +18,12 @@ from adscan_internal.services.relay.core import RelayRunResult, RelayTarget
 from adscan_internal.services.relay.runner import NativeRelayRunConfig, run_native_relay
 
 
+#: Longest wait for the relay listener to come up before coercing anyway (the
+#: claim on the listener broker is near-instant); past this the coercion runs
+#: and the relay result decides.
+_LISTENER_READY_BUDGET_SECONDS = 30.0
+
+
 @dataclass(frozen=True)
 class NativeCoerceRelayConfig:
     """Configuration for a native coerce-and-relay chain."""
@@ -73,6 +79,21 @@ def _report_callback_outcome(
         print_info_debug(f"callback outcome not recorded: {type(exc).__name__}")
 
 
+def _relay_config_expecting(
+    relay: NativeRelayRunConfig, *hosts: str | None
+) -> NativeRelayRunConfig:
+    """The relay config waiting for the coerced host (unless the caller named one).
+
+    The coerced target is the caller the relay wants: the listener broker routes
+    its connections to the relay and keeps every other caller (a victim of the
+    background poisoning) on the capture, so the two share the port.
+    """
+    if getattr(relay, "expected_sources", ()) or not dataclasses.is_dataclass(relay):
+        return relay
+    expected = tuple(dict.fromkeys(str(h).strip() for h in hosts if str(h or "").strip()))
+    return dataclasses.replace(relay, expected_sources=expected)
+
+
 async def run_native_coerce_and_relay(
     *,
     targets: list[RelayTarget],
@@ -96,15 +117,46 @@ async def run_native_coerce_and_relay(
     # piling stray coerced connections onto the (now idle) listener that each
     # block ~20s waiting for a challenge that will never come.
     relay_success_event = asyncio.Event()
+    listener_ready = asyncio.Event()
     relay_task = asyncio.create_task(
         run_native_relay(
             targets=targets,
-            config=config.relay,
+            config=_relay_config_expecting(
+                config.relay, coercion_target_host, coercion_target_name
+            ),
             success_event=relay_success_event,
+            listener_ready=listener_ready,
         )
     )
     coercion_task: asyncio.Task | None = None
     try:
+        # Coerce only at a live listener: a listener that never started must
+        # not cost a coercion against the target (OPSEC, and a misleading "no
+        # callback" afterwards).
+        ready_wait = asyncio.create_task(listener_ready.wait())
+        try:
+            await asyncio.wait(
+                {relay_task, ready_wait},
+                timeout=_LISTENER_READY_BUDGET_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ready_wait
+        if relay_task.done() and not listener_ready.is_set():
+            relay_result = relay_task.result()
+            if relay_result.listener_error:
+                _report_callback_outcome(
+                    config,
+                    target=coercion_target_name or coercion_target_host,
+                    relay_result=relay_result,
+                )
+                return NativeCoerceRelayResult(
+                    relay_result=relay_result,
+                    coercion_success=False,
+                    coercion_attempts=0,
+                )
         await asyncio.sleep(max(config.listener_ready_delay_seconds, 0.0))
         existing_signal = getattr(config.coercion, "capture_signal", None)
 

@@ -280,7 +280,8 @@ def stamp_scan_end_report_blocks(
         frameworks: The compliance frameworks the scan selected. Empty or
             ``None`` removes any compliance block an earlier run left behind:
             this scan scoped no regime, so a verdict over its findings is one
-            nobody chose.
+            nobody chose. ``["none"]`` (the assessor's "no framework applies")
+            removes it too, and records that decision.
     """
     from adscan_internal.services.report_attack_paths import (  # noqa: PLC0415
         as_report_attack_paths,
@@ -389,9 +390,24 @@ def _stamp_compliance(
     carries no compliance mapping by design; on LITE, or when the scan selected
     no framework, any block an earlier run left is removed instead.
     """
+    from adscan_core.compliance_frameworks import (  # noqa: PLC0415
+        parse_framework_selection,
+    )
+    from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+        record_compliance_decision,
+    )
     from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
 
-    selected = [str(f).strip().lower() for f in (frameworks or []) if str(f).strip()]
+    # "none" is the assessor's decision that no framework applies: nothing is
+    # mapped (the block is cleared below), and the decision itself is recorded
+    # so the web and a later render state it instead of "nothing was chosen".
+    answer = parse_framework_selection(frameworks or [])
+    selected = list(answer.keys)
+    record_compliance_decision(
+        SimpleNamespace(current_workspace_dir=str(workspace_dir)),
+        frameworks=selected,
+        none_declared=answer.none_declared and not selected,
+    )
     stamper = None
     if selected:
         try:

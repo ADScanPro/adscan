@@ -2319,6 +2319,11 @@ def build_group_member_example_resolver(
         return None
     if not isinstance(snapshot, dict) or not snapshot:
         return None
+    from adscan_internal.services.group_member_index import (  # noqa: PLC0415
+        prepared_membership_snapshot,
+    )
+
+    snapshot = prepared_membership_snapshot(snapshot, domain_name) or snapshot
     user_members, computer_members, has_principals = build_group_member_index(
         snapshot, domain_name
     )

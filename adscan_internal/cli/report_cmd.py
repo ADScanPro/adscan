@@ -18,6 +18,7 @@ import argparse
 from typing import Any
 
 from adscan_core import tier
+from adscan_core.compliance_frameworks import framework_keys_text
 from adscan_core.reporting.technical_report import _get_technical_report_path
 from adscan_core.rich_output import print_error
 from adscan_internal.cli.ci import run_generate_report
@@ -163,8 +164,9 @@ def add_report_subparser(
         default=None,
         help=(
             "Comma-separated compliance frameworks to render (PRO only). "
-            "Choices: ens, nis2, iso27001, dora, pci_dss, cis. There is no "
-            "default: required for an audit engagement, omitted otherwise."
+            f"Choices: {framework_keys_text()}, or none when the organisation "
+            "follows none of them. There is no default: required for an audit "
+            "engagement, omitted otherwise."
         ),
     )
     # Mirrors the per-subcommand --debug on start/ci/deliver/execute/doctor.

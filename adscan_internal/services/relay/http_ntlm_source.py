@@ -101,8 +101,9 @@ class HTTPNtlmRelaySource(NativeRelaySource):
     """HTTP listener that drives the SPNEGO/NTLM exchange and queues GSSAPI.
 
     The class follows the same ``NativeRelaySource`` pattern as
-    ``SMBRelaySource``: ``_start_server`` returns a long-running task and
-    ``_bridge_relay_contexts`` (inherited) publishes relay authentications.
+    ``SMBRelaySource``: ``_open_server`` returns the stream handler the listener
+    broker hands each connection to, and ``_bridge_relay_contexts`` (inherited)
+    publishes relay authentications.
     """
 
     protocol = "http-ntlm"
@@ -116,9 +117,8 @@ class HTTPNtlmRelaySource(NativeRelaySource):
     ) -> None:
         super().__init__(config=config, auth_queue=auth_queue)
         self._gssapi_factory = gssapi_factory
-        self._http_server: asyncio.Server | None = None
 
-    async def _start_server(self) -> object:
+    async def _open_server(self):
         from badauth.protocols.ntlm.relay.native import ntlmrelay_factory  # noqa: PLC0415
         from badauth.protocols.spnego.relay.native import (  # noqa: PLC0415
             spnegorelay_ntlm_factory,
@@ -135,19 +135,12 @@ class HTTPNtlmRelaySource(NativeRelaySource):
         ) -> None:
             await self._handle_one_connection(reader, writer, gssapi_factory)
 
-        self._http_server = await asyncio.start_server(
-            _handle_connection,
-            self.config.listen_host,
-            self.config.listen_port,
-        )
         print_info(
             f"HTTP NTLM relay listener ready — "
             f"{self.config.listen_host}:{self.config.listen_port}"
         )
-        # Keep this coroutine alive — it is awaited as the source's server task.
-        async with self._http_server:
-            await self._http_server.serve_forever()
-        return None
+        # No server of its own: the listener broker hands each connection here.
+        return _handle_connection, None
 
     async def _handle_one_connection(
         self,
@@ -172,14 +165,6 @@ class HTTPNtlmRelaySource(NativeRelaySource):
         """Backwards-compat shim — delegate to module-level ``_read_request``."""
 
         return await _read_request(reader)
-
-    async def stop(self) -> None:
-        if self._http_server is not None:
-            self._http_server.close()
-            with contextlib.suppress(Exception):
-                await self._http_server.wait_closed()
-            self._http_server = None
-        await super().stop()
 
 
 def _decode_auth_blob(auth_header: str) -> bytes | None:
@@ -370,11 +355,15 @@ class HTTPNtlmCaptureSource:
     ) -> None:
         self._config = config
         self._capture_queue = capture_queue
-        self._http_server: asyncio.Server | None = None
-        self._serve_task: asyncio.Task[None] | None = None
+        self._claim = None
 
     async def start(self) -> None:
-        """Bind the HTTP listener and start serving."""
+        """Claim the HTTP port from the listener broker as its capture."""
+
+        from adscan_internal.services.listener_broker import (  # noqa: PLC0415
+            ClaimRole,
+            acquire_listener,
+        )
 
         gssapi_factory = self._build_capture_factory()
 
@@ -383,30 +372,25 @@ class HTTPNtlmCaptureSource:
         ) -> None:
             await _drive_ntlm_over_http(reader, writer, gssapi_factory)
 
-        self._http_server = await asyncio.start_server(
-            _handle_connection,
-            self._config.listen_host,
-            self._config.listen_port,
+        self._claim = await acquire_listener(
+            port=self._config.listen_port,
+            consumer_id=f"capture:http@{self._config.listen_host}",
+            handler=_handle_connection,
+            role=ClaimRole.CAPTURE,
+            local_address=self._config.listen_host,
         )
         print_info(
             f"HTTP NTLM capture listener ready — "
             f"{self._config.listen_host}:{self._config.listen_port}"
         )
-        self._serve_task = asyncio.create_task(self._http_server.serve_forever())
 
     async def stop(self) -> None:
-        """Stop the listener (best-effort)."""
+        """Release the port claim (best-effort)."""
 
-        if self._serve_task is not None:
-            self._serve_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._serve_task
-            self._serve_task = None
-        if self._http_server is not None:
-            self._http_server.close()
+        claim, self._claim = self._claim, None
+        if claim is not None:
             with contextlib.suppress(Exception):
-                await self._http_server.wait_closed()
-            self._http_server = None
+                await claim.arelease()
 
     # -- internals ------------------------------------------------------
 

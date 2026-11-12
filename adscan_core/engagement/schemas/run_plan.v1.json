@@ -418,6 +418,17 @@
             "secret_env": {"type": "string", "pattern": "^ADSCAN_[A-Z0-9_]{1,120}$"}
           }
         },
+        "agreed_policy": {
+          "type": "object",
+          "$comment": "The scan policy agreed with the client for the engagement (adscan_core/scan_policy/agreed.py). Disclosure only: the report states whether this run's digest matches it.",
+          "additionalProperties": false,
+          "required": ["digest"],
+          "properties": {
+            "name": {"type": "string", "maxLength": 255},
+            "revision": {"type": "integer", "minimum": 0},
+            "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{1,64}$"}
+          }
+        },
         "checks": {
           "type": "object",
           "$comment": "The scan policy (adscan_core/scan_policy/policy.py parse_policy_definition).",

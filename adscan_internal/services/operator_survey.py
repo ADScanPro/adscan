@@ -112,8 +112,22 @@ ROLE_OPTIONS: tuple[tuple[str, str], ...] = (
 # Emitted under ``role_survey_version: 2`` so v2 answers never mix with the v1
 # ones in an insight. The keys are a superset of the runtime role profile
 # (``operator_role_profile.ROLE_PROFILE_KEYS``).
+#
+# 2026-11-12: ``platform_partner`` added for a platform, PTaaS vendor or MSSP that
+# would embed or resell ADscan in its own service (the /partners door). The
+# consultancy label now says "auditing clients" so the two MSSP readings are told
+# apart by what the firm does: audit a client's AD (PRO) or sell ADscan inside its
+# own service (partner). Additive: the version stamp stays 2, every existing key
+# keeps its meaning, and an operator who already answered is not asked again.
 ROLE_OPTIONS_V2: tuple[tuple[str, str], ...] = (
-    ("consultancy_pentester", "Pentester or red teamer (consultancy, MSSP, freelance)"),
+    (
+        "consultancy_pentester",
+        "Pentester or red teamer auditing clients (consultancy, MSSP, freelance)",
+    ),
+    (
+        "platform_partner",
+        "Platform, PTaaS or MSSP looking to embed or resell ADscan",
+    ),
     ("internal_security", "Pentester or internal security (my own organization)"),
     ("sysadmin_blue_team", "Sysadmin, IT, or blue team"),
     ("security_manager_ciso", "Security manager, CISO, or security lead"),

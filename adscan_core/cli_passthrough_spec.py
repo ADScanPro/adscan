@@ -595,7 +595,11 @@ RECHECK_PASSTHROUGH = PassthroughCommand(
         ),
         PassthroughArg(("--finding",), "A finding key (for example kerberoast) or id.", metavar="KEY|ID"),
         PassthroughArg(("--step",), "An attack step id (8+ characters).", metavar="ID"),
-        PassthroughArg(("--path",), "An attack path id (8+ characters).", metavar="ID"),
+        PassthroughArg(
+            ("--path",),
+            "An attack path id: the id the report prints next to the path (8+ characters).",
+            metavar="ID",
+        ),
         PassthroughArg(("--object",), "With --finding: only this affected object (a SID). Repeatable.",
                        metavar="ID"),
         PassthroughArg(
@@ -609,10 +613,19 @@ RECHECK_PASSTHROUGH = PassthroughCommand(
             choices=("observe", "exercise", "walk"),
         ),
         PassthroughArg(("--walk",), "With --path: same as --depth walk."),
-        PassthroughArg(("--json",), "Print the result document as JSON."),
+        PassthroughArg(
+            ("--username", "-u", "--user"),
+            "Read with this account instead of the workspace's (user, user@domain or DOMAIN\\user). "
+            "This run only; never stored.",
+            metavar="USER",
+        ),
+        PassthroughArg(("--password", "-p"), "Password or NT hash of --username.", metavar="SECRET"),
+        PassthroughArg(("--json",), "Print only the result document, as JSON, on stdout."),
     ),
     examples=(
         "adscan recheck -w Corp-Assessment",
+        "adscan recheck -w Corp-Assessment -u retest.user -p '<password>'",
+        "adscan recheck -w Corp-Assessment --finding kerberoast --json",
         "adscan recheck -w Corp-Assessment --finding kerberoast",
         "adscan recheck -w Corp-Assessment --step 3f9a1c2b7d4e --depth exercise",
         "adscan recheck -w Corp-Assessment --path 8c41d0e95a7b --walk",

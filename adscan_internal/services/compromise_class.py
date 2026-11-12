@@ -2185,19 +2185,36 @@ def compromise_terminus_label(cls: CompromiseClass) -> str:
     return _COMPROMISE_TERMINUS_LABELS.get(cls, "Standard Reach")
 
 
-def compromise_terminus_label_for_key(value: str) -> str:
+#: The domain-breaker terminus for a route that was NOT walked end to end
+#: (partially validated, mapped, attempted). "Domain Compromised" is a past
+#: outcome and may head only a route ADscan executed to the end; a route whose
+#: entry step is proven but which stopped short reaches the domain, it did not
+#: take it (CLAUDE.md, Exposure Validation: partial is never "reached").
+DOMAIN_COMPROMISE_REACHABLE_TERMINUS = "Domain Compromise Reachable"
+
+
+def compromise_terminus_label_for_key(value: str, *, walked_end_to_end: bool = True) -> str:
     """Return the terminus label for a raw ``compromise_class`` string.
 
     Convenience for renderers that carry the class as the plain string stamped
     on a path record rather than the enum. An unknown value falls back to the
     domain-breaker terminus, matching the report's own default for a path whose
     class did not resolve.
+
+    ``walked_end_to_end`` is whether the route was executed to its end (its
+    display status is in the fully-executed set). Only the domain-breaker
+    terminus states an outcome in the past tense, so only it changes: a route
+    that was not walked reads :data:`DOMAIN_COMPROMISE_REACHABLE_TERMINUS`.
     """
     key = (value or "").strip().lower()
+    cls = CompromiseClass.DOMAIN_BREAKER
     for member in CompromiseClass:
         if member.value == key:
-            return compromise_terminus_label(member)
-    return compromise_terminus_label(CompromiseClass.DOMAIN_BREAKER)
+            cls = member
+            break
+    if cls is CompromiseClass.DOMAIN_BREAKER and not walked_end_to_end:
+        return DOMAIN_COMPROMISE_REACHABLE_TERMINUS
+    return compromise_terminus_label(cls)
 
 
 # ---------------------------------------------------------------------------

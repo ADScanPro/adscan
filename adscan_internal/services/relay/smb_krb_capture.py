@@ -8,12 +8,12 @@ running a full SMB stack. The DC sends:
 We respond with valid SMB2 headers to keep the DC happy, extract the security
 blob from SESSION_SETUP, and put it in the asyncio Queue.
 
-Why raw asyncio instead of aiosmb SMBServer:
+Why a raw asyncio stream handler instead of aiosmb SMBServer:
   aiosmb's SMBServer uses UniServer (asysocks) which adds an extra layer of
   connection dispatching. Under load (coercion running concurrently), incoming
-  connections occasionally get lost in the dispatch queue. A raw asyncio.start_server
-  handler is simpler, more reliable, and already confirmed to receive connections
-  from KINGSLANDING in practice.
+  connections occasionally got lost in the dispatch queue. A raw stream handler
+  is simpler and reliable. It binds nothing: the listener broker owns the port
+  and hands this handler the connections from the coerced host.
 """
 
 from __future__ import annotations
@@ -270,6 +270,10 @@ class SMBKrbCaptureConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 445
     timeout_seconds: float = 120.0
+    #: The coerced host(s) whose connections this capture wants (IP or name).
+    #: The listener broker routes them here and every other caller to the
+    #: background capture. Empty means any caller.
+    expected_sources: tuple[str, ...] = ()
 
 
 class SMBKrbCaptureListener:
@@ -293,40 +297,41 @@ class SMBKrbCaptureListener:
     ) -> None:
         self._config = config
         self._queue = capture_queue
-        self._server: asyncio.Server | None = None
+        self._claim = None
 
     async def start(self) -> None:
-        from adscan_internal.services.relay.core import (  # noqa: PLC0415
-            RelayListenerUnavailableError,
+        """Claim the SMB port from the listener broker.
+
+        Raises:
+            RelayListenerUnavailableError: the port could not be served (another
+                process holds it, or the privileged port was refused). The
+                ESC8-KRB and Kerberos coercion callers render it as an honest
+                data gap and continue.
+        """
+        from adscan_internal.services.listener_broker import (  # noqa: PLC0415
+            ClaimRole,
+            acquire_listener,
         )
 
-        try:
-            self._server = await asyncio.start_server(
-                self._handle,
-                self._config.listen_host,
-                self._config.listen_port,
-            )
-        except OSError as exc:
-            # Port already held (e.g. by the poisoning / capture listener). Raise
-            # the typed listener-unavailable error so the ESC8-KRB caller renders
-            # an honest data gap and continues, instead of a raw OSError crash.
-            raise RelayListenerUnavailableError(
-                host=self._config.listen_host,
-                port=self._config.listen_port,
-                reason=str(exc) or "address already in use",
-            ) from exc
+        expected = tuple(item for item in self._config.expected_sources if item)
+        self._claim = await acquire_listener(
+            port=self._config.listen_port,
+            consumer_id=f"capture:smb-krb:{id(self):x}",
+            handler=self._handle,
+            role=ClaimRole.TARGETED if expected else ClaimRole.UNTARGETED,
+            expected_sources=expected,
+            local_address=self._config.listen_host,
+        )
         print_info(
             f"Kerberos relay SMB listener ready — "
             f"{self._config.listen_host}:{self._config.listen_port}"
         )
 
     async def stop(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
-        with contextlib.suppress(Exception):
-            await self._server.wait_closed()
-        self._server = None
+        claim, self._claim = self._claim, None
+        if claim is not None:
+            with contextlib.suppress(Exception):
+                await claim.arelease()
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

@@ -361,6 +361,36 @@ def public_key_b64_from_private_bytes(private_raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def sign_payload(
+    payload: Mapping[str, Any],
+    *,
+    private_key_raw: bytes,
+    key_id: str,
+    format_version: int = FORMAT_VERSION,
+) -> dict[str, Any]:
+    """Sign ``payload`` into a format ``format_version`` envelope.
+
+    The one signing implementation for every document in this envelope: the
+    Enterprise licence and every PRO licence-server document (licences,
+    receipts, notices and the requests an installation signs). It checks only
+    the envelope rules (no decimals, so the canonical bytes are deterministic);
+    each document kind validates its own payload before calling it.
+    """
+    _reject_floats(dict(payload))
+    private_cls, _public_cls, _invalid = _load_ed25519()
+    key = private_cls.from_private_bytes(private_key_raw)
+    signature = key.sign(canonical_payload_bytes(payload))
+    return {
+        "adscan_license": format_version,
+        "payload": dict(payload),
+        "signature": {
+            "alg": SIGNATURE_ALGORITHM,
+            "kid": key_id,
+            "value": base64.b64encode(signature).decode("ascii"),
+        },
+    }
+
+
 def build_license_document(
     payload: Mapping[str, Any], *, private_key_raw: bytes, key_id: str
 ) -> dict[str, Any]:
@@ -371,42 +401,34 @@ def build_license_document(
     the product would reject.
     """
     validated = _validate_payload(payload, key_id=key_id)
-    private_cls, _public_cls, _invalid = _load_ed25519()
-    key = private_cls.from_private_bytes(private_key_raw)
-    signature = key.sign(canonical_payload_bytes(payload))
-    return {
-        "adscan_license": validated.format_version,
-        "payload": dict(payload),
-        "signature": {
-            "alg": SIGNATURE_ALGORITHM,
-            "kid": key_id,
-            "value": base64.b64encode(signature).decode("ascii"),
-        },
-    }
+    return sign_payload(
+        payload,
+        private_key_raw=private_key_raw,
+        key_id=key_id,
+        format_version=validated.format_version,
+    )
 
 
-def parse_license_document(
+def verify_signed_envelope(
     raw: bytes | str,
     *,
-    trusted_keys: Mapping[str, str] | None = None,
-) -> LicensePayload:
-    """Verify a license document and return its payload.
+    trusted_keys: Mapping[str, str],
+    max_bytes: int = MAX_LICENSE_BYTES,
+) -> tuple[dict[str, Any], str]:
+    """Verify a signed envelope and return ``(payload, key_id)``.
 
-    Args:
-        raw: The file content.
-        trusted_keys: Key id -> base64 raw public key. Defaults to
-            :data:`PRODUCTION_PUBLIC_KEYS`. Tests pass their own development
-            key here; there is deliberately no environment variable that adds
-            a key, so a production appliance accepts production keys only.
+    The one signature check for every document in this envelope. It verifies
+    the structure, the format marker inside the signed payload, the algorithm,
+    the key id against ``trusted_keys`` and the signature; it does not judge
+    the payload's content, which each document kind does next.
 
     Raises:
-        LicenseError: malformed, unsigned, signed by an unknown key, or a
+        LicenseError: too large, malformed, signed by an unknown key, or a
             signature that does not match.
     """
-    keys = PRODUCTION_PUBLIC_KEYS if trusted_keys is None else trusted_keys
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
-    if len(raw) > MAX_LICENSE_BYTES:
+    if len(raw) > max_bytes:
         raise LicenseError("too_large", "The license file is too large.")
     try:
         document = json.loads(raw.decode("utf-8"))
@@ -433,7 +455,7 @@ def parse_license_document(
             "malformed", "The license uses an unsupported signature algorithm."
         )
     key_id = str(signature.get("kid") or "")
-    public_b64 = keys.get(key_id)
+    public_b64 = trusted_keys.get(key_id)
     if not public_b64:
         raise LicenseError(
             "unknown_key",
@@ -457,6 +479,29 @@ def parse_license_document(
         ) from exc
     except ValueError as exc:
         raise LicenseError("malformed", "The license signature is unreadable.") from exc
+    return payload, key_id
+
+
+def parse_license_document(
+    raw: bytes | str,
+    *,
+    trusted_keys: Mapping[str, str] | None = None,
+) -> LicensePayload:
+    """Verify a license document and return its payload.
+
+    Args:
+        raw: The file content.
+        trusted_keys: Key id -> base64 raw public key. Defaults to
+            :data:`PRODUCTION_PUBLIC_KEYS`. Tests pass their own development
+            key here; there is deliberately no environment variable that adds
+            a key, so a production appliance accepts production keys only.
+
+    Raises:
+        LicenseError: malformed, unsigned, signed by an unknown key, or a
+            signature that does not match.
+    """
+    keys = PRODUCTION_PUBLIC_KEYS if trusted_keys is None else trusted_keys
+    payload, key_id = verify_signed_envelope(raw, trusted_keys=keys)
     return _validate_payload(payload, key_id=key_id)
 
 
@@ -1107,4 +1152,6 @@ __all__ = [
     "record_engine_info",
     "record_last_seen",
     "scan_launch_status",
+    "sign_payload",
+    "verify_signed_envelope",
 ]

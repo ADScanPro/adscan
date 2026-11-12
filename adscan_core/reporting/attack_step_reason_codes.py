@@ -61,8 +61,22 @@ class ReasonCode(str, Enum):
     NO_RELAY_TARGET = "no_relay_target"
     #: A coercion request was sent, but the target never authenticated back.
     COERCION_NO_CALLBACK = "coercion_no_callback"
+    #: The scanning host could not open the local listener the step needs (a
+    #: relay or capture port already in use on the host, or refused to it), so
+    #: the target was never asked to authenticate. A limit of the assessment
+    #: host: it says nothing about the environment and never credits a control.
+    LISTENER_UNAVAILABLE = "listener_unavailable"
     #: This step is not automated and was not executed in this run.
     NOT_AUTOMATED = "not_automated"
+    #: Something the step needs before it can act (a target account, the data
+    #: that addresses the target) was not available in this run.
+    PRECONDITION_MISSING = "precondition_missing"
+    #: The step ran and did not complete, and nothing the scan recorded states
+    #: the cause with certainty. The neutral category: it never guesses a cause
+    #: and never credits a defensive control (Exposure-Validation doctrine).
+    #: Every attempted step that no other category explains carries this one,
+    #: so no attempted step reaches a client without a reason.
+    CAUSE_NOT_RECORDED = "cause_not_recorded"
 
 
 #: Client-facing note for each reason code, worded once here and read by every
@@ -90,9 +104,22 @@ _REASON_CODE_NOTES: dict[str, str] = {
     ReasonCode.COERCION_NO_CALLBACK.value: (
         "The coercion request was sent, but the target never authenticated back."
     ),
+    ReasonCode.LISTENER_UNAVAILABLE.value: (
+        "The scanning host could not open the listener this step needs, so the "
+        "target was never asked to authenticate. This is a limit of the "
+        "assessment host, not a finding about the environment."
+    ),
     ReasonCode.NOT_AUTOMATED.value: (
         "This step is not automated and was not run; the manual command above "
         "validates it by hand."
+    ),
+    ReasonCode.PRECONDITION_MISSING.value: (
+        "Something the step needs before it can act was not available in this "
+        "run, so it stopped before acting on the target."
+    ),
+    ReasonCode.CAUSE_NOT_RECORDED.value: (
+        "The step was run and did not complete. The scan recorded no cause it "
+        "can state with certainty."
     ),
 }
 

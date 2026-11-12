@@ -4980,3 +4980,11 @@ def compute_display_paths_with_fallback(
             examined_routes=exc.examined_routes,
             exposure_source_count=exposure_source_count,
         )
+
+
+# Let dependency-light readers of memberships.json (the affected-assets member
+# resolver) prepare a raw snapshot with the engine's own normaliser. See
+# ``group_member_index.set_membership_snapshot_preparer``.
+from adscan_internal.services import group_member_index as _group_member_index  # noqa: E402
+
+_group_member_index.set_membership_snapshot_preparer(prepare_membership_snapshot)

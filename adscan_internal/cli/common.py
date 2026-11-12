@@ -18,9 +18,11 @@ from adscan_core.lab_context import (
     build_workspace_telemetry_fields,
     scan_policy_base_of,
 )
-from adscan_core.reporting.framework_provenance import (
-    framework_display_name,
-    framework_version,
+from adscan_core.compliance_frameworks import (
+    COMPLIANCE_FRAMEWORKS,
+    FRAMEWORK_KEYS,
+    framework_selection_error,
+    parse_framework_selection,
 )
 from adscan_core.paths import get_workspaces_dir
 from adscan_internal.path_utils import get_adscan_state_dir
@@ -54,31 +56,15 @@ from adscan_core.rich_output import print_exception
 # ``_VALID_FRAMEWORK_KEYS`` are unaffected — same names, new home).
 # ---------------------------------------------------------------------------
 
-# ENS and NIS2 are DISTINCT compliance regimes (ENS = Spanish public sector /
-# CCN-CERT; NIS2 = EU critical-infrastructure directive) and are selectable
-# independently — a client may need NIS2 but not ENS. They share findings/
-# attack-path semantics, which is modularized in the content layer, not by
-# collapsing them into one key.
+# The framework list is the registry in ``adscan_core.compliance_frameworks``:
+# keys, order, menu labels (versioned through the provenance record) and the
+# "not a regulation" framing of CIS all come from there, so this module and the
+# web, the scan phases, the report engine and the help text cannot disagree.
+# ENS and NIS2 stay DISTINCT, independently selectable regimes.
 _FRAMEWORK_KEY_MAP: dict[str, str] = {
-    # No category in the label: the ENS category belongs to the SYSTEM (RD
-    # 311/2022 art. 40.1), is derived from the client's own declared dimension
-    # levels, and is resolved per workspace by the declared-scope machinery in
-    # ``adscan_core.reporting.ens_applicability``.
-    # The versioned part of every label comes from the provenance record, so a
-    # new edition renames the menu entry by the same edit that renames the
-    # report section.
-    "ENS — Spain / CCN-CERT (recommended)": "ens",
-    "NIS2 — EU Directive (EU) 2022/2555 (critical infrastructure)": "nis2",
-    f"{framework_display_name('iso27001')} — International ISMS standard": "iso27001",
-    "DORA — EU 2022/2554 (financial sector)": "dora",
-    f"{framework_display_name('pci_dss')} — Payment Card Industry": "pci_dss",
-    # CIS is technical hardening config best-practice, NOT a regulation — the
-    # label says so explicitly so the operator never confuses it with a legal
-    # obligation (see the compliance report's non-regulatory framing).
-    f"{framework_display_name('cis')} v{framework_version('cis')}"
-    " — technical hardening (not a regulation)": "cis",
+    framework.menu_label: framework.key for framework in COMPLIANCE_FRAMEWORKS
 }
-_VALID_FRAMEWORK_KEYS: tuple[str, ...] = tuple(_FRAMEWORK_KEY_MAP.values())
+_VALID_FRAMEWORK_KEYS: tuple[str, ...] = FRAMEWORK_KEYS
 
 
 def log_into_workspace(workspace_dir: Path | None) -> bool:
@@ -162,32 +148,24 @@ def _parse_frameworks(raw: str | None) -> list[str] | None:
 
     Returns:
         Canonicalised list of framework keys (preserving caller order, no
-        duplicates) when ``raw`` is a non-empty valid input. ``None`` when
-        the flag was not provided — caller should then prompt or default.
+        duplicates) when ``raw`` names frameworks; ``["none"]`` when it is the
+        explicit "no compliance framework applies" answer; ``None`` when the
+        flag was not provided, so the caller prompts or applies the
+        requiredness gate. The ``"none"`` token is resolved into a decision by
+        ``services/compliance_scope.resolve_compliance_scope``.
 
     Raises:
-        ValueError: Any token is not a known framework key. The message
-            names the bad token and the allowed set so the operator can
-            self-correct without reading source.
+        ValueError: Any token is not a known framework key, or ``none`` was
+            combined with a framework. The message names the bad token and the
+            allowed set so the operator can self-correct without reading source.
     """
     if raw is None or not raw.strip():
         return None
-    tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        return None
-    invalid = [tok for tok in tokens if tok not in _VALID_FRAMEWORK_KEYS]
-    if invalid:
-        raise ValueError(
-            f"--frameworks: unknown value(s): {', '.join(invalid)}. "
-            f"Use one of: {', '.join(_VALID_FRAMEWORK_KEYS)}."
-        )
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for tok in tokens:
-        if tok not in seen:
-            seen.add(tok)
-            ordered.append(tok)
-    return ordered
+    selection = parse_framework_selection(raw.split(","))
+    error = framework_selection_error(selection)
+    if error:
+        raise ValueError(error)
+    return selection.as_tokens() or None
 
 _WORKSPACE_ONBOARDING_KEY = "workspace_onboarding"
 _WORKSPACE_SCAN_STARTED_KEY = "start_scan_completed"

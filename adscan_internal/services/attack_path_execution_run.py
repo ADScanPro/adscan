@@ -60,12 +60,22 @@ from adscan_core.reporting.attack_path_execution_events import (
     STAGE_RUN_STARTED,
     STAGE_STEP_FINISHED,
     STAGE_STEP_STARTED,
+    declined_explanation,
+    declined_reason,
     not_needed_explanation,
     not_needed_reason,
     outcome_from_status,
     summarize_run_result,
 )
-from adscan_core.reporting.execution_failure_explanations import failure_view
+from adscan_core.reporting.attack_step_reason_codes import (
+    ReasonCode,
+    normalize_reason_code,
+)
+from adscan_core.reporting.execution_failure_explanations import (
+    failure_view,
+    is_attempted_step_status,
+    resolve_step_failure_reason,
+)
 from adscan_core.path_offer import display_label
 from adscan_core.sensitive import strip_sensitive_markers
 from adscan_core.theme import (
@@ -74,7 +84,7 @@ from adscan_core.theme import (
     COLOR_MUTED,
     COLOR_SAGE,
 )
-from adscan_internal import print_info_debug, telemetry
+from adscan_internal import print_exception, print_info_debug, telemetry
 from adscan_internal.rich_output import mark_sensitive, print_panel
 
 _ACTIVE_RUN_ATTR = "_attack_path_execution_run"
@@ -380,6 +390,9 @@ class AttackPathExecutionRun:
         self._finished = False
         self._outcomes: dict[int, str] = {}
         self._explanations: dict[int, dict[str, str]] = {}
+        # Attempted steps no reason category explains, with the sanitized shape
+        # of their cause: the measurement that drives the next mappings.
+        self._unexplained: list[dict[str, Any]] = []
         # Per-run order of emission. The host wall clock can be stepped to the
         # domain controller mid-run, so timestamps are not a reliable order.
         self._seq = 0
@@ -676,6 +689,9 @@ class AttackPathExecutionRun:
                 breaking,
                 not_needed=not_needed,
             ),
+            # Internal measurement (sanitized, never rendered to a client): the
+            # attempted steps whose cause no reason category explains yet.
+            "unexplained_attempted": [dict(item) for item in self._unexplained],
         }
         self._emit(STAGE_RUN_FINISHED, summary["headline"], summary)
         if self._render:
@@ -770,6 +786,12 @@ class AttackPathExecutionRun:
             # The scan policy kept the step off: a choice, not a failure.
             outcome = OUTCOME_SKIPPED
             explanation = _scan_policy_explanation(self.shell, step, notes)
+        elif _declined_before_acting(state):
+            # Declined before any write because the change could not be shown
+            # to be undoable (``reversal_not_proven`` / ``revert_not_permitted``):
+            # nothing was attempted, so it is never an unexplained attempt.
+            outcome = OUTCOME_SKIPPED
+            explanation = declined_explanation(declined_reason(notes, state.reasons))
         elif state.error is not None:
             outcome = OUTCOME_ATTEMPTED
             explanation = failure_view(state.error, *state.reasons)
@@ -823,6 +845,13 @@ class AttackPathExecutionRun:
                         if readable
                         else dict(_UNRECORDED_ENDING)
                     )
+        actor = state.actor or acting_principal_from_notes(notes)
+        target_host = state.target_host or str(notes.get("target_host") or "")
+        cause_signature = ""
+        if outcome == OUTCOME_ATTEMPTED:
+            explanation, cause_signature = self._classify_attempted(
+                step, state, explanation, actor=actor, target_host=target_host
+            )
         self._outcomes[index] = outcome
         self._explanations[index] = explanation
         duration_ms = (
@@ -830,8 +859,6 @@ class AttackPathExecutionRun:
             if state.started_at is not None
             else None
         )
-        actor = state.actor or acting_principal_from_notes(notes)
-        target_host = state.target_host or str(notes.get("target_host") or "")
         self._emit_step_finished(
             step,
             outcome,
@@ -839,6 +866,7 @@ class AttackPathExecutionRun:
             duration_ms=duration_ms,
             actor=actor,
             target_host=target_host,
+            cause_signature=cause_signature,
         )
         if self._render and outcome != OUTCOME_NOT_REACHED:
             _render_step_outcome(step, outcome, explanation, duration_ms)
@@ -854,21 +882,132 @@ class AttackPathExecutionRun:
         duration_ms: int | None,
         actor: str,
         target_host: str,
+        cause_signature: str = "",
     ) -> None:
         self._outcomes[step.index] = outcome
+        payload: dict[str, Any] = {
+            "step_index": step.index,
+            "position": self._position(step.index),
+            "outcome": outcome,
+            "explanation": explanation or None,
+            "duration_ms": duration_ms,
+            "actor": actor or None,
+            "target_host": target_host or None,
+        }
+        if cause_signature:
+            # Internal measurement only (sanitized): the raw shape of a cause
+            # no reason category explains yet. Never rendered to a client.
+            payload["unexplained_cause"] = cause_signature
         self._emit(
             STAGE_STEP_FINISHED,
             f"{step.technique} ({OUTCOME_LABELS.get(outcome, outcome).lower()}).",
+            payload,
+        )
+
+    def _classify_attempted(
+        self,
+        step: PlanStep,
+        state: "_StepState",
+        explanation: dict[str, str],
+        *,
+        actor: str,
+        target_host: str,
+    ) -> tuple[dict[str, str], str]:
+        """Give an attempted step its reason category, and measure the unexplained.
+
+        Every attempted step leaves here with a valid ``reason_code`` on its
+        explanation (the run view, the reports and the web read the same
+        category). A cause the resolver explains only through what this run
+        observed (an exception, a reason a branch attached to an event) is
+        written back to the edge, so the deliverable states it too. A cause no
+        category explains is counted: in the run record, in telemetry and in
+        the debug log, as a sanitized signature.
+        """
+        notes = state.status_notes
+        status = state.status if is_attempted_step_status(state.status) else "attempted"
+        reason = resolve_step_failure_reason(
+            status,
+            notes,
+            relation=step.relation,
+            sources=[value for value in (state.error, *state.reasons) if value],
+            known_identifiers=(
+                step.from_label,
+                step.to_label,
+                actor,
+                target_host,
+                notes.get("username"),
+                notes.get("target"),
+                notes.get("user"),
+            ),
+        )
+        if reason is None:  # pragma: no cover - status is attempted by construction
+            return explanation, ""
+        view = dict(explanation or {})
+        explained_by_view = normalize_reason_code(view.get("reason_code"))
+        if explained_by_view == ReasonCode.CAUSE_NOT_RECORDED.value:
+            explained_by_view = ""
+        if not explained_by_view:
+            view["reason_code"] = reason.reason_code
+            if reason.mapped and view.get("headline") == _UNRECORDED_ENDING["headline"]:
+                view.update(
+                    {"code": reason.code, "headline": reason.client_note, "detail": ""}
+                )
+        for key in ("code", "reason_code", "headline", "detail", "next_step"):
+            view.setdefault(key, "")
+        edge_code = reason.reason_code if reason.mapped else explained_by_view
+        if edge_code:
+            self._persist_reason_code(step, state, edge_code)
+            return view, ""
+        signature = reason.cause_signature or "no_cause_recorded"
+        self._unexplained.append(
             {
                 "step_index": step.index,
-                "position": self._position(step.index),
-                "outcome": outcome,
-                "explanation": explanation or None,
-                "duration_ms": duration_ms,
-                "actor": actor or None,
-                "target_host": target_host or None,
-            },
+                "relation": step.relation,
+                "status": status,
+                "cause_signature": signature,
+            }
         )
+        print_info_debug(
+            "attack_paths unexplained step failure: "
+            f"relation={step.relation} status={status} "
+            f"cause={mark_sensitive(signature, 'detail')}"
+        )
+        try:
+            telemetry.capture(
+                "attack_step_unexplained_failure",
+                {
+                    "relation": step.relation,
+                    "step_status": status,
+                    "cause_signature": signature,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - measurement never breaks a run
+            telemetry.capture_exception(exc)
+        return view, signature
+
+    def _persist_reason_code(self, step: PlanStep, state: "_StepState", code: str) -> None:
+        """Write a cause the run observed onto the step's edge, best-effort."""
+        if not is_attempted_step_status(state.status):
+            return
+        if normalize_reason_code(state.status_notes.get("reason_code")) == code:
+            return
+        try:
+            from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+                update_edge_status_by_labels,
+            )
+
+            update_edge_status_by_labels(
+                self.shell,
+                self.domain,
+                from_label=step.from_label,
+                relation=step.relation,
+                to_label=step.to_label,
+                status=state.status,
+                notes={"reason_code": code},
+            )
+        except Exception as exc:  # noqa: BLE001 - never alter the execution flow
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     def _record_step_gate_refusal(self, step: PlanStep) -> Any:
         """Record why this step and the rest of the route did not run.
@@ -1062,6 +1201,16 @@ def acting_principal_from_notes(notes: dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _declined_before_acting(state: "_StepState") -> bool:
+    """A step declined before acting, whose latest write did not prove or attempt it."""
+    if not declined_reason(state.status_notes, state.reasons):
+        return False
+    return outcome_from_status(state.status, state.status_notes) not in (
+        OUTCOME_SUCCESS,
+        OUTCOME_ATTEMPTED,
+    )
 
 
 def _excluded_by_scan_policy(notes: dict[str, Any], reasons: list[str]) -> bool:

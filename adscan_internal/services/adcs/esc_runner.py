@@ -27,8 +27,26 @@ from adscan_internal.services.adcs.esc_principal_write import run_esc9, run_esc1
 from adscan_internal.services.adcs.esc_relay import run_esc8, run_esc8_krb, run_esc11
 
 
+async def _reversal_refusal(config: EscConfig, technique: str) -> EscResult | None:
+    """Decline before the flow's first write when nobody can revoke here (§ 5.1).
+
+    Every ESC below requests a certificate; several write something first (a
+    template, a UPN, a CA right). Asking here keeps all of that from happening for
+    a certificate ADscan could not revoke. The enrollment seam asks again as the
+    backstop.
+    """
+    from adscan_internal.services.adcs.reversal_capability import (  # noqa: PLC0415
+        esc_reversal_refusal,
+    )
+
+    return await esc_reversal_refusal(config, technique=technique, surface="esc_runner")
+
+
 async def run_esc(config: EscConfig) -> EscResult:
     """Run the appropriate ESC exploitation flow after showing the pre-flight panel."""
+    declined = await _reversal_refusal(config, f"ADCSESC{config.esc}")
+    if declined is not None:
+        return declined
     steps = build_esc_steps(config)
     if not print_esc_preflight(config, steps):
         return EscResult(success=False, esc=config.esc, error="Aborted by user")
@@ -92,6 +110,9 @@ async def run_esc15_confirm(
     actual proof runs through ``confirm_esc15_vulnerable``; the full ``run_esc15``
     exploit is untouched and stays the default via ``run_esc``.
     """
+    declined = await _reversal_refusal(config, "ADCSESC15")
+    if declined is not None:
+        return declined
     steps = build_esc15_confirm_steps(config)
     if not print_esc_preflight(config, steps, title_override=_ESC15_CONFIRM_TITLE):
         return EscResult(success=False, esc=15, error="Aborted by user")
@@ -114,6 +135,9 @@ async def run_esc15_schannel_flow(config: EscConfig) -> EscResult:
     certificate and grants DCSync — showing the method-A steps (cert request,
     Schannel LDAPS bind, DCSync grant), then runs ``run_esc15_schannel``.
     """
+    declined = await _reversal_refusal(config, "ADCSESC15")
+    if declined is not None:
+        return declined
     steps = build_esc15_schannel_steps(config)
     if not print_esc_preflight(config, steps, title_override=_ESC15_SCHANNEL_TITLE):
         return EscResult(success=False, esc=15, error="Aborted by user")

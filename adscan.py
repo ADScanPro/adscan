@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # pylint: disable=unexpected-keyword-arg
+from adscan_core.async_bridge import run_on_new_loop
+from adscan_core.domain_auth_state import is_authenticated_state
+from adscan_core.scan_control import ScanAbortRequested
 from adscan_internal.rich_output import (
     mark_passthrough,
     mark_sensitive,
@@ -4372,7 +4375,23 @@ def _maybe_show_report_cta(shell) -> None:
     # demo — continuous validation + a board/auditor report — not the /pro CLI they
     # would run themselves. A consultant / unknown role stays on /pro (the light,
     # safe default; the Enterprise lane is only offered on a positive buyer signal).
-    from adscan_internal.services.operator_role_cta import is_enterprise_lane
+    from adscan_internal.services.operator_role_cta import (
+        CtaLane,
+        is_enterprise_lane,
+        resolve_cta_lane,
+    )
+
+    _summary_lane = resolve_cta_lane()
+    if _summary_lane is CtaLane.LEARN:
+        # A learner gets no sales ask; the session output is the lesson.
+        return
+    if _summary_lane is CtaLane.PARTNER:
+        _partner_url = mark_passthrough(cta_display_url("session_summary_partner"))
+        print_info(
+            "To deliver this from your own platform or service, ADscan runs inside "
+            f"it under partner terms → {_partner_url}"
+        )
+        return
 
     if is_enterprise_lane():
         _demo_url = mark_passthrough(cta_display_url("session_summary_enterprise_demo"))
@@ -10730,7 +10749,10 @@ class PentestShell:
         )
         if not hasattr(self, "domains_data") or self.domains_data is None:
             self.domains_data = CaseInsensitiveDict()
-        signal.signal(signal.SIGINT, self.signal_handler)  # Keep custom signal handling
+        # Ctrl+C goes through the scan control plane first (operator menu during
+        # a scan, cancel the command otherwise); only an unattended run without
+        # a scan in progress falls back to the graceful shutdown.
+        signal.signal(signal.SIGINT, self._sigint_handler)
         for optional_sig in ("SIGHUP", "SIGTERM"):
             if hasattr(signal, optional_sig):
                 try:
@@ -12026,6 +12048,19 @@ class PentestShell:
         """Queues an instruction message for printing."""
         # Instructions typically don't have prefixes like [+] or [-]
         self.queued_print(f"   {message.strip()}", style="dim")
+
+    def _sigint_handler(self, signum, frame):
+        """SIGINT policy: the scan control plane decides, shutdown is the fallback.
+
+        Interactive: Ctrl+C during a scan opens the operator menu (stop this
+        step, skip the phase, stop the scan, keep going); outside a scan it
+        cancels the running command and returns to the prompt. The CLI never
+        exits on Ctrl+C. Unattended (``adscan ci``): the first SIGINT stops the
+        scan cleanly, a second one runs the graceful shutdown below.
+        """
+        from adscan_core.scan_control.interrupts import handle_sigint
+
+        handle_sigint(signum, frame, fallback=self.signal_handler)
 
     def signal_handler(self, _signum, _frame):
         """Handles the interrupt signal (Ctrl+C) gracefully."""
@@ -14543,8 +14578,11 @@ class PentestShell:
         # self.console.print(self._get_rich_prompt_object(), end="") # The prompt is now part of session.prompt
 
         while True:
-            self.check_background_tasks()
             try:
+                # Inside the try: a Ctrl+C that lands while background results
+                # render cancels the render, never the session (the CLI exits
+                # only through `exit`).
+                self.check_background_tasks()
                 # >>> START OF MODIFICATION <<<
                 should_skip_prompt_this_iteration = False
                 with self.prompt_interaction_lock:
@@ -14873,6 +14911,12 @@ class PentestShell:
                 )
                 print_warning("\nKeyboardInterrupt. Type 'exit' or 'quit' to exit.")
                 # Optionally, add a small delay or a clear visual break
+                continue
+            except ScanAbortRequested:
+                # A command stopped from the Ctrl+C menu ("stop this command and
+                # return to the prompt"): its finally blocks ran, results so far
+                # are kept, and the session goes on.
+                print_info("Command stopped. Results found so far are kept.")
                 continue
             except EOFError:
                 _log_interrupt_debug(kind="eof", source="pentestshell.prompt_loop")
@@ -15453,10 +15497,12 @@ class PentestShell:
     def do_cleanup_credential(self, args):
         """Manage the client's cleanup-only account saved in this workspace.
 
-        Usage: cleanup_credential set [<domain>] | show | clear [<domain>|all]
+        Usage: cleanup_credential set [<domain>] | show | check | clear [<domain>|all]
             set     Save the account your client provided to undo ADscan's
                     changes (the secret is asked for at a masked prompt).
             show    List the cleanup accounts available, never the secret.
+            check   Check, read-only, what the account can undo in each
+                    in-scope forest, domain and certification authority.
             clear   Remove the saved account for a domain, or every one.
 
         ADscan tries this account first when it undoes its own changes and never
@@ -17314,6 +17360,12 @@ class PentestShell:
         from adscan_internal.services.scan_phases import (
             SCAN_PHASES as _SCAN_PHASES_REG,
         )
+        from adscan_core.scan_control import scan_control as _scan_control
+
+        def _step_control_id(step_name: str) -> str:
+            """Stable machine id of a pipeline step, for the scan control plane."""
+            return re.sub(r"[^a-z0-9]+", "_", str(step_name).lower()).strip("_") or "step"
+
         from adscan_internal.services.scan_timeline import (
             phase_span as _phase_span,
         )
@@ -17370,6 +17422,13 @@ class PentestShell:
         def _enter_phase(title: str) -> None:
             """Render the chapter for ``title`` and open a fresh timeline span."""
             _close_active_phase()
+            # Scan control boundary: an operator "stop the scan" is honoured
+            # here, and a "skip the rest of the phase" aimed at the previous
+            # phase ends with it.
+            _entering = next((p for p in _SCAN_PHASES_REG if p.title == title), None)
+            _scan_control().enter_phase(
+                _entering.phase_id if _entering is not None else "", domain=domain
+            )
             # Phase-2d: at a loop-free boundary (previous phase's asyncio.run has
             # returned), surface any NEW Tier 0 / path-to-Tier-0 background crack
             # BEFORE announcing the next phase, so a DA captured mid-scan is not
@@ -17424,6 +17483,21 @@ class PentestShell:
                 ``_StepOutcome.STOP_OBJECTIVE_MET`` when the domain is owned in CTF
                 mode and the remaining phases are deliberately skipped.
             """
+            # Scan control boundary: an operator "stop the scan" is honoured
+            # before the step starts, and the remaining steps of a phase the
+            # operator skipped are not run.
+            _control = _scan_control()
+            _control.checkpoint()
+            if _control.phase_skip_active():
+                print_step_status(
+                    step_name,
+                    status="skipped",
+                    step_number=step_number,
+                    total_steps=total_steps,
+                    details="Skipped by the operator",
+                )
+                return _StepOutcome.CONTINUE
+
             # If we were compromised asynchronously (e.g. by another pipeline), stop
             # without printing additional "Running/Completed" noise in CTF mode.
             # Cross-domain escalation first, and do not stop while one is pending.
@@ -17449,12 +17523,17 @@ class PentestShell:
             )
             try:
                 self._enter_enumeration_context()
-                step_fn()
+                with _control.step(
+                    _step_control_id(step_name), label=step_name, domain=domain
+                ):
+                    step_fn()
+                _cut_short = _control.phase_was_stopped(_current_phase_id[0] or "")
                 print_step_status(
                     step_name,
                     status="completed",
                     step_number=step_number,
                     total_steps=total_steps,
+                    details="Stopped early by the operator" if _cut_short else None,
                 )
             except Exception as e:
                 telemetry.capture_exception(e)
@@ -17564,6 +17643,10 @@ class PentestShell:
             return _scan_progress.phase_already_complete(self, domain, phase_id)
 
         def _mark_done(phase_id: str) -> None:
+            # A phase the operator cut short is not complete: it stays open for a
+            # resume, and the gap recorder already marked it incomplete.
+            if _scan_control().phase_was_stopped(phase_id):
+                return
             if _manage_progress:
                 _scan_progress.mark_phase_complete(self, domain, phase_id)
 
@@ -18077,13 +18160,38 @@ class PentestShell:
             if not _tier_cta.is_pro() and should_show_victory_hint(
                 "scan_complete_report", "subtle"
             ):
-                _pro_url = mark_passthrough(cta_display_url("scan_complete_paths"))
-                self.console.print()
-                print_info(
-                    f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold] — PRO turns them into a "
-                    f"client-ready PDF (exec summary, attack chains, compliance mapping) "
-                    f"in 90 seconds → {_pro_url}"
+                # Routed by the operator's role like every peak-value CTA
+                # (CLAUDE.md § "Commercial CTA is ROLE- and OS-aware"). The
+                # learning lane carries no sales ask here, so it prints nothing.
+                from adscan_core.operator_role import CtaLane, resolve_cta_lane
+                from adscan_core.outbound_links import cta_placement_for_lane
+
+                _paths_lane = resolve_cta_lane()
+                _paths_placement = cta_placement_for_lane(
+                    _paths_lane, surface="scan_complete_paths"
                 )
+                if _paths_placement is not None:
+                    _paths_url = mark_passthrough(cta_display_url(_paths_placement))
+                    if _paths_lane is CtaLane.ENTERPRISE:
+                        _paths_hint = (
+                            f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold] in "
+                            f"your own AD. ADscan Enterprise re-checks them continuously "
+                            f"and reports for your board and auditors → {_paths_url}"
+                        )
+                    elif _paths_lane is CtaLane.PARTNER:
+                        _paths_hint = (
+                            f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold]. "
+                            f"To deliver this from your own platform or service, ADscan "
+                            f"runs inside it under partner terms → {_paths_url}"
+                        )
+                    else:
+                        _paths_hint = (
+                            f"💡 Found [bold]{_ap_verdict.total} attack path(s)[/bold] — PRO turns them into a "
+                            f"client-ready PDF (exec summary, attack chains, compliance mapping) "
+                            f"in 90 seconds → {_paths_url}"
+                        )
+                    self.console.print()
+                    print_info(_paths_hint)
                 mark_victory_hint_shown("scan_complete_report")
             # A soft give:ask at the peak-value moment: ADscan just walked the
             # domain to compromise, so this is where an operator is most open to
@@ -18097,7 +18205,13 @@ class PentestShell:
                     is_non_interactive as _is_non_interactive,
                 )
 
-                if not _is_non_interactive(self):
+                # "walked your domain to compromise" is a claim about the domain
+                # itself: an exploited foothold route alone (a session on a DC,
+                # control pending) must not trigger it.
+                if (
+                    not _is_non_interactive(self)
+                    and _ap_verdict.proves_domain_compromise
+                ):
                     from adscan_core import first_run_notices  # noqa: PLC0415
 
                     if first_run_notices.should_show_once(
@@ -18837,7 +18951,6 @@ class PentestShell:
         # discovered creds via add_credential). Idempotent: no-op when posture
         # is already fresh in this session.
         try:
-            import asyncio as _asyncio
 
             from adscan_internal.services.posture_orchestration import (
                 ensure_posture_fresh,
@@ -18848,7 +18961,7 @@ class PentestShell:
             if pdc_for_probe:
                 creds_for_probe = self._build_probe_credentials(domain)
                 if creds_for_probe is not None:
-                    _asyncio.run(
+                    run_on_new_loop(
                         ensure_posture_fresh(
                             self,
                             domain=domain,
@@ -21308,7 +21421,7 @@ class PentestShell:
         manspider_bin = shlex.quote(str(self.manspider_path))
         hosts_str = " ".join(shlex.quote(str(host)) for host in hosts)
         exclusion_args = build_manspider_exclusion_args()
-        if self.domains_data[target_domain]["auth"] == "auth":
+        if is_authenticated_state(self.domains_data[target_domain]["auth"]):
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
             )
@@ -21414,7 +21527,7 @@ class PentestShell:
             ]
         )
         extensions_arg = " ".join(shlex.quote(str(ext)) for ext in selected_extensions)
-        if self.domains_data[target_domain]["auth"] == "auth":
+        if is_authenticated_state(self.domains_data[target_domain]["auth"]):
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
             )
@@ -21516,7 +21629,7 @@ class PentestShell:
             if isinstance(max_file_size_bytes, int) and max_file_size_bytes > 0:
                 max_file_size_mb = max(1, int(max_file_size_bytes // (1024 * 1024)))
                 max_filesize_arg = f"--max-filesize {max_file_size_mb}M "
-        if self.domains_data[target_domain]["auth"] == "auth":
+        if is_authenticated_state(self.domains_data[target_domain]["auth"]):
             auth = self.build_auth_nxc(
                 username, password, target_domain, kerberos=False
             )
@@ -27529,7 +27642,6 @@ class PentestShell:
         Example:
             paths_execute north.sevenkingdoms.local 1 2
         """
-        import asyncio  # noqa: PLC0415
         from adscan_core import telemetry  # noqa: PLC0415
         from adscan_internal.cli.attack_graph_reports import (  # noqa: PLC0415
             _resolve_attack_paths_compute_cap,
@@ -27593,7 +27705,7 @@ class PentestShell:
             return
 
         try:
-            asyncio.run(
+            run_on_new_loop(
                 render_paths_execute(
                     shell=self,
                     console=self.console,
@@ -28997,7 +29109,8 @@ class PentestShell:
         Args:
             args (str): Optional profile and frameworks.
                        Profile: "full" (default), "technical", or "executive"
-                       Frameworks (optional, comma-separated): ens, iso27001, dora
+                       Frameworks (optional, comma-separated): any keys from
+                       adscan_core.compliance_frameworks.FRAMEWORK_KEYS
                        Example: "generate_report"
                                 "generate_report technical"
                                 "generate_report technical ens,iso27001,dora"
@@ -29062,7 +29175,6 @@ class PentestShell:
         # gate (an audit engagement refuses to render a conformance verdict the
         # operator never scoped; a ctf workspace renders with none).
         from adscan_internal.cli.common import (
-            _FRAMEWORK_KEY_MAP,
             _parse_frameworks,
         )
 
@@ -29079,15 +29191,38 @@ class PentestShell:
             # A lab has no regulatory regime, so do not ask.
             frameworks_arg = []
         else:
-            selected_labels = self._questionary_checkbox(
-                "Select compliance frameworks to include in the report:",
-                list(_FRAMEWORK_KEY_MAP.keys()),
+            # Same prompt as ``deliver``: an audit engagement requires a
+            # framework, so an empty answer is explained and asked again here
+            # instead of failing after the remaining prompts.
+            from adscan_internal.services.compliance_scope import (
+                FrameworkSelectionCancelled,
+                frameworks_are_required,
+                prompt_frameworks,
+                resolve_engagement_type,
             )
-            frameworks_arg = [
-                _FRAMEWORK_KEY_MAP[label]
-                for label in (selected_labels or [])
-                if label in _FRAMEWORK_KEY_MAP
-            ]
+
+            _workspace_dir = getattr(self, "current_workspace_dir", None)
+            _fw_required = frameworks_are_required(
+                resolve_engagement_type(shell=self, workspace_dir=_workspace_dir)
+            )
+            try:
+                frameworks_arg = prompt_frameworks(
+                    required=_fw_required,
+                    # Required: the shared title says so. Optional: the verb's own.
+                    title=(
+                        None
+                        if _fw_required
+                        else "Select compliance frameworks to include in the report:"
+                    ),
+                    workspace_dir=_workspace_dir,
+                    shell=self,
+                )
+            except FrameworkSelectionCancelled:
+                print_warning(
+                    "Report cancelled: no compliance framework was selected, "
+                    "so nothing was generated."
+                )
+                return None
 
         # ── Report stack ────────────────────────────────────────────────────
         engine_arg = "chromium"
@@ -33504,6 +33639,11 @@ if __name__ == "__main__":
         "uninstall", help="Uninstall ADscan and remove data"
     )
     version_parser = subparsers.add_parser("version", help="Show ADscan version.")
+    version_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Machine-readable: version, build commit and the PRO licence keys this build trusts.",
+    )
 
     welcome_parser = subparsers.add_parser(
         "welcome",
@@ -33610,6 +33750,14 @@ if __name__ == "__main__":
         raise
     except Exception:  # noqa: BLE001 — gate must never crash dispatch
         pass
+
+    # `recheck --json` / `engagement --json` promise a script ONE document on
+    # stdout. Reserve it now, before the first line anything below prints:
+    # human output moves to stderr for the rest of the process.
+    if args.command in ("recheck", "engagement") and getattr(args, "json", False):
+        from adscan_core.output.machine_output import reserve_stdout_for_machine_output
+
+        reserve_stdout_for_machine_output()
 
     if args.command == "host-helper":
         from adscan_internal.host_privileged_helper import run_host_helper_server
@@ -33803,6 +33951,23 @@ if __name__ == "__main__":
         handle_uninstall()
     elif args.command == "version":
         license_mode = _resolve_license_mode(requested_pro=False)
+        if getattr(args, "json", False):
+            # Read by scripts/check_pro_license_anchors.py --image: the built
+            # binary states which licence-server keys it trusts.
+            from adscan_core.pro_license.trust_report import REPORT_KEY, trust_anchor_report
+
+            print(
+                json.dumps(
+                    {
+                        "version": _format_runtime_version_tag(license_mode),
+                        "license_mode": license_mode,
+                        "build_commit": os.getenv("ADSCAN_BUILD_COMMIT", "").strip() or None,
+                        REPORT_KEY: trust_anchor_report(),
+                    },
+                    sort_keys=True,
+                )
+            )
+            sys.exit(0)
         print(f"ADscan {_format_runtime_version_tag(license_mode)}")
         sys.exit(0)
     elif args.command == "ci":

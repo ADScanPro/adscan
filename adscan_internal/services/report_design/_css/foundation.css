@@ -26,3 +26,8 @@ body {
   font-variant-numeric: tabular-nums lining-nums;
   font-feature-settings: "tnum" on, "lnum" on;
 }
+
+/* A bare <code> (a file name inside a note) otherwise prints in the browser's
+   own monospace, which is a system face, not one ADscan ships. Opt-in
+   documents only, so PRO's existing render is unchanged. */
+.ds-doc :where(code, kbd, samp, pre) { font-family: var(--font-mono); }

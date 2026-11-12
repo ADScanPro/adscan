@@ -382,6 +382,8 @@ async def _run_suite(
 
     from adscan_internal.services.poisoning import PoisonerConfig, PoisoningSuite  # noqa: PLC0415
 
+    # The poisoners keep answering while a relay step runs: the listener broker
+    # routes the coerced target to the relay and a lured victim to the capture.
     poisoner_config = PoisonerConfig(
         interface_name=interface_name,
         our_ipv4=advertised_ipv4,

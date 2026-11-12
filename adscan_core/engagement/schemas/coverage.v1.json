@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.coverage/1",
+  "title": "ADscan run coverage v1",
+  "description": "coverage.json: which checks a run performed, on which domain and scope, and how completely. It is the projection of the observation record that decides what a run may close: only a check that ran completely on a scope can resolve a finding there. A check absent from this document was not assessed by the run, which is never the same as clear. May name AD objects in examined_ids, so it stays on the node unless the data policy allows findings. Written by adscan_core/engagement/coverage_io.py (run_coverage_to_document); the tag in schema is the constant COVERAGE_SCHEMA.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "run_id", "run_status", "vantage", "checks"],
+  "properties": {
+    "schema": {"const": "adscan.coverage/1"},
+    "run_id": {"type": "string", "maxLength": 64},
+    "run_status": {"enum": ["complete", "partial", "interrupted", "unknown"]},
+    "vantage": {"enum": ["unauth", "auth", "privileged_read"]},
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "incomplete_phases": {
+      "type": "array",
+      "$comment": "Every scan phase that started but did not finish; empty when none.",
+      "items": {"type": "string", "minLength": 1, "maxLength": 128}
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["check_id", "status", "domain_id", "scope_kind", "examined", "total", "reason"],
+        "properties": {
+          "check_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,127}$"},
+          "status": {"enum": ["ran", "partial", "skipped", "failed", "not_applicable"]},
+          "domain_id": {"type": "string", "minLength": 1, "maxLength": 255},
+          "scope_kind": {"enum": ["domain", "object", "host", "route"]},
+          "examined": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+          "total": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+          "examined_ids": {"type": "array", "items": {"type": "string"}},
+          "reason": {"type": "string", "maxLength": 1024}
+        }
+      }
+    }
+  }
+}

@@ -81,6 +81,23 @@ def _host_object_id(*nodes: Optional[Mapping[str, Any]]) -> Optional[str]:
     return None
 
 
+def step_object_id(
+    source_node: Optional[Mapping[str, Any]],
+    target_node: Optional[Mapping[str, Any]],
+    *,
+    target_ref: str = "",
+) -> str:
+    """The ledger ``object_id`` of one edge's step item (the ONE rule).
+
+    The computer the edge sits on (target first, then source), else the
+    target's stable object id. The ledger writer and the recheck observers
+    both use it, so a re-read names a step exactly as the scan recorded it.
+    """
+    return _host_object_id(target_node, source_node) or object_id_from_node(
+        target_node or {"id": target_ref}
+    )
+
+
 def step_item_id(
     relation: str,
     source_node: Optional[Mapping[str, Any]],
@@ -121,7 +138,6 @@ def step_items(graph: Mapping[str, Any], domain: str) -> list[LedgerItem]:
         notes = raw.get("notes") if isinstance(raw.get("notes"), Mapping) else {}
         source_node = nodes.get(source) if isinstance(nodes.get(source), Mapping) else None
         target_node = nodes.get(target) if isinstance(nodes.get(target), Mapping) else None
-        target_oid = object_id_from_node(target_node or {"id": target})
         item_id = step_item_id(
             relation, source_node, target_node, notes, domain_id,
             source_ref=source, target_ref=target,
@@ -136,7 +152,7 @@ def step_items(graph: Mapping[str, Any], domain: str) -> list[LedgerItem]:
                 kind=kind,
                 key=relation,
                 domain_id=domain_id,
-                object_id=_host_object_id(target_node, source_node) or target_oid,
+                object_id=step_object_id(source_node, target_node, target_ref=target),
                 label=f"{label_source} -> {relation} -> {label_target}",
                 legacy_alias=attack_graph_edge_fingerprint(source, relation, target, dict(notes)),
             ),
@@ -149,4 +165,11 @@ def observed(items: list[LedgerItem]) -> list[Observed]:
     return [Observed(i.item_id, i.kind, i.key, i.domain_id, i.object_id) for i in items]
 
 
-__all__ = ("domain_key", "finding_items", "observed", "step_item_id", "step_items")
+__all__ = (
+    "domain_key",
+    "finding_items",
+    "observed",
+    "step_item_id",
+    "step_items",
+    "step_object_id",
+)

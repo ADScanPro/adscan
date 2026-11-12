@@ -26,6 +26,7 @@ Design notes
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 import asyncio
 import time
 from dataclasses import dataclass, field
@@ -783,7 +784,7 @@ def run_unauth_probes(config: UnauthProbeConfig) -> UnauthProbeResults:
     an event loop in another thread).
     """
     try:
-        return asyncio.run(run_unauth_probes_async(config))
+        return run_on_new_loop(run_unauth_probes_async(config))
     except RuntimeError as exc:
         # Defensive: another loop is already running on this thread. We do
         # not silently swallow this — surface a clear, actionable error.

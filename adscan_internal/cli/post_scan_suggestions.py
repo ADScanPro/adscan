@@ -484,7 +484,9 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
         headline_path=headline_path,
         paths_total=path_totals.paths_total,
         paths_full_domain_compromise=path_totals.paths_full_domain_compromise,
-        paths_proven=path_totals.paths_proven,
+        paths_full_domain_compromise_proven=(
+            path_totals.effective_proven_full_domain_compromise
+        ),
         ttc_label=_format_scan_delta(shell, "_scan_compromise_time"),
         ttfc_label=_format_scan_delta(shell, "_scan_first_credential_time"),
         report_path=report_path,

@@ -395,7 +395,6 @@ class WinRMPSRPService:
             _WINRM_CCACHE_CACHE.pop(_cache_key, None)
 
         try:
-            import concurrent.futures
             import tempfile
 
             from adscan_internal.services.kerberos_transport import (
@@ -419,14 +418,11 @@ class WinRMPSRPService:
                 posture_snapshot=self._posture_snapshot,
             )
 
-            try:
-                ccache_bytes = asyncio.run(get_tgs(krb_config, spn))
-            except RuntimeError:
-                # Already inside a running event loop (thread executor context).
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    ccache_bytes = pool.submit(
-                        asyncio.run, get_tgs(krb_config, spn)
-                    ).result(timeout=30)
+            from adscan_core.async_bridge import run_async_sync  # noqa: PLC0415
+
+            # Offloads to a worker thread only when a loop is already running
+            # here; a RuntimeError from get_tgs itself is no longer retried.
+            ccache_bytes = run_async_sync(get_tgs(krb_config, spn), timeout=30)
 
             tmp = tempfile.NamedTemporaryFile(
                 suffix=".ccache", prefix="adscan_winrm_tgt_", delete=False

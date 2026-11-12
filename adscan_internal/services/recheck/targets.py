@@ -4,7 +4,9 @@ The ledger (``engagement.sqlite``) is the source: a target names ledger items,
 never a fresh computation. Three joins live here and nowhere else:
 
 * item -> detector check id (``adscan_core.engagement.detectors``), kept only when
-  the family has a read-only check in this release (``observers.OBSERVERS``);
+  the family has a read-only check in this release (``observers.OBSERVERS``),
+  and otherwise the reason the recheck declares for it
+  (``not_recheckable.NOT_RECHECKABLE`` / ``NOT_RECHECKABLE_KEYS``);
 * step relation -> finding key through the attack-step catalog's ``vuln_key``
   (spec 10.2), so a finding recheck expands to the steps that back it and a step
   found present marks its finding present;
@@ -27,6 +29,7 @@ from adscan_core.engagement.recheck import (
     TargetItem,
     is_open,
 )
+from adscan_internal.services.recheck.not_recheckable import declared_reason
 from adscan_internal.services.recheck.observers import has_read_only_check
 
 #: Ledger kinds a recheck selects. Structural edges (membership, containment)
@@ -67,6 +70,14 @@ def read_check_for(kind: str, key: str) -> Optional[str]:
     return det.check_id
 
 
+def not_recheckable_reason_for(kind: str, key: str) -> str:
+    """The declared reason an item cannot be re-checked read-only, or ``""``."""
+    det = detector_for(kind, key)
+    if det is None:
+        return ""
+    return declared_reason(det.check_id, kind, key, observed=has_read_only_check(det.check_id))
+
+
 def to_target_item(row: dict[str, Any]) -> TargetItem:
     """A ledger row as a :class:`TargetItem` (with its read check and joins)."""
     kind, key = str(row["kind"]), str(row["key"])
@@ -83,6 +94,7 @@ def to_target_item(row: dict[str, Any]) -> TargetItem:
         check_id=read_check_for(kind, key),
         finding_keys=(backed,) if backed else (),
         disposition=str(row.get("disposition") or ""),
+        not_recheckable_reason=not_recheckable_reason_for(kind, key),
     )
 
 
@@ -177,6 +189,7 @@ def select_targets(
                 item_id=finding_id(key, dom), kind="finding", key=key, domain_id=dom,
                 object_id=None, label=key, status="", last_vantage=Vantage.UNAUTH,
                 check_id=read_check_for("finding", key),
+                not_recheckable_reason=not_recheckable_reason_for("finding", key),
             )
         )
     backing = relations_backing(key)
@@ -221,6 +234,7 @@ def read_plan(
 
 __all__ = (
     "RECHECK_KINDS",
+    "not_recheckable_reason_for",
     "read_check_for",
     "read_plan",
     "relations_backing",

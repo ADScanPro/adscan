@@ -32,9 +32,12 @@ class SMBServerSettings:
 	
 
 class SMBRelayServer:
-	def __init__(self, target, settings):
+	def __init__(self, target, settings, handoff = False):
 		self.target = target
 		self.settings = settings
+		# ADSCAN: handoff mode binds nothing; ADscan's listener broker owns the
+		# port and feeds each routed connection to ``handle_stream``.
+		self.handoff = handoff
 		self.server = None
 		self.serving_task = None
 		self.connections = {}
@@ -68,8 +71,12 @@ class SMBRelayServer:
 				await connection.stop()
 
 	async def run(self):
-		self.server = UniServer(self.target, NetBIOSPacketizer())
+		self.server = UniServer(self.target, NetBIOSPacketizer(), handoff = self.handoff)
 		return await self.server.serve_callback(self.__handle_connection)
+
+	async def handle_stream(self, reader, writer):
+		"""Serve one connection accepted by an external listener (handoff mode)."""
+		await self.server.handle_accepted_stream(reader, writer)
 
 async def test_relay_queue(rq):
 	try:

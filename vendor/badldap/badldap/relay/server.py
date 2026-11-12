@@ -16,9 +16,12 @@ class LDAPServerSettings:
 		return self.gssapi_factory()
 
 class LDAPRelayServer:
-	def __init__(self, target, settings):
+	def __init__(self, target, settings, handoff = False):
 		self.target = target
 		self.settings = settings
+		# ADSCAN: handoff mode binds nothing; ADscan's listener broker owns the
+		# port and feeds each routed connection to ``handle_stream``.
+		self.handoff = handoff
 		self.server = None
 		self.serving_task = None
 		self.connections = {}
@@ -45,9 +48,13 @@ class LDAPRelayServer:
 			return
 
 	async def run(self):
-		self.server = UniServer(self.target, LDAPPacketizer())
+		self.server = UniServer(self.target, LDAPPacketizer(), handoff = self.handoff)
 		self.serving_task = asyncio.create_task(self.__handle_connection())
 		return self.serving_task
+
+	async def handle_stream(self, reader, writer):
+		"""Serve one connection accepted by an external listener (handoff mode)."""
+		await self.server.handle_accepted_stream(reader, writer)
 
 # ADSCAN log-hygiene: removed the upstream ``test_relay_queue`` / ``amain`` /
 # ``if __name__ == '__main__':`` self-test harness. It printed relayed auth

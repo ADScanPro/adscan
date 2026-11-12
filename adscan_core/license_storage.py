@@ -1,11 +1,13 @@
 """Ownership and failure handling for the license storage directory.
 
 The license directory (``adscan_core.enterprise_license.license_dir``) is
-shared by processes running as DIFFERENT users. On the Enterprise appliance the
-web backend container runs as root and writes the clock high-water mark, the
-environment ledger and the lock that serialises them on every scan launch, while
-the scan engine container drops to the host user before it reads and writes the
-same files through a bind mount.
+shared by two containers through a bind mount. On the Enterprise appliance the
+web backend writes the clock high-water mark, the environment ledger and the
+lock that serialises them on every scan launch, and the scan engine container,
+which starts as root and drops to the host user, reads and writes the same
+files. Since 14.0.1 the backend runs as that host user as well; until then it
+ran as root, and directories in the field may still hold files it left
+root-owned, which is what the rules below keep usable.
 
 Two rules keep that sharing safe, and both live here so every writer applies
 them the same way:

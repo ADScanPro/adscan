@@ -28,6 +28,7 @@ import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from adscan_core.compliance_frameworks import framework_keys_text
 from adscan_core.rich_output import print_exception
 
 
@@ -134,7 +135,8 @@ def _parse_deliver_args(args: str) -> argparse.Namespace:
         "--theme",
         dest="theme",
         default="",
-        choices=["", "dark", "premium_dark", "light", "corporate_light"],
+        # No ``choices``: a retired name or a .css skin is resolved (and a
+        # retired one noticed) by ``resolve_report_theme``, not rejected here.
     )
     return parser.parse_args(shlex.split(args) if args.strip() else [])
 
@@ -482,20 +484,19 @@ REGISTRY: tuple[ShellCommandSpec, ...] = (
         long_help=(
             "Usage:\n"
             "  deliver [--client NAME] [--engagement CODE] [--output DIR]\n"
-            "          [--only SLUGS] [--frameworks ens,iso27001,dora,pci_dss,cis]\n"
+            f"          [--only SLUGS] [--frameworks {framework_keys_text(',')}|none]\n"
             "          [--no-navigator]\n"
-            "          [--theme dark|light|premium_dark|corporate_light]\n\n"
+            "          [--theme corporate_light|editorial]\n\n"
             "Generates the four PDFs in parallel and packages them into a single ZIP\n"
             "under the active workspace's deliverables/ folder.\n\n"
             "Inside the shell, the workspace is auto-detected — no flag needed.\n\n"
-            "--only:        report, playbook, checklist, coverage-matrix (default: all).\n"
+            "--only:        report, playbook, coverage-matrix, password-hygiene (default: all).\n"
             "--frameworks:  comma-separated compliance set rendered in the kit.\n"
             "               In a TTY a checkbox prompts; non-interactive defaults to 'ens'.\n\n"
             "Examples:\n"
             "  deliver\n"
             "  deliver --client 'Acme Corp' --engagement ENG-001\n"
             "  deliver --theme light                       # corporate white for board/auditor\n"
-            "  deliver --theme dark                        # operator dark mode\n"
             "  deliver --only report                       # security assessment PDF only\n"
             "  deliver --frameworks ens,iso27001,dora      # multi-framework compliance kit\n"
         ),

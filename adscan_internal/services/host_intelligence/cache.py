@@ -1,20 +1,20 @@
 """Workspace-scoped cache of :class:`HostFingerprint` per host IP.
 
 Persists to ``<workspace>/domains/<domain>/host_intel.json``. TTL is
-configurable (default 1 hour). A per-IP :class:`asyncio.Lock` prevents
+configurable (default 1 hour). A per-IP :class:`CrossLoopLock` prevents
 concurrent callers from fingerprinting the same host twice during a
 single event-loop session.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
 
+from adscan_core.cross_loop_lock import CrossLoopLock
 from adscan_internal import telemetry
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.services.host_intelligence.models import (
@@ -38,7 +38,7 @@ class HostIntelligenceCache:
         self._dir = Path(cache_dir)
         self._path = self._dir / self._FILENAME
         self._data: dict = self._load()
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, CrossLoopLock] = {}
         # Domain to which fingerprints in this cache should be attributed
         # in the defensive_posture inventory writer. ``None`` disables the
         # parallel writer (the operational cache file is always saved).
@@ -123,10 +123,10 @@ class HostIntelligenceCache:
 
     # ---------------------------------------------------------------- API
 
-    def _lock_for(self, target_ip: str) -> asyncio.Lock:
+    def _lock_for(self, target_ip: str) -> CrossLoopLock:
         lk = self._locks.get(target_ip)
         if lk is None:
-            lk = asyncio.Lock()
+            lk = CrossLoopLock()
             self._locks[target_ip] = lk
         return lk
 

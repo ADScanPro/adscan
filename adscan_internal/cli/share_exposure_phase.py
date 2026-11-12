@@ -378,7 +378,13 @@ def _run_writable_capture_substep(
     from adscan_core.tui.progress_dashboard import ProgressEstimator  # noqa: PLC0415
 
     estimator = ProgressEstimator()
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
     for index, (host, names) in enumerate(by_host.items(), start=1):
+        # Scan control checkpoint: stop dropping bait on new hosts once the
+        # operator stopped the step.
+        if scan_control().should_stop():
+            break
         _emit_share_operation_progress(
             label="Share enumeration",
             phase="share_credential_hunt",
@@ -609,6 +615,11 @@ def _run_readable_hunt_substep(
     )
 
 
+#: Scan-control identity of the SMB share credential hunt (one long step).
+SHARE_HUNT_STEP_ID = "share_credential_hunt"
+SHARE_HUNT_STEP_LABEL = "SMB share credential hunt"
+
+
 def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
     """Phase 7 — SMB Share Exposure: overview -> write capture -> read hunt."""
     from adscan_internal.services.scan_phases import phase_is_enabled  # noqa: PLC0415
@@ -691,19 +702,34 @@ def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
     # the ``finally`` once both substeps have run — the live strip clears
     # immediately instead of freezing on the last host count, even if a
     # substep raised.
+    # One long scan-control step covers both sub-steps: Ctrl+C offers "stop
+    # this step and keep what it found", the share loops check it per share, and
+    # a stop is declared as a coverage gap with how far the hunt got.
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
     try:
-        try:
-            _run_writable_capture_substep(
-                shell, domain=domain, writable=writable, domain_data=domain_data, guard=guard
-            )
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-        try:
-            _run_readable_hunt_substep(shell, domain=domain, readable=readable, guard=guard)
-        except Exception as exc:  # noqa: BLE001
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
+        with scan_control().step(
+            SHARE_HUNT_STEP_ID,
+            label=SHARE_HUNT_STEP_LABEL,
+            long=True,
+            unit="shares",
+            total=len(readable) or None,
+            domain=domain,
+        ) as step:
+            try:
+                _run_writable_capture_substep(
+                    shell, domain=domain, writable=writable, domain_data=domain_data, guard=guard
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            if step.should_stop():
+                return
+            try:
+                _run_readable_hunt_substep(shell, domain=domain, readable=readable, guard=guard)
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
     finally:
         _emit_share_operation_progress(
             label="Share enumeration",

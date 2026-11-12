@@ -30,6 +30,7 @@ import os
 from typing import Any
 
 from adscan_core import telemetry
+from adscan_core.engagement.identity import stamp_attack_path_ids
 from adscan_core.reporting.attack_path_memory_gate import (
     _AttackPathMemoryBudgetExceeded,
 )
@@ -171,6 +172,7 @@ def compute_report_attack_paths(
             return []
         bounded = [path for path in paths if isinstance(path, dict)]
         annotate_report_policy_exclusions(workspace_dir, domain, bounded)
+        stamp_attack_path_ids(bounded, domain)
         return bounded
     except Exception as exc:  # noqa: BLE001 - a report never crashes on paths
         telemetry.capture_exception(exc)
@@ -185,6 +187,10 @@ def compute_report_attack_paths(
         return []
     shaped = as_report_attack_paths(paths)
     annotate_report_policy_exclusions(workspace_dir, domain, shaped)
+    # The public path id (the route fingerprint) every surface prints, keys on
+    # and resolves: the report card, report_model.json, the web CTEM and
+    # ``recheck --path``.
+    stamp_attack_path_ids(shaped, domain)
     return shaped
 
 
@@ -253,7 +259,50 @@ def as_report_attack_paths(paths: Any) -> list[dict[str, Any]]:
     clean = [path for path in paths if isinstance(path, dict)]
     for path in clean:
         stamp_adcs_finding_views(path)
+        stamp_step_status_reasons(path)
     return clean
+
+
+#: Key of the render-ready reason view on an attempted step's ``details``.
+STEP_STATUS_REASON_VIEW_KEY = "status_reason_view"
+
+
+def stamp_step_status_reasons(path: Any) -> None:
+    """Stamp the reason view on every attempted step of a report path.
+
+    Every attempted step gets one, from the shared resolver
+    (:func:`adscan_core.reporting.execution_failure_explanations.step_status_reason_view`)
+    that the web CTEM edge detail calls too, so no attempted step reaches a
+    deliverable without a reason category and both surfaces word it the same.
+    Mutates the step ``details`` in place; idempotent; never raises.
+    """
+
+    from adscan_core.reporting.execution_failure_explanations import (  # noqa: PLC0415
+        step_status_reason_view,
+    )
+
+    if not isinstance(path, dict):
+        return
+    steps = path.get("steps")
+    if not isinstance(steps, list):
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        details = step.get("details")
+        view = step_status_reason_view(
+            step.get("status"),
+            details if isinstance(details, dict) else {},
+            relation=str(step.get("action") or ""),
+        )
+        if view is None:
+            if isinstance(details, dict):
+                details.pop(STEP_STATUS_REASON_VIEW_KEY, None)
+            continue
+        if not isinstance(details, dict):
+            details = {}
+            step["details"] = details
+        details[STEP_STATUS_REASON_VIEW_KEY] = view
 
 
 def compute_report_attack_paths_display(

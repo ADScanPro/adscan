@@ -75,6 +75,10 @@ from adscan_internal.services.attack_step_catalog import (
 )
 from adscan_core.scan_policy.model import (
     REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
+    REVERT_RIGHT_MANAGE_CA,
+    REVERT_RIGHT_REVOKE_CERTIFICATE,
+    REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    REVERT_RIGHT_WRITE_FOREST_CONFIGURATION,
     REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK,
     REVERT_RIGHT_WRITE_RBCD_DELEGATION,
 )
@@ -97,6 +101,9 @@ __all__ = [
     "UNREGISTERED_WRITE_KINDS",
     "VERIFIED_AUTO_REVERT_KINDS",
     "NEVER_AUTO_REVERT_KINDS",
+    "BACKSTOP_REVERT_RIGHTS",
+    "CLEANUP_ACCOUNT_REVERT_RIGHTS",
+    "revert_right_for_kind",
     "build_safeguard_profile",
     "build_all_safeguard_profiles",
     "pending_fields",
@@ -358,11 +365,15 @@ REVERTED_UNCONFIRMED_KINDS: frozenset[str] = frozenset()
 #: lifecycle class says. ``password_changed`` is the load-bearing one: the
 #: original secret is gone, and ``acl_change_cleanup_service`` marks it
 #: ``manual_required`` explicitly ("Password reset cannot be reverted
-#: automatically"). The ADCS kinds need CA rights the assessment does not hold.
+#: automatically"). A forged certificate exists outside the CA database and a
+#: copied CA key cannot be taken back, so nobody can revoke or undo either. An
+#: ISSUED certificate is not here: the assessment's own account cannot revoke it,
+#: but a cleanup account holding the officer right on that CA can, so it is
+#: conditional (``CLEANUP_ACCOUNT_REVERT_RIGHTS``), and the step runs only once
+#: that right is established on that CA, before the certificate exists.
 NEVER_AUTO_REVERT_KINDS: frozenset[str] = frozenset(
     {
         "password_changed",
-        _tax.KIND_ISSUED_CERTIFICATE,
         _tax.KIND_FORGED_CERTIFICATE,
         _tax.KIND_CA_PRIVATE_KEY_EXFILTRATED,
         # Legacy ESC15 method A record (workspaces written before the grant was
@@ -958,15 +969,82 @@ _OPERATOR_CONFIRMED_KINDS: frozenset[str] = frozenset(
 #:   (Written through ``cli/delegations.py`` by a GenericWrite holder, RBCD is
 #:   restorable by that holder; the kind is classified by its worst case.)
 #:
+#: * ``issued_certificate``: a certificate a live CA issued cannot be removed
+#:   from its database (and must not be); revoking it is the complete undo, and
+#:   revoking needs the "Issue and Manage Certificates" (officer) right on THAT
+#:   CA, which enrolling never grants. A CA right, resolved per CA by the CA
+#:   itself (``revert_right_probes``), never from a directory group.
+#:
 #: The exit hook and the final retry pass try the client cleanup account FIRST
 #: (``revert_credentials.revert_candidates``), revert as it, and settle the entry
 #: only after a re-read. Locked by tests/unit/services/test_revert_permission.py.
+#: Each value is a token of the revert-right registry
+#: (``adscan_core.scan_policy.revert_rights``), which carries its scope, its
+#: granting roles and, engine-side, its probe.
 CLEANUP_ACCOUNT_REVERT_RIGHTS: dict[str, str] = {
     "machine_account_created": REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
     "computer_account_created": REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
     "rbcd_delegation_added": REVERT_RIGHT_WRITE_RBCD_DELEGATION,
     "keycredentiallink_added": REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK,
+    _tax.KIND_ISSUED_CERTIFICATE: REVERT_RIGHT_REVOKE_CERTIFICATE,
 }
+
+
+#: Change kinds whose own AUTHOR undoes them (the step's rollback, confirmed by a
+#: re-read), keyed to the right a cleanup account needs to undo them as the
+#: backup when the author no longer can. Not a gate: these never stop a step.
+#: They feed the pre-scan checklist, so the client sees, per domain, per forest
+#: and per CA, everything the account they supply can and cannot undo. The
+#: right each one needs, established from the revert code:
+#:
+#: * ``template_mutated`` (ESC4) restores a certificate template and
+#:   ``ca_template_enabled`` (ESC7) edits ``certificateTemplates`` on the CA's
+#:   enrollment-service object, both over LDAP in ``CN=Configuration``: a
+#:   forest-wide partition only an Enterprise Admin of the forest root (or the
+#:   object's owner) writes by default; a child-domain Domain Admin cannot.
+#: * ``ca_officer_added`` (ESC7) is removed through ``SetCASecurity``, which
+#:   needs "Manage CA" on that CA, a different right from the officer bit (with
+#:   role separation one account may hold only one of them).
+#: * Every other directory write lives in the domain's own naming context, so a
+#:   Domain Admin of that domain (or an Enterprise Admin of its forest) covers it.
+BACKSTOP_REVERT_RIGHTS: dict[str, str] = {
+    "template_mutated": REVERT_RIGHT_WRITE_FOREST_CONFIGURATION,
+    "ca_template_enabled": REVERT_RIGHT_WRITE_FOREST_CONFIGURATION,
+    _tax.KIND_CA_OFFICER_ADDED: REVERT_RIGHT_MANAGE_CA,
+    "shadow_credentials_added": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "dacl_ace_added": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "owner_changed": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "spn_added": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "group_membership_added": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "group_membership_changed": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "upn_changed": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "altsecurityidentities_written": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "victim_attribute_written": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "logon_script_path_modified": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "rodc_prp_modified": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "user_created": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    "gpo_ldap_attribute_modified": REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+    _tax.KIND_ACCOUNT_ENABLED: REVERT_RIGHT_UNDO_DIRECTORY_CHANGE,
+}
+
+
+def revert_right_for_kind(kind: str) -> tuple[str, str] | None:
+    """``(token, need)`` for a change kind, or ``None`` when no account can undo it.
+
+    ``need`` is ``revert_rights.NEED_REQUIRED`` (only an account holding the
+    right can undo it: the step is gated) or ``NEED_BACKSTOP`` (its author undoes
+    it; the cleanup account is the backup).
+    """
+    from adscan_core.scan_policy.revert_rights import (  # noqa: PLC0415
+        NEED_BACKSTOP,
+        NEED_REQUIRED,
+    )
+
+    if kind in CLEANUP_ACCOUNT_REVERT_RIGHTS:
+        return CLEANUP_ACCOUNT_REVERT_RIGHTS[kind], NEED_REQUIRED
+    if kind in BACKSTOP_REVERT_RIGHTS:
+        return BACKSTOP_REVERT_RIGHTS[kind], NEED_BACKSTOP
+    return None
 
 
 #: Rollback lifecycle classes: the language-neutral SSOT that both this module's

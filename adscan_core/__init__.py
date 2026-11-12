@@ -7,5 +7,4 @@ by the full in-container runtime.
 
 from __future__ import annotations
 
-# Outbound link placements used by cta_placement_for_lane: "pro_gate_enterprise_demo"
 __all__ = []

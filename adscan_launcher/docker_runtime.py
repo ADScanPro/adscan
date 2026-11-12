@@ -1280,6 +1280,8 @@ LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
         # --- host preflight / capability escape hatches (launcher-only gates) ---
         "ADSCAN_ALLOW_LEGACY_IMAGE_FALLBACK",
         "ADSCAN_ALLOW_LOW_MEMORY",
+        # --- secrets the launcher consumes (never copied into `docker run -e`) ---
+        "ADSCAN_ACTIVATION_KEY",  # `adscan license activate` key (visible in docker inspect if forwarded)
         "ADSCAN_ALLOW_PODMAN_DOCKER_API",
         "ADSCAN_ALLOW_UNSUPPORTED_ARCH",
         "ADSCAN_ALLOW_UNSUPPORTED_PLATFORM",

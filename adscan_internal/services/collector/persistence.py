@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from adscan_core import telemetry
+from adscan_core.engagement.output_formats import output_marker
 from adscan_core.kerberos_roasting import AccountSignals
 from adscan_core.kerberos_roasting import (
     is_managed_service_account as _node_is_managed_service_account,
@@ -680,7 +681,8 @@ class CollectorPersistence:
         graph: dict[str, Any] = {
             "domain": domain,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "schema_version": "membership-1.0",
+            # Owned by the output contract (schema memberships.v1.json).
+            "schema_version": output_marker("memberships"),
             "nodes": {},
             "edges": [],
             "version": 2,

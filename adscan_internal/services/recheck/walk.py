@@ -20,13 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Mapping, Optional, Sequence
 
-from adscan_core.engagement.identity import compute_attack_path_fingerprint, normalize_identity_token
+from adscan_core.engagement.identity import attack_path_id_for_record, normalize_identity_token
 from adscan_core.engagement.recheck import (
     WALK_COMPLETED,
     WALK_NOT_WALKED,
     WALK_STOPPED,
     RecheckError,
     WalkStep,
+    is_legacy_path_label,
 )
 
 #: Explanation codes meaning the credential the step needed was refused.
@@ -48,16 +49,13 @@ class ResolvedPath:
 
 
 def path_id_of(record: Mapping[str, Any], domain: str) -> str:
-    """The path id the report and the web CTEM show (ordered-route fingerprint)."""
-    details = record.get("details") if isinstance(record.get("details"), Mapping) else {}
-    return compute_attack_path_fingerprint(
-        steps=record.get("steps"),
-        nodes=details.get("nodes") or record.get("nodes") or [],
-        domain=domain,
-        source=record.get("source") or details.get("source"),
-        target=details.get("target") or record.get("target"),
-        title=record.get("title"),
-    )
+    """The path id the report, the web CTEM and the snapshot carry (route fingerprint).
+
+    The report prints its first characters next to "Path N"; the attack-path
+    snapshot and the report data carry it in full as ``path_id``. One SSOT:
+    :func:`adscan_core.engagement.identity.attack_path_id_for_record`.
+    """
+    return attack_path_id_for_record(record, domain)
 
 
 def canonical_paths(workspace_dir: str, domains: Sequence[str]) -> list[ResolvedPath]:
@@ -75,13 +73,25 @@ def canonical_paths(workspace_dir: str, domains: Sequence[str]) -> list[Resolved
 
 
 def find_path(paths: Sequence[ResolvedPath], token: str) -> ResolvedPath:
-    """The path whose id starts with ``token`` (unambiguous prefix)."""
+    """The path ``token`` names.
+
+    Accepts the path id (any unambiguous prefix of 8 or more hex characters of
+    the route fingerprint the report, the web CTEM and the attack-path snapshot
+    carry) and, for compatibility, the ``P-XXXXXXXX`` label the legacy Word
+    report printed (:func:`adscan_internal.services.path_identity.attack_path_id`).
+    """
     token = token.strip().lower()
-    hits = {p.path_id: p for p in paths if p.path_id.startswith(token)}
+    if is_legacy_path_label(token):
+        from adscan_internal.services.path_identity import attack_path_id  # noqa: PLC0415
+
+        hits = {p.path_id: p for p in paths if attack_path_id(p.record).lower() == token}
+    else:
+        hits = {p.path_id: p for p in paths if p.path_id.startswith(token)}
     if not hits:
         raise RecheckError(
             f"No attack path with id '{token}' in the current listing of this workspace's "
-            "attack paths (the id the report and the web show for each path)."
+            "attack paths (the id the report prints next to each path, or the path_id in "
+            "attack_paths_snapshot.json)."
         )
     if len(hits) > 1:
         raise RecheckError(f"'{token}' matches {len(hits)} paths; give more characters of the id.")

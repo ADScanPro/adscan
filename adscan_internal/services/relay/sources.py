@@ -11,10 +11,13 @@ from dataclasses import dataclass
 
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.native_log_taming import is_benign_native_noise
-from adscan_internal.services.relay.core import (
-    RelayAuthentication,
-    RelayListenerUnavailableError,
+from adscan_internal.services.listener_broker import (
+    ClaimHandle,
+    ClaimRole,
+    StreamHandler,
+    acquire_listener,
 )
+from adscan_internal.services.relay.core import RelayAuthentication
 from adscan_internal.services.relay.identity import extract_ntlm_identity
 
 # Markers that are only safe to drop inside the relay listener flow — too
@@ -120,45 +123,29 @@ def _install_known_smb_relay_noise_filter() -> None:
 
 @dataclass(frozen=True)
 class RelaySourceConfig:
-    """Listener configuration for native relay sources."""
+    """Listener configuration for native relay sources.
+
+    ``expected_sources`` names the host(s) the relay is waiting for: the coerced
+    target, as an IP and/or a name. The listener broker routes their connections
+    to the relay and every other connection to the capture, so a relay and the
+    background capture share the port. Empty means "any caller" (the mitm6 WPAD
+    relay, whose victims are not known in advance).
+    """
 
     listen_host: str = "0.0.0.0"
     listen_port: int = 445
     protocol: str = "smb"
-
-
-async def probe_listener_bindable(host: str, port: int) -> None:
-    """Confirm the relay listen port can be bound; raise a typed error if not.
-
-    Runs BEFORE the OPSEC-costly coerce/ADIDNS setup so a port already held by
-    another ADscan listener (poisoning, the shared capture listener) is surfaced
-    immediately as a vantage/data gap instead of a 120s timeout followed by a raw
-    ``OSError`` at listener teardown. Binds a throwaway TCP server on the same
-    ``host``/``port`` (a plain-TCP bind is correct even for LDAPS/SMB — the TLS /
-    SMB negotiation happens after ``accept``), then closes it. On any ``OSError``
-    (``EADDRINUSE`` and friends) raises :class:`RelayListenerUnavailableError`.
-    """
-
-    async def _noop(
-        _reader: asyncio.StreamReader, _writer: asyncio.StreamWriter
-    ) -> None:  # pragma: no cover - never accepts a connection
-        return
-
-    try:
-        server = await asyncio.start_server(_noop, host, port)
-    except OSError as exc:
-        raise RelayListenerUnavailableError(
-            host=host, port=port, reason=str(exc) or "address already in use"
-        ) from exc
-    server.close()
-    try:
-        await server.wait_closed()
-    except Exception:  # noqa: BLE001 - best-effort teardown of the probe socket
-        pass
+    expected_sources: tuple[str, ...] = ()
 
 
 class NativeRelaySource:
-    """Base class for relay listeners that publish ADscan auth events."""
+    """Base class for relay listeners that publish ADscan auth events.
+
+    A source never binds. ``start`` opens its server in handoff mode and claims
+    the port from the listener broker (``services/listener_broker.py``), which
+    hands it the connections from the expected sources; ``stop`` releases the
+    claim and stops the server.
+    """
 
     protocol: str
 
@@ -173,26 +160,48 @@ class NativeRelaySource:
         self._relay_queue: asyncio.Queue[object] = asyncio.Queue()
         self._bridge_task: asyncio.Task[None] | None = None
         self._server_task: asyncio.Task[object] | None = None
+        self._claim: ClaimHandle | None = None
+
+    @property
+    def consumer_id(self) -> str:
+        return f"relay:{self.protocol}:{id(self):x}"
 
     async def start(self) -> None:
-        """Start the listener and bridge captured contexts into ADscan events.
+        """Open the server, then claim the port; raise when it cannot be served.
 
-        Confirms the listen port is bindable FIRST (raising
-        :class:`RelayListenerUnavailableError` when it is not) so a port already
-        held by another process is surfaced synchronously here — before any task
-        is spawned — instead of as a latent task exception that only crashes at
-        teardown. The runner converts that error into a failed result.
+        Raises:
+            RelayListenerUnavailableError: the broker could not serve the port
+                (another process holds it, or the privileged port was refused).
+                Nothing is left running; the runner converts it into a failed
+                result.
         """
 
-        await probe_listener_bindable(
-            self.config.listen_host, self.config.listen_port
-        )
+        handler, server_task = await self._open_server()
+        self._server_task = server_task
         self._bridge_task = asyncio.create_task(self._bridge_relay_contexts())
-        self._server_task = asyncio.create_task(self._start_server())
+        expected = tuple(item for item in self.config.expected_sources if item)
+        try:
+            self._claim = await acquire_listener(
+                port=self.config.listen_port,
+                consumer_id=self.consumer_id,
+                handler=handler,
+                role=ClaimRole.TARGETED if expected else ClaimRole.UNTARGETED,
+                expected_sources=expected,
+                local_address=self.config.listen_host,
+            )
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
-        """Stop listener tasks (best-effort; never raises)."""
+        """Release the port claim and stop listener tasks (best-effort; never raises)."""
 
+        claim, self._claim = self._claim, None
+        if claim is not None:
+            try:
+                await claim.arelease()
+            except Exception as exc:  # noqa: BLE001 - teardown must not raise
+                print_info_debug(f"relay-teardown claim release failed: {exc}")
         for task in (self._server_task, self._bridge_task):
             if task is not None:
                 task.cancel()
@@ -201,14 +210,14 @@ class NativeRelaySource:
                 except asyncio.CancelledError:
                     pass
                 except Exception as exc:  # noqa: BLE001
-                    # A background listener task that already failed (e.g. a bind
-                    # error that raced past the preflight probe) must never crash
-                    # teardown — it has already been surfaced/logged elsewhere.
                     print_info_debug(
                         f"relay-teardown listener task ended with error: {exc}"
                     )
+        self._server_task = None
+        self._bridge_task = None
 
-    async def _start_server(self) -> object:
+    async def _open_server(self) -> tuple[StreamHandler, "asyncio.Task[object] | None"]:
+        """Build the protocol server in handoff mode; return its stream handler."""
         raise NotImplementedError
 
     async def _bridge_relay_contexts(self) -> None:
@@ -236,7 +245,7 @@ class SMBRelaySource(NativeRelaySource):
         _install_known_smb_relay_noise_filter()
         await super().start()
 
-    async def _start_server(self) -> object:
+    async def _open_server(self) -> tuple[StreamHandler, "asyncio.Task[object] | None"]:
         from badauth.protocols.ntlm.relay.native import (
             NTLMRelaySettings,
             ntlmrelay_factory,
@@ -262,21 +271,11 @@ class SMBRelaySource(NativeRelaySource):
         settings.ServerGuid = GUID.random()
         settings.RequireSigning = False
         settings.shares = {}
-        server = SMBRelayServer(target, settings)
+        server = SMBRelayServer(target, settings, handoff=True)
         task, err = await server.run()
         if err is not None:
-            # A bind failure that raced past the preflight probe: re-raise as the
-            # typed listener-unavailable error so the runner converts it to a
-            # failed result rather than a raw OSError crash. Non-bind errors keep
-            # their original type.
-            if isinstance(err, OSError):
-                raise RelayListenerUnavailableError(
-                    host=self.config.listen_host,
-                    port=self.config.listen_port,
-                    reason=str(err) or "address already in use",
-                ) from err
             raise err
-        return await task
+        return server.handle_stream, task
 
 
 class LDAPRelaySource(NativeRelaySource):
@@ -284,7 +283,7 @@ class LDAPRelaySource(NativeRelaySource):
 
     protocol = "ldap"
 
-    async def _start_server(self) -> object:
+    async def _open_server(self) -> tuple[StreamHandler, "asyncio.Task[object] | None"]:
         from badauth.protocols.ntlm.relay.native import ntlmrelay_factory
         from badauth.protocols.spnego.relay.native import spnegorelay_ntlm_factory
         from asysocks.unicomm.common.target import UniProto, UniTarget
@@ -303,6 +302,6 @@ class LDAPRelaySource(NativeRelaySource):
             ),
             log_callback=make_relay_log_callback("ldap-relay"),
         )
-        server = LDAPRelayServer(target, settings)
+        server = LDAPRelayServer(target, settings, handoff=True)
         task = await server.run()
-        return await task
+        return server.handle_stream, task

@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from rich.console import Console
 
+from adscan_core.compliance_frameworks import framework_keys_text
 from adscan_core.cli_passthrough_spec import (
     CI_PASSTHROUGH,
     DOCTOR_PASSTHROUGH,
@@ -124,6 +125,7 @@ _LINUX_REQUIRED_COMMANDS = {
 }
 _KNOWN_LAUNCHER_COMMANDS = {
     "install",
+    "license",
     "check",
     "start",
     "tui",
@@ -947,7 +949,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--frameworks", dest="frameworks", default=None,
         help=(
             "Comma-separated compliance frameworks (PRO only): "
-            "ens, nis2, iso27001, dora, pci_dss, cis. Default: none."
+            f"{framework_keys_text()}, or none when the organisation follows "
+            "none of them. No default."
         ),
     )
 
@@ -1003,6 +1006,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "welcome",
         help="Show the editorial welcome screen (default with no command).",
     )
+
+    # ── adscan license (host-side; every launcher, LITE included) ─────
+    # The PRO licence: activation, status, release, relay. Host-side because
+    # activation must work before a PRO image exists on the host
+    # (docs/superpowers/specs/2026-11-11-pro-licence-server-design.md § 8).
+    from adscan_launcher.license_command import add_license_subparser
+
+    add_license_subparser(sub)
 
     # Internal-only command used by the host launcher to run the privileged
     # helper process required by container runtime features (notably host
@@ -1138,6 +1149,18 @@ def _consume_ci_remainder_global_flags(ns: argparse.Namespace) -> None:
         return
 
     setattr(ns, "args", _consume_trailing_global_flags(ns, remainder))
+
+
+#: Container commands whose ``--json`` output is one document on stdout.
+_MACHINE_JSON_COMMANDS = ("recheck", "engagement")
+
+
+def _wants_machine_json_output(cmd: str | None, ns: argparse.Namespace, unknown: list[str]) -> bool:
+    """Whether this run promised a script a JSON document alone on stdout."""
+    if cmd not in _MACHINE_JSON_COMMANDS:
+        return False
+    tokens = list(unknown) + list(getattr(ns, f"{cmd}_args", []) or [])
+    return "--json" in tokens
 
 
 def _consume_run_passthrough(ns: argparse.Namespace, unknown: list[str]) -> list[str]:
@@ -1382,8 +1405,12 @@ def _enforce_partner_tag_before_container() -> None:
         SystemExit: with code 1 when a PRO run has no resolvable partner tag.
     """
     from adscan_core import telemetry as _telemetry
+    from adscan_core.pro_license.identity import installed_licence_identity
     from adscan_launcher.docker_commands import _select_existing_or_preferred_image
 
+    if installed_licence_identity() is not None:
+        # A verified PRO licence (`adscan license activate`) is the identity.
+        return
     # Resolve the image ONCE so the license inference and the dev/CI :edge skip
     # both key off the exact same reference the run will use.
     image_ref = _select_existing_or_preferred_image()
@@ -2912,6 +2939,15 @@ def main(argv: list[str] | None = None) -> None:
         debug=bool(getattr(ns, "debug", False)),
         telemetry_console=telemetry_console,
     )
+    if _wants_machine_json_output(cmd, ns, unknown):
+        # The container writes the document straight to this process's stdout
+        # (the docker child inherits it); everything the launcher itself says
+        # (pull progress, notices) goes to stderr so the stream stays parseable.
+        from adscan_core.output.machine_output import (  # noqa: PLC0415
+            reserve_stdout_for_machine_output,
+        )
+
+        reserve_stdout_for_machine_output()
     # Log files: only a maintenance command (install/update/check/version) gets
     # the global log. Everything else this launcher logs is held in memory and
     # dropped at exit, so no engagement detail (the ci target, credentials)
@@ -2973,6 +3009,13 @@ def main(argv: list[str] | None = None) -> None:
             print_error("Host helper is unavailable in this launcher build.")
             raise SystemExit(2) from exc
         raise SystemExit(run_host_helper_server(str(getattr(ns, "socket", ""))))
+
+    if cmd == "license":
+        # Host-only, no container, no update probe: the licence state lives in
+        # the bind-mounted state dir the engine reads.
+        from adscan_launcher.license_command import run_license_command
+
+        raise SystemExit(run_license_command(ns))
 
     _emit_launcher_privilege_context(cmd)
     _guard_root_shell_without_user_context(cmd)

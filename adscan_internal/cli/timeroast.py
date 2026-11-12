@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 
 from dataclasses import asdict, dataclass
@@ -713,7 +714,6 @@ def _collect_timeroast_hashes(
     candidates: list[TimeroastCandidate],
 ) -> str | None:
     """Run native Timeroast (MS-SNTP UDP) and write hashcat-ready hashes."""
-    import asyncio
 
     from adscan_internal.services.timeroasting.config import TimeroastConfig
     from adscan_internal.services.timeroasting.display import (
@@ -759,7 +759,7 @@ def _collect_timeroast_hashes(
     )
 
     try:
-        result = asyncio.run(
+        result = run_on_new_loop(
             run_timeroast_with_display(cfg, candidates_by_rid=candidates_by_rid)
         )
     except Exception as exc:

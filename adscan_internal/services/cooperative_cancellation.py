@@ -16,36 +16,15 @@ module is the single, operation-agnostic implementation of that pattern:
     Observing the sentinel latches the in-process flag, so the file is read
     at most once per token lifetime.
 
-  * ONE CLI trigger (:func:`cli_cooperative_stop`) that turns the operator's
-    ``Ctrl+C`` into a *stop-and-continue* and, by itself, NEVER aborts the run.
-    A no-op under ``is_non_interactive`` — automated runs (``adscan ci``) never
-    install a signal handler; the sentinel trigger still works.
-
-  The Ctrl+C state machine — PANIC-PROOF (the core invariant):
-
-    Field forensics showed operators MASH ``Ctrl+C`` in a panic (one real
-    session logged nine "Shutdown already in progress" lines), and a design
-    that asks a panicking human to press a key an exact number of times still
-    fails — they do not count, they mash. So the handler must ABSORB the
-    mashing, never interpret a count:
-
-    * The FIRST press latches the cooperative stop (:meth:`request_stop`). The
-      loop drains in-flight work and RETURNS; the caller continues the scan
-      with the partial result. The handler shows a brief "stopping" notice.
-    * EVERY subsequent press while the stop is latched is a pure NO-OP — it
-      does not raise, it does not abort, it at most re-emits a calm debug line.
-      Mashing during the drain can never do anything destructive, ever.
-    * The handler NEVER raises ``KeyboardInterrupt``. Exiting the whole run is
-      NOT a keystroke anyone can fall into: it is only ever an EXPLICIT menu
-      choice offered by the operation's own call site AFTER the loop returns
-      and its ``LiveSession`` alt-screen has popped (see
-      :mod:`adscan_internal.cli.intelligence` for the host-sweep decision
-      prompt). ``Ctrl+C`` inside THAT prompt is likewise a no-op.
-
-  This inverts the old handler, which raised ``KeyboardInterrupt`` on any tap
-  after a stop was requested (or a double-tap within a window) — the exact bug
-  that aborted a 15h sweep and lost all its work when the operator, seeing no
-  instant response, pressed the key again.
+  * ONE CLI trigger (:func:`cli_cooperative_stop`), now a consumer of the scan
+    control plane (:mod:`adscan_core.scan_control`). It opens a LONG step for the
+    operation and links the token to it: the operator's Ctrl+C opens the shared
+    operator menu, and "Stop this step and keep what it found" (or a skipped
+    phase, or a stopped scan) flips this token. It installs NO signal handler of
+    its own: one SIGINT policy for the whole product lives in
+    ``adscan_core.scan_control.interrupts``, so mashing Ctrl+C can never end the
+    run (the panic-proof property the old private handler provided), and the
+    same stop reaches every long step, not only the two that had a handler.
 
 The contract every consumer loop follows is the same regardless of what it is
 iterating over (hosts, username candidates, ...):
@@ -69,12 +48,10 @@ from __future__ import annotations
 
 import contextlib
 import os
-import signal
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from adscan_core.interaction import is_non_interactive
 from adscan_core.rich_output import print_info_debug, print_warning
 
 # Historical constant. The cooperative-stop handler NO LONGER escalates a
@@ -131,6 +108,15 @@ class CooperativeCancellation:
     sentinel_path: str | None = None
     _flag: threading.Event = field(default_factory=threading.Event, repr=False)
     _source: str = field(default="", repr=False)
+    _linked: Any = field(default=None, repr=False)
+
+    def link(self, predicate: Any, *, source: str = "operator") -> None:
+        """Also stop when ``predicate()`` is true (the scan-control step's check).
+
+        Set by :func:`cli_cooperative_stop`; ``source`` is what
+        :attr:`requested_source` reports when the link fires.
+        """
+        self._linked = (predicate, source)
 
     def request_stop(self, *, source: str = "cli") -> None:
         """Latch the in-process stop flag (idempotent). Called by the CLI handler."""
@@ -154,6 +140,16 @@ class CooperativeCancellation:
         """
         if self._flag.is_set():
             return True
+        linked = self._linked
+        if linked is not None:
+            predicate, source = linked
+            try:
+                fired = bool(predicate())
+            except Exception:  # noqa: BLE001 - a broken link never breaks the loop
+                fired = False
+            if fired:
+                self.request_stop(source=source)
+                return True
         if self.sentinel_path:
             try:
                 if os.path.exists(self.sentinel_path):
@@ -182,43 +178,21 @@ class CooperativeCancellation:
         return self.is_requested()
 
 
-# Shown on a redundant Ctrl+C after the stop is already latched. Calm, never
-# blocks, and does NOT offer a keystroke to exit: exiting is only ever the
-# explicit menu choice at the operation's call site once the loop returns.
-_REDUNDANT_TAP_NOTICE = "Already stopping the current step; please wait for in-flight work to finish."
+#: Display names of the known operations, for the operator menu and the gap
+#: statement. Unknown operations fall back to their id.
+OPERATION_LABELS: dict[str, str] = {
+    "kerberos_user_enum": "Kerberos user enumeration",
+    "host_enrichment": "SMB host enrichment",
+}
 
 
-@dataclass
-class _CliStopHandlerState:
-    cancellation: CooperativeCancellation
-    shell: Any
-    stop_message: str
-    previous_handler: Any = None
-
-
-def _on_sigint(state: _CliStopHandlerState) -> Any:
-    def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
-        # PANIC-PROOF: this handler NEVER raises. Ctrl+C during a cooperative
-        # operation can only request the stop (once) or be a no-op; it can never
-        # abort the run. Exiting is an explicit menu choice at the call site
-        # after the loop returns, so a mashed key has nowhere to fall into.
-        if state.cancellation.is_requested():
-            # Already stopping. A redundant Ctrl+C (the panicked mash) is a pure
-            # no-op: no raise, no abort. Emit a quiet debug line so the terminal
-            # is not spammed while in-flight work drains.
-            print_info_debug(_REDUNDANT_TAP_NOTICE)
-            return
-
-        # First press: cooperative stop-and-continue. Flip the thread-safe flag;
-        # the loop drains in-flight work and tears its LiveSession down. We do
-        # NOT read stdin or render a prompt here (signal handler on the main
-        # thread, the loop owns the alt-screen). The decision prompt lives at
-        # the call site, AFTER the loop returns and the alt-screen has popped.
-        # The stop_message is a non-blocking notice that survives the pop.
-        state.cancellation.request_stop(source="cli")
-        print_warning(state.stop_message)
-
-    return _handler
+def operation_label(operation: str) -> str:
+    """Display name of an operation (``"Kerberos user enumeration"``)."""
+    known = OPERATION_LABELS.get(str(operation or ""))
+    if known:
+        return known
+    text = str(operation or "operation").replace("_", " ").strip()
+    return text[:1].upper() + text[1:]
 
 
 @contextlib.contextmanager
@@ -227,66 +201,68 @@ def cli_cooperative_stop(
     *,
     shell: Any = None,
     stop_message: str,
+    label: str | None = None,
+    unit: str = "",
+    total: int | None = None,
+    record_gap: bool = True,
 ) -> Any:
-    """Activate the Ctrl+C stop-and-continue handler for one operation.
+    """Run a cooperative operation as a LONG step of the scan control plane.
 
-    Wrap the long-running call with this context manager. On a TTY it installs
-    a PANIC-PROOF ``SIGINT`` handler: the FIRST ``Ctrl+C`` requests a
-    cooperative stop (``stop_message`` is shown, ``cancellation`` is flipped,
-    the loop keeps running and drains), and EVERY subsequent ``Ctrl+C`` is a
-    pure no-op. The handler NEVER raises, so mashing the key in panic can never
-    abort the run. Exiting is not a keystroke: the operation's own call site
-    offers an explicit menu choice AFTER the loop returns and its alt-screen
-    has popped (see the host-sweep decision prompt in
-    :mod:`adscan_internal.cli.intelligence`). The previous handler is restored
-    on exit.
+    Opens ``scan_control().step(<operation>, long=True)`` and links
+    ``cancellation`` to it, so the shared Ctrl+C operator menu ("Stop this step
+    and keep what it found"), a skipped phase, a stopped scan and the platform's
+    control file all stop this operation's loop the same way. No signal handler
+    is installed here: the one SIGINT policy lives in
+    ``adscan_core.scan_control.interrupts``.
 
-    Under ``is_non_interactive(shell)`` (``adscan ci``) it is a pure no-op:
-    the platform uses the sentinel, not Ctrl+C, so an automated run keeps the
-    default ``KeyboardInterrupt`` semantics on a stray signal.
-
-    Best-effort: if the signal cannot be installed (e.g. called off the main
-    thread), it yields without a handler rather than failing the operation:
-    the sentinel-file trigger still works via the same ``cancellation`` token.
+    The loop drains in-flight work and returns its partial result; when the
+    operator chose to stop the whole scan, leaving this block raises
+    ``ScanAbortRequested`` so the scan unwinds to its entry point.
 
     Args:
         cancellation: The token this operation's loop polls.
-        shell: Optional shell instance, threaded to the non-interactive gate.
-        stop_message: The line shown to the operator on the first Ctrl+C.
-            Required (no generic default) so every call site's wording stays
-            accurate to what it is stopping and what continues.
+        shell: Kept for call-site compatibility (interactivity is the control
+            plane's concern now).
+        stop_message: Shown once when the operator stops this step.
+        label: Display name for the menu and the gap statement (default: the
+            operation's known label).
+        unit: Plural noun for progress counts (``"hosts"``).
+        total: Units the operation has to do, when known.
+        record_gap: ``False`` when the operation declares its own coverage gap
+            (the host sweep's ``host_enrichment_coverage``), so the stop is not
+            stated twice.
     """
-    if is_non_interactive(shell):
-        yield cancellation
-        return
+    del shell  # interactivity is decided by the control plane
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
 
-    state = _CliStopHandlerState(
-        cancellation=cancellation, shell=shell, stop_message=stop_message
-    )
-    installed = False
-    try:
-        # signal.signal raises ValueError off the main thread — fall back to a
-        # no-op handler install in that case (the sentinel trigger still works).
-        state.previous_handler = signal.getsignal(signal.SIGINT)
-        signal.signal(signal.SIGINT, _on_sigint(state))
-        installed = True
-    except (ValueError, OSError, RuntimeError) as exc:
-        print_info_debug(
-            f"cooperative-cancel: could not install Ctrl+C stop handler "
-            f"({type(exc).__name__}); Ctrl+C keeps default behaviour, "
-            "platform sentinel still active."
-        )
-    try:
+    control = scan_control()
+    with control.step(
+        cancellation.operation,
+        label=label or operation_label(cancellation.operation),
+        long=True,
+        unit=unit,
+        total=total,
+        record_gap=record_gap,
+    ) as step:
+        announced: list[bool] = []
+
+        def _linked() -> bool:
+            if not step.should_stop():
+                return False
+            if not announced:
+                announced.append(True)
+                print_warning(stop_message)
+            return True
+
+        cancellation.link(_linked, source="operator")
         yield cancellation
-    finally:
-        if installed:
-            with contextlib.suppress(ValueError, OSError, RuntimeError):
-                signal.signal(signal.SIGINT, state.previous_handler)
 
 
 __all__ = [
     "DOUBLE_TAP_WINDOW_SECS",
+    "OPERATION_LABELS",
     "CooperativeCancellation",
     "cooperative_stop_sentinel_path",
     "cli_cooperative_stop",
+    "operation_label",
 ]

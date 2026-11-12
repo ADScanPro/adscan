@@ -32,7 +32,12 @@ import requests
 import sentry_sdk
 
 from .ssl_certificates import configure_ssl_certificates_for_requests
-from adscan_core.offline import offline_mode_enabled
+from adscan_core.offline import offline_mode_enabled, telemetry_disabled_by_environment
+from adscan_core.partner_tag_format import (
+    PARTNER_TAG_FORMAT_HINT as _PARTNER_TAG_FORMAT_HINT,
+    PARTNER_TAG_PATTERN as _PARTNER_TAG_FORMAT_PATTERN,
+    validate_partner_tag as _validate_partner_tag_format,
+)
 from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_core.lab_context import (
     build_lab_slug,
@@ -973,12 +978,12 @@ def _is_telemetry_enabled() -> bool:
     # ADSCAN_NO_EXTERNAL) must never send, persist, or drain telemetry — this
     # one gate also governs the disk-queue writer and the queue drainer, so
     # offline means off on all three axes (send / persist / flush).
-    if offline_mode_enabled():
+    # The explicit ADSCAN_TELEMETRY=0 opt-out is folded into the same
+    # environment gate (adscan_core.offline), so the web backend reads the
+    # exact predicate this engine obeys when it reports the toggle as enforced.
+    if telemetry_disabled_by_environment():
         return False
-    # Explicit telemetry setting takes highest priority
     env_val = os.getenv("ADSCAN_TELEMETRY", None)
-    if env_val == "0":
-        return False
     if env_val == "1":
         return True
 
@@ -1441,10 +1446,12 @@ _PARTNER_TAG_FIELD = "partner_tag"
 # because both sides validate against it: the host launcher's `--partner-tag`
 # flag and the in-container PRO gate. One pattern means a tag the launcher
 # accepts is never rejected by the gate that consumes it.
-_PARTNER_TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+# The pattern and the hint are defined once in adscan_core.partner_tag_format
+# (dependency-free, so the PRO licence model and the licence server share it).
+_PARTNER_TAG_PATTERN = _PARTNER_TAG_FORMAT_PATTERN
 
 #: Human-readable description of the format, for prompts and error messages.
-PARTNER_TAG_FORMAT_HINT = "lowercase letters, digits and hyphens, 2-41 characters"
+PARTNER_TAG_FORMAT_HINT = _PARTNER_TAG_FORMAT_HINT
 
 #: The refusal message shown when ADscan PRO is started without a resolvable
 #: partner tag. It lives HERE (adscan_core) so the host launcher's fast
@@ -1473,9 +1480,7 @@ def validate_partner_tag(tag: object) -> bool:
     Returns:
         True if the tag is well-formed, False otherwise.
     """
-    if not isinstance(tag, str):
-        return False
-    return bool(_PARTNER_TAG_PATTERN.match(tag.strip()))
+    return _validate_partner_tag_format(tag)
 
 
 def _extract_partner_tag(partner_file: Path) -> str:
@@ -1518,12 +1523,25 @@ def _read_persisted_partner_tag() -> str:
 
 
 def resolve_partner_tag() -> str:
-    """Resolve the partner tag using env override → volume file → "".
+    """Resolve the partner tag: signed PRO licence → env override → volume file → "".
+
+    A PRO licence that verifies carries the partner tag inside its signed
+    payload, so it is identity rather than a typed claim and wins over the
+    other two (``adscan_core.pro_license.identity``; one ``stat`` per call).
 
     Returns:
-        The resolved partner tag, or an empty string when neither the
-        ``ADSCAN_PARTNER_TAG`` env var nor a persisted volume file is present.
+        The resolved partner tag, or an empty string when no licence carries
+        one and neither the ``ADSCAN_PARTNER_TAG`` env var nor a persisted
+        volume file is present.
     """
+    try:
+        from adscan_core.pro_license.identity import installed_licence_identity
+
+        licensed = installed_licence_identity()
+    except Exception:  # noqa: BLE001 - identity lookup never breaks telemetry
+        licensed = None
+    if licensed is not None and licensed.partner_tag:
+        return licensed.partner_tag
     env_tag = os.getenv("ADSCAN_PARTNER_TAG", "").strip()
     if env_tag:
         return env_tag
@@ -2669,10 +2687,12 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "adcs_discovered",
         "adcs_not_discovered",
         "asreproast_no_users_found",
+        "asyncio_cross_loop_escape",
         "asreproast_started",
         "asreproast_users_found",
         "attack_path_compute_performance",
         "attack_path_discovery_started",
+        "attack_step_unexplained_failure",
         "attribution_source",
         "audit_wordlist_cracked",
         "binary_deploy",
@@ -2775,13 +2795,20 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "poisoning_capture",
         "poisoning_skipped_no_interface",
         "post_scan_report_moment",
+        "pro_domain_admission",
+        "pro_license_checked",
         "rdp_scan_started",
         "reinstall",
+        # Properties limited to report_options.REPORT_THEME_TELEMETRY_VALUES and
+        # deliver.REPORT_RENDER_ENTRIES (closed vocabularies, no path or name).
+        "report_theme_selected",
+        "lab_policy_refused",
         "repl_command",
         "repl_command_unknown",
         "roast_etype_prevalence",
         "scan_complete",
         "scan_outcome",
+        "scan_stopped_by_operator",
         "session_ci_check_failed",
         "session_ci_check_passed",
         "session_ci_override_accepted",

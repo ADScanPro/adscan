@@ -89,7 +89,6 @@ from typing import Any, Optional
 from jinja2 import Environment, select_autoescape
 
 from adscan_core import telemetry
-from adscan_core.offline import offline_mode_enabled
 from adscan_core.operator_role import CtaLane, resolve_cta_lane
 from adscan_core.reporting.cleanup_disclosures import (
     STILL_IN_PLACE_LABEL,
@@ -145,6 +144,10 @@ from adscan_core.reporting.chokepoint_copy import (
     remediation_start_here_headline,
 )
 from adscan_core.reporting.endpoint_defense import merge_endpoint_defense
+from adscan_core.reporting.execution_failure_explanations import (
+    is_attempted_step_status,
+    step_status_reason_view,
+)
 from adscan_core.reporting.host_reach_coverage import merge_host_reach_coverage
 from adscan_core.reporting.scan_pacing_disclosure import merge_scan_pacing
 from adscan_core.scan_policy.annotate import NOTE_LABEL_KEY as POLICY_NOTE_LABEL_KEY
@@ -152,6 +155,9 @@ from adscan_core.scan_policy.annotate import (
     META_UNLOCK_LINE_KEY as POLICY_META_UNLOCK_LINE_KEY,
 )
 from adscan_core.scan_policy.coverage import merge_scan_policy_coverage
+from adscan_core.reporting.operator_stop_coverage import (
+    merge_operator_stop_coverage,
+)
 from adscan_core.reporting.host_enrichment_coverage import (
     merge_host_enrichment_coverage,
 )
@@ -295,7 +301,7 @@ from adscan_internal.services.post_compromise_obligations import (
     load_post_compromise_obligations,
     obligations_to_dicts,
 )
-from adscan_internal.services.report_design import load_design_css
+from adscan_internal.services.report_design import embed_report_fonts, load_design_css
 
 # How many attack paths to render before collapsing the rest into an honest
 # "N more omitted" note. A dump of every path is not an artifact anyone
@@ -331,6 +337,11 @@ _PRO_URL = cta_url("lite_report")
 #: forwarded document is attributed). The colophon leads with this when the CTA
 #: lane resolves to ENTERPRISE (see :attr:`LiteReportModel.cta_lane_enterprise`).
 _ENTERPRISE_URL = cta_url("lite_report_enterprise_demo")
+#: The partner door for the report: the operator said they would build ADscan
+#: into a platform or service they sell (PTaaS, MSSP).
+_PARTNER_URL = cta_url("lite_report_partner")
+#: The learning lane's link for the report: lab walkthroughs, no sales ask.
+_LEARN_URL = cta_url("lite_report_learn")
 _LITE_REPO_URL = "https://github.com/ADScanPro/adscan"
 
 #: The house theme. Warm bone paper, editorial serif display, one deep-teal
@@ -495,6 +506,9 @@ class PathStepRow:
     #: "Not executed, excluded by the scan policy" when the policy kept this
     #: step from running (shared annotation, adscan_core.scan_policy.annotate).
     not_executed_label: str = ""
+    #: Why an attempted step did not complete, from the shared reason SSOT
+    #: (execution_failure_explanations). Empty for any other status.
+    status_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -1132,6 +1146,10 @@ class LiteReportModel:
     #: boundary so it never reads as exhaustive; the identity graph is always 100%.
     #: SSOT: :mod:`adscan_core.reporting.host_enrichment_coverage`.
     host_enrichment_coverage_statement: str = ""
+    #: Client-facing statements for every step the operator stopped, phase
+    #: skipped or scan stopped early, in order. Empty when nothing was stopped.
+    #: SSOT: :mod:`adscan_core.reporting.operator_stop_coverage`.
+    operator_stop_statements: tuple[str, ...] = ()
     #: Network reach of the assessment over the enabled computers: the report-wide
     #: view from the tier-shared SSOT, with ``scope_statement`` (always, when a
     #: block was recorded), ``has_gap`` and the per-segment rows. Empty mapping
@@ -1238,6 +1256,13 @@ class LiteReportModel:
     #: then LEADS with the Enterprise platform and mentions the PRO CLI kit second;
     #: otherwise it leads with the PRO client kit and mentions Enterprise second.
     cta_lane_enterprise: bool = False
+    #: The resolved CTA lane's value (``"pro"``, ``"enterprise"``, ``"partner"``
+    #: or ``"learn"``). Selects which close the colophon renders; the partner
+    #: close points at ``partner_url`` and the learning close at ``learn_url``
+    #: with no sales ask.
+    cta_lane: str = "pro"
+    partner_url: str = _PARTNER_URL
+    learn_url: str = _LEARN_URL
 
 
 # --- Pure builders ----------------------------------------------------------
@@ -1780,6 +1805,20 @@ def _step_narrative_base(step: dict[str, Any]) -> str:
     return f"{_humanize_relation(relation)}."
 
 
+def _step_status_reason(step: dict[str, Any], relation: str) -> str:
+    """The client sentence for an attempted step, "" for any other status."""
+    details = step.get("details")
+    details = details if isinstance(details, dict) else {}
+    view = details.get("status_reason_view")
+    if not isinstance(view, dict):
+        view = step_status_reason_view(step.get("status"), details, relation=relation)
+    if not isinstance(view, dict) or not view.get("has_reason"):
+        return ""
+    if not is_attempted_step_status(step.get("status")):
+        return ""
+    return str(view.get("client_note") or "")
+
+
 def _build_path_steps(
     steps: list[dict[str, Any]],
 ) -> tuple[list[PathStepRow], int, list[str]]:
@@ -1820,6 +1859,7 @@ def _build_path_steps(
                 )
                 if isinstance(step.get("details"), dict)
                 else "",
+                status_reason=_step_status_reason(step, relation),
             )
         )
     extra = 0
@@ -3265,8 +3305,13 @@ def _build_sprawl_lead(
     if reach.ordinary_available and affected > 0:
         remaining = "account" if ordinary_total == 1 else "accounts"
         also = "has" if affected == 1 else "have"
+        # "8 of the remaining 8" reads as a typo: say "all" when it is all.
+        if affected == ordinary_total:
+            share = "The 1 remaining" if ordinary_total == 1 else f"All {ordinary_total} remaining"
+        else:
+            share = f"{affected} of the remaining {ordinary_total}"
         return (
-            f"{lead} {affected} of the remaining {ordinary_total} ordinary "
+            f"{lead} {share} ordinary "
             f"(non-administrative) {remaining} also {also} "
             f"{full_compromise_reach_phrase(end_to_end_proven, evidence=reach_evidence, reason=reach_reason, awaiting_wait_seconds=reach_awaiting_wait)}."
             f"{_tier1_remainder(sprawl)}"
@@ -3680,7 +3725,7 @@ def _now_display() -> str:
 def _with_runbook_steps(obligation: dict[str, Any]) -> dict[str, Any]:
     """An obligation carrying its procedure as command steps.
 
-    The document prints a procedure through ``client_command``, one block per
+    The document prints a procedure through ``terminal_block``, one block per
     command with its prose outside, so an obligation that arrives with only the
     flat ``runbook`` lines is split the same way the ledger splits it.
     """
@@ -3690,6 +3735,16 @@ def _with_runbook_steps(obligation: dict[str, Any]) -> dict[str, Any]:
     if not any(line.strip() for line in lines):
         return obligation
     return {**obligation, "runbook_steps": remediation_steps("\n".join(lines))}
+
+
+def _no_framework_decision(technical_report: Any) -> bool:
+    """Whether the technical report records the "no framework applies" decision."""
+    from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+        compliance_decision_from_report,
+    )
+
+    decision = compliance_decision_from_report(technical_report)
+    return bool(decision is not None and decision.none_declared)
 
 
 def build_report_model(
@@ -3928,7 +3983,8 @@ def build_report_model(
     # compromise on the reader's OWN directory, so the reader is plausibly the org's
     # security owner (CISO/sysadmin) who buys the Enterprise platform, not the
     # pentester who buys the /pro CLI. Best-effort: resolve_cta_lane never raises.
-    cta_lane_enterprise = resolve_cta_lane() is CtaLane.ENTERPRISE
+    _report_lane = resolve_cta_lane()
+    cta_lane_enterprise = _report_lane is CtaLane.ENTERPRISE
 
     return LiteReportModel(
         workspace_name=workspace_name,
@@ -4009,6 +4065,9 @@ def build_report_model(
         host_enrichment_coverage_statement=(
             merge_host_enrichment_coverage(domains.values()).get("statement") or ""
         ),
+        operator_stop_statements=tuple(
+            merge_operator_stop_coverage(domains.values()).get("statements") or ()
+        ),
         host_reach_coverage=merge_host_reach_coverage(domains.values()),
         scan_policy=merge_scan_policy_coverage(domains.values()),
         scan_pacing=merge_scan_pacing(domains.values()),
@@ -4027,7 +4086,11 @@ def build_report_model(
             raw_paths, excluded_users=population_exclusions(domains)
         ),
         tier_glossary=build_tier_glossary_rows(),
-        severity_methodology=severity_methodology_view(),
+        # The free report maps no framework; its methodology note still words
+        # the absence as the assessor's decision when one was recorded.
+        severity_methodology=severity_methodology_view(
+            no_framework_applies=_no_framework_decision(technical_report),
+        ),
         # Endpoint defense, merged across domains by the shared SSOT. The free
         # report carries the two statements and the per-state counts; the
         # per-technique table stays in the paid deliverable.
@@ -4035,6 +4098,7 @@ def build_report_model(
             domains.values() if isinstance(domains, dict) else ()
         ),
         cta_lane_enterprise=cta_lane_enterprise,
+        cta_lane=str(getattr(_report_lane, "value", "pro")),
     )
 
 
@@ -4115,26 +4179,27 @@ def derive_report_content_metrics(model: LiteReportModel) -> ReportContentMetric
 # --- Rendering --------------------------------------------------------------
 
 
-def render_report_html(model: LiteReportModel, *, webfonts: bool = False) -> str:
+def render_report_html(model: LiteReportModel) -> str:
     """Render the model to a single self-contained HTML string.
+
+    The faces are declared as local ``adscan-font:`` references (see
+    ``report_design.fonts``): the PDF engine answers them from the package, and
+    nothing in the document ever reaches the network. The ``.html`` written to
+    disk inlines them (see :func:`generate_lite_report_artifacts`).
 
     Args:
         model: The resolved report model.
-        webfonts: Load the display faces from the web-font provider. Only the
-            copy handed to the PDF engine sets this: Chromium fetches the
-            faces once at render time and embeds them in the document, so the
-            resulting PDF is still self-contained. The ``.html`` written to
-            disk must never set it — that file has to open with no network,
-            and it degrades to the local fallbacks in the same type stacks.
 
     Returns:
         One HTML document with all CSS inline.
     """
-    env = Environment(autoescape=select_autoescape(["html", "xml"]))
+    from adscan_internal.services.report_design.terminal import install_terminal  # noqa: PLC0415
+
+    env = install_terminal(Environment(autoescape=select_autoescape(["html", "xml"])))
     template = env.from_string(_TEMPLATE)
     return template.render(
         m=model,
-        design_css=load_design_css(LITE_THEME, webfonts=webfonts),
+        design_css=load_design_css(LITE_THEME),
         reference_environment_label=REFERENCE_ENVIRONMENT_LABEL,
         reference_environment_assurance=REFERENCE_ENVIRONMENT_ASSURANCE,
     )
@@ -4198,17 +4263,13 @@ def render_report_pdf(
     shared with the PRO deliverable kit: there is exactly one HTML-to-PDF
     implementation in ADscan.
 
-    The markup handed to Chromium asks for the real display faces, which the
-    engine fetches once and embeds, so the PDF reads in the same typography as
-    the paid deliverable while the ``.html`` on disk stays network-free. In
-    offline deployments the request is skipped and both fall back to the local
-    faces in the same stacks.
+    The faces come from the package through the engine, so the PDF reads in
+    the same typography as the paid deliverable and the render makes no
+    outbound connection, online or air-gapped.
 
     Args:
         model: The resolved report model.
-        html_text: An already-rendered HTML string to use as-is. Only pass the
-            copy that was rendered for the PDF; the self-contained ``.html``
-            is a different render.
+        html_text: An already-rendered HTML string to use as-is.
 
     Returns:
         Raw PDF bytes.
@@ -4223,7 +4284,7 @@ def render_report_pdf(
     if not available:
         raise EngineRenderError(f"Chromium engine unavailable: {reason}")
     if html_text is None:
-        html_text = render_report_html(model, webfonts=not offline_mode_enabled())
+        html_text = render_report_html(model)
     return engine.render_pdf(
         html_text,
         base_url=None,
@@ -4742,7 +4803,9 @@ def generate_lite_report_artifacts(
             out_path = Path(workspace_dir) / f"{_REPORT_FILENAME_PREFIX}_{stamp}.html"
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(html_text, encoding="utf-8")
+        # The file on disk carries its faces inline, so it opens anywhere in
+        # the report's own typography with no network and nothing beside it.
+        out_path.write_text(embed_report_fonts(html_text), encoding="utf-8")
 
         pdf_path = _write_report_pdf(model, out_path)
 
@@ -4832,7 +4895,8 @@ def _print_report_ready_panel(
 
     from adscan_core.rich_output import print_panel
 
-    placement = cta_placement_for_lane(resolve_cta_lane(), surface="report_ready_panel")
+    lane = resolve_cta_lane()
+    placement = cta_placement_for_lane(lane, surface="report_ready_panel")
 
     # The PDF leads when it exists: it is the copy that gets forwarded onward.
     lines: list[Text] = []
@@ -4903,11 +4967,24 @@ def _print_report_ready_panel(
             ]
         )
     else:
-        lines.append(
-            Text.from_markup(
+        # One dim line naming the next step for THIS operator's lane.
+        if lane is CtaLane.ENTERPRISE:
+            lead = (
+                "Validated continuously on your own domain, with a report your "
+                "board and auditors can read: "
+            )
+        elif lane is CtaLane.PARTNER:
+            lead = "Deliver this from your own platform or service: "
+        elif lane is CtaLane.LEARN:
+            lead = "Step-by-step walkthroughs on public practice labs: "
+        else:
+            lead = (
                 "Client-ready version mapped to your engagement's regime, "
                 "per-finding remediation and your own branding: "
-                + cta_markup(placement, cta_display_url(placement)),
+            )
+        lines.append(
+            Text.from_markup(
+                lead + cta_markup(placement, cta_display_url(placement)),
                 style="dim",
             )
         )
@@ -4952,6 +5029,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
    `safe` because it is bundled CSS, not user data — autoescaping it turns
    every child combinator into `&gt;` and silently kills those rules. #}
 {{ design_css | safe }}
+{{ terminal_css() }}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    Composition — this document only.
@@ -5405,33 +5483,9 @@ ol.oblig-steps > li {
 }
 /* Where and as whom a step's commands run: prose above them. */
 .oblig-where { font-size: 7.6pt; color: var(--text-3); line-height: 1.45; margin-top: 1.4mm; }
-.oblig-cmd {
-  font-family: var(--font-mono); font-size: 6.8pt; color: var(--text);
-  background: var(--bg-1); border: 1px solid var(--line);
-  border-left: 2px solid var(--accent);
-  padding: 1.6mm 2.4mm; margin-top: 1.4mm;
-  /* A crafted command block, not a ragged paste. `pre-wrap` keeps the authored
-     line breaks; `break-word` wraps at spaces and only breaks a token that is
-     itself longer than the line (a long DN or certificate serial), so the right
-     edge stays even instead of the mid-token shredding `overflow-wrap: anywhere`
-     produced on the certutil revocation runbook. Uniform left padding (no
-     text-indent, which would only outdent a multi-line runbook's first line)
-     keeps every line of the block aligned to one gutter. */
-  white-space: pre-wrap; overflow-wrap: break-word; word-break: normal;
-  hyphens: none; tab-size: 2; line-height: 1.5;
-}
-/* The document's client command block (rule: CLAUDE.md, "Every command a
-   client is shown renders through the shared terminal block"): prose before
-   the block, the shell it runs in, the command alone in the runbook box, then
-   the caption. Cleanup and custody commands both go through client_command. */
-.ccmd-item { margin-top: 1.4mm; page-break-inside: avoid; break-inside: avoid; }
-.ccmd-intro { font-size: 7.6pt; color: var(--text-2); line-height: 1.45; margin: 1.4mm 0 0; }
-.ccmd-shell {
-  display: block; font-family: var(--font-mono); font-size: 5.8pt; letter-spacing: 0.06em;
-  color: var(--text-4); margin-top: 1mm;
-}
-.ccmd-item .oblig-cmd { margin-top: 0.4mm; }
-.ccmd-note { font-size: 7pt; color: var(--text-3); line-height: 1.45; margin: 0.8mm 0 0; }
+/* Every command this document prints renders through terminal_block()
+   (adscan_internal/services/report_design/terminal.py), the shared client
+   command block; terminal_css() emits its stylesheet below the design system. */
 /* One change still in place, grouped by why (shared outcome copy). */
 .change-group { margin-top: 6mm; }
 .change-group-t { font-size: 10pt; font-weight: 700; color: var(--text); display: flex; gap: 2mm; align-items: baseline; }
@@ -5479,7 +5533,6 @@ ol.oblig-steps > li {
   margin-top: 0.8mm; word-break: break-all; line-height: 1.35;
 }
 .change-detail { font-size: 7.5pt; color: var(--text-3); margin-top: 1mm; line-height: 1.4; }
-.change-cmd { font-family: var(--font-mono, monospace); font-size: 7pt; margin: 0.8mm 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── Closing call to action ───────────────────────────────────────────────
    The report's highest-intent moment: the reader has just seen the domain fall.
@@ -5546,20 +5599,6 @@ ol.oblig-steps > li {
 </style>
 </head>
 <body class="ds-doc">
-{# THE document's client command block. ``step`` is the shared command shape
-   (adscan_core.reporting.cleanup_remediation): intro, command, platform,
-   caption, outro. A prose-only step prints its intro alone. #}
-{% macro client_command(step) %}
-<div class="ccmd-item">
-  {% if step.intro %}<p class="ccmd-intro">{{ step.intro }}</p>{% endif %}
-  {% if step.command %}
-  <span class="ccmd-shell">{{ 'SQL Server query' if step.platform == 'sql' else ('Linux shell' if step.platform == 'linux' else 'PowerShell') }}</span>
-  <div class="oblig-cmd">{{ step.command }}</div>
-  {% if step.caption %}<p class="ccmd-note">{{ step.caption }}</p>{% endif %}
-  {% if step.outro %}<p class="ccmd-note">{{ step.outro }}</p>{% endif %}
-  {% endif %}
-</div>
-{% endmacro %}
 <div class="sheet">
 
   <header class="masthead">
@@ -5800,7 +5839,7 @@ ol.oblig-steps > li {
   <section class="ds-section">
     <div class="ds-note">
       <div class="ds-note-k">Scan policy</div>
-      <div class="ds-note-t">{% if m.scan_policy.prominent %}{{ m.scan_policy.statement }}{% if m.scan_policy.cleared_line %} {{ m.scan_policy.cleared_line }}{% endif %}{% if m.scan_policy.families %} The families it narrowed are {% for f in m.scan_policy.families %}{{ f.label }} ({{ f.excluded }} of {{ f.total }}){{ ', ' if not loop.last else '.' }}{% endfor %}{% endif %}{% if m.scan_policy.routes_line %} {{ m.scan_policy.routes_line }}{% endif %}{% if m.scan_policy.execution_line and not m.scan_policy.map_only %} {{ m.scan_policy.execution_line }}{% endif %}{% else %}{{ m.scan_policy.headline }}{% endif %}{% if m.scan_policy.new_checks_line %} {{ m.scan_policy.new_checks_line }}{% endif %}{% if m.scan_policy.password_attempts_line %} {{ m.scan_policy.password_attempts_line }}{% endif %}{% if m.scan_policy.settings_line %} {{ m.scan_policy.settings_line }}{% endif %}{% if m.scan_policy.revert_permission_line %} {{ m.scan_policy.revert_permission_line }}{% endif %}</div>
+      <div class="ds-note-t">{% if m.scan_policy.prominent %}{{ m.scan_policy.statement }}{% if m.scan_policy.cleared_line %} {{ m.scan_policy.cleared_line }}{% endif %}{% if m.scan_policy.families %} The families it narrowed are {% for f in m.scan_policy.families %}{{ f.label }} ({{ f.excluded }} of {{ f.total }}){{ ', ' if not loop.last else '.' }}{% endfor %}{% endif %}{% if m.scan_policy.routes_line %} {{ m.scan_policy.routes_line }}{% endif %}{% if m.scan_policy.execution_line and not m.scan_policy.map_only %} {{ m.scan_policy.execution_line }}{% endif %}{% else %}{{ m.scan_policy.headline }}{% endif %}{% if m.scan_policy.agreed_policy_line %} {{ m.scan_policy.agreed_policy_line }}{% endif %}{% if m.scan_policy.new_checks_line %} {{ m.scan_policy.new_checks_line }}{% endif %}{% if m.scan_policy.password_attempts_line %} {{ m.scan_policy.password_attempts_line }}{% endif %}{% if m.scan_policy.settings_line %} {{ m.scan_policy.settings_line }}{% endif %}{% if m.scan_policy.revert_permission_line %} {{ m.scan_policy.revert_permission_line }}{% endif %}{% if m.scan_policy.reversal_capability and m.scan_policy.reversal_capability.present %}{% for forest in m.scan_policy.reversal_capability.forests %}{% for line in forest.lines %} {{ line }}{% endfor %}{% endfor %}{% for line in m.scan_policy.reversal_capability.lines %} {{ line }}{% endfor %}{% endif %}</div>
     </div>
     {# The excluded checks, one row each, from the same shared view the paid
        report renders, so both reports name the same excluded steps. #}
@@ -6235,7 +6274,7 @@ ol.oblig-steps > li {
         <li>
           {{ step.text }}
           {% if step.where and step.commands %}<div class="oblig-where">{{ step.where }}</div>{% endif %}
-          {% for cmd in step.commands %}{{ client_command({'command': cmd, 'platform': 'windows'}) }}{% endfor %}
+          {% for cmd in step.commands %}{{ terminal_block({'command': cmd, 'platform': 'windows'}) }}{% endfor %}
         </li>
         {% endfor %}
       </ol>
@@ -6245,7 +6284,7 @@ ol.oblig-steps > li {
          from here; this document has no such section, so it carries it. #}
       {% if ob.runbook_steps %}
       <div class="oblig-runbook-k">The procedure, with this engagement's values</div>
-      {% for rs in ob.runbook_steps %}{{ client_command(rs) }}{% endfor %}
+      {% for rs in ob.runbook_steps %}{{ terminal_block(rs) }}{% endfor %}
       {% endif %}
       {% if ob.caveat %}
       <p class="oblig-caveat"><b>What stays true afterwards</b>{{ ob.caveat }}</p>
@@ -6453,6 +6492,12 @@ ol.oblig-steps > li {
       <div class="ds-note-t">{{ m.host_enrichment_coverage_statement }}</div>
     </div>
     {% endif %}
+    {% if m.operator_stop_statements %}
+    <div class="ds-note">
+      <div class="ds-note-k">Stopped by the operator</div>
+      {% for _line in m.operator_stop_statements %}<div class="ds-note-t">{{ _line }}</div>{% endfor %}
+    </div>
+    {% endif %}
     {# Routes vs findings. When several routes reach the same target by the same
        technique from different footholds, ADscan shows the group once as one
        finding and names every foothold — so a finding below can stand for more
@@ -6495,6 +6540,7 @@ ol.oblig-steps > li {
           <span class="ds-step-txt">{% if s.technique %}<span class="step-tech">{{ s.technique }}.</span> {% endif %}{{ s.narrative }}</span>
           <span class="chip {{ s.status_tone }} ds-step-status">{{ s.status_label }}</span>
           {% if s.not_executed_label %}<span class="chip ds-step-status">{{ s.not_executed_label }}</span>{% endif %}
+          {% if s.status_reason %}<div class="ds-step-reason">{{ s.status_reason }}</div>{% endif %}
         </li>
         {% endfor %}
       </ol>
@@ -6580,7 +6626,7 @@ ol.oblig-steps > li {
     {# Every change still in place, grouped by WHY, with the shared outcome
        copy (adscan_core.reporting.cleanup_outcome; the paid report and the
        platform use the same groups). Each command goes through
-       client_command. #}
+       terminal_block. #}
     {% for g in m.changes.outcome_groups %}
     <div class="change-group">
       <div class="change-group-t"><span class="chip {{ g.tone }}">{{ g.title }}</span><span class="change-group-n">{{ g.rows | length }}</span></div>
@@ -6605,7 +6651,7 @@ ol.oblig-steps > li {
         {% elif c.detail and c.outcome != 'kept_by_decision' %}
         <div class="change-detail">{{ c.detail }}.</div>
         {% endif %}
-        {% for step in c.steps %}{{ client_command(step) }}{% endfor %}
+        {% for step in c.steps %}{{ terminal_block(step) }}{% endfor %}
       </div>
       {% endfor %}
     </div>
@@ -6668,7 +6714,37 @@ ol.oblig-steps > li {
   </section>
 
   <footer class="colophon">
-    {% if m.cta_lane_enterprise %}
+    {% if m.cta_lane == "partner" %}
+    {# The operator would build ADscan into a platform or service they sell
+       (PTaaS, MSSP): the next step is partner terms, not a seat of the CLI. #}
+    <div class="close">
+      <div class="close-k">Where to take this</div>
+      <h2 class="close-title">Deliver this from your own service.</h2>
+      <p class="close-lead">
+        Platforms and MSSPs run this same engine inside the service they sell:
+        their runner starts the assessment at the client site, and their dashboard
+        reads the results from versioned files with a published schema.
+      </p>
+      <p class="close-action">
+        Partner terms and how platforms integrate:
+        <a href="{{ m.partner_url }}">ADscan for partners</a>.
+      </p>
+    </div>
+    {% elif m.cta_lane == "learn" %}
+    {# A student, CTF player or learner: no sales ask. Point at the lab
+       walkthroughs that take each technique apart. #}
+    <div class="close">
+      <div class="close-k">Where to take this</div>
+      <h2 class="close-title">See how each step works.</h2>
+      <p class="close-lead">
+        The lab walkthroughs run ADscan on public practice domains, from a fresh
+        box to Domain Admin, with the reasoning behind each step.
+      </p>
+      <p class="close-action">
+        Start with the <a href="{{ m.learn_url }}">lab walkthroughs</a>.
+      </p>
+    </div>
+    {% elif m.cta_lane_enterprise %}
     {# The reader runs their OWN directory (a CISO/sysadmin): lead with the
        Enterprise platform that validates it continuously, and name the PRO CLI
        kit second for the consultant case. #}

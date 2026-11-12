@@ -194,6 +194,62 @@ def _register_ca_identity(ca_name: str, ca_host: str) -> None:
         pass
 
 
+_UNSET: Any = object()
+
+
+def _stamp_role_separation_reading(
+    ca: CollectorNode,
+    *,
+    role_separation: Any = _UNSET,
+    security_edges: list[CollectorEdge] | None = None,
+) -> None:
+    """Record on the CA node what was read about its role separation.
+
+    The segregation-of-duties evidence
+    (:mod:`adscan_core.reporting.ca_role_separation`) is decided from this
+    record, so it stores only what the CA ANSWERED: the flag when the CA gave a
+    definitive 0 or 1, and the CA Administrator / Certificate Manager trustees
+    only when the security descriptor itself was read. A read that failed leaves
+    its field absent, which the evidence reads as "not read", never as "off" or
+    as "nobody holds the role".
+    """
+    from adscan_core.reporting.ca_role_separation import (  # noqa: PLC0415
+        READING_ADMINS,
+        READING_ATTEMPTED,
+        READING_FLAG,
+        READING_OFFICERS,
+        READING_PROPERTY,
+        READING_SECURITY_READ,
+    )
+    from adscan_core.scan_policy.revert_rights import (  # noqa: PLC0415
+        role_separation_state,
+    )
+
+    reading = ca.properties.get(READING_PROPERTY)
+    if not isinstance(reading, dict):
+        reading = {}
+        ca.properties[READING_PROPERTY] = reading
+    reading[READING_ATTEMPTED] = True
+    if role_separation is not _UNSET:
+        state = role_separation_state(role_separation)
+        if state is not None:
+            reading[READING_FLAG] = 1 if state else 0
+    if security_edges is not None:
+        admins = sorted(
+            {e.source_object_id for e in security_edges if e.relation == "ManageCA"}
+        )
+        officers = sorted(
+            {
+                e.source_object_id
+                for e in security_edges
+                if e.relation == "ManageCertificates"
+            }
+        )
+        reading[READING_SECURITY_READ] = True
+        reading[READING_ADMINS] = admins
+        reading[READING_OFFICERS] = officers
+
+
 # ---------------------------------------------------------------------------
 # Attribute lists per kind
 # ---------------------------------------------------------------------------
@@ -621,13 +677,51 @@ class ADCSCollector:
         # Set once a PKI-container search returns ``noSuchObject`` so the whole
         # domain reports "no ADCS" as a single quiet line, not per-container.
         self._adcs_absent = False
+        # Object ids of PKI objects returned WITHOUT a security descriptor (the
+        # account cannot read it). An ACL-derived ESC verdict on such an object
+        # is unknown, never clear: an unread ACL must not read as "nobody can
+        # enroll". The recheck observers consult it; the scan path ignores it.
+        self.unread_security_descriptors: set[str] = set()
 
     def _note_adcs_absent(self) -> None:
         """Record that a PKI container was absent (no ADCS in this domain)."""
         self._adcs_absent = True
 
+    @property
+    def adcs_absent(self) -> bool:
+        """Whether a PKI container answered ``noSuchObject`` (no AD CS here)."""
+        return self._adcs_absent
+
     def collect(self) -> CollectionResult:
         """Run all five enumerations and return a populated ``CollectionResult``."""
+        result, oid_links = self.collect_directory()
+        if oid_links is None:
+            return result
+
+        self._detect_escalations(result, oid_links=oid_links)
+
+        # One quiet line for a domain with no PKI, instead of ~6 red errors.
+        if self._adcs_absent and not result.nodes:
+            print_info_verbose(
+                "No Active Directory Certificate Services in "
+                f"{mark_sensitive(self._domain, 'domain')} — skipping ADCS checks."
+            )
+
+        print_info_debug(
+            "[adcs-collector] done "
+            f"domain={mark_sensitive(self._domain, 'domain')} "
+            f"nodes={len(result.nodes)} edges={len(result.edges)}"
+        )
+        return result
+
+    def collect_directory(self) -> tuple[CollectionResult, "_OidToGroupLinks | None"]:
+        """Read the PKI objects, their ACL edges and the ESC13 OID links (LDAP only).
+
+        The directory half of :meth:`collect`: no detection, no CA-host contact.
+        ``oid_links`` is ``None`` when the connection has no configuration
+        naming context (nothing was read). The recheck observers call it so a
+        re-check reads the CURRENT state with exactly the scan's own reads.
+        """
         result = CollectionResult(domain=self._domain)
 
         config_dn = self._connection.config_dn
@@ -635,7 +729,7 @@ class ADCSCollector:
             print_warning_debug(
                 "[adcs-collector] connection has no config_dn; skipping ADCS"
             )
-            return result
+            return result, None
 
         pks_base = f"CN=Public Key Services,CN=Services,{config_dn}"
         print_info_verbose(
@@ -700,22 +794,7 @@ class ADCSCollector:
         # ``msDS-OIDToGroupLink``. The map is consumed by ``detect_esc13`` to
         # enrich edge notes with the linked group DN.
         oid_links = self._collect_oid_to_group_links(pks_base, result=result)
-
-        self._detect_escalations(result, oid_links=oid_links)
-
-        # One quiet line for a domain with no PKI, instead of ~6 red errors.
-        if self._adcs_absent and not result.nodes:
-            print_info_verbose(
-                "No Active Directory Certificate Services in "
-                f"{mark_sensitive(self._domain, 'domain')} — skipping ADCS checks."
-            )
-
-        print_info_debug(
-            "[adcs-collector] done "
-            f"domain={mark_sensitive(self._domain, 'domain')} "
-            f"nodes={len(result.nodes)} edges={len(result.edges)}"
-        )
-        return result
+        return result, oid_links
 
     def _collect_category(
         self,
@@ -759,6 +838,7 @@ class ADCSCollector:
         print_info_debug(f"[adcs-collector] {label} found {len(entries)} entries")
 
         for entry in entries:
+            node = None
             try:
                 node = _build_node_from_ldap_entry(entry, kind, self._domain)
                 if node is None:
@@ -771,7 +851,11 @@ class ADCSCollector:
                         sd_bytes, node.object_id, node.kind
                     ):
                         result.add_edge(edge)
+                else:
+                    self.unread_security_descriptors.add(node.object_id)
             except Exception as exc:
+                if node is not None:
+                    self.unread_security_descriptors.add(node.object_id)
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_info_debug(
@@ -898,183 +982,37 @@ class ADCSCollector:
         if not templates and not cas:
             return
 
-        oid_to_group_dn = dict(oid_links.links) if oid_links is not None else {}
-        oid_links_resolved = oid_links.resolved if oid_links is not None else False
-
-        edges_by_target: dict[str, list] = {}
-        for edge in result.edges:
-            edges_by_target.setdefault(edge.target_object_id, []).append(edge)
-
         # Run async probe phase. Any orchestration error degrades to an
         # empty probe map; per-CA / per-domain failures already degrade
         # individually inside ``_run_probes``.
-        ca_probes: dict[str, _CAProbeBundle] = {}
-        domain_binding: tuple[int, bool] | None = None
-        try:
-            from adscan_internal.services.async_bridge import run_async_sync
+        ca_probes, domain_binding = self.read_ca_host_state(cas)
 
-            ca_probes, domain_binding = run_async_sync(self._run_probes(cas))
-        except Exception as exc:
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_info_debug(f"[adcs-collector] probe phase failed: {exc}")
-
-        cert_mapping_methods, strong_cert_binding_enforced = (
-            domain_binding if domain_binding is not None else (0, False)
+        # The detection itself is ONE shared function: the scan here and the
+        # read-only recheck observers grade the same inputs the same way.
+        detected = detect_collected_escalations(
+            result,
+            domain=self._domain,
+            oid_links=oid_links,
+            ca_probes=ca_probes,
+            domain_binding=domain_binding,
         )
-
-        # Publication gate (mirrors Certipy's ``is_enabled`` flag): a template is
-        # issuable only when its enrollment name (its ``cn``) appears in some
-        # Enterprise CA's ``certificateTemplates`` list. An unpublished template
-        # object cannot be requested from any CA (the CA rejects it with
-        # CERTSRV_E_UNSUPPORTED_CERT_TYPE), so its issuance ESC findings would be
-        # false-positive executable paths. Collected across ALL CAs, casefolded,
-        # matched on ``cn`` (the enrollment name) — NOT ``displayName``, which
-        # ``template.name`` derives from and which may differ from the CN.
-        published_labels: set[str] = set()
-        for ca in cas:
-            ca_templates = ca.properties.get("certificate_templates") or []
-            if not isinstance(ca_templates, (list, tuple)):
-                ca_templates = [ca_templates]
-            for entry in ca_templates:
-                label = str(entry).strip().casefold()
-                if label:
-                    published_labels.add(label)
-
-        def _template_is_published(template_node: CollectorNode) -> bool:
-            cn = str(template_node.properties.get("cn") or "").strip().casefold()
-            return bool(cn) and cn in published_labels
-
-        # Build a "is template published by any CA whose ESC6 probe says
-        # SAN2 is enabled?" flag per template. ESC6 takes a single bool;
-        # if any CA publishing the template has the flag set, surface the
-        # finding. Match on ``cn`` (enrollment name), same as the publication
-        # gate — the old ``template.name`` (displayName) match was a latent
-        # false-negative when displayName != CN.
-        template_to_san2: dict[str, bool] = {}
-        for ca in cas:
-            probe = ca_probes.get(ca.object_id)
-            if probe is None or probe.registry is None:
-                continue
-            if not probe.registry.editf_attributesubjectaltname2_enabled:
-                continue
-            ca_published = ca.properties.get("certificate_templates") or []
-            if not isinstance(ca_published, (list, tuple)):
-                ca_published = [ca_published]
-            published_norm = {str(t).strip().casefold() for t in ca_published if t}
-            for template in templates:
-                cn_label = str(template.properties.get("cn") or "").strip().casefold()
-                if cn_label and cn_label in published_norm:
-                    template_to_san2[template.object_id] = True
-
-        # Per-template detection.
         added = 0
-        for template in templates:
-            template_edges = edges_by_target.get(template.object_id, [])
-            try:
-                new_edges = _detect_adcs_escalations(
-                    template_node=template,
-                    template_acl_edges=template_edges,
-                    domain=self._domain,
-                    ca_editf_san2_enabled=template_to_san2.get(
-                        template.object_id, False
-                    ),
-                    cert_mapping_methods=cert_mapping_methods,
-                    strong_cert_binding_enforced=strong_cert_binding_enforced,
-                    oid_to_group_dn=oid_to_group_dn,
-                    oid_links_resolved=oid_links_resolved,
-                    published=_template_is_published(template),
-                )
-            except Exception as exc:
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                print_info_debug(
-                    f"[adcs-collector] esc detection failed for {template.object_id}: {exc}"
-                )
-                continue
-            for edge in new_edges:
-                result.add_edge(edge)
-                added += 1
-
-        # Per-PKI-object detection (ESC5: write on NTAuthStore / RootCA / AIACA / EnterpriseCA).
-        pki_nodes = [
-            n
-            for n in result.nodes.values()
-            if n.kind in {"NTAuthStore", "RootCA", "AIACA", "EnterpriseCA"}
-        ]
+        for edge in detected.template_edges:
+            result.add_edge(edge)
+            added += 1
         pki_added = 0
-        for pki_node in pki_nodes:
-            pki_edges = edges_by_target.get(pki_node.object_id, [])
-            try:
-                from adscan_internal.services.collector.adcs_detectors.esc5 import (
-                    detect_esc5,
-                )
+        for edge in detected.pki_edges:
+            result.add_edge(edge)
+            pki_added += 1
 
-                new_edges = detect_esc5(
-                    pki_node=pki_node,
-                    pki_acl_edges=pki_edges,
-                    domain=self._domain,
-                )
-            except Exception as exc:
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                print_info_debug(
-                    f"[adcs-collector] esc5 detection failed for {pki_node.object_id}: {exc}"
-                )
-                continue
-            for edge in new_edges:
-                result.add_edge(edge)
-                pki_added += 1
-
-        # ESC8 / ESC11 anchor at the well-known Authenticated Users SID
-        # (S-1-5-11) — resolved by the detectors themselves — so no domain-SID
-        # derivation is needed here. That node is injected into the graph before
-        # persistence, so the edge always resolves and (unlike a domain-local
-        # Domain Users anchor) surfaces the cross-forest NTLM-relay surface.
-
-        # Per-CA detection (ESC7 + probe-driven ESC8 / ESC11).
         ca_added = 0
         for ca in cas:
-            probe = ca_probes.get(ca.object_id)
-            # Merge the LDAP-derived CA ACL edges with the ManageCA /
-            # ManageCertificates edges read from the CA's own security
-            # descriptor (MS-CSRA). detect_esc7 dedups by SID, so the overlap
-            # with the LDAP defaults collapses; the delta is the delegated
-            # (non-default) management holders LDAP alone cannot see.
-            ca_edges = list(edges_by_target.get(ca.object_id, []))
-            if probe is not None and probe.ca_security_edges:
-                ca_edges = ca_edges + probe.ca_security_edges
-            web_enabled = (
-                probe.web.web_enrollment_enabled
-                if probe is not None and probe.web is not None
-                else False
-            )
-            # ESC8 data gap (Exposure-Validation doctrine): the CA host could
-            # not be resolved / reached, so ESC8 is UNKNOWN — surface it as a
-            # data gap, never let a DNS failure read as "web enrollment absent".
-            if probe is not None and probe.web is not None and probe.web.could_not_verify:
-                print_info_debug(
-                    "[adcs-collector] ESC8 could not be verified for CA "
-                    f"{mark_sensitive(ca.name or ca.object_id, 'hostname')}: "
-                    "CA host name could not be resolved or reached (data gap) — "
-                    "web enrollment status is UNKNOWN, not disabled"
-                )
-            registry = probe.registry if probe is not None else None
-            try:
-                new_edges = _detect_adcs_ca_escalations(
-                    ca_node=ca,
-                    ca_acl_edges=ca_edges,
-                    domain=self._domain,
-                    web_enrollment_enabled=web_enabled,
-                    **registry_ca_detector_kwargs(registry),
-                )
-            except Exception as exc:
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                print_info_debug(
-                    f"[adcs-collector] esc detection failed for CA {ca.object_id}: {exc}"
-                )
+            if ca.object_id not in detected.ca_edges:
+                # Detection failed for this CA (already reported): nothing to
+                # record, exactly as before the detection was factored out.
                 continue
+            probe = ca_probes.get(ca.object_id)
+            new_edges = detected.ca_edges[ca.object_id]
             for edge in new_edges:
                 result.add_edge(edge)
                 ca_added += 1
@@ -1527,9 +1465,14 @@ class ADCSCollector:
         )
 
     def _ca_host_not_contacted(
-        self, *, ca_name: str, ca_host: str, verdict: Any
+        self, *, ca_name: str, ca_host: str, verdict: Any, record_esc12: bool = True
     ) -> "_CAProbeBundle":
-        """Record every host-level CA check as not checked, with the reason."""
+        """Record every host-level CA check as not checked, with the reason.
+
+        ``record_esc12=False`` (the read-only recheck) keeps the ESC12
+        observation out of any recorded run: a recheck writes only its own
+        evidence, never the scan's observation record.
+        """
         from adscan_internal.services.adcs import esc12_detection as esc12  # noqa: PLC0415
         from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
             note_collection_host_skipped,
@@ -1547,7 +1490,7 @@ class ADCSCollector:
                 f"contacted: {verdict.reason}"
             )
         esc12_result = esc12.not_checked(ca_name, ca_host, verdict.reason)
-        if self._shell is not None and ca_name:
+        if record_esc12 and self._shell is not None and ca_name:
             esc12.observe_esc12_result(
                 self._shell, domain=self._domain, result=esc12_result
             )
@@ -1601,6 +1544,10 @@ class ADCSCollector:
                 f"CA host not contacted from this domain ({verdict.reason})"
             )
             return []
+        # From here this domain owns the CA: whatever the reads below return,
+        # the segregation-of-duties evidence knows the CA was in its remit, so
+        # a CA nothing could be read from reads "not assessed", never absent.
+        _stamp_role_separation_reading(ca)
         if is_ip_address(ca_host):
             print_info_debug(
                 f"adcs GetCASecurity skipped for {mark_sensitive(ca_name, 'hostname')}: "
@@ -1694,9 +1641,28 @@ class ADCSCollector:
         sd_bytes = None
         try:
             async with smb_machine_with_fallback(smb_config) as machine:
-                sd_bytes, err = await machine.get_ca_security_dcom(ca_name)
+                # The security descriptor and the role-separation flag are read
+                # on ONE CA-administration interface, one after the other, so
+                # the flag costs no second sign-in. A refused descriptor read
+                # (the normal answer for an account that is not a CA
+                # administrator) still leaves the flag, which needs only Read.
+                facts, err = await machine.get_ca_security_and_role_separation_dcom(
+                    ca_name
+                )
                 if err is not None:
                     raise err
+                _stamp_role_separation_reading(
+                    ca, role_separation=facts.get("role_separation")
+                )
+                if facts.get("role_separation_error") is not None:
+                    print_info_debug(
+                        "adcs role-separation flag not read for "
+                        f"{mark_sensitive(ca_name, 'hostname')}: "
+                        f"{type(facts['role_separation_error']).__name__}"
+                    )
+                if facts.get("security_error") is not None:
+                    raise facts["security_error"]
+                sd_bytes = facts.get("security")
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {rich.markup.escape(str(exc))}"
             if _is_expected_ca_security_denial(exc):
@@ -1733,6 +1699,8 @@ class ADCSCollector:
             return []
 
         edges = parse_ca_security_edges(sd_bytes, ca.object_id)
+        if sd_bytes is not None:
+            _stamp_role_separation_reading(ca, security_edges=edges)
         if sd_bytes is None:
             print_info_debug(
                 f"adcs GetCASecurity read failed for "
@@ -1839,8 +1807,28 @@ class ADCSCollector:
             print_exception(exception=exc)
         return ""
 
+    def read_ca_host_state(
+        self, cas: list[CollectorNode], *, check_esc12: bool = True
+    ) -> tuple[dict[str, "_CAProbeBundle"], tuple[int, bool] | None]:
+        """Run the CA-host and DC-binding reads; never raises.
+
+        The single sync entry to :meth:`_run_probes` (one bridge call). Any
+        orchestration error degrades to an empty probe map, so a CA-host check
+        whose input was not read stays undecided. ``check_esc12=False`` (the
+        read-only recheck) skips the ESC12 check and its observation record.
+        """
+        try:
+            from adscan_internal.services.async_bridge import run_async_sync
+
+            return run_async_sync(self._run_probes(cas, check_esc12=check_esc12))
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[adcs-collector] probe phase failed: {exc}")
+            return {}, None
+
     async def _run_probes(
-        self, cas: list[CollectorNode]
+        self, cas: list[CollectorNode], *, check_esc12: bool = True
     ) -> tuple[dict[str, "_CAProbeBundle"], tuple[int, bool] | None]:
         """Run all CA-host and DC binding probes concurrently."""
         registry_probe = ADCSCARegistryProbe()
@@ -1870,7 +1858,10 @@ class ADCSCollector:
             host_verdict = self._ca_host_verdict(ca_host)
             if host_verdict is not None and not host_verdict.allowed:
                 ca_probes[ca.object_id] = self._ca_host_not_contacted(
-                    ca_name=ca_name, ca_host=ca_host, verdict=host_verdict
+                    ca_name=ca_name,
+                    ca_host=ca_host,
+                    verdict=host_verdict,
+                    record_esc12=check_esc12,
                 )
                 continue
 
@@ -1964,9 +1955,10 @@ class ADCSCollector:
             # outcome is recorded in the run's observation record. Best-effort.
             esc12_result = None
             try:
-                esc12_result = await self._check_esc12(
-                    ca_host=ca_host, ca_name=ca_name, host_verdict=host_verdict
-                )
+                if check_esc12:
+                    esc12_result = await self._check_esc12(
+                        ca_host=ca_host, ca_name=ca_name, host_verdict=host_verdict
+                    )
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
@@ -1997,6 +1989,202 @@ class ADCSCollector:
                 )
 
         return ca_probes, domain_binding
+
+
+class DetectedEscalations(NamedTuple):
+    """The ESC edges one detection pass produced, in the order the scan adds them.
+
+    ``ca_edges`` maps each Enterprise CA object id to its edges; a CA whose
+    detection raised is ABSENT from the map (an empty list means detection ran
+    and found nothing), so a caller never reads a failed CA as clear.
+    """
+
+    template_edges: list[CollectorEdge]
+    pki_edges: list[CollectorEdge]
+    ca_edges: dict[str, list[CollectorEdge]]
+
+    def all_edges(self) -> list[CollectorEdge]:
+        """Every detected edge, template first, then PKI objects, then CAs."""
+        out = list(self.template_edges) + list(self.pki_edges)
+        for edges in self.ca_edges.values():
+            out.extend(edges)
+        return out
+
+
+def published_template_labels(cas: Iterable[CollectorNode]) -> set[str]:
+    """Casefolded enrollment names (``cn``) every Enterprise CA publishes.
+
+    The publication gate (mirrors Certipy's ``is_enabled``): a template is
+    issuable only when its ``cn`` appears in some CA's ``certificateTemplates``.
+    Matched on ``cn``, never ``displayName``, which may differ.
+    """
+    labels: set[str] = set()
+    for ca in cas:
+        ca_templates = ca.properties.get("certificate_templates") or []
+        if not isinstance(ca_templates, (list, tuple)):
+            ca_templates = [ca_templates]
+        for entry in ca_templates:
+            label = str(entry).strip().casefold()
+            if label:
+                labels.add(label)
+    return labels
+
+
+def template_is_published(template: CollectorNode, labels: set[str]) -> bool:
+    """Whether ``template`` is published by a CA (see :func:`published_template_labels`)."""
+    cn = str(template.properties.get("cn") or "").strip().casefold()
+    return bool(cn) and cn in labels
+
+
+def detect_collected_escalations(
+    result: CollectionResult,
+    *,
+    domain: str,
+    oid_links: "_OidToGroupLinks | None",
+    ca_probes: Mapping[str, "_CAProbeBundle"],
+    domain_binding: tuple[int, bool] | None,
+) -> DetectedEscalations:
+    """Run every ESC detector over one collection's PKI objects. No side effects.
+
+    The single detection seam of AD CS: the scan's collector and the read-only
+    recheck observers both call it, so a re-check grades the current state with
+    exactly the predicates that raised the finding. Inputs are the collected
+    nodes and their ACL edges (``result``), the ESC13 OID links, and the CA-host
+    reads (``ca_probes``, ``domain_binding``); with a CA-host read missing the
+    detectors emit nothing for the checks it feeds (no false positive). A
+    detector that raises is reported and skipped, never fatal.
+    """
+    templates = [n for n in result.nodes.values() if n.kind == "CertTemplate"]
+    cas = [n for n in result.nodes.values() if n.kind == "EnterpriseCA"]
+
+    oid_to_group_dn = dict(oid_links.links) if oid_links is not None else {}
+    oid_links_resolved = oid_links.resolved if oid_links is not None else False
+
+    edges_by_target: dict[str, list] = {}
+    for edge in result.edges:
+        edges_by_target.setdefault(edge.target_object_id, []).append(edge)
+
+    cert_mapping_methods, strong_cert_binding_enforced = (
+        domain_binding if domain_binding is not None else (0, False)
+    )
+
+    published_labels = published_template_labels(cas)
+
+    # Build a "is template published by any CA whose ESC6 probe says
+    # SAN2 is enabled?" flag per template. ESC6 takes a single bool;
+    # if any CA publishing the template has the flag set, surface the
+    # finding. Match on ``cn`` (enrollment name), same as the publication
+    # gate — the old ``template.name`` (displayName) match was a latent
+    # false-negative when displayName != CN.
+    template_to_san2: dict[str, bool] = {}
+    for ca in cas:
+        probe = ca_probes.get(ca.object_id)
+        if probe is None or probe.registry is None:
+            continue
+        if not probe.registry.editf_attributesubjectaltname2_enabled:
+            continue
+        for template_id in _published_template_ids(ca, templates):
+            template_to_san2[template_id] = True
+
+    # Per-template detection.
+    template_edges: list[CollectorEdge] = []
+    for template in templates:
+        try:
+            new_edges = _detect_adcs_escalations(
+                template_node=template,
+                template_acl_edges=edges_by_target.get(template.object_id, []),
+                domain=domain,
+                ca_editf_san2_enabled=template_to_san2.get(template.object_id, False),
+                cert_mapping_methods=cert_mapping_methods,
+                strong_cert_binding_enforced=strong_cert_binding_enforced,
+                oid_to_group_dn=oid_to_group_dn,
+                oid_links_resolved=oid_links_resolved,
+                published=template_is_published(template, published_labels),
+            )
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[adcs-collector] esc detection failed for {template.object_id}: {exc}"
+            )
+            continue
+        template_edges.extend(new_edges)
+
+    # Per-PKI-object detection (ESC5: write on NTAuthStore / RootCA / AIACA / EnterpriseCA).
+    from adscan_internal.services.collector.adcs_detectors.esc5 import (  # noqa: PLC0415
+        detect_esc5,
+    )
+
+    pki_edges: list[CollectorEdge] = []
+    for pki_node in result.nodes.values():
+        if pki_node.kind not in {"NTAuthStore", "RootCA", "AIACA", "EnterpriseCA"}:
+            continue
+        try:
+            new_edges = detect_esc5(
+                pki_node=pki_node,
+                pki_acl_edges=edges_by_target.get(pki_node.object_id, []),
+                domain=domain,
+            )
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[adcs-collector] esc5 detection failed for {pki_node.object_id}: {exc}"
+            )
+            continue
+        pki_edges.extend(new_edges)
+
+    # ESC8 / ESC11 anchor at the well-known Authenticated Users SID
+    # (S-1-5-11) — resolved by the detectors themselves — so no domain-SID
+    # derivation is needed here. That node is injected into the graph before
+    # persistence, so the edge always resolves and (unlike a domain-local
+    # Domain Users anchor) surfaces the cross-forest NTLM-relay surface.
+
+    # Per-CA detection (ESC7 + probe-driven ESC8 / ESC11).
+    ca_edges_by_ca: dict[str, list[CollectorEdge]] = {}
+    for ca in cas:
+        probe = ca_probes.get(ca.object_id)
+        # Merge the LDAP-derived CA ACL edges with the ManageCA /
+        # ManageCertificates edges read from the CA's own security
+        # descriptor (MS-CSRA). detect_esc7 dedups by SID, so the overlap
+        # with the LDAP defaults collapses; the delta is the delegated
+        # (non-default) management holders LDAP alone cannot see.
+        ca_acl_edges = list(edges_by_target.get(ca.object_id, []))
+        if probe is not None and probe.ca_security_edges:
+            ca_acl_edges = ca_acl_edges + probe.ca_security_edges
+        web_enabled = (
+            probe.web.web_enrollment_enabled
+            if probe is not None and probe.web is not None
+            else False
+        )
+        # ESC8 data gap (Exposure-Validation doctrine): the CA host could
+        # not be resolved / reached, so ESC8 is UNKNOWN — surface it as a
+        # data gap, never let a DNS failure read as "web enrollment absent".
+        if probe is not None and probe.web is not None and probe.web.could_not_verify:
+            print_info_debug(
+                "[adcs-collector] ESC8 could not be verified for CA "
+                f"{mark_sensitive(ca.name or ca.object_id, 'hostname')}: "
+                "CA host name could not be resolved or reached (data gap) — "
+                "web enrollment status is UNKNOWN, not disabled"
+            )
+        registry = probe.registry if probe is not None else None
+        try:
+            ca_edges_by_ca[ca.object_id] = list(
+                _detect_adcs_ca_escalations(
+                    ca_node=ca,
+                    ca_acl_edges=ca_acl_edges,
+                    domain=domain,
+                    web_enrollment_enabled=web_enabled,
+                    **registry_ca_detector_kwargs(registry),
+                )
+            )
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[adcs-collector] esc detection failed for CA {ca.object_id}: {exc}"
+            )
+    return DetectedEscalations(template_edges, pki_edges, ca_edges_by_ca)
 
 
 class PendingCARegistryProbe(NamedTuple):

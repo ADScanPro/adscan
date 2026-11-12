@@ -16,6 +16,8 @@ It uses:
 
 from __future__ import annotations
 
+from adscan_core.domain_auth_state import is_authenticated_state
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 
 from collections.abc import Callable
@@ -916,7 +918,7 @@ def _print_roast_results_table(
     total_normal = len(non_admin_users) + len(privileged_users)
     total_all = total_admin + total_normal
 
-    if auth_mode == "auth":
+    if is_authenticated_state(auth_mode):
         # Authenticated table: privilege columns + DA visual grouping.
         # Border accent escalates to crimson when a DA account is present.
         border_color = COLOR_CRIMSON if total_admin > 0 else COLOR_STEEL
@@ -1182,7 +1184,7 @@ def finalize_roast_results(
         report_field = roast_type.lower()
         if report_field:
             domain_data = shell.domains_data.get(domain, {})
-            if domain_data.get("auth") == "auth":
+            if is_authenticated_state(domain_data.get("auth")):
                 value = {
                     "all_users": None,
                     "admin_users": None,
@@ -1205,7 +1207,7 @@ def finalize_roast_results(
     non_admin_users: list[str] = []
 
     domain_data = shell.domains_data.get(domain, {})
-    if domain_data.get("auth") == "auth":
+    if is_authenticated_state(domain_data.get("auth")):
         for user in normalized_users:
             all_users.append(user)
             if shell.check_high_value(domain, user, logging=False):
@@ -1255,7 +1257,7 @@ def finalize_roast_results(
 
     report_field = roast_type.lower()
     if report_field:
-        if domain_data.get("auth") == "auth":
+        if is_authenticated_state(domain_data.get("auth")):
             value = {
                 "all_users": all_users if all_users else None,
                 "admin_users": admin_users if admin_users else None,
@@ -1273,7 +1275,7 @@ def finalize_roast_results(
 
     try:
         total_users = len(all_users)
-        admin_count = len(admin_users) if domain_data.get("auth") == "auth" else 0
+        admin_count = len(admin_users) if is_authenticated_state(domain_data.get("auth")) else 0
         base_properties = {
             "total_users": total_users,
             "admin_users": admin_count,
@@ -1692,8 +1694,7 @@ def run_asreproast(
 
     username_display = (
         shell.domains_data.get(shell.domain or "", {}).get("username", "N/A")
-        if shell.domains_data[target_domain].get("auth") == "auth"
-        or shell.domains_data[target_domain].get("auth") == "pwned"
+        if is_authenticated_state(shell.domains_data[target_domain].get("auth"))
         else "Unauthenticated"
     )
 
@@ -1710,7 +1711,7 @@ def run_asreproast(
     auth_mode = shell.domains_data[target_domain].get("auth")
     enum_service = EnumerationService(license_mode=shell._get_license_mode_enum())
 
-    if auth_mode == "auth" or auth_mode == "pwned":
+    if is_authenticated_state(auth_mode):
         hashes = enum_service.kerberos.asreproast(
             domain=target_domain,
             pdc=shell.domains_data[target_domain]["pdc"],
@@ -2113,7 +2114,7 @@ def sync_clock_with_pdc(
                         return await get_dc_time(pdc_ip, sock_path=sock_path)
 
                     try:
-                        reading = _asyncio.run(_read_dc_time())
+                        reading = run_on_new_loop(_read_dc_time())
                     except DCTimeUnavailable as exc:
                         print_info_debug(
                             "[clock-sync] all DC-time read channels failed, "

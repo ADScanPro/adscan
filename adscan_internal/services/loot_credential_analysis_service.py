@@ -13,7 +13,6 @@ The service then handles:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,6 +45,7 @@ from adscan_internal.services.share_loot_ai_analysis_service import (
     ShareLootAICredentialFinding,
     ShareLootAIAnalysisService,
 )
+from adscan_core.async_bridge import run_async_sync
 from adscan_core.rich_output import print_exception
 
 ENGINE_CREDSWEEPER = "credsweeper"
@@ -359,8 +359,12 @@ def _run_secret_intelligence_pass(
         Both are empty on failure.
     """
     try:
+        # run_async_sync runs on a fresh loop, or on a worker thread when the
+        # caller already owns a running loop (what the old dedicated-loop
+        # fallback intended; that fallback could never run, because a second
+        # loop cannot be driven on a thread that is running one).
         svc = SecretIntelligenceService()
-        si_result = asyncio.run(svc.analyze_path(Path(loot_dir), policy=scoring_policy))
+        si_result = run_async_sync(svc.analyze_path(Path(loot_dir), policy=scoring_policy))
         si_grouped = normalize_secret_intelligence_findings_to_grouped_credentials(
             si_result.findings
         )
@@ -372,51 +376,13 @@ def _run_secret_intelligence_pass(
             f"indicators={len(si_result.indicators)}"
         )
         return si_grouped, list(si_result.indicators), list(si_result.findings)
-    except RuntimeError as exc:
-        # asyncio.run() raises RuntimeError when called inside an existing loop.
-        # In that case, fall back to creating a dedicated loop to avoid breaking
-        # the caller's async context.
-        if "cannot be called from a running event loop" not in str(exc):
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_info_debug(
-                f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
-            )
-            return {}, [], []
-        try:
-            loop = asyncio.new_event_loop()
-            try:
-                svc = SecretIntelligenceService()
-                si_result = loop.run_until_complete(
-                    svc.analyze_path(Path(loot_dir), policy=scoring_policy)
-                )
-                si_grouped = normalize_secret_intelligence_findings_to_grouped_credentials(
-                    si_result.findings
-                )
-                total = sum(len(v) for v in si_grouped.values())
-                print_info_debug(
-                    "[secret_intelligence] Pass completed (dedicated loop): "
-                    f"loot_dir={loot_dir} total_findings={total} "
-                    f"grouped_rules={len(si_grouped)} "
-                    f"indicators={len(si_result.indicators)}"
-                )
-                return si_grouped, list(si_result.indicators), list(si_result.findings)
-            finally:
-                loop.close()
-        except Exception as inner_exc:  # noqa: BLE001
-            telemetry.capture_exception(inner_exc)
-            print_exception(exception=inner_exc)
-            print_info_debug(
-                f"[secret_intelligence] Pass skipped (dedicated loop error): {type(inner_exc).__name__}"
-            )
-            return {}, [], []
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(
             f"[secret_intelligence] Pass skipped due to error: {type(exc).__name__}"
         )
-        return {}, []
+        return {}, [], []
 
 
 def parse_ai_loot_local_source(

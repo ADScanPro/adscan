@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.attack_graph/1",
+  "title": "ADscan attack graph v1",
+  "description": "domains/<domain>/attack_graph.json: the directory objects of one domain (nodes) and every relation between them that grants access or control (edges), with the execution status ADscan recorded on each edge. Written by one writer (save_attack_graph in adscan_internal/services/attack_graph_service.py). Version marker: schema_version, '1.<minor>' (1.1 graphs carry no edge kind and are upgraded on the next write). Declared objects may gain fields within a major; do not reject unknown keys. properties, notes, knowledge, evidence and maintenance are opaque. No recovered password, hash or key value is ever written into this file.",
+  "type": "object",
+  "required": ["schema_version", "domain", "generated_at", "nodes", "edges"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 255},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "coverage_run_id": {"type": "string", "maxLength": 64},
+    "maintenance": {"type": "object", "$comment": "Engine bookkeeping for one-time graph migrations. Not for consumers."},
+    "dc_ip": {"type": "string", "$comment": "Domain controller address the verification commands are filled with."},
+    "dc_fqdn": {"type": "string"},
+    "netbios": {"type": "string"},
+    "scan_principal": {"type": "string", "$comment": "The account the scan authenticated as. Never a secret."},
+    "ca_name": {"type": "string"},
+    "ca_host": {"type": "string"},
+    "nodes": {
+      "type": "object",
+      "$comment": "Keyed by node id, the same value as the node's id field.",
+      "additionalProperties": {"$ref": "#/$defs/node"}
+    },
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nullable_string": {"type": ["string", "null"]},
+    "node": {
+      "type": "object",
+      "required": ["id", "label", "kind"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "label": {"type": "string"},
+        "name": {"type": "string"},
+        "kind": {"type": "string", "minLength": 1, "$comment": "Directory object class: User, Group, Computer, Domain, GPO, OU, Container, CertTemplate, EnterpriseCA, RootCA, AIACA, NTAuthStore, ... (open vocabulary)."},
+        "objectId": {"$ref": "#/$defs/nullable_string"},
+        "properties": {"type": "object"},
+        "highvalue": {"type": "boolean"},
+        "is_high_value": {"type": "boolean"},
+        "isTierZero": {"type": "boolean", "$comment": "Legacy collection-time flag. The authoritative tier is properties.privilege_tier (tier0_direct, tier0_escalation_capable, tier1, tier2), or privilege_tier on the node itself."},
+        "privilege_tier": {"$ref": "#/$defs/nullable_string"},
+        "system_tags": {"type": "array", "items": {"type": "string"}},
+        "target_terminal_class": {"$ref": "#/$defs/nullable_string"},
+        "tier0_inherited": {"type": "boolean"},
+        "compromise_class": {"$ref": "#/$defs/nullable_string"}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "$comment": "Endpoints are from/to (node ids). Edges derived from a host check (unpatched vulnerabilities, NTLMv1 relay avenues) name their endpoints as source/target, and some carry both pairs: read from/to and fall back to source/target.",
+      "required": ["relation"],
+      "properties": {
+        "id": {"type": "string"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "relation": {"type": "string", "minLength": 1, "$comment": "Relation name (GenericAll, AdminTo, ADCSESC1, DCSync, ...; open vocabulary)."},
+        "kind": {"type": "string", "$comment": "control, auth, membership, trust, derived, escalation or unknown."},
+        "status": {"type": "string", "$comment": "discovered, theoretical, attempted, success, blocked, closed_by_configuration, unsupported, ... (open vocabulary)."},
+        "edge_type": {"type": "string"},
+        "category": {"$ref": "#/$defs/nullable_string"},
+        "vuln_key": {"$ref": "#/$defs/nullable_string"},
+        "notes": {"type": "object"},
+        "knowledge": {"type": "object"},
+        "evidence": {"type": "object"},
+        "first_seen": {"$ref": "#/$defs/timestamp"},
+        "last_seen": {"$ref": "#/$defs/timestamp"},
+        "discovered_at": {"$ref": "#/$defs/timestamp"},
+        "recorded_at": {"$ref": "#/$defs/timestamp"}
+      }
+    }
+  }
+}

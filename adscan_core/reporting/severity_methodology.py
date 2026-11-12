@@ -14,7 +14,9 @@ adopt the same block without a second copy, and a test can assert the annex is
 present without parsing a PDF. Keeping the prose at the boundary of authorship
 is the same rule the catalog prose follows.
 
-Nothing in this module reads the engine at runtime. It DESCRIBES
+Nothing in this module reads the engine at runtime, apart from one count: how
+many catalogued finding types carry a CVSS Base vector, read from the catalog
+so the annex cannot state a stale figure. It DESCRIBES
 ``adscan_internal.services.severity`` (the attack-step grade) and
 ``adscan_core.cvss`` (the finding grade), and the contract test beside it fails
 if either model grows or loses an input this annex does not mention.
@@ -155,12 +157,17 @@ _NO_CVSS_PCI_SCOPE = (
 _NO_CVSS_CITE_ORDER: tuple[str, ...] = ("dora", "nis2", "ens", "iso27001", "cis")
 
 
-def _no_cvss_regime_paragraph(frameworks: Sequence[str] | None) -> str:
+def _no_cvss_regime_paragraph(
+    frameworks: Sequence[str] | None, *, no_framework_applies: bool = False
+) -> str:
     """Build the "does anyone require CVSS" paragraph for the mapped frameworks.
 
     Args:
         frameworks: Canonical framework keys the report maps. ``None`` or empty
             means none were selected, and no regime is cited.
+        no_framework_applies: The assessor decided no compliance framework
+            applies to the organisation, so the absence is worded as that
+            decision rather than as "nothing was selected".
 
     Returns:
         One paragraph that names only the selected frameworks.
@@ -169,6 +176,13 @@ def _no_cvss_regime_paragraph(frameworks: Sequence[str] | None) -> str:
     cited = [k for k in _NO_CVSS_CITE_ORDER if k in selected]
     pci = "pci_dss" in selected
     if not cited and not pci:
+        if no_framework_applies:
+            return (
+                "No compliance framework applies to this organisation, by the "
+                "assessor's decision, so this report cites no regime. Severity "
+                "here is reported on the model above, which does not depend on "
+                "any framework."
+            )
         return (
             "No compliance framework was selected for this report, so it cites "
             "no regime. Severity here is reported on the model above, which "
@@ -208,17 +222,57 @@ def _no_cvss_regime_paragraph(frameworks: Sequence[str] | None) -> str:
     return " ".join(parts)
 
 
-def no_cvss_column_body(frameworks: Sequence[str] | None = None) -> list[str]:
+def no_cvss_column_body(
+    frameworks: Sequence[str] | None = None, *, no_framework_applies: bool = False
+) -> list[str]:
     """Return the "why no CVSS column" paragraphs for the mapped frameworks.
 
     Args:
         frameworks: Canonical framework keys the report maps.
+        no_framework_applies: The assessor decided no framework applies.
 
     Returns:
         The paragraphs in order, with the regime paragraph tailored.
     """
     first, _regimes, *rest = NO_CVSS_COLUMN_BODY
-    return [first, _no_cvss_regime_paragraph(frameworks), *rest]
+    regimes = _no_cvss_regime_paragraph(
+        frameworks, no_framework_applies=no_framework_applies
+    )
+    return [first, regimes, *rest]
+
+
+def published_vector_coverage() -> tuple[int, int]:
+    """Return ``(finding types with a CVSS Base vector, finding types catalogued)``.
+
+    Counted from the catalog rather than typed: the annex used to state "17 of
+    the 93" as literal prose, and it was still saying so after the catalog had
+    grown to 94 finding types with 18 vectors, in a paragraph whose whole point
+    is that a figure a reader cannot reproduce is the one an auditor queries.
+    Both numbers come from the same LITE-safe sources the severity engine reads.
+    """
+    from adscan_core.cvss import compute_base_cvss_result  # noqa: PLC0415
+    from adscan_core.reporting.vuln_catalog_meta import (  # noqa: PLC0415
+        VULN_CATALOG_META,
+    )
+
+    with_vector = sum(
+        1 for key in VULN_CATALOG_META if compute_base_cvss_result(key).vector
+    )
+    return with_vector, len(VULN_CATALOG_META)
+
+
+def _vector_coverage_paragraph() -> str:
+    with_vector, total = published_vector_coverage()
+    blank = total - with_vector
+    return (
+        f"{with_vector} of the {total} finding types ADscan catalogues map to a "
+        f"published Base vector. Printing a CVSS column would therefore fill "
+        f"{with_vector} rows and leave {blank} blank, so every finding here is "
+        "graded by the model set out above, with its bands and its inputs "
+        "published. Where a finding does map to a vector, ADscan holds both the "
+        "vector and the score it computes, and prints them when an engagement is "
+        "contractually scoped to CVSS."
+    )
 
 
 NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
@@ -229,12 +283,7 @@ NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
     "printed without its vector cannot be verified by the reader, and an "
     "unverifiable figure is the one an auditor queries.",
     _no_cvss_regime_paragraph(("dora", "nis2", "ens", "pci_dss")),
-    "17 of the 93 finding types ADscan catalogues map to a published Base "
-    "vector. Printing a CVSS column would therefore fill 17 rows and leave 76 "
-    "blank, so every finding here is graded by the model set out above, with "
-    "its bands and its inputs published. Where a finding does map to a vector, "
-    "ADscan holds both the vector and the score it computes, and prints them "
-    "when an engagement is contractually scoped to CVSS.",
+    _vector_coverage_paragraph(),
     "A named CVE is the exception, because its score is somebody else's work "
     "and can be checked at the source. Where a finding concerns one, the "
     "report names the CVE so the official NVD score can be looked up against "
@@ -244,12 +293,16 @@ NO_CVSS_COLUMN_BODY: tuple[str, ...] = (
 
 def severity_methodology_view(
     frameworks: Sequence[str] | None = None,
+    *,
+    no_framework_applies: bool = False,
 ) -> dict[str, object]:
     """Return the annex as the render context both tiers consume.
 
     Args:
         frameworks: Canonical keys of the frameworks the report maps. Only
             these are cited as regimes; ``None`` cites none.
+        no_framework_applies: The assessor decided no compliance framework
+            applies to the organisation (worded as that decision).
 
     Returns:
         A mapping with the two graded models and the CVSS note, ready to loop
@@ -294,7 +347,9 @@ def severity_methodology_view(
         },
         "no_cvss": {
             "heading": NO_CVSS_COLUMN_HEADING,
-            "body": no_cvss_column_body(frameworks),
+            "body": no_cvss_column_body(
+                frameworks, no_framework_applies=no_framework_applies
+            ),
         },
     }
 
@@ -305,6 +360,7 @@ __all__ = [
     "FINDING_INPUTS",
     "FINDING_RULES",
     "NO_CVSS_COLUMN_BODY",
+    "published_vector_coverage",
     "NO_CVSS_COLUMN_HEADING",
     "no_cvss_column_body",
     "severity_methodology_view",

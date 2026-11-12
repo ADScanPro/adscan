@@ -402,6 +402,21 @@ def ldap_entry_attributes(entry: Any) -> dict[str, list[Any]]:
     return _attrs(entry)
 
 
+def decode_object_sid(raw: Any) -> str:
+    """Public name of the collector's ``objectSid`` decoder (``""`` when unreadable)."""
+    return _decode_sid(raw) if raw else ""
+
+
+def raw_attribute_bytes(entry: Any, attr: str) -> bytes | None:
+    """Public name of the collector's raw (binary) attribute reader."""
+    return _raw_bytes(entry, attr)
+
+
+def parse_gmsa_membership_sd(sd_bytes: bytes, *, target_object_id: str) -> list[CollectorEdge]:
+    """Public name of the collector's ``msDS-GroupMSAMembership`` parser (ReadGMSAPassword)."""
+    return _parse_gmsa_membership_sd(sd_bytes, target_object_id=target_object_id)
+
+
 def _attrs(entry: Any) -> dict[str, list[Any]]:
     raw = getattr(entry, "entry_raw_attributes", {}) or {}
     decoded = getattr(entry, "entry_attributes_as_dict", {}) or {}

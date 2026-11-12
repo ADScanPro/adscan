@@ -27,6 +27,7 @@ contract, not a description of the tool that produced it.
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 import asyncio
 import ipaddress
 import json
@@ -270,7 +271,7 @@ def resolve_hostnames_to_ipv4(
     )
     started = time.monotonic()
     try:
-        host_to_ips = asyncio.run(_resolve_all(unique_hosts, clean_resolvers))
+        host_to_ips = run_on_new_loop(_resolve_all(unique_hosts, clean_resolvers))
     except Exception as exc:  # noqa: BLE001 — resolution is best-effort; a failure must not abort the caller
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -339,7 +340,7 @@ def resolve_computer_nodes(
     )
     started = time.monotonic()
     try:
-        host_to_ips = asyncio.run(_resolve_all(unique_hostnames, [dc_ip]))
+        host_to_ips = run_on_new_loop(_resolve_all(unique_hostnames, [dc_ip]))
     except Exception as exc:  # noqa: BLE001 — resolution is best-effort; a failure must not abort collection
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

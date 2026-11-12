@@ -250,9 +250,26 @@ def _esc8_not_viable_result(technique: str, reason: str) -> EscResult:
     )
 
 
+async def _declined_before_coercion(config: EscConfig, technique: str) -> EscResult | None:
+    """Reversible by construction (§ 5.1): no coercion for a certificate nobody can revoke.
+
+    The relay obtains its certificate outside the enrollment seam, so the revoke
+    right on this CA is established here, before a domain controller is made to
+    authenticate to the scanner.
+    """
+    from adscan_internal.services.adcs.reversal_capability import (  # noqa: PLC0415
+        esc_reversal_refusal,
+    )
+
+    return await esc_reversal_refusal(config, technique=technique, surface="esc_relay")
+
+
 async def run_esc8(config: EscConfig) -> EscResult:
     """Run native ESC8: coerce a DC and relay NTLM to ADCS Web Enrollment."""
 
+    declined = await _declined_before_coercion(config, "ADCSESC8")
+    if declined is not None:
+        return declined
     listener = _listener_host(config)
     if not listener.ip:
         return _listener_unresolved_result("ESC8: ADCS Web Enrollment", 8, listener)
@@ -299,6 +316,9 @@ async def run_esc8(config: EscConfig) -> EscResult:
 async def run_esc11(config: EscConfig) -> EscResult:
     """Run native ESC11: coerce a DC and relay NTLM to MS-ICPR."""
 
+    declined = await _declined_before_coercion(config, "ADCSESC11")
+    if declined is not None:
+        return declined
     listener = _listener_host(config)
     if not listener.ip:
         return _listener_unresolved_result("ESC11: MS-ICPR (RPC/DCOM)", 11, listener)
@@ -403,6 +423,9 @@ async def run_esc8_krb(config: EscConfig) -> EscResult:
 
     No computer account creation, no SPN write — DNS-only setup.
     """
+    declined = await _declined_before_coercion(config, "ADCSESC8")
+    if declined is not None:
+        return declined
     listener = _listener_host(config)
     if not listener.ip:
         return _listener_unresolved_result("ESC8: Kerberos relay", 8, listener)
@@ -501,6 +524,11 @@ async def _run_adcs_smb_krb_relay_chain(
             listen_host="0.0.0.0",
             listen_port=_SMB_PORT,
             timeout_seconds=120.0,
+            # The coerced DC is the caller we want; the background capture keeps
+            # every other caller on the shared port.
+            expected_sources=tuple(
+                host for host in (config.dc_ip, config.dc_fqdn) if host
+            ),
         ),
         capture_queue,
     )
@@ -521,27 +549,39 @@ async def _run_adcs_smb_krb_relay_chain(
         authproto="kerberos" if config.use_kerberos else "ntlm",
     )
 
+    return await _run_smb_krb_capture_and_relay(
+        config,
+        listener,
+        capture_queue,
+        factory,
+        listener_host,
+        coerce_listener_name,
+        target,
+    )
+
+
+async def _run_smb_krb_capture_and_relay(
+    config: EscConfig,
+    listener: SMBKrbCaptureListener,
+    capture_queue: "asyncio.Queue[bytes]",
+    factory,
+    listener_host: str,
+    coerce_listener_name: str,
+    target: AdcsEsc8KrbRelayTarget,
+) -> object:
+    """Start the Kerberos capture listener, coerce, relay the captured blob."""
     from adscan_internal.services.relay.core import (
         RelayListenerUnavailableError,
         RelayRunResult,
+        report_relay_listener_unavailable,
     )
 
     try:
         await listener.start()
     except RelayListenerUnavailableError as exc:
-        # The SMB listen port is already held (e.g. by the poisoning / capture
-        # listener). Return a failed chain result carrying the honest reason so
-        # ESC8-KRB continues instead of aborting the phase with a raw traceback.
-        from adscan_core import telemetry  # noqa: PLC0415
-        from adscan_core.rich_output import print_exception  # noqa: PLC0415
-        from adscan_internal.rich_output import print_warning  # noqa: PLC0415
-
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_warning(
-            f"Kerberos relay SMB listener could not start on port {exc.port} "
-            f"({exc.reason}). Skipping ESC8 Kerberos relay and continuing."
-        )
+        # The SMB listen port could not be opened. Return a failed chain result
+        # carrying the classified reason, without coercing the target.
+        report_relay_listener_unavailable(exc, technique="ESC8 (Kerberos relay)")
         return _KrbRelayChainResult(
             relay_result=RelayRunResult(
                 results=(),
@@ -702,12 +742,15 @@ def _relay_result_to_esc(
             },
         )
 
-    print_relay_no_auth(
-        technique=technique,
-        timed_out=result.relay_result.timed_out,
-        coercion_success=result.coercion_success,
-    )
     listener_error = getattr(result.relay_result, "listener_error", None)
+    if not listener_error:
+        # A listener that never started already said so in one line; "the
+        # coercion did not trigger" would be false (nothing was coerced).
+        print_relay_no_auth(
+            technique=technique,
+            timed_out=result.relay_result.timed_out,
+            coercion_success=result.coercion_success,
+        )
     error = listener_error or fallback_error
     if not listener_error and relay_results:
         error = relay_results[-1].error or error
@@ -763,12 +806,15 @@ def _relay_chain_to_esc_result(
             },
         )
 
-    print_relay_no_auth(
-        technique=technique,
-        timed_out=result.relay_result.timed_out,
-        coercion_success=result.coercion_success,
-    )
     listener_error = getattr(result.relay_result, "listener_error", None)
+    if not listener_error:
+        # A listener that never started already said so in one line; "the
+        # coercion did not trigger" would be false (nothing was coerced).
+        print_relay_no_auth(
+            technique=technique,
+            timed_out=result.relay_result.timed_out,
+            coercion_success=result.coercion_success,
+        )
     error = listener_error or fallback_error
     if not listener_error and relay_results:
         error = relay_results[-1].error or error

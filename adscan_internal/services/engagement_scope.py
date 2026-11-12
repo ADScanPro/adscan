@@ -223,10 +223,22 @@ def origin_domains(shell: Any) -> list[str]:
 
 
 def _known_domains(shell: Any) -> list[str]:
+    """Every AD domain the session knows of, from recorded data only.
+
+    A recorded forest root counts (``forest_topology.FOREST_KEY``): it is a real
+    domain even when nothing of it was collected, and without it a host of the
+    root (``ca.<root>``) seen from a child's records matched no known suffix and
+    was attributed to the child, so the child's checks contacted it.
+    """
+    from adscan_internal.services.forest_topology import FOREST_KEY  # noqa: PLC0415
+
     known: list[str] = []
     domains_data = getattr(shell, "domains_data", None)
     if isinstance(domains_data, Mapping):
         known.extend(_norm(k) for k in domains_data.keys())
+        for entry in domains_data.values():
+            if isinstance(entry, Mapping) and entry.get(FOREST_KEY):
+                known.append(_norm(entry.get(FOREST_KEY)))
     known.extend(_record(shell)["entries"].keys())
     known.extend(origin_domains(shell))
     return [d for d in domains_named(known) if d not in _PLACEHOLDERS]

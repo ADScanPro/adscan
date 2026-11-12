@@ -25,13 +25,14 @@ Anti-patterns intentionally avoided:
 
 from __future__ import annotations
 
-import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
 
 from adscan_core import telemetry
+from adscan_core.cross_loop_lock import CrossLoopLock
 from adscan_core.rich_output import print_info_debug, print_warning
 from adscan_internal.services.domain_posture import (
     ConstraintCategory,
@@ -101,8 +102,9 @@ class PostureFreshness:
 _session_probed: set[tuple[str, ProbePhase]] = set()
 
 # Per-(domain, phase) lock to serialize concurrent probe attempts.
-_probe_locks: dict[tuple[str, ProbePhase], asyncio.Lock] = {}
-_locks_mutex = asyncio.Lock()
+# CrossLoopLock: probes run from a fresh asyncio.run loop per sync call.
+_probe_locks: dict[tuple[str, ProbePhase], CrossLoopLock] = {}
+_locks_mutex = threading.Lock()
 
 
 def clear_session_cache() -> None:
@@ -173,12 +175,12 @@ def posture_categories_excluded_by_policy(
         return frozenset(ConstraintCategory)
 
 
-async def _get_lock(key: tuple[str, ProbePhase]) -> asyncio.Lock:
+async def _get_lock(key: tuple[str, ProbePhase]) -> CrossLoopLock:
     """Return (and lazily create) the lock guarding probes for ``key``."""
-    async with _locks_mutex:
+    with _locks_mutex:  # dict access only, never awaited while held
         lock = _probe_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = CrossLoopLock()
             _probe_locks[key] = lock
         return lock
 

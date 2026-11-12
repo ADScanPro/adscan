@@ -1,10 +1,11 @@
 # Async DCOM Connection Manager for aiosmb
 #
-# Implements a singleton pattern for managing DCOM connections and
-# object lifetime via async ping mechanism.
+# One manager per running event loop (see DCOMConnectionManager.get_instance)
+# tracks DCOM connections and object lifetime via an async ping mechanism.
 #
 
 import asyncio
+import weakref
 import copy
 from typing import Dict, Set, Optional, List
 
@@ -20,39 +21,49 @@ from aiosmb.dcerpc.v5.dcom.dcomrt import IID_IObjectExporter
 
 class DCOMConnectionManager:
     """
-    Singleton manager for DCOM connections.
-    
+    Manager for DCOM connections, ONE PER RUNNING EVENT LOOP.
+
     Manages:
     - Connection pooling per target
     - Object ID (OID) tracking for keep-alive pings
     - Background ping task to prevent server-side garbage collection
-    
+
+    Everything it holds (portmap and OXID DCE/RPC connections, the ping task)
+    is bound to the loop that created it. A process-wide singleton handed a
+    later loop the previous loop's connections and a dead ping task, so
+    get_instance() returns the manager of the CALLER's running loop. Managers
+    of closed loops are dropped on the next lookup.
+
     Usage:
         manager = DCOMConnectionManager.get_instance()
         # ... or use DCOMConnection which handles this automatically
     """
-    _instance = None
-    _lock = asyncio.Lock()
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
+    # loop -> manager. A manager's tasks reference their loop, so entries of
+    # closed loops are pruned explicitly in get_instance().
+    _instances = weakref.WeakKeyDictionary()
+    # Used only when no loop is running (synchronous construction/inspection).
+    _unbound_instance = None
+
     @classmethod
     def get_instance(cls) -> 'DCOMConnectionManager':
-        """Get or create the singleton instance"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
+        """Get or create the manager of the running event loop"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            if cls._unbound_instance is None:
+                cls._unbound_instance = cls()
+            return cls._unbound_instance
+        for other in [k for k in list(cls._instances.keys()) if k.is_closed()]:
+            cls._instances.pop(other, None)
+        instance = cls._instances.get(loop)
+        if instance is None:
+            instance = cls()
+            cls._instances[loop] = instance
+        return instance
+
     def __init__(self):
-        if self._initialized:
-            return
-        
-        self._initialized = True
-        
         # Per-target state tracking
         # target -> DCERPC5Connection (portmap connection)
         self._portmaps: Dict[str, DCERPC5Connection] = {}
@@ -77,8 +88,18 @@ class DCOMConnectionManager:
         self._ping_interval: int = 120  # seconds
         self._ping_running: bool = False
         
-        # Lock for thread-safe operations
-        self._state_lock = asyncio.Lock()
+        # Per-event-loop locks (defence in depth: the manager is per loop, but
+        # the unbound instance can be reached from more than one loop).
+        self._state_locks = weakref.WeakKeyDictionary()
+
+    @property
+    def _state_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._state_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._state_locks[loop] = lock
+        return lock
     
     async def add_oid(self, target: str, oid: int):
         """Register an OID for keep-alive pinging"""
@@ -296,8 +317,12 @@ class DCOMConnection:
         self._domain = domain
         
         self._portmap: Optional[DCERPC5Connection] = None
-        self._manager = DCOMConnectionManager.get_instance()
         self._connected = False
+
+    @property
+    def _manager(self) -> 'DCOMConnectionManager':
+        # Resolved at use time: the manager of the loop running this coroutine.
+        return DCOMConnectionManager.get_instance()
     
     async def __aenter__(self):
         _, err = await self.connect()

@@ -9,6 +9,17 @@ hands the route to the same attack-path loop ``attack_paths`` uses.
   that back it, optionally narrowed to named objects;
 * ``--step ID``: one attack step (``--depth exercise`` re-performs it);
 * ``--path ID [--walk]``: one attack path (``--walk`` executes it end to end).
+  ``ID`` is the path id the report prints next to each path (any unambiguous
+  prefix of 8+ characters of the ``path_id`` in ``attack_paths_snapshot.json``),
+  or the ``P-XXXXXXXX`` label an older Word report printed.
+
+``-u/--username`` with ``-p/--password`` gives the reads an account for this run
+only (the audit account is often disabled after an engagement). It goes through
+the same credential SSOT and lockout guard as the workspace's account and is
+never written into the workspace.
+
+``--json`` writes the result document (``adscan.recheck_result/1``) to stdout
+and nothing else; every human line goes to stderr.
 
 ``--depth observe`` (the default) only reads. Without a target the run re-checks
 every open item read-only; ``exercise`` and ``walk`` are never inferred. PRO only
@@ -20,11 +31,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+from rich.markup import escape
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from adscan_internal.services.recheck.runner import ReadCredential
 
 from adscan_core import telemetry
 from adscan_core.engagement.model import Transition
@@ -36,6 +50,7 @@ from adscan_core.engagement.recheck import (
     LEVEL_FINDING,
     LEVEL_PATH,
     LEVEL_STEP,
+    REASON_LABELS,
     REASON_NO_READ_ONLY_CHECK,
     VERDICT_NOT_RECHECKED,
     RecheckError,
@@ -44,6 +59,7 @@ from adscan_core.engagement.recheck import (
     validate_target,
 )
 from adscan_core.engagement.store import EngagementStoreError, store_path
+from adscan_core.output.machine_output import machine_readable_stdout, write_machine_document
 from adscan_core.paths import get_workspaces_dir
 from adscan_core.rich_output import (
     mark_sensitive,
@@ -84,7 +100,11 @@ def add_recheck_subparser(subparsers: Any) -> argparse.ArgumentParser:
                         help="Every open finding and attack step (the default without a target).")
     target.add_argument("--finding", metavar="KEY|ID", help="A finding key (for example kerberoast) or id.")
     target.add_argument("--step", metavar="ID", help="An attack step id (8+ characters).")
-    target.add_argument("--path", metavar="ID", help="An attack path id (8+ characters).")
+    target.add_argument(
+        "--path",
+        metavar="ID",
+        help="An attack path id: the id the report prints next to the path (8+ characters).",
+    )
     parser.add_argument("--object", action="append", default=[], metavar="ID", dest="objects",
                         help="With --finding: only this affected object (a SID). Repeatable.")
     parser.add_argument("--filter", metavar="EXPR", dest="filter_expr",
@@ -92,8 +112,34 @@ def add_recheck_subparser(subparsers: Any) -> argparse.ArgumentParser:
     parser.add_argument("--depth", choices=DEPTHS, default=None,
                         help="observe (read-only, default), exercise (re-perform a step) or walk (a path).")
     parser.add_argument("--walk", action="store_true", help="With --path: same as --depth walk.")
-    parser.add_argument("--json", action="store_true", help="Print the result document as JSON.")
+    parser.add_argument(
+        "-u", "--username", "--user", dest="username", metavar="USER",
+        help="Read with this account instead of the workspace's (user, user@domain or DOMAIN\\user). "
+        "This run only; never stored.",
+    )
+    parser.add_argument(
+        "-p", "--password", dest="password", metavar="SECRET",
+        help="Password or NT hash of --username.",
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="Print only the result document, as JSON, on stdout.")
     return parser
+
+
+def read_credential_from_args(args: argparse.Namespace) -> Optional["ReadCredential"]:
+    """The ``-u/-p`` override, or ``None``; raises :class:`RecheckError` when half-given."""
+    from adscan_internal.services.recheck.runner import ReadCredential  # noqa: PLC0415
+
+    user = str(getattr(args, "username", None) or "").strip()
+    secret = getattr(args, "password", None)
+    if not user and secret is None:
+        return None
+    if not user or not secret:
+        raise RecheckError("--username and --password go together: pass both, or neither.")
+    credential = ReadCredential(username=user, secret=str(secret))
+    if not credential.account:
+        raise RecheckError("--username needs an account name.")
+    return credential
 
 
 def request_from_args(args: argparse.Namespace) -> tuple[RecheckTarget, str, bool]:
@@ -134,13 +180,15 @@ def request_from_args(args: argparse.Namespace) -> tuple[RecheckTarget, str, boo
 def _print_report(report: Any, *, defaulted: bool) -> None:
     verdicts = report.decisions.verdicts
     transitions = {r.item_id: r.transition.value for r in report.decisions.results}
-    shown, no_check = [], 0
+    shown: list[list[Any]] = []
+    # Declared reason -> items that have no read-only check for that reason.
+    no_check: dict[str, int] = {}
     for item in report.targets:
         verdict = verdicts.get(item.item_id)
         if verdict is None:
             continue
         if verdict.code == VERDICT_NOT_RECHECKED and verdict.reason == REASON_NO_READ_ONLY_CHECK:
-            no_check += 1
+            no_check[verdict.detail] = no_check.get(verdict.detail, 0) + 1
             continue
         shown.append([
             mark_sensitive(item.domain_id, "domain"),
@@ -160,9 +208,15 @@ def _print_report(report: Any, *, defaulted: bool) -> None:
         print_table(table)
     if no_check:
         print_info(
-            f"{no_check} item(s) have no read-only check in this release and were not re-checked; "
-            "they keep their status until the next scan re-evaluates them."
+            f"{sum(no_check.values())} item(s) have no read-only check in this release and were not "
+            "re-checked; they keep their status until the next scan re-evaluates them."
         )
+        table = Table(title="Not re-checked, and why", show_lines=False)
+        table.add_column("Items", justify="right")
+        table.add_column("Why")
+        for reason, count in sorted(no_check.items(), key=lambda kv: (-kv[1], kv[0])):
+            table.add_row(str(count), escape(reason or REASON_LABELS[REASON_NO_READ_ONLY_CHECK]))
+        print_table(table)
     closed = report.count(Transition.REMEDIATED)
     still = report.count(Transition.STILL_PRESENT) + report.count(Transition.REOPENED) + report.count(
         Transition.NEW
@@ -179,12 +233,21 @@ def run_recheck_command(args: argparse.Namespace, deps: Any) -> int:
 
     ``deps`` is the shared bootstrap of ``execute``
     (:class:`adscan_internal.cli.execute.ExecuteDeps`): shell factory, licence
-    mode, preflight hooks.
+    mode, preflight hooks. With ``--json`` stdout carries the result document
+    alone; every other line, an error included, goes to stderr.
     """
+    if getattr(args, "json", False):
+        with machine_readable_stdout():
+            return _run_recheck_command(args, deps)
+    return _run_recheck_command(args, deps)
+
+
+def _run_recheck_command(args: argparse.Namespace, deps: Any) -> int:
     from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
 
     try:
         target, depth, defaulted = request_from_args(args)
+        credential = read_credential_from_args(args)
     except RecheckError as exc:
         print_error(str(exc))
         return 2
@@ -250,7 +313,8 @@ def run_recheck_command(args: argparse.Namespace, deps: Any) -> int:
     exit_code = 1
     try:
         shell = _prepare_shell(deps, workspace, non_interactive=non_interactive)
-        exit_code = _run(shell, workspace, args, target, depth, defaulted, run_id, emit_event)
+        exit_code = _run(shell, workspace, args, target, depth, defaulted, run_id, emit_event,
+                         credential=credential)
         return exit_code
     except Exception as exc:  # noqa: BLE001 - one command, one exit code
         telemetry.capture_exception(exc)
@@ -288,7 +352,7 @@ def _prepare_shell(deps: Any, workspace: Path, *, non_interactive: bool) -> Any:
 
 
 def _run(shell: Any, workspace: Path, args: argparse.Namespace, target: RecheckTarget, depth: str,
-         defaulted: bool, run_id: str, emit: Any) -> int:
+         defaulted: bool, run_id: str, emit: Any, *, credential: Any = None) -> int:
     from adscan_internal.services.engagement.run_summary import run_stamp  # noqa: PLC0415
     from adscan_internal.services.recheck import walk as walk_mod  # noqa: PLC0415
     from adscan_internal.services.recheck.runner import (  # noqa: PLC0415
@@ -297,14 +361,24 @@ def _run(shell: Any, workspace: Path, args: argparse.Namespace, target: RecheckT
         shell_connector,
     )
 
-    request = RecheckRequest(workspace=workspace.name, target=target, depth=depth)
+    request = RecheckRequest(
+        workspace=workspace.name,
+        target=target,
+        depth=depth,
+        override_username=credential.username if credential is not None else "",
+    )
+    if credential is not None:
+        print_info(
+            f"The reads use {mark_sensitive(credential.username, 'user')}, given for this run "
+            "only; the workspace's own account is not used and nothing is stored."
+        )
     observations: list[dict[str, Any]] = []
     try:
         report = execute_recheck(
             workspace,
             request,
             run_id=run_id,
-            connect=shell_connector(shell, observations),
+            connect=shell_connector(shell, observations, credential=credential),
             control_observations=observations,
             execute=lambda domain, summary: walk_mod.execute_summary(shell, domain, summary),
             domains=sorted(getattr(shell, "domains_data", {}) or {}),
@@ -317,13 +391,22 @@ def _run(shell: Any, workspace: Path, args: argparse.Namespace, target: RecheckT
     except EngagementStoreError as exc:
         print_error(str(exc))
         return 2
+    # The PRO licence usage line: a recheck of the parent scan's domain codes,
+    # never billable and never sent to the licence server (dormant without a licence).
+    from adscan_internal.cli.pro_license_gate import record_pro_recheck_usage  # noqa: PLC0415
+
+    record_pro_recheck_usage(shell, run_id=run_id, parent_run_id=report.parent_run_id)
     if args.json:
         doc = json.loads((workspace / report.result_path).read_text(encoding="utf-8"))
-        sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-        sys.stdout.flush()
+        write_machine_document(doc)
     else:
         _print_report(report, defaulted=defaulted)
     return 0
 
 
-__all__ = ("add_recheck_subparser", "request_from_args", "run_recheck_command")
+__all__ = (
+    "add_recheck_subparser",
+    "read_credential_from_args",
+    "request_from_args",
+    "run_recheck_command",
+)

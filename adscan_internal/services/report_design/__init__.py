@@ -12,9 +12,13 @@ How ADscan *looks*, expressed once:
     The token vocabulary of one theme — colour ramps, the severity scale, the
     type stacks, radii, the bonus-document token bridge and the OKLCH
     refinement layer. Nothing but custom properties.
-``_css/webfonts_<theme>.css``
-    The theme's web-font ``@import``. Opt-in, because an artifact that must be
-    self-contained (the LITE ``.html``) may not fetch anything at view time.
+``fonts.py`` + ``_fonts/``
+    The theme's faces, shipped as static files and declared with
+    ``@font-face`` rules that reference them through an inert
+    ``adscan-font:`` scheme. Nothing is ever fetched from a font service:
+    the shared PDF engine answers those references from the package, and an
+    HTML artifact either inlines them (:func:`fonts.embed_report_fonts`) or
+    falls back to the local faces in the same stacks. See ``fonts.py``.
 ``_css/defaults.css``
     The token floor a document renders on before any theme is applied, so a
     template is never token-less.
@@ -27,6 +31,11 @@ How ADscan *looks*, expressed once:
     the figure ledger, the note, the numbered step list.
 ``_css/print.css``
     Page-break control and the print rules a paginated document needs.
+``terminal.py``
+    The client command block every report document draws (Windows, Linux or
+    ADscan workbench console), the print twin of the web's ``TerminalBlock``.
+    Installed on each report's Jinja environment with ``install_terminal``;
+    see that module.
 
 What does NOT live here
 -----------------------
@@ -54,13 +63,19 @@ from __future__ import annotations
 
 from importlib.resources import files
 
+from adscan_internal.services.report_design.fonts import (
+    embed_report_fonts,
+    font_face_css,
+)
+
 _CSS_PACKAGE = "adscan_internal.services.report_design._css"
 
 #: Themes that ship a token file. ``editorial`` is the house style — warm bone
 #: paper, Fraunces display, one deep-teal accent — and the default for any new
-#: surface. ``corporate_light`` is the white/navy auditor variant;
-#: ``premium_dark`` is the (misnamed, actually light) bonus-document theme.
-DESIGN_THEMES: tuple[str, ...] = ("editorial", "corporate_light", "premium_dark")
+#: surface. ``corporate_light`` is the white/navy auditor variant. The
+#: ``premium_dark`` theme was retired on 2026-11-11 (see
+#: ``adscan_core.report_options.RETIRED_REPORT_THEMES``).
+DESIGN_THEMES: tuple[str, ...] = ("editorial", "corporate_light")
 
 DEFAULT_THEME = "editorial"
 
@@ -73,9 +88,7 @@ DESIGN_LAYERS: tuple[str, ...] = ("foundation", "components", "print")
 AVAILABLE_LAYERS: tuple[str, ...] = ("defaults", *DESIGN_LAYERS)
 
 #: Themes whose rendered PAGE BACKGROUND is dark — keyed by the *rendered*
-#: background, NOT by the theme name. ``premium_dark`` is a misnomer: it
-#: renders a warm-bone LIGHT paper (``--paper:#faf7f2``), so it is
-#: intentionally NOT in this set. Both light themes are light. This is the one
+#: background, NOT by the theme name. Both themes are light. This is the one
 #: place that decides "white-ink or charcoal-ink wordmark?" for every document
 #: — adding a genuinely dark theme here flips the wordmark everywhere with no
 #: template or call-site edits.
@@ -102,28 +115,23 @@ def list_design_themes() -> list[str]:
     return [name for name in DESIGN_THEMES if _read(f"tokens_{name}.css")]
 
 
-def load_design_tokens(theme: str | None, *, webfonts: bool = False) -> str:
-    """Return the token CSS for ``theme``.
+def load_design_tokens(theme: str | None) -> str:
+    """Return the token CSS for ``theme``, preceded by the theme's faces.
 
     Args:
         theme: A name from :data:`DESIGN_THEMES`. Unknown or empty falls back
             to :data:`DEFAULT_THEME` so a caller can never render token-less.
-        webfonts: Prepend the theme's ``@import`` so Chromium fetches the real
-            display faces. Leave ``False`` for any artifact that must not
-            reach the network when it is opened.
 
     Returns:
-        CSS text. The ``@import`` (when requested) comes first, as the CSS
-        grammar requires.
+        CSS text: the theme's ``@font-face`` rules (local files only, see
+        :mod:`.fonts`), then its custom properties.
     """
     name = _normalize(theme)
     if name not in DESIGN_THEMES:
         name = DEFAULT_THEME
     tokens = _read(f"tokens_{name}.css")
-    if not webfonts:
-        return tokens
-    imports = _read(f"webfonts_{name}.css")
-    return f"{imports}\n{tokens}" if imports else tokens
+    faces = font_face_css(name)
+    return f"{faces}\n{tokens}" if faces else tokens
 
 
 def load_design_layer(layer: str) -> str:
@@ -137,15 +145,14 @@ def load_design_layer(layer: str) -> str:
 def load_design_css(
     theme: str | None = None,
     *,
-    webfonts: bool = False,
     tokens: bool = True,
     layers: tuple[str, ...] = DESIGN_LAYERS,
 ) -> str:
     """Return the shared design CSS, assembled in cascade order.
 
     Args:
-        theme: Theme whose tokens to include. Ignored when ``tokens`` is False.
-        webfonts: Include the theme's web-font ``@import``.
+        theme: Theme whose tokens (and faces) to include. Ignored when
+            ``tokens`` is False.
         tokens: Include the token layer. PRO passes ``False`` here because its
             tokens arrive with the theme, later in the cascade, so that a theme
             can still override the template's own fallbacks.
@@ -156,10 +163,7 @@ def load_design_css(
     """
     parts: list[str] = []
     if tokens:
-        parts.append(load_design_tokens(theme, webfonts=webfonts))
-    elif webfonts:
-        name = _normalize(theme)
-        parts.append(_read(f"webfonts_{name}.css"))
+        parts.append(load_design_tokens(theme))
     parts.extend(load_design_layer(layer) for layer in layers)
     return "\n".join(part for part in parts if part.strip())
 
@@ -184,6 +188,8 @@ __all__ = [
     "DEFAULT_THEME",
     "DESIGN_LAYERS",
     "DESIGN_THEMES",
+    "embed_report_fonts",
+    "font_face_css",
     "list_design_themes",
     "load_design_css",
     "load_design_layer",

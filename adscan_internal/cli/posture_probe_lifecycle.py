@@ -15,7 +15,7 @@ sends nothing and leaves its category UNKNOWN for the reactive layer to learn.
 
 from __future__ import annotations
 
-import asyncio
+from adscan_core.async_bridge import run_on_new_loop
 import os
 import time
 from typing import Any, Optional
@@ -161,7 +161,7 @@ def run_posture_probe(
         return []
 
     try:
-        return asyncio.run(
+        return run_on_new_loop(
             arun_posture_probe(
                 shell,
                 domain=domain,

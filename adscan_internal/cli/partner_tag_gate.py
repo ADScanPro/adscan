@@ -122,6 +122,11 @@ def partner_tag_required(license_mode: object) -> bool:
             "Partner-tag gate skipped: running the dev/CI :edge image."
         )
         return False
+    from adscan_core.pro_license.identity import installed_licence_identity
+
+    if installed_licence_identity() is not None:
+        # A verified PRO licence is the identity (a trial carries no partner tag).
+        return False
     return not telemetry.resolve_partner_tag()
 
 

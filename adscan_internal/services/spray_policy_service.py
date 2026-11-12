@@ -905,35 +905,11 @@ def fetch_spray_policy_sync(
     posture_snapshot: Any = None,
 ) -> SprayPolicyResult:
     """Synchronous wrapper around fetch_spray_policy_native."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    lambda: asyncio.run(
-                        fetch_spray_policy_native(
-                            domain=domain,
-                            dc_ip=dc_ip,
-                            username=username,
-                            password=password,
-                            use_kerberos=use_kerberos,
-                            kerberos_target_hostname=kerberos_target_hostname,
-                            auth_domain=auth_domain,
-                            auth_kdc=auth_kdc,
-                            account_scope=account_scope,
-                            only_account=only_account,
-                            only_accounts=only_accounts,
-                            ccache_path=ccache_path,
-                            posture_snapshot=posture_snapshot,
-                        )
-                    )
-                )
-                return future.result(timeout=30)
-    except RuntimeError:
-        pass
+    # From inside a running loop the fetch runs on a worker thread and the wait
+    # is bounded at 30s, as before; otherwise it runs on a fresh loop here.
+    from adscan_core.async_bridge import run_async_sync  # noqa: PLC0415
 
-    return asyncio.run(
+    return run_async_sync(
         fetch_spray_policy_native(
             domain=domain,
             dc_ip=dc_ip,
@@ -948,7 +924,8 @@ def fetch_spray_policy_sync(
             only_accounts=only_accounts,
             ccache_path=ccache_path,
             posture_snapshot=posture_snapshot,
-        )
+        ),
+        timeout=30,
     )
 
 

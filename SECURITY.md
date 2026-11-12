@@ -2,11 +2,14 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-|---------|--------------------|
-| 8.x     | ✅ Active support  |
-| 7.x     | ⚠️ Critical fixes only |
-| < 7.0   | ❌ End of life     |
+Security fixes ship in a new release of the latest major version. We do not backport them to older majors.
+
+| Version | Security fixes |
+|---------|----------------|
+| 14.x    | Yes            |
+| < 14.0  | No. Update to the latest release |
+
+To update on Linux or macOS, run `adscan update`. On Windows, download the latest `adscan.exe` from the [releases page](https://github.com/ADScanPro/adscan/releases/latest).
 
 ## Reporting a Vulnerability
 

@@ -4311,7 +4311,18 @@ def run_adscan_passthrough_docker(
             return 1
         acq.helper_proc = helper_proc
 
-        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+        # A run that promised a JSON document on stdout (``--json``) never gets
+        # a TTY: with one, Docker merges the container's stderr into stdout and
+        # the human output would land inside the document. The reservation also
+        # points sys.stdout at stderr, so isatty() alone would answer for the
+        # wrong stream.
+        from adscan_core.output.machine_output import (  # noqa: PLC0415
+            machine_stdout_reserved,
+        )
+
+        interactive = bool(
+            sys.stdin.isatty() and sys.stdout.isatty() and not machine_stdout_reserved()
+        )
         resolver_claim = _claim_container_local_resolver_ip(command_name="passthrough")
         if resolver_claim is None:
             return 1

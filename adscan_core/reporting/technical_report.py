@@ -79,13 +79,16 @@ from adscan_core.reporting.finding_aliases import (
 )
 from adscan_core.reporting.finding_vuln_map import is_reportable_finding
 from adscan_core.reporting.vuln_catalog_meta import VULN_CATALOG_META
+from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
 from adscan_core.rich_output import (
     print_error,
     print_exception,
     print_warning,
 )
 
-TECHNICAL_REPORT_SCHEMA_VERSION = "2.0"
+#: The file's version marker, owned by the output contract
+#: (``adscan_core/engagement/output_formats.py``, schema ``technical_report.v2.json``).
+TECHNICAL_REPORT_SCHEMA_VERSION = output_marker("technical_report")
 TECHNICAL_REPORT_FILENAME = "technical_report.json"
 
 
@@ -563,6 +566,9 @@ def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
         # A frozen workspace (a recheck) keeps the scan's report byte-identical.
         return
     _stamp_coverage_run_id(shell, report)
+    # The writer states the format it writes: a report an earlier build created
+    # and this one re-saves is in this build's format now.
+    report[SCHEMA_VERSION_KEY] = TECHNICAL_REPORT_SCHEMA_VERSION
     # The artifact feeds the deliverable kit and the web platform, so no
     # recovered secret value is ever written into it: the credential store
     # holds the values, the report holds a reference (account + kind).
@@ -1301,6 +1307,38 @@ def record_host_enrichment_coverage(
     _save_technical_report(shell, report)
 
 
+def record_operator_stop(
+    shell: ReportShell,
+    domain: str,
+    *,
+    entry: dict[str, Any],
+) -> None:
+    """Persist one operator stop (a skipped step, phase or scan) for *domain*.
+
+    Write-side SSOT for the honest answer to "did every step of this assessment
+    run to the end". A step the operator stopped, a phase skipped or a scan
+    stopped early is a DATA GAP (see
+    :mod:`adscan_core.reporting.operator_stop_coverage`), the same family as the
+    host-enrichment and attack-path coverage gaps. Appends the entry to
+    ``domains[<domain>]["operator_stop_coverage"]["stops"]`` so the JSON export
+    carries it and the PDF report, the LITE report AND ``adscan_web`` render the
+    SAME statement. Best-effort: ignores an invalid payload, never raises.
+    """
+    if not domain or not isinstance(entry, dict) or "statement" not in entry:
+        return
+    from adscan_core.reporting.operator_stop_coverage import (  # noqa: PLC0415
+        OPERATOR_STOP_COVERAGE_KEY,
+        append_operator_stop,
+    )
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[OPERATOR_STOP_COVERAGE_KEY] = append_operator_stop(
+        domain_entry.get(OPERATOR_STOP_COVERAGE_KEY), entry
+    )
+    _save_technical_report(shell, report)
+
+
 def record_host_reach_coverage(
     shell: ReportShell,
     domain: str,
@@ -1588,6 +1626,123 @@ def record_attack_fanout_rollup(
     report = _load_technical_report(shell)
     report["attack_fanout_rollup"] = rollup
     _save_technical_report(shell, report)
+
+
+#: Top-level key carrying the operator's compliance-framework decision.
+COMPLIANCE_DECISION_KEY = "compliance_decision"
+
+#: ``compliance_decision.decision`` when frameworks were selected.
+COMPLIANCE_DECISION_FRAMEWORKS = "frameworks"
+
+#: ``compliance_decision.decision`` when the assessor decided none applies.
+COMPLIANCE_DECISION_NONE = "none"
+
+
+def record_compliance_decision(
+    shell: ReportShell,
+    *,
+    frameworks: Any = (),
+    none_declared: bool = False,
+) -> None:
+    """Persist the compliance-framework decision the scan or render ran with.
+
+    Write-side single source of truth for the TOP-LEVEL ``compliance_decision``
+    block: ``{"decision": "frameworks", "frameworks": [...]}`` when the operator
+    selected frameworks, ``{"decision": "none", "frameworks": []}`` when they
+    decided that no compliance framework applies to the organisation. With
+    neither (nothing chosen, a lab render) the block is REMOVED, so the file
+    never carries a decision the current data was not rendered under; a missing
+    block means "no decision recorded", never "none applies".
+
+    The renderers read the "none" decision from here to word the report's
+    no-mapping notice as the assessor's decision, and integrators read it to
+    tell "no framework applies" from "nobody chose". Best-effort: never raises.
+
+    Args:
+        shell: Shell object with report paths.
+        frameworks: Canonical framework keys selected (iterable of strings).
+        none_declared: The operator answered "none". Ignored when frameworks
+            are also given (a contradiction the parsers refuse upstream).
+    """
+    try:
+        keys = [
+            str(key).strip().lower()
+            for key in (frameworks or ())
+            if str(key).strip() and str(key).strip().lower() != COMPLIANCE_DECISION_NONE
+        ]
+        report = _load_technical_report(shell)
+        if keys:
+            block: dict[str, Any] | None = {
+                "decision": COMPLIANCE_DECISION_FRAMEWORKS,
+                "frameworks": list(dict.fromkeys(keys)),
+            }
+        elif none_declared:
+            block = {"decision": COMPLIANCE_DECISION_NONE, "frameworks": []}
+        else:
+            block = None
+        if block is None:
+            if report.pop(COMPLIANCE_DECISION_KEY, None) is None:
+                return
+        elif report.get(COMPLIANCE_DECISION_KEY) == block:
+            return
+        else:
+            report[COMPLIANCE_DECISION_KEY] = block
+        _save_technical_report(shell, report)
+    except Exception as exc:  # noqa: BLE001 - a decision record never breaks a run
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+
+
+def compliance_decision_from_report(report: Any) -> Any:
+    """Read the recorded compliance decision out of a loaded technical report.
+
+    Returns:
+        A :class:`adscan_core.compliance_frameworks.FrameworkSelection` (its
+        ``none_declared`` set for the "none" decision), or ``None`` when the
+        report records no decision. Never raises.
+    """
+    from adscan_core.compliance_frameworks import (  # noqa: PLC0415
+        FrameworkSelection,
+        parse_framework_selection,
+    )
+
+    block = report.get(COMPLIANCE_DECISION_KEY) if isinstance(report, dict) else None
+    if not isinstance(block, dict):
+        return None
+    decision = str(block.get("decision") or "").strip().lower()
+    if decision == COMPLIANCE_DECISION_NONE:
+        return FrameworkSelection(none_declared=True)
+    if decision == COMPLIANCE_DECISION_FRAMEWORKS:
+        raw = block.get("frameworks")
+        tokens = [str(item) for item in raw] if isinstance(raw, list) else []
+        selection = parse_framework_selection(tokens)
+        return FrameworkSelection(keys=selection.keys) if selection.keys else None
+    return None
+
+
+def load_compliance_decision(workspace_dir: Any) -> Any:
+    """Read the recorded compliance decision of a workspace, or ``None``.
+
+    The renderer-side reader: a report built from a workspace calls this once
+    rather than threading the decision through every render hop. Never raises.
+    """
+    if not workspace_dir:
+        return None
+    try:
+        path = Path(str(workspace_dir)) / "technical_report.json"
+        if not path.is_file():
+            return None
+        return compliance_decision_from_report(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+    except Exception:  # noqa: BLE001 - an unreadable report records no decision
+        return None
+
+
+def no_framework_decision_recorded(workspace_dir: Any) -> bool:
+    """Whether the workspace records the assessor's "no framework applies" answer."""
+    decision = load_compliance_decision(workspace_dir)
+    return bool(decision is not None and decision.none_declared)
 
 
 def record_workspace_remediation(

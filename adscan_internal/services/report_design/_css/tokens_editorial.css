@@ -15,11 +15,12 @@
    Optimised for Chromium/Playwright print rendering.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Distinctive, PDF-safe web fonts — matched to the bonus deliverables so the
+/* Distinctive, PDF-safe faces, matched to the bonus deliverables so the
    report and the kit share one typographic voice. Fraunces is the report's
    native editorial display serif; Spectral is the bonus serif and a robust
-   companion fallback. Local fallbacks (DejaVu / Liberation) guarantee a clean
-   render when the build container is offline. */
+   companion fallback. The faces ship with ADscan (report_design/fonts.py) and
+   are never fetched; the local fallbacks (DejaVu / Liberation) only draw the
+   glyphs those faces lack. */
 
 /* ── Design tokens — REPORT vocabulary (--bg-0/--text/--accent/...) ───────── */
 :root {
@@ -71,7 +72,7 @@
   --purple:      #6d4f8f;
 
   /* Fonts — editorial serif display + refined sans body + mono */
-  --font-sans:  'Archivo','Lato','Liberation Sans','DejaVu Sans',system-ui,sans-serif;
+  --font-sans:  'Archivo','Inter','Lato','Liberation Sans','DejaVu Sans',system-ui,sans-serif;
   --font-serif: 'Fraunces','Spectral','Georgia','Times New Roman',serif;
   --font-mono:  'Spline Sans Mono','JetBrains Mono','DejaVu Sans Mono',monospace;
 

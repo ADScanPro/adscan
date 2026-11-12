@@ -79,56 +79,60 @@ def _logged_prompt_ask(*prompt_args: Any, **kwargs: Any) -> str:
     """Prompt.ask wrapper with centralized telemetry/debug answer logging."""
     from adscan_core import prompting
 
-    return prompting.logged_prompt_ask(
-        *prompt_args,
-        original_prompt_ask=_ORIGINAL_PROMPT_ASK,
-        telemetry=print_telemetry_only,
-        debug=print_info_debug,
-        info=print_info,
-        **kwargs,
-    )
+    with _state.centralized_prompt_active():
+        return prompting.logged_prompt_ask(
+            *prompt_args,
+            original_prompt_ask=_ORIGINAL_PROMPT_ASK,
+            telemetry=print_telemetry_only,
+            debug=print_info_debug,
+            info=print_info,
+            **kwargs,
+        )
 
 
 def _logged_confirm_ask(*confirm_args: Any, **kwargs: Any) -> bool:
     """Confirm.ask wrapper with centralized telemetry/debug answer logging."""
     from adscan_core import prompting
 
-    return prompting.logged_confirm_ask(
-        *confirm_args,
-        original_confirm_ask=_ORIGINAL_CONFIRM_ASK,
-        telemetry=print_telemetry_only,
-        debug=print_info_debug,
-        info=print_info,
-        **kwargs,
-    )
+    with _state.centralized_prompt_active():
+        return prompting.logged_confirm_ask(
+            *confirm_args,
+            original_confirm_ask=_ORIGINAL_CONFIRM_ASK,
+            telemetry=print_telemetry_only,
+            debug=print_info_debug,
+            info=print_info,
+            **kwargs,
+        )
 
 
 def _logged_int_prompt_ask(*prompt_args: Any, **kwargs: Any) -> Any:
     """IntPrompt.ask wrapper with centralized telemetry/debug answer logging."""
     from adscan_core import prompting
 
-    return prompting.logged_int_prompt_ask(
-        *prompt_args,
-        original_int_prompt_ask=_ORIGINAL_INT_PROMPT_ASK,
-        telemetry=print_telemetry_only,
-        debug=print_info_debug,
-        info=print_info,
-        **kwargs,
-    )
+    with _state.centralized_prompt_active():
+        return prompting.logged_int_prompt_ask(
+            *prompt_args,
+            original_int_prompt_ask=_ORIGINAL_INT_PROMPT_ASK,
+            telemetry=print_telemetry_only,
+            debug=print_info_debug,
+            info=print_info,
+            **kwargs,
+        )
 
 
 def _logged_float_prompt_ask(*prompt_args: Any, **kwargs: Any) -> Any:
     """FloatPrompt.ask wrapper with centralized telemetry/debug answer logging."""
     from adscan_core import prompting
 
-    return prompting.logged_float_prompt_ask(
-        *prompt_args,
-        original_float_prompt_ask=_ORIGINAL_FLOAT_PROMPT_ASK,
-        telemetry=print_telemetry_only,
-        debug=print_info_debug,
-        info=print_info,
-        **kwargs,
-    )
+    with _state.centralized_prompt_active():
+        return prompting.logged_float_prompt_ask(
+            *prompt_args,
+            original_float_prompt_ask=_ORIGINAL_FLOAT_PROMPT_ASK,
+            telemetry=print_telemetry_only,
+            debug=print_info_debug,
+            info=print_info,
+            **kwargs,
+        )
 
 
 def install_prompt_logging_wrappers() -> None:
@@ -305,11 +309,12 @@ def questionary_checkbox_values(
     print_info_debug(f"[questionary] Prompt: {title}")
     print_telemetry_only(f"[questionary] Prompt: {title}")
     try:
-        selected_values = questionary_checkbox_values_raw(
-            title=title,
-            options=options,
-            default_values=resolved_defaults,
-        )
+        with _state.centralized_prompt_active():
+            selected_values = questionary_checkbox_values_raw(
+                title=title,
+                options=options,
+                default_values=resolved_defaults,
+            )
     except KeyboardInterrupt:
         _state._emit_prompt_interrupt_debug(
             kind="keyboard_interrupt", source="questionary.checkbox"
@@ -381,7 +386,8 @@ def questionary_select_index(
     print_info_debug(f"[questionary] Prompt: {title}")
     print_telemetry_only(f"[questionary] Prompt: {title}")
     try:
-        selected_value = questionary_select_value(title=title, options=options)
+        with _state.centralized_prompt_active():
+            selected_value = questionary_select_value(title=title, options=options)
     except KeyboardInterrupt:
         _state._emit_prompt_interrupt_debug(
             kind="keyboard_interrupt", source="questionary.select"

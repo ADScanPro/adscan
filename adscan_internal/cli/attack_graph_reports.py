@@ -2019,9 +2019,60 @@ def _render_sampled_reachability_rows(
     return rows
 
 
+def _attack_path_scope_phrase(
+    *,
+    start_user: str | None,
+    start_users: list[str] | None,
+) -> str:
+    """Name the starting set a route count was computed from.
+
+    A bare "Attack paths computed: 26" read as the domain's route inventory,
+    while the final summary of the same run said 10. The two answer different
+    questions (routes from the accounts this run starts from, against routes
+    across the domain), so the on-screen figure carries its scope.
+    """
+    start_user_norm = (start_user or "").strip().lower()
+    if start_user_norm == "owned":
+        return "from the accounts you control"
+    if start_users and len(start_users) > 1:
+        return f"from {len(start_users)} selected accounts"
+    if start_user:
+        return f"from {mark_sensitive(start_user, 'user')}"
+    return "across the domain"
+
+
+def _route_count_phrase(count: int, scope_phrase: str) -> str:
+    """Return ``"26 routes from ..."`` (or the bare number with no scope)."""
+    if not scope_phrase:
+        return f"{count:,}"
+    noun = "route" if count == 1 else "routes"
+    return f"{count:,} {noun} {scope_phrase}"
+
+
+def _raw_walk_rows(progress: "AttackPathComputeProgress") -> list[Any]:
+    """Return the raw graph-walk count row, under ``--debug`` only.
+
+    The raw walk count is combinatorial and depth-sensitive (CLAUDE.md and
+    ``attack_path_counts`` bar it from every panel), so a default run never
+    shows it; a maintainer debugging the engine still sees it, labelled for
+    what it is.
+    """
+    from adscan_core.output._state import is_debug_mode
+
+    if not progress.raw_paths or not is_debug_mode():
+        return []
+    return [
+        Text(
+            f"Raw graph walks (debug, not a route count): {progress.raw_paths:,}",
+            style="dim",
+        )
+    ]
+
+
 def _render_attack_path_compute_progress(
     progress: "AttackPathComputeProgress",
     headline: "PathHeadline | None" = None,
+    scope_phrase: str = "",
 ) -> Panel:
     """Build the live progress panel for the attack-path compute.
 
@@ -2059,13 +2110,13 @@ def _render_attack_path_compute_progress(
             rows.append(
                 Text.assemble(
                     ("Attack paths computed: ", "bold"),
-                    (f"{progress.final_paths:,}", "green"),
+                    (
+                        _route_count_phrase(progress.final_paths, scope_phrase),
+                        "green",
+                    ),
                 )
             )
-        if progress.raw_paths:
-            rows.append(
-                Text(f"Paths discovered: {progress.raw_paths:,}", style="dim")
-            )
+        rows.extend(_raw_walk_rows(progress))
         if progress.nodes or progress.edges:
             rows.append(
                 Text(
@@ -2120,8 +2171,7 @@ def _render_attack_path_compute_progress(
                 )
             )
 
-    if progress.raw_paths:
-        rows.append(Text(f"Paths discovered: {progress.raw_paths:,}", style="dim"))
+    rows.extend(_raw_walk_rows(progress))
     if progress.nodes or progress.edges:
         rows.append(
             Text(
@@ -2146,15 +2196,20 @@ class _AttackPathComputeProgressRenderable:
         self,
         progress: "AttackPathComputeProgress",
         headline: "PathHeadline | None" = None,
+        scope_phrase: str = "",
     ) -> None:
         self._progress = progress
         #: Resolved once the compute is done, so the final frame (and the
         #: alt-screen-pop summary) can show reachable routes when a sampled
         #: materialization returned 0 concrete paths.
         self.headline = headline
+        #: Which starting set the route count was computed from.
+        self.scope_phrase = scope_phrase
 
     def __rich__(self) -> Panel:
-        return _render_attack_path_compute_progress(self._progress, self.headline)
+        return _render_attack_path_compute_progress(
+            self._progress, self.headline, self.scope_phrase
+        )
 
 
 def _emit_attack_path_compute_telemetry(
@@ -2441,12 +2496,15 @@ def run_show_attack_paths(
         # after Password Spraying), so the attack-paths menu no longer
         # offers it — keeping the UX focused on path execution only.
 
+        # The interactive menu below lists the top ``max_display`` routes: that
+        # cap is for a human reading a menu. The unattended branch hands the
+        # execution seam the FULL list (see the comment there).
         attack_paths = path_refs[:max_display]
 
         while True:
             # ── CI / non-interactive fallback ──────────────────────────────────
             if _non_interactive:
-                if not attack_paths:
+                if not path_refs:
                     return
                 from adscan_internal import print_info_debug as _dbg
                 # Mirror the interactive gate: only EXECUTE when the start
@@ -2463,7 +2521,7 @@ def run_show_attack_paths(
                 _dbg(
                     f"[attack_paths] non-interactive execution: "
                     f"is_ci={is_ci!r} isatty={sys.stdin.isatty()!r} "
-                    f"paths={len(attack_paths)} domain={target_domain}"
+                    f"paths={len(path_refs)} domain={target_domain}"
                 )
                 # Use the execution framework that auto-selects and auto-confirms
                 # in non-interactive mode, rather than _handle_path_detail which
@@ -2496,12 +2554,25 @@ def run_show_attack_paths(
                 from adscan_internal.cli.attack_path_execution import (
                     offer_attack_paths_for_execution_summaries as _offer_exec,
                 )
+                # Hand over the FULL route list with the display cap kept as
+                # the display cap: the panel then reads "Found 26, showing 20"
+                # rather than presenting the truncated 20 as everything found,
+                # and an unattended run is not silently limited to the first 20
+                # candidates by a limit that exists for a human reading a menu
+                # (the post-execution refresh already re-offers from the full
+                # recompute, so the first round must not be narrower than the
+                # rest). The snapshot labels name the computation that produced
+                # the list, so no consumer mistakes an owned-scope listing for
+                # the domain listing.
                 _offer_exec(
                     shell,
                     target_domain,
-                    summaries=attack_paths,
-                    max_display=len(attack_paths),
+                    summaries=path_refs,
+                    max_display=max_display,
                     recompute_summaries=_compute_paths,
+                    snapshot_scope=_snapshot_scope,
+                    snapshot_target=_snapshot_target,
+                    snapshot_target_mode=_snapshot_target_mode,
                 )
                 return
 
@@ -2618,6 +2689,17 @@ def run_show_attack_paths(
     membership_cache_before = get_membership_snapshot_cache_stats()
 
     start_user_norm = (start_user or "").strip().lower()
+    # The scope label persisted with the attack-path snapshot: the SAME branch
+    # ``_compute_paths`` takes below, so the file says which listing it holds.
+    _snapshot_scope = (
+        "owned"
+        if start_user_norm == "owned"
+        else "principals"
+        if start_users and len(start_users) > 1
+        else "user"
+        if start_user
+        else "domain"
+    )
 
     # Domain-wide all-targets is a DEV-ONLY lens (see attack_path_domain_all_policy).
     # Domain scope = no explicit start user / users / owned. On that combination in
@@ -2644,6 +2726,10 @@ def run_show_attack_paths(
             else:
                 print_warning(DOMAIN_ALL_UNSUPPORTED_NOTE)
                 target = "highvalue"
+    # Snapshot labels, bound under their own names: the detail loop below binds
+    # a local ``target`` of its own (a path's endpoint).
+    _snapshot_target = target
+    _snapshot_target_mode = target_mode
 
     # Two-section display (HV first + pivot section) is active when target="all".
     show_sections = target == "all"
@@ -2823,13 +2909,20 @@ def run_show_attack_paths(
         preselect_dev_engine_for_display,
     )
 
-    _progress_renderable = _AttackPathComputeProgressRenderable(_compute_progress)
+    _progress_renderable = _AttackPathComputeProgressRenderable(
+        _compute_progress,
+        scope_phrase=_attack_path_scope_phrase(
+            start_user=start_user, start_users=start_users
+        ),
+    )
 
     def _compute_progress_summary(console: Any) -> None:
         try:
             console.print(
                 _render_attack_path_compute_progress(
-                    _compute_progress, _progress_renderable.headline
+                    _compute_progress,
+                    _progress_renderable.headline,
+                    _progress_renderable.scope_phrase,
                 )
             )
         except Exception:  # noqa: BLE001 — the recap must never break the flow

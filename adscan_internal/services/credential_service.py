@@ -7,7 +7,6 @@ This module provides services for credential verification, roasting attacks
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
-import asyncio
 import subprocess
 import os
 import logging
@@ -1196,26 +1195,18 @@ class CredentialService(BaseService):
         ``posture_snapshot`` is forwarded to gate the KDC-unreachable NTLM
         fallback (skipped when NTLM is known-disabled).
         """
-        import concurrent.futures
+        from adscan_core.async_bridge import run_async_sync  # noqa: PLC0415
 
-        coro = self._verify_via_kerberos(
-            domain=domain,
-            kdc_ip=kdc_ip,
-            username=username,
-            credential=credential,
-            credential_type=credential_type,
-            posture_snapshot=posture_snapshot,
+        return run_async_sync(
+            self._verify_via_kerberos(
+                domain=domain,
+                kdc_ip=kdc_ip,
+                username=username,
+                credential=credential,
+                credential_type=credential_type,
+                posture_snapshot=posture_snapshot,
+            )
         )
-        try:
-            asyncio.get_running_loop()
-            in_loop = True
-        except RuntimeError:
-            in_loop = False
-
-        if in_loop:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(lambda: asyncio.run(coro)).result()
-        return asyncio.run(coro)
 
 
     def _parse_password_change_output(
@@ -1283,8 +1274,7 @@ class CredentialService(BaseService):
         confidential (PKT_PRIVACY). Two transports are attempted: authenticated
         ncacn_np, then ncacn_ip_tcp anonymous on a must-change rejection.
         """
-        import asyncio as _asyncio
-        import concurrent.futures as _cf
+        from adscan_core.async_bridge import run_async_sync  # noqa: PLC0415
         from adscan_internal.services.smb_transport import SMBConfig
         from adscan_internal.services.exploitation._samr_backend import (
             samr_change_password,
@@ -1319,11 +1309,10 @@ class CredentialService(BaseService):
             )
 
         try:
-            try:
-                ok = _asyncio.run(_do_samr_unicode_change())
-            except RuntimeError:
-                with _cf.ThreadPoolExecutor(max_workers=1) as pool:
-                    ok = pool.submit(_asyncio.run, _do_samr_unicode_change()).result(timeout=timeout)
+            # One attempt only. The old ``except RuntimeError`` fallback re-ran
+            # the whole password change on a thread whenever the change itself
+            # raised a RuntimeError, not just when a loop was already running.
+            ok = run_async_sync(_do_samr_unicode_change(), timeout=timeout)
         except Exception as exc:
             from adscan_core import telemetry
             telemetry.capture_exception(exc)

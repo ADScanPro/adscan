@@ -11,6 +11,30 @@ scanner node, an OEM consumer) exchanges with the engine:
   (counts, ratios and closed enums only; no identifier).
 * ``artifact_manifest`` (``adscan.artifact_manifest/1``): every artifact the
   run left in its workspace, with its egress class.
+* ``coverage`` (``adscan.coverage/1``): which checks ran on which scope, the
+  record that decides what a run may close.
+* ``recheck_result`` (``adscan.recheck_result/1``): what one ``adscan recheck``
+  run decided per item, what it read and where a walk went (also what
+  ``adscan recheck --json`` prints).
+
+The same loader and validator serve the **output contract**: the files a scan
+writes to its workspace (``technical_report.json``, ``attack_graph.json``,
+``inventory/*.json`` ...), whose versions live in
+:mod:`adscan_core.engagement.output_formats`. Their schemas sit beside these as
+``<name>.v<major>.json``, each at its own major.
+
+Two conventions tell a declared object from a free-form one, and
+:func:`undeclared_fields` enforces them in the contract tests:
+
+* an object schema with ``properties`` DECLARES its fields. A key outside them
+  is undeclared unless ``additionalProperties`` is ``true`` (free-form
+  extension) or a schema (a map, e.g. keyed by domain). An output schema leaves
+  ``additionalProperties`` unset on declared objects, so a reader validating an
+  older schema still accepts a newer minor's additive field, while the
+  contract test still fails when the engine writes a field the schema does not
+  declare.
+* an object schema without ``properties`` is opaque (``details``, ``notes``,
+  ``properties``): its content is not frozen by the contract.
 
 The schemas are JSON files under ``schemas/`` so non-Python consumers read the
 same documents. This module validates against the subset of JSON Schema
@@ -33,6 +57,8 @@ from functools import lru_cache
 from importlib.resources import files
 from typing import Any, Mapping
 
+from adscan_core.engagement.output_formats import OUTPUT_FORMATS, OUTPUT_SCHEMA_NAMES
+
 #: The contract's documents, in the order the specification lists them.
 SCHEMA_NAMES: tuple[str, ...] = (
     "run_plan",
@@ -41,10 +67,15 @@ SCHEMA_NAMES: tuple[str, ...] = (
     "artifact_manifest",
     "observations",
     "ledger",
+    "coverage",
+    "recheck_result",
 )
 
 #: Major version of every v1 document. Additive fields only within a major.
 CONTRACT_MAJOR = 1
+
+#: Every schema this module can load: the engine contract, then the output contract.
+KNOWN_SCHEMA_NAMES: tuple[str, ...] = SCHEMA_NAMES + OUTPUT_SCHEMA_NAMES
 
 _SUPPORTED_KEYWORDS = frozenset(
     {
@@ -109,9 +140,21 @@ def schema_tag(name: str) -> str:
     return f"adscan.{name}/{CONTRACT_MAJOR}"
 
 
+def schema_major(name: str) -> int:
+    """Return the major version of the schema ``name`` (engine or output contract)."""
+    if name in OUTPUT_FORMATS:
+        return OUTPUT_FORMATS[name].major
+    return CONTRACT_MAJOR
+
+
+def schema_id(name: str) -> str:
+    """Return the identifier of the schema ``name``, ``adscan.<name>/<major>``."""
+    return f"adscan.{name}/{schema_major(name)}"
+
+
 @lru_cache(maxsize=None)
 def _load_schema_text(name: str) -> str:
-    resource = files("adscan_core.engagement") / "schemas" / f"{name}.v{CONTRACT_MAJOR}.json"
+    resource = files("adscan_core.engagement") / "schemas" / f"{name}.v{schema_major(name)}.json"
     return resource.read_text(encoding="utf-8")
 
 
@@ -119,9 +162,10 @@ def load_schema(name: str) -> dict[str, Any]:
     """Return a fresh copy of the JSON Schema for ``name``.
 
     Raises:
-        ContractError: ``unknown_schema`` when ``name`` is not a contract document.
+        ContractError: ``unknown_schema`` when ``name`` is neither an engine
+            contract document nor an output-contract file.
     """
-    if name not in SCHEMA_NAMES:
+    if name not in KNOWN_SCHEMA_NAMES:
         raise ContractError("unknown_schema", "", name)
     schema = json.loads(_load_schema_text(name))
     _check_keywords(schema, "#")
@@ -150,12 +194,12 @@ def _check_keywords(node: Any, where: str) -> None:
         _check_keywords(child, f"{where}/oneOf/{index}")
 
 
-def validate(schema_name: str, doc: Mapping[str, Any]) -> None:
+def validate(schema_name: str, doc: Any) -> None:
     """Validate ``doc`` against the contract schema ``schema_name``.
 
     Args:
-        schema_name: One of :data:`SCHEMA_NAMES`.
-        doc: The parsed JSON document.
+        schema_name: One of :data:`KNOWN_SCHEMA_NAMES`.
+        doc: The parsed JSON document (an object, or an array for a list-rooted file).
 
     Raises:
         ContractError: On the first violation found, with its code and path.
@@ -164,7 +208,7 @@ def validate(schema_name: str, doc: Mapping[str, Any]) -> None:
     _validate_node(doc, schema, schema, "")
 
 
-def is_valid(schema_name: str, doc: Mapping[str, Any]) -> bool:
+def is_valid(schema_name: str, doc: Any) -> bool:
     """Return whether ``doc`` satisfies ``schema_name`` (never raises for a bad doc)."""
     try:
         validate(schema_name, doc)
@@ -294,12 +338,58 @@ def _validate_one_of(value: Any, options: list[Mapping[str, Any]], root: Mapping
     raise ContractError("one_of", path, f"{matches} branches matched")
 
 
+def undeclared_fields(schema_name: str, doc: Any) -> list[str]:
+    """Return JSON Pointers to every key ``doc`` carries that ``schema_name`` does not declare.
+
+    Applies the declared-object convention in the module docstring. ``doc`` must
+    already be valid (call :func:`validate` first): a ``oneOf`` is resolved to
+    the branch the document matches.
+    """
+    schema = _cached_schema(schema_name)
+    out: list[str] = []
+    _collect_undeclared(doc, schema, schema, "", out)
+    return out
+
+
+def _collect_undeclared(
+    value: Any, schema: Mapping[str, Any], root: Mapping[str, Any], path: str, out: list[str]
+) -> None:
+    if "$ref" in schema:
+        _collect_undeclared(value, _resolve_ref(root, schema["$ref"]), root, path, out)
+        return
+    for option in schema.get("oneOf") or ():
+        try:
+            _validate_node(value, option, root, path)
+        except ContractError:
+            continue
+        _collect_undeclared(value, option, root, path, out)
+        break
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        additional = schema.get("additionalProperties")
+        for key, child in value.items():
+            pointer = _pointer(path, key)
+            if properties is not None and key in properties:
+                _collect_undeclared(child, properties[key], root, pointer, out)
+            elif isinstance(additional, dict):
+                _collect_undeclared(child, additional, root, pointer, out)
+            elif properties is not None and additional is not True:
+                out.append(pointer)
+    if isinstance(value, (list, tuple)) and isinstance(schema.get("items"), dict):
+        for index, item in enumerate(value):
+            _collect_undeclared(item, schema["items"], root, _pointer(path, index), out)
+
+
 __all__ = (
     "CONTRACT_MAJOR",
+    "KNOWN_SCHEMA_NAMES",
     "SCHEMA_NAMES",
     "ContractError",
     "is_valid",
     "load_schema",
+    "schema_id",
+    "schema_major",
     "schema_tag",
+    "undeclared_fields",
     "validate",
 )

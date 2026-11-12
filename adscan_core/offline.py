@@ -39,3 +39,29 @@ def offline_mode_enabled(*, env: dict[str, str] | None = None) -> bool:
         if str(source.get(name, "")).strip().lower() in _TRUTHY_VALUES:
             return True
     return False
+
+
+# The telemetry kill switch the launcher seam sets (``adscan ci --no-telemetry``)
+# and the hardened appliance pins. Only the exact value ``"0"`` disables, which is
+# how ``adscan_core.telemetry._is_telemetry_enabled`` has always read it.
+TELEMETRY_ENV_VAR = "ADSCAN_TELEMETRY"
+
+
+def telemetry_disabled_by_environment(*, env: dict[str, str] | None = None) -> bool:
+    """Return True when the process environment forbids telemetry outright.
+
+    This is the environment half of the telemetry gate: the offline kill switch
+    (which turns telemetry off with everything else) or ``ADSCAN_TELEMETRY=0``.
+    No persisted preference, CLI override or UI toggle can re-enable telemetry
+    while it holds, which is what lets a deployment (the hardened appliance)
+    enforce the posture instead of merely defaulting to it. The telemetry engine
+    consults it first, and the web backend reads it to report the toggle as
+    locked.
+
+    Args:
+        env: Optional environment mapping to inspect instead of ``os.environ``.
+    """
+    if offline_mode_enabled(env=env):
+        return True
+    source = os.environ if env is None else env
+    return source.get(TELEMETRY_ENV_VAR) == "0"

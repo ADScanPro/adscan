@@ -166,7 +166,23 @@ REVERT_REQUIRES_CLEANUP_ACCOUNT = "cleanup_account"
 REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT = "delete_computer_account"
 REVERT_RIGHT_WRITE_RBCD_DELEGATION = "write_rbcd_delegation"
 REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK = "write_key_credential_link"
+#: Any other directory change in a domain (an ACE, an owner, a group membership,
+#: an attribute). Its author normally undoes it; this token states whether the
+#: cleanup account can too.
+REVERT_RIGHT_UNDO_DIRECTORY_CHANGE = "undo_directory_change"
+#: A change written in the forest-wide configuration partition (a certificate
+#: template, the templates a CA publishes). Only an Enterprise Admin of the
+#: forest root holds it by default; a Domain Admin of a child domain does not.
+REVERT_RIGHT_WRITE_FOREST_CONFIGURATION = "write_forest_configuration"
+#: Revoke a certificate on a certification authority: the "Issue and Manage
+#: Certificates" (officer) right on THAT CA, a different ACL from Domain Admin.
+REVERT_RIGHT_REVOKE_CERTIFICATE = "revoke_certificate"
+#: Change a CA's own security settings (remove an officer right ADscan granted):
+#: the "Manage CA" right on that CA, distinct from the officer right.
+REVERT_RIGHT_MANAGE_CA = "manage_ca"
 #: Client-facing name of each right (completes "an account allowed to ...").
+#: The scope, the granting roles and the probe of each token live in the
+#: registry (``adscan_core.scan_policy.revert_rights``).
 REVERT_RIGHT_LABELS: dict[str, str] = {
     REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT: "delete the computer account ADscan created",
     REVERT_RIGHT_WRITE_RBCD_DELEGATION: (
@@ -175,6 +191,12 @@ REVERT_RIGHT_LABELS: dict[str, str] = {
     REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK: (
         "restore msDS-KeyCredentialLink on the target computer"
     ),
+    REVERT_RIGHT_UNDO_DIRECTORY_CHANGE: "undo a change to a directory object",
+    REVERT_RIGHT_WRITE_FOREST_CONFIGURATION: (
+        "restore a certificate template or the templates a CA publishes"
+    ),
+    REVERT_RIGHT_REVOKE_CERTIFICATE: "revoke a certificate on the CA that issued it",
+    REVERT_RIGHT_MANAGE_CA: "remove a certificate manager right on the CA",
 }
 
 # ── Lockout risk (declared) ──────────────────────────────────────────────────
@@ -415,8 +437,10 @@ ROLLBACK_CLAUSES: dict[str, str] = {
         "be renewed."
     ),
     "issued_certificate": (
-        "{what}, revoked on your CA and confirmed by re-reading the CA database "
-        "when the run holds an account allowed to revoke it, or listed with its "
+        "{what}, revoked on your CA and confirmed by re-reading the CA database. "
+        "Under a policy that allows no manual cleanup, ADscan first confirms that an "
+        "account can revoke it on that CA and does not request it otherwise. Under "
+        "any other policy, a certificate no account could revoke is listed with its "
         "serial number for your team to revoke."
     ),
     "forged_certificate": (
@@ -578,6 +602,10 @@ __all__ = (
     "REVERT_REQUIRES_CLEANUP_ACCOUNT",
     "REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT",
     "REVERT_RIGHT_LABELS",
+    "REVERT_RIGHT_MANAGE_CA",
+    "REVERT_RIGHT_REVOKE_CERTIFICATE",
+    "REVERT_RIGHT_UNDO_DIRECTORY_CHANGE",
+    "REVERT_RIGHT_WRITE_FOREST_CONFIGURATION",
     "REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK",
     "REVERT_RIGHT_WRITE_RBCD_DELEGATION",
     "ROLLBACK_CLAUSES",

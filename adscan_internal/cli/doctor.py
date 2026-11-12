@@ -58,6 +58,7 @@ Exit-code contract (``DoctorReport.exit_code``):
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -256,6 +257,9 @@ class DoctorReport:
     # Per partner: {"direction", "type"} from the origin's trust listing, so the
     # decision prompt can draw the trust topology.
     partner_meta: dict[str, dict[str, str]] = field(default_factory=dict)
+    # What the cleanup account can undo (``reversal_capability_view``), when one
+    # was supplied. The web scan form renders it as the pre-scan checklist.
+    cleanup_capability: dict[str, Any] | None = None
 
     def add(
         self,
@@ -440,6 +444,8 @@ class DoctorReport:
             },
             "domains": [d.to_dict() for d in self.domain_results()],
             "checks": [c.to_dict() for c in self.checks],
+            # Additive: absent (None) when no cleanup account was supplied.
+            "cleanup_capability": self.cleanup_capability,
         }
 
     def to_json(self, *, domain: str = "", dc_ip: str = "") -> str:
@@ -1206,6 +1212,114 @@ def _check_trusts(
         return None
 
 
+def _read_cleanup_check_inputs(shell: Any, config: DoctorConfig, dc_ip: str) -> None:
+    """The domain facts the cleanup-account check needs, read once with the scan credential.
+
+    The doctor collects nothing, so the domain's SID (to read roles from SIDs)
+    and the enterprise CAs (one row each) are read here with two LDAP searches
+    over the same sanctioned transport, and recorded in the doctor's throwaway
+    workspace. Read-only, best-effort.
+    """
+    from adscan_internal.services.forest_topology import (  # noqa: PLC0415
+        resolve_forest_root,
+    )
+    from adscan_internal.services.ldap_query_service import (  # noqa: PLC0415
+        _extract_attribute_values,
+        domain_to_base_dn,
+    )
+    from adscan_internal.services.ldap_transport_service import (  # noqa: PLC0415
+        ADscanLDAPConnection,
+    )
+
+    domain = (config.domain or "").strip().lower()
+    entry = shell.domains_data.setdefault(domain, {})
+    entry.setdefault("pdc", dc_ip)
+    ldap_cfg = _build_doctor_ldap_config(shell, config, dc_ip)
+    root = resolve_forest_root(shell, domain) or domain
+    config_base = (
+        "CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,"
+        + domain_to_base_dn(root)
+    )
+    with ADscanLDAPConnection(ldap_cfg) as conn:
+        conn.search(ldap_cfg.domain_dn, "(objectClass=domain)", attributes=["objectSid"], search_scope="BASE")
+        sids = _extract_attribute_values(conn.entries, "objectSid")
+        if sids:
+            entry["domain_sid"] = sids[0]
+        conn.search(
+            config_base,
+            "(objectClass=pKIEnrollmentService)",
+            attributes=["cn", "dNSHostName"],
+            search_scope="SUBTREE",
+            paged_size=1000,
+        )
+        cas = []
+        for ca_entry in conn.entries:
+            names = _extract_attribute_values([ca_entry], "cn")
+            hosts = _extract_attribute_values([ca_entry], "dNSHostName")
+            if names and hosts:
+                cas.append({"name": names[0], "dns_hostname": hosts[0]})
+        entry["enterprise_cas"] = cas
+
+
+def _check_cleanup_capability(
+    report: Any, shell: Any, config: DoctorConfig, dc_ip: str, *, authed: bool
+) -> None:
+    """What the client's cleanup account can undo, before the scan (§ 10.1b).
+
+    Runs only when a cleanup account is supplied (``ADSCAN_CLEANUP_*`` in the
+    doctor's environment, the way the web passes it). The directory rows read
+    the account's group SIDs with the scan credential; the CA rows ask each CA,
+    as the cleanup account, what it may do there. Nothing is written.
+    """
+    from adscan_core.reporting.reversal_capability import (  # noqa: PLC0415
+        ANSWER_YES,
+        reversal_capability_view,
+    )
+    from adscan_internal.services.cleanup_capability import (  # noqa: PLC0415
+        check_cleanup_capability,
+    )
+    from adscan_internal.services.cleanup_credential_loader import (  # noqa: PLC0415
+        cleanup_account_supplied,
+        load_cleanup_credential_for_run,
+    )
+    from adscan_internal.services.revert_right_probes import (  # noqa: PLC0415
+        set_directory_reader,
+    )
+
+    load_cleanup_credential_for_run(shell)
+    if not cleanup_account_supplied():
+        return
+    if not authed or not dc_ip:
+        report.add(
+            "Cleanup account",
+            "skip",
+            "Checked once the scan credential authenticates against the domain controller.",
+        )
+        return
+    try:
+        domain = (config.domain or "").strip().lower()
+        if not getattr(shell, "domain", None):
+            shell.domain = domain
+        _read_cleanup_check_inputs(shell, config, dc_ip)
+        set_directory_reader(shell, domain, config.username or "", config.password or "")
+        view = reversal_capability_view(check_cleanup_capability(shell, refresh=True))
+        root_report = getattr(report, "report", report)
+        root_report.cleanup_capability = view
+        rows = [r for f in view.get("forests") or () for r in f.get("rows") or ()]
+        gaps = [r for r in rows if r.get("required") and r.get("answer") != ANSWER_YES]
+        report.add(
+            "Cleanup account",
+            "pass" if rows and not gaps else "info",
+            "It can undo every change your scan policy relies on here."
+            if rows and not gaps
+            else "Some changes here cannot be undone with this account. The checklist shows which.",
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; never crash doctor
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        report.add("Cleanup account", "skip", "The cleanup account could not be checked.")
+
+
 def _check_posture(
     report: Any, shell: Any, config: DoctorConfig, dc_ip: str
 ) -> None:
@@ -1215,7 +1329,6 @@ def _check_posture(
         report.add("Posture probe", "skip", "No domain / DC IP to probe.")
         return
     try:
-        import asyncio  # noqa: PLC0415
 
         from adscan_internal.services.posture_orchestration import (  # noqa: PLC0415
             ensure_posture_fresh,
@@ -1232,7 +1345,7 @@ def _check_posture(
                 username=str(config.username), password=str(config.password)
             )
             phase = ProbePhase.AUTH
-        freshness = asyncio.run(
+        freshness = run_on_new_loop(
             ensure_posture_fresh(
                 shell, domain=domain, dc_ip=dc_ip, creds=creds, phase=phase
             )
@@ -2052,6 +2165,7 @@ def run_doctor(*, config: DoctorConfig, deps: DoctorDeps) -> int:
             partners=partners,
             origin_authed=authed,
         )
+        _check_cleanup_capability(origin, shell, config, dc_ip, authed=authed)
     finally:
         domain = (config.domain or "").strip()
         if config.json_output:

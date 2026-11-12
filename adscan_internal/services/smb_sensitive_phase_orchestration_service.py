@@ -321,9 +321,15 @@ def run_staged_smb_sensitive_scan(
 
     results: list[dict[str, Any]] = []
 
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
     for phase in get_production_sensitive_scan_phase_sequence():
         if phase not in selected_phases:
             continue
+        # Scan control checkpoint between analysis passes: an operator stop
+        # keeps the passes already done and skips the rest.
+        if scan_control().should_stop():
+            break
         phase_result = run_phase(
             shell=shell,
             domain=domain,

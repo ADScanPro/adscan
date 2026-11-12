@@ -113,12 +113,17 @@ def register_issued_certificate(
     Every certificate ADscan obtains from a live CA — through enrollment or
     through a relayed authentication — is a durable credential that outlives the
     engagement: it sits in the CA database and authenticates its subject until it
-    expires or is revoked. Revoking it needs certificate-manager rights on the CA
-    that ADscan does not hold, so the record is written straight to the
-    ``manual_required`` terminal state (``not_attempted``) rather than left
-    pending. That matters operationally: the disclosure is complete on disk the
-    moment the certificate exists, so a scan killed before it can finalize still
-    leaves the client a full, actionable record.
+    expires or is revoked. Revoking it needs certificate-manager rights on the CA,
+    which the ASSESSMENT account does not hold; the client's cleanup account (or a
+    privileged credential the run verified) may, and under a policy that accepts
+    no manual cleanup the certificate was only requested once that right was
+    established on this CA (``adcs.reversal_capability``). The record is still
+    written straight to the ``manual_required`` terminal state (``not_attempted``)
+    as the floor: the disclosure is complete on disk the moment the certificate
+    exists, so a scan killed before it can revoke still leaves the client a full,
+    actionable record, and the revocation pass
+    (``certificate_revocation.revoke_ledger_certificate``) settles it as reverted
+    only after re-reading the CA database.
 
     This is the single registration point for issued certificates. Native
     enrollment converges here through ``cert_request``; the relay ESCs converge

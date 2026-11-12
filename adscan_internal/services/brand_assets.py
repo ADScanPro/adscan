@@ -159,8 +159,7 @@ def brand_variant_for_theme(theme_name: str | None) -> str:
 
     The one place the naming inversion is handled. ``report_design`` decides
     whether a theme renders on dark paper (the SSOT, keyed on the *rendered*
-    background rather than the theme's name — ``premium_dark`` is a misnomer
-    and renders warm-bone light); this translates that verdict into the
+    background rather than the theme's name); this translates that verdict into the
     ``"dark"`` / ``"light"`` vocabulary the asset filenames use.
 
     Args:

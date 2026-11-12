@@ -34,6 +34,7 @@ Design rules
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 import asyncio
 import time
 from dataclasses import dataclass, field
@@ -1378,7 +1379,7 @@ async def run_unauth_enrichment_async(
 def run_unauth_enrichment(config: UnauthEnrichmentConfig) -> UnauthEnrichmentResults:
     """Synchronous entry point — wraps :func:`run_unauth_enrichment_async`."""
     try:
-        return asyncio.run(run_unauth_enrichment_async(config))
+        return run_on_new_loop(run_unauth_enrichment_async(config))
     except RuntimeError as exc:
         if "asyncio.run() cannot be called" in str(exc) or "running event loop" in str(
             exc

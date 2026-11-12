@@ -11,7 +11,7 @@ Design: docs/superpowers/specs/2026-11-04-scan-policy-checks-by-family-design.md
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from adscan_core.scan_policy.model import (
     ENV_MANUAL_CLEANUP,
@@ -74,19 +74,33 @@ def revert_permission_lines(
     surface (CLI recap, report, web policy view) renders these lines.
     """
     from adscan_core.scan_policy.revert_permission import (  # noqa: PLC0415
+        conditional_ca_line,
         conditional_line,
         excluded_line,
+    )
+    from adscan_core.scan_policy.revert_rights import (  # noqa: PLC0415
+        SCOPE_CA,
+        revert_right,
     )
 
     reg = registry or load_registry()
 
-    def _titles(ids: frozenset[str]) -> list[str]:
+    def _titles(ids: Iterable[str]) -> list[str]:
         return sorted(
             (c.title or c.check_id) for c in (reg.get(i) for i in ids) if c is not None
         )
 
+    def _needs_a_ca_right(check_id: str) -> bool:
+        check = reg.get(check_id)
+        return check is not None and any(
+            (r := revert_right(token)) is not None and r.scope == SCOPE_CA
+            for token in check.revert_rights
+        )
+
+    ca_ids = {cid for cid in resolved.revert_conditional_ids if _needs_a_ca_right(cid)}
     lines = [
-        conditional_line(_titles(resolved.revert_conditional_ids)),
+        conditional_line(_titles(set(resolved.revert_conditional_ids) - ca_ids)),
+        conditional_ca_line(_titles(ca_ids)),
         excluded_line(
             _titles(resolved.revert_excluded_ids),
             run_context=resolved.revert_permission is not None,

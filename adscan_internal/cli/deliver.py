@@ -45,13 +45,20 @@ quality gain.
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.report_options import (
     REPORT_DEFAULT_EMIT,
+    REPORT_DEFAULT_THEME,
     REPORT_EMIT_VALUES,
     REPORT_ONLY_ALIASES,
+    RETIRED_REPORT_ONLY_NOTICE,
+    retired_only_requested,
+    REPORT_THEMES,
     add_report_arguments,
     parse_emit_values,
     parse_only_slugs,
+    report_theme_telemetry_value,
+    resolve_report_theme,
 )
 from adscan_core.version import get_version
 
@@ -77,15 +84,17 @@ from adscan_core.rich_output import (
 )
 from adscan_core.rich_output import print_exception
 from adscan_internal.cli.common import (
-    _FRAMEWORK_KEY_MAP,
+    _FRAMEWORK_KEY_MAP,  # noqa: F401 - re-exported (tests read deliver._FRAMEWORK_KEY_MAP)
     _VALID_FRAMEWORK_KEYS,  # noqa: F401 - re-exported (tests read deliver._VALID_FRAMEWORK_KEYS)
     _parse_frameworks,
     _resolve_workspace,
     log_into_workspace,
 )
 from adscan_internal.services.compliance_scope import (
+    ComplianceScope,
+    FrameworkSelectionCancelled,
     announce_compliance_scope,
-    resolve_compliance_scope,
+    persist_compliance_decision,
 )
 
 
@@ -232,9 +241,7 @@ DEFAULT_DELIVERABLE_SLUGS: tuple[str, ...] = DELIVERABLE_SLUGS
 # semantically correct alias we direct users to. Add new aliases here when
 # the public vocabulary drifts ahead of the internal slug — never rename
 # the slug itself in this codebase.
-# ``checklist`` → ``executive``: the standalone MITRE Remediation Checklist was
-# retired (folded into the main report). A pinned ``--only checklist`` now renders
-# the Security Assessment Report (which carries the ATT&CK lens) instead of erroring.
+# The retired ``checklist`` name lives in ``RETIRED_REPORT_ONLY`` (report_options).
 _ONLY_ALIASES: dict[str, str] = dict(REPORT_ONLY_ALIASES)
 
 
@@ -514,8 +521,26 @@ def _parse_only(raw: str | None) -> tuple[_KitItem, ...]:
     return tuple(item for item in _KIT if item.slug in selected_slugs)
 
 
+def _deliver_in_repl(args: argparse.Namespace) -> bool:
+    """Whether the operator is typing ``deliver`` inside the interactive shell."""
+    from adscan_internal.interaction import is_non_interactive
+
+    return getattr(args, "_shell", None) is not None and not is_non_interactive()
+
+
 def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
-    """Resolve compliance frameworks from the flag or the interactive picker.
+    """The framework keys this kit renders against (see :func:`_resolve_compliance_scope`).
+
+    Empty both when nothing was chosen (a lab) and when the operator decided no
+    framework applies; the scope tells the two apart.
+    """
+    return list(_resolve_compliance_scope(args).frameworks)
+
+
+def _resolve_compliance_scope(
+    args: argparse.Namespace, workspace_dir: Path | None = None
+) -> ComplianceScope:
+    """Resolve the compliance scope from the flag or the interactive picker.
 
     Order:
         1. ``--frameworks`` flag value, validated via :func:`_parse_frameworks`.
@@ -524,6 +549,11 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
            ``ctf`` workspace (a lab has no regulatory regime, so there is
            nothing to ask).
         3. Nothing selected (:data:`_DEFAULT_FRAMEWORKS`, which is empty).
+
+    ``none`` (flag or picker) is the operator's explicit "no compliance
+    framework applies to this organisation": it satisfies the audit
+    requirement, renders no compliance mapping, and the report says so as the
+    assessor's decision.
 
     The final selection then goes through the shared resolver
     (``services/compliance_scope.resolve_compliance_scope``) that
@@ -542,7 +572,12 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
         resolve_engagement_type,
     )
 
-    workspace_dir = getattr(args, "workspace", None)
+    # The resolved directory when the caller holds it (run_deliver), so the
+    # engagement type is read from, and the decision recorded into, the real
+    # workspace even when ``--workspace`` named it relative to the workspaces
+    # root.
+    if workspace_dir is None:
+        workspace_dir = getattr(args, "workspace", None)
     engagement_type = resolve_engagement_type(
         shell=getattr(args, "_shell", None), workspace_dir=workspace_dir
     )
@@ -578,10 +613,12 @@ def _resolve_frameworks(args: argparse.Namespace) -> list[str]:
     if scope.missing_required:
         raise ValueError(
             missing_framework_error(
-                rerender_hint="adscan deliver --frameworks <keys>"
+                command="deliver",
+                workspace=Path(str(workspace_dir)).name if workspace_dir else None,
+                in_repl=_deliver_in_repl(args),
             )
         )
-    return list(scope.frameworks)
+    return scope
 
 
 def _pick_frameworks_interactively(
@@ -601,28 +638,26 @@ def _pick_frameworks_interactively(
     latent rather than live, and ``default_values=[]`` keeps the resolved
     answer identical: no framework is ever substituted.
     """
-    from adscan_core.rich_output import questionary_checkbox_values
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
-    from adscan_internal.services.compliance_scope import CTF_ENGAGEMENT
+    from adscan_internal.services.compliance_scope import (
+        CTF_ENGAGEMENT,
+        frameworks_are_required,
+        prompt_frameworks,
+    )
 
     if engagement_type == CTF_ENGAGEMENT:
         return list(_DEFAULT_FRAMEWORKS)
     if _is_non_interactive() or getattr(args, "_prompts_prefilled", False):
         return list(_DEFAULT_FRAMEWORKS)
 
-    selected = questionary_checkbox_values(
-        title="Select compliance frameworks to include in the kit:",
-        options=list(_FRAMEWORK_KEY_MAP.keys()),
-        default_values=[],
+    # An audit engagement requires a framework, so the prompt itself enforces
+    # it (re-asks, explains, offers to cancel) rather than letting an empty
+    # answer surface as a hard error after the remaining prompts.
+    return prompt_frameworks(
+        required=frameworks_are_required(engagement_type),
+        workspace_dir=getattr(args, "workspace", None),
         shell=getattr(args, "_shell", None),
     )
-
-    if not selected:
-        return list(_DEFAULT_FRAMEWORKS)
-
-    return [
-        _FRAMEWORK_KEY_MAP[label] for label in selected if label in _FRAMEWORK_KEY_MAP
-    ]
 
 
 def _resolve_deliverables(
@@ -829,30 +864,19 @@ async def _render_bonus_async(
     )
 
 
-_VALID_REPORT_THEMES: tuple[str, ...] = ("corporate_light", "premium_dark", "editorial")
-# Audit-grade light by default. The Security Assessment Report is the client's
-# status instrument toward their board and DORA auditors — it must read as a
-# serious, print-clean compliance document, not a dark terminal artefact. The
-# report template is built on the ``--bg-0``/``--text`` variable scheme, which
-# only ``corporate_light`` re-skins (``premium_dark`` is built on
-# ``--paper``/``--ink`` for the editorial bonuses and would leave the report on
-# its own DARK ``:root``). So ``corporate_light`` is both the strategy-correct
-# AND the technically-correct default for the report. Bonuses keep their own
-# editorial catalog theme (see ``bonus_theme`` in ``_render_kit``).
-_DEFAULT_REPORT_THEME: str = "corporate_light"
+# The rendered themes, the default and the alias / retired-name resolution all
+# live in ONE place, ``adscan_core.report_options`` (the web schemas and the
+# scan-config descriptor read it too). Audit-grade light by default: the
+# Security Assessment Report is the client's status instrument toward their
+# board and auditors. The dark theme was retired on 2026-11-11 (unreadable in
+# the report); ``--theme dark`` / ``premium_dark`` still resolve, to the
+# default, with one notice line. Bonuses keep their own editorial catalog theme
+# (see ``bonus_theme`` in ``_render_kit``).
+_VALID_REPORT_THEMES: tuple[str, ...] = REPORT_THEMES
+_DEFAULT_REPORT_THEME: str = REPORT_DEFAULT_THEME
 
-# Short aliases for --theme: operators can pass "dark" or "light" instead of
-# the full canonical names. Empty string means "not set — use env var or default".
-_THEME_ALIASES: dict[str, str] = {
-    "dark": "premium_dark",
-    "light": "corporate_light",
-    "warm": "editorial",
-    "": "",
-}
-
-# Labels shown in the questionary picker. Order is intentional: dark first
-# (default for screen demos), light second (auditor / board print). Keep
-# this map in lockstep with :data:`_VALID_REPORT_THEMES`.
+# Labels shown in the questionary picker. Keep this map in lockstep with
+# :data:`_VALID_REPORT_THEMES`.
 _THEME_PICKER_MAP: dict[str, str] = {
     "Editorial — warm bone, ember accent (premium, McKinsey-grade)": "editorial",
     "Corporate — white/navy, print-safe (Big-4 / auditor)": "corporate_light",
@@ -863,12 +887,16 @@ def _resolve_theme(args: argparse.Namespace) -> str:
     """Resolve the report theme using the canonical precedence chain.
 
     Order of precedence:
-        1. ``--theme`` flag (with short aliases ``dark``/``light``).
+        1. ``--theme`` flag (short aliases ``light``/``warm``).
         2. Legacy ``--report-theme`` flag.
         3. ``ADSCAN_PDF_THEME`` environment variable.
         4. Interactive questionary select in TTY contexts — mirrors the
            ``generate_report`` REPL command for cross-command parity.
-        5. :data:`_DEFAULT_REPORT_THEME` (``premium_dark``).
+        5. :data:`_DEFAULT_REPORT_THEME` (``corporate_light``).
+
+    A retired theme (``dark`` / ``premium_dark``) resolves to the default and
+    prints one notice line, so existing scripts and stored web scans keep
+    working.
 
     Returns:
         A theme value guaranteed to be in :data:`_VALID_REPORT_THEMES`.
@@ -876,7 +904,6 @@ def _resolve_theme(args: argparse.Namespace) -> str:
         fall back to the default — the kit must always render.
     """
     raw_theme = getattr(args, "theme", "") or ""
-    resolved_alias = _THEME_ALIASES.get(raw_theme, raw_theme)
     report_theme_flag = getattr(args, "report_theme", "") or ""
     env_theme = os.environ.get("ADSCAN_PDF_THEME", "").strip()
 
@@ -888,11 +915,13 @@ def _resolve_theme(args: argparse.Namespace) -> str:
     if external_theme_css:
         return external_theme_css
 
-    chosen = resolved_alias or report_theme_flag or env_theme
+    chosen = raw_theme.strip() or report_theme_flag.strip() or env_theme
     if chosen:
-        if chosen.endswith(".css"):
-            return chosen
-        return chosen if chosen in _VALID_REPORT_THEMES else _DEFAULT_REPORT_THEME
+        choice = resolve_report_theme(chosen)
+        if choice.notice and not getattr(args, "_retired_theme_notice_shown", False):
+            print_warning(choice.notice)
+            setattr(args, "_retired_theme_notice_shown", True)
+        return choice.theme or _DEFAULT_REPORT_THEME
 
     from adscan_internal.interaction import is_non_interactive as _is_non_interactive
 
@@ -912,6 +941,38 @@ def _resolve_theme(args: argparse.Namespace) -> str:
     if not label:
         return _DEFAULT_REPORT_THEME
     return _THEME_PICKER_MAP.get(label, _DEFAULT_REPORT_THEME)
+
+
+#: Where a kit render was started, as reported in telemetry. ``ci`` is a scan's
+#: ``--generate-report``; ``deliver`` is the ``deliver`` command, which is also
+#: what the Enterprise worker runs for a kit generated from the web.
+REPORT_RENDER_ENTRIES: tuple[str, ...] = ("deliver", "ci")
+
+
+def _capture_report_theme_choice(args: argparse.Namespace, report_theme: str) -> None:
+    """Report which theme a kit renders in, from a closed vocabulary only.
+
+    The theme is one of the rendered themes, ``custom`` (a bring-your-own skin,
+    never its path) or ``default``; whether a retired theme was asked for tells
+    us if anyone still relies on it. Best-effort: telemetry never breaks a kit.
+    """
+    try:
+        from adscan_internal.interaction import is_non_interactive
+
+        entry = getattr(args, "_report_entry", "deliver")
+        telemetry.capture(
+            "report_theme_selected",
+            {
+                "theme": report_theme_telemetry_value(report_theme),
+                "entry": entry if entry in REPORT_RENDER_ENTRIES else "deliver",
+                "retired_theme_requested": bool(
+                    getattr(args, "_retired_theme_notice_shown", False)
+                ),
+                "interactive": not is_non_interactive(),
+            },
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break the kit
+        pass
 
 
 def _is_lite_runtime() -> bool:
@@ -1082,8 +1143,7 @@ async def _render_assessment_async(
         workspace_dir: Workspace containing ``technical_report.json``.
         metadata: Report metadata (workspace_name, report_date, client, ...).
         report_theme: Visual theme — one of :data:`_VALID_REPORT_THEMES`.
-            Defaults to ``premium_dark`` for backwards compatibility with
-            existing callers that did not pass a theme. Invalid values fall
+            Defaults to :data:`_DEFAULT_REPORT_THEME`. Invalid values fall
             back to the default rather than raising — the kit should always
             render even with a typo'd flag.
         emit: Which output formats to produce for this report, from
@@ -1144,6 +1204,7 @@ async def _render_assessment_async(
             generate_report_html,
             generate_report_pdf,
         )
+        from adscan_internal.services.report_design import embed_report_fonts
         from adscan_internal.pro.reporting.report_builder import (
             build_report_data_from_raw,
         )
@@ -1227,7 +1288,11 @@ async def _render_assessment_async(
             # and no client logo (see client_logo.client_logo_permitted).
             is_sample=is_sample,
         )
-        output_path.with_suffix(".html").write_text(html_str, encoding="utf-8")
+        # The twin carries its faces inline: it opens in the report's own
+        # typography with no network, wherever the client keeps it.
+        output_path.with_suffix(".html").write_text(
+            embed_report_fonts(html_str), encoding="utf-8"
+        )
         # Emit the branding-invariant derived-data export (report_model.json)
         # beside the PDF/HTML — opt-in via ``--emit data`` AND gated on the
         # ``data_export`` entitlement, so an un-entitled install that passes
@@ -2495,6 +2560,8 @@ async def run_deliver(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print_error(str(exc))
         return 2
+    if retired_only_requested(getattr(args, "only", None)):
+        print_warning(RETIRED_REPORT_ONLY_NOTICE)
 
     try:
         emit = _parse_emit(getattr(args, "emit", None))
@@ -2565,10 +2632,11 @@ async def _run_deliver_in_workspace(
         return 2
 
     try:
-        frameworks = _resolve_frameworks(args)
+        compliance_scope = _resolve_compliance_scope(args, workspace_dir=workspace_dir)
     except ValueError as exc:
         print_error(str(exc))
         return 2
+    frameworks = list(compliance_scope.frameworks)
     # Use the client name as the workspace display name when provided so the
     # cover title reads "Acme Corp Security Report" rather than the internal
     # workspace directory name (e.g. "Goad-example").
@@ -2605,6 +2673,7 @@ async def _run_deliver_in_workspace(
     # ``_resolve_theme`` mirrors ``_resolve_frameworks`` and gives the
     # operator one place to look when the kit ships with the wrong skin.
     report_theme = _resolve_theme(args)
+    _capture_report_theme_choice(args, report_theme)
 
     # Decouple the bonus skin from the report skin. By default the bonuses
     # render with their OWN editorial catalog theme (warm-bone playbook /
@@ -2676,11 +2745,11 @@ async def _run_deliver_in_workspace(
     # State the compliance scope out loud, including when it is empty. A kit
     # that quietly omits its paid-tier compliance mapping is how one ships
     # without it and nobody notices.
-    announce_compliance_scope(
-        resolve_compliance_scope(
-            explicit=frameworks, workspace_dir=workspace_dir
-        )
-    )
+    announce_compliance_scope(compliance_scope)
+    # Record the decision the kit renders under BEFORE rendering: the report
+    # reads an explicit "no framework applies" from the workspace file and
+    # states it as the assessor's decision.
+    persist_compliance_decision(compliance_scope)
     # Open this run's own staging directory. Everything below writes into it
     # and reads back out of it, so the kit can only contain artefacts this run
     # produced — see the § Staging block above for why this is a directory per
@@ -2897,7 +2966,9 @@ def _prefill_interactive_inputs(args: argparse.Namespace) -> None:
     # non-interactively and auto-resolve to ALL (or their explicit ``--only``).
     args.only = _resolve_deliverables(args, shell=getattr(args, "_shell", None))
     try:
-        args.frameworks = ",".join(_resolve_frameworks(args))
+        # The tokens, not the keys: an explicit "none" must survive the
+        # prefill, or run_deliver would re-resolve an empty selection.
+        args.frameworks = ",".join(_resolve_compliance_scope(args).as_selection())
     except ValueError:
         # Either an invalid --frameworks value or an audit engagement with no
         # framework scoped. Leave both for run_deliver to re-resolve and
@@ -2953,7 +3024,13 @@ def run_deliver_sync(args: argparse.Namespace) -> int:
         # All interactive prompts run HERE, outside the event loop. See
         # _prefill_interactive_inputs for why (questionary + asyncio.run).
         _prefill_interactive_inputs(args)
-        rc = asyncio.run(run_deliver(args))
+        rc = run_on_new_loop(run_deliver(args))
+    except FrameworkSelectionCancelled:
+        print_warning(
+            "Deliver cancelled: no compliance framework was selected, so "
+            "nothing was generated."
+        )
+        return 130
     except KeyboardInterrupt:
         print_warning("Deliver cancelled.")
         return 130

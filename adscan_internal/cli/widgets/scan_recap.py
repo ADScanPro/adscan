@@ -113,7 +113,10 @@ class ScanRecapModel:
     # and status-blind, and it is barred from every human-facing surface.
     paths_total: int = 0
     paths_full_domain_compromise: int = 0
-    paths_proven: int = 0
+    # Of ``paths_full_domain_compromise``, the routes walked end to end. Only
+    # ``domain_breaker`` routes: a walked Tier 0 foothold is not a walked route
+    # to full domain compromise, so it must not silence "none walked end to end".
+    paths_full_domain_compromise_proven: int = 0
     ttc_label: str | None = None
     ttfc_label: str | None = None
     report_path: str | None = None
@@ -263,7 +266,7 @@ def _paths_line(model: ScanRecapModel) -> Text | None:
         f"{reached} of {total} identified attack path{plural} "
         f"{verb} {_FULL_COMPROMISE_PHRASE}"
     )
-    if max(0, int(model.paths_proven)) <= 0:
+    if max(0, int(model.paths_full_domain_compromise_proven)) <= 0:
         clause += ", none walked end to end"
     return Text(clause, style="dim")
 

@@ -28,14 +28,17 @@ from adscan_internal.services.cleanup_credential_loader import (
 
 __all__ = ["SUBCOMMANDS", "USAGE", "handle_cleanup_credential_command", "known_domains"]
 
-SUBCOMMANDS: tuple[str, ...] = ("set", "show", "clear")
+SUBCOMMANDS: tuple[str, ...] = ("set", "show", "check", "clear")
 
 USAGE = (
-    f"Usage: {CLEANUP_COMMAND} set [<domain>] | show | clear [<domain>|all]\n\n"
+    f"Usage: {CLEANUP_COMMAND} set [<domain>] | show | check | clear [<domain>|all]\n\n"
     "  set     Save the cleanup-only account your client provided for a domain\n"
     "          (default: the current domain). The secret is asked for at a\n"
     "          masked prompt and saved in this workspace.\n"
     "  show    List the cleanup accounts available, never the secret.\n"
+    "  check   Check, without changing anything, what the account can undo in\n"
+    "          each in-scope forest, domain and certification authority, and\n"
+    "          which techniques that lets your scan policy run.\n"
     "  clear   Remove the saved account for a domain, or every one with 'all'.\n\n"
     "ADscan tries this account first when it undoes its own changes and never uses\n"
     "it for the assessment."
@@ -70,6 +73,8 @@ def handle_cleanup_credential_command(shell: Any, args: str) -> None:
         _show()
     elif action == "set":
         _set(shell, target)
+    elif action == "check":
+        _check(shell)
     elif action == "clear":
         _clear(shell, target)
     else:
@@ -96,6 +101,23 @@ def _show() -> None:
         )
     print_table(table)
     print_info("Used only to undo ADscan's changes, never for the assessment.")
+
+
+def _check(shell: Any) -> None:
+    """Re-check, read-only, what the cleanup account can undo, and print it."""
+    from adscan_internal.services.cleanup_capability import (  # noqa: PLC0415
+        check_and_print,
+    )
+
+    if not describe_cleanup_accounts():
+        print_info(
+            "No cleanup account is configured, so ADscan skips every step whose "
+            f"change only such an account can undo. Save one with '{CLEANUP_COMMAND} set'."
+        )
+    check_and_print(shell, refresh=True)
+    saver = getattr(shell, "save_workspace_data", None)
+    if callable(saver) and getattr(shell, "current_workspace_dir", None):
+        saver()
 
 
 def _set(shell: Any, target: Optional[str]) -> None:

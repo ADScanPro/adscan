@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.environment_changes/1",
+  "title": "ADscan environment change ledger v1",
+  "description": "environment_changes.json: every change ADscan made in the assessed environment during a session (a group membership, an ACE, a computer account, a file), whether it was reverted and confirmed, and the exact command to remove what is still in place. Written on every change by one writer (EnvironmentChangeLedger in adscan_internal/services/environment_change_ledger.py), so it survives an abrupt exit. Version marker: schema_version, '1.<minor>'. Declared objects may gain fields within a major; do not reject unknown keys. detail is opaque. No secret is ever recorded.",
+  "type": "object",
+  "required": ["schema_version", "session_id", "scan_started_at", "scan_completed_at", "changes", "summary"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "session_id": {"type": "string", "minLength": 1},
+    "scan_started_at": {"$ref": "#/$defs/timestamp"},
+    "scan_completed_at": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+    "changes": {"type": "array", "items": {"$ref": "#/$defs/change"}},
+    "summary": {
+      "type": "object",
+      "$comment": "Counts by cleanup outcome. pending_manual counts every change still in place for the client to remove or accept.",
+      "required": ["total"],
+      "properties": {
+        "total": {"$ref": "#/$defs/count"},
+        "reverted": {"$ref": "#/$defs/count"},
+        "reverted_confirmed": {"$ref": "#/$defs/count"},
+        "manual_required": {"$ref": "#/$defs/count"},
+        "kept": {"$ref": "#/$defs/count"},
+        "pending": {"$ref": "#/$defs/count"},
+        "pending_manual": {"$ref": "#/$defs/count"},
+        "failed": {"$ref": "#/$defs/count"},
+        "in_progress": {"$ref": "#/$defs/count"}
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "count": {"type": "integer", "minimum": 0},
+    "nullable_string": {"type": ["string", "null"]},
+    "change": {
+      "type": "object",
+      "required": ["change_id", "kind", "domain", "target", "detail", "method", "registered_at", "revert_status"],
+      "properties": {
+        "change_id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "change_class": {"type": "string", "$comment": "auto_revert (undone at the end of the session) or operator_confirmed (kept unless the operator confirms the revert)."},
+        "domain": {"type": "string"},
+        "target": {"type": "string"},
+        "detail": {"type": "object"},
+        "method": {"type": "string"},
+        "registered_at": {"$ref": "#/$defs/timestamp"},
+        "revert_status": {"type": "string", "$comment": "pending, revert_in_progress, reverted, reverted_confirmed, kept, manual_required, and the legacy failed / operator_required (open vocabulary)."},
+        "reverted_at": {"$ref": "#/$defs/nullable_string"},
+        "revert_error": {"$ref": "#/$defs/nullable_string"},
+        "manual_cleanup_instructions": {"$ref": "#/$defs/nullable_string"},
+        "verified_at": {"$ref": "#/$defs/nullable_string"},
+        "verification_method": {"$ref": "#/$defs/nullable_string"},
+        "manual_reason": {"$ref": "#/$defs/nullable_string"},
+        "remediation_command": {"$ref": "#/$defs/nullable_string"},
+        "remediation_object_dn": {"$ref": "#/$defs/nullable_string"},
+        "revert_attempts": {"$ref": "#/$defs/count"},
+        "min_credential_principal": {"$ref": "#/$defs/nullable_string"},
+        "kept_reason": {"$ref": "#/$defs/nullable_string"},
+        "revert_principal": {"type": "string"},
+        "revert_principal_role": {"type": "string"},
+        "revert_rights": {
+          "type": "object",
+          "properties": {
+            "cleanup_account": {"type": "boolean"},
+            "privileged_account": {"type": "boolean"}
+          }
+        },
+        "revert_credential_attempts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["principal", "role", "outcome", "at"],
+            "properties": {
+              "principal": {"type": "string"},
+              "role": {"type": "string"},
+              "outcome": {"type": "string"},
+              "at": {"$ref": "#/$defs/timestamp"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

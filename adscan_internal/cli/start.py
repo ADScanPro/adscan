@@ -6,6 +6,7 @@ to keep `adscan.py` slimmer while preserving the exact runtime behaviour.
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 
 from collections.abc import Callable
@@ -43,7 +44,6 @@ from adscan_internal.cli.session_preflight import (
     SessionPreflightDeps,
     run_session_preflight,
 )
-import asyncio
 from adscan_internal.services.posture_orchestration import ensure_posture_fresh
 from adscan_internal.cli.enterprise_license_gate import (
     PHASE_UNAUTH,
@@ -96,6 +96,8 @@ from adscan_internal.services.engagement_timeline_record import (
     record_engagement_timeline_for_session,
 )
 from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome, write_scan_summary
+from adscan_internal.services.scan_control_bridge import operator_scan_scope
+from adscan_core.scan_control import scan_control
 from adscan_core.rich_output_collection import (
     SessionHeader,
     print_session_header,
@@ -752,6 +754,9 @@ def mark_scan_launched(shell: Any) -> None:
         setattr(shell, _SCAN_LAUNCHED_ATTR, True)
     except Exception:  # noqa: BLE001 - advisory marker, never blocks a scan
         pass
+    # First safe point after setup: a "stop the scan" chosen during setup is
+    # honoured here, before any scan work starts.
+    scan_control().checkpoint()
 
 
 def _scan_has_launched(shell: Any) -> bool:
@@ -1231,6 +1236,12 @@ def _offer_cleanup_account(shell: Any, domain: str) -> None:
     )
 
     offer_cleanup_credential_prompt(shell, domain=domain)
+    # With an account set, state what it can undo here, now (printed, never
+    # asked). A fresh workspace knows no domain yet; the checklist is then
+    # printed again before the first attack step, once the directory is read.
+    from adscan_internal.services.cleanup_capability import print_once  # noqa: PLC0415
+
+    print_once(shell, force=True)
 
 
 def _maybe_ask_operator_role_at_startup(shell) -> None:
@@ -1825,7 +1836,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
         _offer_cleanup_account(shell, known_domain)
 
         # Skip to enumeration for this domain
-        asyncio.run(
+        run_on_new_loop(
             ensure_posture_fresh(
                 shell,
                 domain=known_domain,
@@ -2077,7 +2088,7 @@ def _run_start_unauth_impl(shell, args: str | None) -> bool:
 
                 _offer_cleanup_account(shell, known_domain)
 
-                asyncio.run(
+                run_on_new_loop(
                     ensure_posture_fresh(
                         shell,
                         domain=known_domain,
@@ -3843,6 +3854,78 @@ def _emit_post_scan_panels(shell, verb: str) -> None:
         pass
 
 
+def _print_operator_stopped_panel(shell: Any, *, command_name: str) -> None:
+    """Report a scan the operator stopped from the Ctrl+C menu (or ``ci`` SIGINT)."""
+    body_lines = [
+        f"[bold yellow]■[/bold yellow]  [bold]{command_name} stopped by the operator.[/bold]",
+        "",
+        "Results collected before the stop are kept in the workspace, and the",
+        "report declares what was not assessed.",
+    ]
+    preserved = _summarize_preserved_scan_state(shell)
+    if preserved:
+        body_lines.append("")
+        body_lines.append("[bold]Kept:[/bold]")
+        body_lines.extend(f"    [cyan]›[/cyan]  {line}" for line in preserved)
+    body_lines.extend(
+        [
+            "",
+            "[bold]What to do next:[/bold]",
+            "    [cyan]›[/cyan]  run [bold]info[/bold] to review what was captured",
+            f"    [cyan]›[/cyan]  re-run [bold]{command_name}[/bold] to continue on this workspace",
+        ]
+    )
+    print_panel(
+        "\n".join(body_lines),
+        title="[bold]» Scan Stopped[/bold]",
+        border_style="yellow",
+        padding=(1, 2),
+    )
+
+
+def _finalize_operator_stopped_scan(shell: Any, verb: str) -> None:
+    """Close a scan the operator stopped, the same way a finished one closes.
+
+    The abort unwound through every ``finally`` (rollback, ledger) on its way
+    here. What remains is what the natural end of the scan does: the outcome and
+    the summary, the engagement timeline, the web snapshot and the background
+    jobs. Each step is best-effort, so one failure never hides the others.
+    """
+    telemetry.capture("scan_stopped_by_operator", properties={"command": verb})
+    steps: list[tuple[str, Any]] = [
+        ("scan_outcome", lambda: emit_scan_outcome(shell, verb)),
+        (
+            "scan_summary",
+            lambda: write_scan_summary(
+                shell, verb, getattr(shell, "current_workspace_dir", None) or ""
+            ),
+        ),
+        ("engagement_timeline", lambda: record_engagement_timeline_for_session(shell)),
+    ]
+    from adscan_internal.cli.attack_path_execution import (  # noqa: PLC0415
+        rematerialize_attack_path_snapshots_at_scan_end,
+    )
+
+    steps.append(
+        ("attack_path_snapshot", lambda: rematerialize_attack_path_snapshots_at_scan_end(shell))
+    )
+    steps.append(("background_jobs", lambda: reconcile_jobs_at_scan_end(shell)))
+    for name, step in steps:
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001 - finalisation is best-effort
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[start] operator-stop finalisation step {name} failed")
+    if hasattr(shell, "save_workspace_data"):
+        try:
+            shell.save_workspace_data()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    _print_operator_stopped_panel(shell, command_name=verb)
+
+
 def run_start_unauth(shell, args: str | None) -> None:
     """Start unauthenticated scan using the legacy PentestShell implementation.
 
@@ -3852,7 +3935,11 @@ def run_start_unauth(shell, args: str | None) -> None:
     while True:
         _reset_scan_launch_marker(shell)
         try:
-            scan_ran = _run_start_unauth_impl(shell, args)
+            with operator_scan_scope(shell, "start_unauth") as control:
+                scan_ran = _run_start_unauth_impl(shell, args)
+            if control.last_scan_aborted:
+                _finalize_operator_stopped_scan(shell, "start_unauth")
+                return
             # Only render the post-scan "Scan complete" panel when a scan
             # actually ran. Early bails (no interface, invalid/missing target,
             # cancelled discovery, preflight abort) and delegation to
@@ -4636,7 +4723,11 @@ def run_start_auth(shell, args: str | None) -> None:
     while True:
         _reset_scan_launch_marker(shell)
         try:
-            scan_ran = _run_start_auth_impl(shell, args)
+            with operator_scan_scope(shell, "start_auth") as control:
+                scan_ran = _run_start_auth_impl(shell, args)
+            if control.last_scan_aborted:
+                _finalize_operator_stopped_scan(shell, "start_auth")
+                return
             # Only render the post-scan "Scan complete" panel when a scan
             # actually ran. Early bails (no interface, cancelled creds, invalid
             # target, preflight/DNS abort) and delegation to run_start_unauth

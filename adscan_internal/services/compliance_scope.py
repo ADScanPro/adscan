@@ -40,6 +40,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from adscan_core.compliance_frameworks import (
+    NO_FRAMEWORK_CONFLICT_REASON,
+    NO_FRAMEWORK_DECISION_NOTICE,
+    NO_FRAMEWORK_KEY,
+    NO_FRAMEWORK_MENU_LABEL,
+    accepted_framework_values_text,
+    is_no_framework_token,
+    parse_framework_selection,
+)
 from adscan_core.lab_context import normalize_workspace_type
 from adscan_core.rich_output import print_info, print_info_debug, print_warning
 from adscan_internal.cli.common import _VALID_FRAMEWORK_KEYS
@@ -75,12 +84,16 @@ class ComplianceScope:
             exists). Carried on the scope so a consumer can read per-workspace
             state, such as the client's ENS scope declaration, without being
             handed the directory a second time.
+        declared_none: The operator answered "none": no compliance framework
+            applies to this organisation. A decision, so it satisfies the
+            audit requirement, and ``frameworks`` is empty.
     """
 
     frameworks: tuple[str, ...]
     engagement_type: Optional[str]
     required: bool
     workspace_dir: Optional[str] = None
+    declared_none: bool = False
 
     @property
     def selected(self) -> bool:
@@ -88,13 +101,32 @@ class ComplianceScope:
         return bool(self.frameworks)
 
     @property
+    def decided(self) -> bool:
+        """Whether the operator answered at all: frameworks, or "none"."""
+        return bool(self.frameworks) or self.declared_none
+
+    @property
     def missing_required(self) -> bool:
-        """An audit engagement reached a render with no framework selected."""
-        return self.required and not self.frameworks
+        """An audit engagement reached a render with no answer at all.
+
+        The explicit "none" IS an answer: an organisation that follows none of
+        the mapped frameworks gets a report with no compliance mapping.
+        """
+        return self.required and not self.decided
 
     def as_list(self) -> Optional[list[str]]:
         """The selection as the report pipeline takes it (``None`` = no mapping)."""
         return list(self.frameworks) or None
+
+    def as_selection(self) -> list[str]:
+        """The answer as ``--frameworks`` tokens: the keys, ``["none"]`` or ``[]``.
+
+        What a caller hands back to a parser that will re-resolve it (the
+        ``deliver`` prefill, the web), so the "none" decision survives the hop.
+        """
+        if self.declared_none and not self.frameworks:
+            return [NO_FRAMEWORK_KEY]
+        return list(self.frameworks)
 
 
 def frameworks_are_required(engagement_type: Optional[str]) -> bool:
@@ -208,11 +240,17 @@ def resolve_compliance_scope(
     )
     if resolved_type not in KNOWN_ENGAGEMENT_TYPES:
         resolved_type = None
+    cleaned = _clean(explicit)
+    frameworks = tuple(key for key in cleaned if not is_no_framework_token(key))
     return ComplianceScope(
-        frameworks=_clean(explicit),
+        frameworks=frameworks,
         engagement_type=resolved_type,
         required=frameworks_are_required(resolved_type),
         workspace_dir=str(workspace_dir) if workspace_dir else None,
+        # A selection that also names a framework is not a "none" decision:
+        # the parsers refuse that mix, and should one slip through, the
+        # framework the operator named is the safer reading than dropping it.
+        declared_none=len(cleaned) != len(frameworks) and not frameworks,
     )
 
 
@@ -221,29 +259,243 @@ def valid_framework_list() -> str:
     return ", ".join(_VALID_FRAMEWORK_KEYS)
 
 
-def missing_framework_error(*, rerender_hint: Optional[str] = None) -> str:
+def valid_framework_values() -> str:
+    """Every value ``--frameworks`` accepts, "none" included."""
+    return accepted_framework_values_text()
+
+
+def rerender_command(
+    *,
+    command: str = "deliver",
+    workspace: Optional[str] = None,
+    in_repl: bool = False,
+) -> str:
+    """The command that re-renders with a framework, worded for where the operator is.
+
+    Inside the interactive shell the verb is typed bare (``deliver --frameworks
+    <keys>``), because the session already owns the workspace. From the launcher
+    it is the full ``adscan`` form, naming the workspace when known. Every
+    "re-run with a framework" hint derives from here, so no call site carries its
+    own copy of either form.
+    """
+    if in_repl:
+        return f"{command} --frameworks <keys>"
+    workspace_part = f" --workspace {workspace}" if workspace else ""
+    return f"adscan {command}{workspace_part} --frameworks <keys>"
+
+
+def missing_framework_error(
+    *,
+    rerender_hint: Optional[str] = None,
+    command: Optional[str] = None,
+    workspace: Optional[str] = None,
+    in_repl: bool = False,
+) -> str:
     """The message shown when an audit render has no framework selected.
 
     Names the valid values so the operator can self-correct without reading
     source, and (when the data already exists) the exact command to re-render.
+    Pass ``command`` (and ``in_repl``/``workspace``) to have the hint derived by
+    :func:`rerender_command`; ``rerender_hint`` is an already-built override.
     """
     message = (
         "No compliance framework was selected for this audit engagement. "
         "A compliance section asserts a conformance verdict, so the framework "
         "is a scoping decision ADscan will not make for you. "
-        f"Pass --frameworks with one or more of: {valid_framework_list()}."
+        f"Pass --frameworks with one or more of: {valid_framework_list()}. "
+        "If the organisation follows none of them, pass --frameworks none and "
+        "the report carries no compliance mapping."
     )
+    if rerender_hint is None and command:
+        rerender_hint = rerender_command(
+            command=command, workspace=workspace, in_repl=in_repl
+        )
     if rerender_hint:
         message += f" The workspace is kept, so you can re-render with: {rerender_hint}"
     return message
 
 
+class FrameworkSelectionCancelled(Exception):
+    """The operator chose to stop instead of selecting a required framework."""
+
+
+#: How many times a required framework prompt is re-asked before it gives up.
+_MAX_FRAMEWORK_REASKS = 8
+
+
+def prior_framework_selection(workspace_dir: Any) -> tuple[str, ...]:
+    """The answer a workspace already records, as the operator's earlier decision.
+
+    Three sources, all written by the operator's own choice: the decision a
+    previous run recorded in ``technical_report.json`` (``compliance_scope``,
+    which is how an earlier "none" comes back as ``("none",)``), the compliance
+    block a previous run stamped (its ``selected`` list), and a declared ENS
+    scope (``compliance_scope.json``), which can only exist because the operator
+    scoped ENS. Used only to PRE-TICK the picker; the operator still confirms,
+    and nothing is ever substituted. Never raises.
+    """
+    if not workspace_dir:
+        return ()
+    found: list[str] = []
+    declared_none = False
+    try:
+        report = Path(str(workspace_dir)) / "technical_report.json"
+        if report.is_file():
+            data = json.loads(report.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+                    compliance_decision_from_report,
+                )
+
+                decision = compliance_decision_from_report(data)
+                if decision is not None:
+                    declared_none = decision.none_declared
+                    found.extend(decision.keys)
+            domains = data.get("domains") if isinstance(data, dict) else None
+            for entry in (domains or {}).values():
+                block = entry.get("compliance") if isinstance(entry, dict) else None
+                selected = block.get("selected") if isinstance(block, dict) else None
+                if isinstance(selected, list):
+                    found.extend(str(item) for item in selected)
+    except Exception as exc:  # noqa: BLE001 - a pre-tick is a convenience only
+        print_info_debug(f"Compliance scope: prior selection unreadable: {exc}")
+    if declared_none:
+        # The last answer was "none": pre-tick that, never a stale framework.
+        return (NO_FRAMEWORK_KEY,)
+    try:
+        from adscan_core.reporting.compliance_scope_declaration import load_ens_scope
+
+        if load_ens_scope(workspace_dir) is not None:
+            found.append("ens")
+    except Exception as exc:  # noqa: BLE001
+        print_info_debug(f"Compliance scope: declaration unreadable: {exc}")
+    valid = set(_VALID_FRAMEWORK_KEYS)
+    return tuple(key for key in _clean(found) if key in valid)
+
+
+def prompt_frameworks(
+    *,
+    required: bool,
+    title: Optional[str] = None,
+    workspace_dir: Any = None,
+    shell: Any = None,
+) -> list[str]:
+    """Ask which frameworks apply, enforcing the answer when the engagement requires one.
+
+    The single interactive framework prompt (``deliver`` and the REPL report
+    verb both call it). The last option is the explicit "none" answer
+    (:data:`NO_FRAMEWORK_MENU_LABEL`): an organisation that follows none of the
+    mapped frameworks is a valid scope, and ticking it alone returns
+    ``["none"]``. Ticking it together with a framework is a contradiction, so
+    the prompt says why in one line and asks again.
+
+    For an ``audit`` engagement (``required``) an EMPTY submission is explained
+    and asked again instead of being carried forward to fail after the
+    remaining prompts; the operator can stop cleanly, which raises
+    :class:`FrameworkSelectionCancelled`. Never picks a framework: the only
+    pre-ticked boxes are the operator's own earlier decision
+    (:func:`prior_framework_selection`).
+
+    A non-interactive context resolves to an empty selection without asking, so
+    ``ci`` and the web worker keep their explicit-flag-or-error contract.
+    """
+    from adscan_core.rich_output import confirm_ask, questionary_checkbox_values
+    from adscan_internal.cli.common import _FRAMEWORK_KEY_MAP
+    from adscan_internal.interaction import is_non_interactive
+
+    if is_non_interactive(shell):
+        return []
+
+    if title is None:
+        title = (
+            "Select the compliance framework(s) for this audit report, or None "
+            "if the organisation follows none of them (required; Space ticks "
+            "one, Enter confirms):"
+            if required
+            else "Select compliance frameworks to include in the kit:"
+        )
+    label_to_token = {**_FRAMEWORK_KEY_MAP, NO_FRAMEWORK_MENU_LABEL: NO_FRAMEWORK_KEY}
+    token_to_label = {token: label for label, token in label_to_token.items()}
+    defaults = [
+        token_to_label[token]
+        for token in prior_framework_selection(workspace_dir)
+        if token in token_to_label
+    ]
+    options = list(label_to_token.keys())
+
+    for _ in range(_MAX_FRAMEWORK_REASKS):
+        selected = questionary_checkbox_values(
+            title=title,
+            options=options,
+            default_values=defaults,
+            shell=shell,
+        )
+        if selected is None:
+            # Ctrl+C or an unavailable prompt: an explicit way out.
+            if required:
+                raise FrameworkSelectionCancelled()
+            return []
+        answer = parse_framework_selection(
+            [label_to_token[label] for label in selected if label in label_to_token]
+        )
+        if answer.conflict:
+            print_warning(NO_FRAMEWORK_CONFLICT_REASON)
+            defaults = [label for label in selected if label in label_to_token]
+            continue
+        if answer.provided:
+            return answer.as_tokens()
+        if not required:
+            return []
+        print_warning(
+            "An audit report needs an answer here, and ADscan will not pick a "
+            "framework for you. Tick the frameworks that apply, or None if the "
+            "organisation follows none of them, then press Enter."
+        )
+        if confirm_ask("Cancel instead of generating the report?", default=False):
+            raise FrameworkSelectionCancelled()
+    raise FrameworkSelectionCancelled()
+
+
 def no_framework_notice() -> str:
-    """The one line a report with no compliance mapping must carry."""
+    """The line a report with no compliance mapping, and no decision, carries."""
     return (
         "No compliance framework was selected, so this report carries no "
-        f"compliance mapping. Add one with --frameworks ({valid_framework_list()})."
+        f"compliance mapping. Add one with --frameworks ({valid_framework_values()})."
     )
+
+
+def no_framework_decision_notice() -> str:
+    """The line a report carries when the assessor decided no framework applies."""
+    return NO_FRAMEWORK_DECISION_NOTICE
+
+
+def persist_compliance_decision(scope: ComplianceScope) -> None:
+    """Record the scope's framework decision in the workspace's technical report.
+
+    ``technical_report.json`` carries the answer the render (or the scan) ran
+    with, so a later re-render, the web and an integrator read the same
+    decision, and the renderers state "no framework applies" from the file
+    rather than from a value threaded through every call. No decision (a lab
+    render with nothing chosen) removes an earlier one: the file says what the
+    data was last rendered under. Best-effort: never raises.
+    """
+    workspace_dir = scope.workspace_dir
+    if not workspace_dir:
+        return
+    try:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            record_compliance_decision,
+        )
+
+        record_compliance_decision(
+            SimpleNamespace(current_workspace_dir=str(workspace_dir)),
+            frameworks=scope.frameworks,
+            none_declared=scope.declared_none,
+        )
+    except Exception as exc:  # noqa: BLE001 - a record never blocks a render
+        print_info_debug(f"Compliance scope: decision not recorded: {exc}")
 
 
 def _declaration_path_hint(workspace_dir: Any = None) -> str:
@@ -341,6 +593,9 @@ def announce_compliance_scope(scope: ComplianceScope) -> None:
     governs an ENS render whose scope was never declared: the output is
     correct, and an unattended operator is the one person nobody asked.
     """
+    if scope.declared_none:
+        print_info(no_framework_decision_notice())
+        return
     if scope.selected:
         print_info(f"Compliance frameworks: {', '.join(scope.frameworks)}")
         # Best-effort, and deliberately so: a notice about the output must
@@ -359,13 +614,20 @@ __all__ = (
     "CTF_ENGAGEMENT",
     "KNOWN_ENGAGEMENT_TYPES",
     "ComplianceScope",
+    "FrameworkSelectionCancelled",
     "announce_compliance_scope",
     "frameworks_are_required",
     "missing_framework_error",
+    "no_framework_decision_notice",
     "no_framework_notice",
+    "persist_compliance_decision",
+    "prior_framework_selection",
+    "prompt_frameworks",
+    "rerender_command",
     "resolve_compliance_scope",
     "resolve_engagement_type",
     "undeclared_ens_scope_notice",
     "valid_framework_list",
+    "valid_framework_values",
     "workspace_engagement_type",
 )

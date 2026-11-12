@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from adscan_core.engagement.output_formats import output_marker
 from adscan_core.rich_output import print_info_debug
 from adscan_internal import telemetry
 from adscan_internal.services.host_intelligence.models import (
@@ -29,7 +30,7 @@ from adscan_internal.services.host_intelligence.product_catalog import (
 )
 from adscan_core.rich_output import print_exception
 
-INVENTORY_SCHEMA_VERSION = "inventory-1.0"
+INVENTORY_SCHEMA_VERSION = output_marker("inventory")  # owned by the output contract
 RECORD_TYPE = "defensive_posture"
 _FILENAME = "defensive_posture.json"
 

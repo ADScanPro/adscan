@@ -884,6 +884,10 @@ def _run_chain(
     # inside the relay-source listener stop (stray half-open coerced connections).
     print_info_debug("relay-teardown coerce-and-relay returned to RBCD chain; processing result")
     rbcd_result = _first_relay_result(relay_outcome)
+    if _relay_listener_error(relay_outcome):
+        # Our listener never opened, so nothing was coerced; the relay runner
+        # already said so in one line. "No authentication captured" would be false.
+        return
     if rbcd_result is None or not rbcd_result.success:
         err = rbcd_result.error if rbcd_result else "no authentication captured"
         print_warning(
@@ -993,6 +997,9 @@ def _run_chain_shadow(
     # Safe point: see the RBCD chain; the loop has finished.
     present_pending_callback_advice(shell)
     sc_result = _first_relay_result(relay_outcome)
+    if _relay_listener_error(relay_outcome):
+        # Our listener never opened; the relay runner already said so.
+        return
     if sc_result is None or not sc_result.success:
         err = sc_result.error if sc_result else "no authentication captured"
         print_warning(
@@ -1495,6 +1502,13 @@ def _first_relay_result(relay_outcome: Any) -> Any:
     relay_result = getattr(relay_outcome, "relay_result", None)
     results = getattr(relay_result, "results", None) or ()
     return results[0] if results else None
+
+
+def _relay_listener_error(relay_outcome: Any) -> str:
+    """The listener-unavailable reason of a coerce-and-relay outcome, or ``""``."""
+    relay_result = getattr(relay_outcome, "relay_result", None)
+    value = getattr(relay_result, "listener_error", None)
+    return value if isinstance(value, str) else ""
 
 
 def _resolve_victim_spn_host(

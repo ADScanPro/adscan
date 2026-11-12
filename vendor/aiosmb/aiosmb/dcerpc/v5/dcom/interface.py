@@ -102,6 +102,12 @@ class INTERFACE:
     inherit from this class.
     """
     
+    @property
+    def _manager(self) -> DCOMConnectionManager:
+        # Resolved at use time: the manager of the loop running this coroutine
+        # (managers are per event loop, see DCOMConnectionManager.get_instance).
+        return DCOMConnectionManager.get_instance()
+
     def __init__(self, cinstance=None, objRef=None, ipidRemUnknown=None, 
                  iPid=None, oxid=None, oid=None, target=None,
                  interfaceInstance=None):
@@ -111,8 +117,6 @@ class INTERFACE:
         Can be initialized either from another interface instance (copy)
         or from individual components.
         """
-        self._manager = DCOMConnectionManager.get_instance()
-        
         if interfaceInstance is not None:
             # Copy from existing interface
             self._target = interfaceInstance.get_target()

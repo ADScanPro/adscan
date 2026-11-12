@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.technical_report/2",
+  "title": "ADscan technical report v2",
+  "description": "technical_report.json: every finding, positive control and event a scan recorded, per domain, plus the report-time blocks the deliverables and the web platform read instead of recomputing (exposure score, KPIs, compliance, coverage statements). Written by one writer (adscan_core/reporting/technical_report.py). Version marker: schema_version, '2.<minor>'. A minor bump adds optional fields or blocks; a reader of any 2.x accepts every 2.x file. Objects that list their properties are declared: within a major an engine may add fields to them, so do not reject unknown keys. Objects without properties (details, evidence entries, knowledge, the per-domain report blocks) are opaque: their content is not frozen by this contract, and the blocks that carry their own schema_version (exposure_kpis, compliance, ...) version themselves. No recovered password, hash or key value is ever written into this file.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "domains"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^2\\.[0-9]+$"},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "coverage_run_id": {"type": "string", "maxLength": 64, "$comment": "Id of the recorded run that last wrote the file; coverage.json is trusted for this file only when its run_id matches."},
+    "domains": {
+      "type": "object",
+      "$comment": "Keyed by domain FQDN (lower case). A domain is listed as soon as any producer names it; assessment.enumerated says whether it was actually enumerated.",
+      "additionalProperties": {"$ref": "#/$defs/domain"}
+    },
+    "environment_changes": {"type": "object", "$comment": "Copy of the change ledger attached at session end ({summary, changes}); environment_changes.json is the authoritative file."},
+    "attack_fanout_rollup": {"type": "array", "items": {"type": "object"}},
+    "engagement_timeline": {"type": "object"},
+    "workspace_remediation": {"type": "object"},
+    "compliance_decision": {
+      "type": "object",
+      "$comment": "Added in 2.3. The compliance-framework answer the last scan or render ran with: decision 'frameworks' lists the selected framework keys; decision 'none' means the assessor decided no compliance framework applies to the organisation, so the report carries no compliance mapping. Absent means no decision was recorded (nothing was chosen), never 'none applies'.",
+      "required": ["decision", "frameworks"],
+      "properties": {
+        "decision": {"type": "string", "enum": ["frameworks", "none"]},
+        "frameworks": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "domain": {
+      "type": "object",
+      "required": ["findings", "control_evidence", "events", "attack_paths"],
+      "properties": {
+        "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+        "control_evidence": {"type": "array", "items": {"$ref": "#/$defs/control_evidence"}},
+        "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+        "attack_paths": {"type": "array", "items": {"type": "object"}},
+        "assessment": {"type": "object"},
+        "attack_path_coverage": {"type": "object"},
+        "chokepoint_cardinality": {"type": "object"},
+        "collection_coverage": {"type": "object"},
+        "compliance": {"type": "object"},
+        "cracking_coverage": {"type": "object"},
+        "endpoint_defense": {"type": "object"},
+        "exposure_kpis": {"type": "object"},
+        "exposure_score": {"type": "object"},
+        "host_enrichment_coverage": {"type": "object"},
+        "host_reach_coverage": {"type": "object"},
+        "kit_facts": {"type": "object"},
+        "operator_stop_coverage": {"type": "object", "$comment": "Since 2.4. {stops: [{action, step_id, label, phase_id, phase_title, examined, total, unit, source, statement}]}: every step the operator stopped, phase skipped or scan stopped early, with the client statement (adscan_core/reporting/operator_stop_coverage.py). Absent when nothing was stopped."},
+        "scan_pacing": {"type": "object"},
+        "scan_policy_coverage": {"type": "object", "$comment": "Self-versioned block (adscan_core/scan_policy/coverage.py). Since 2.2 it may carry agreed_policy: {name, revision, digest, matches, reason?}, the policy agreed with the client for the engagement and whether this run's digest matches it; absent when none was agreed."},
+        "vantage_coverage": {"type": "object"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "$comment": "One weakness per key and domain. severity is the authored baseline band; adscan_severity is ADscan's contextual rating of this instance and the one a report counts.",
+      "required": ["id", "key", "title", "severity", "status", "details"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "key": {"type": "string", "minLength": 1, "maxLength": 128},
+        "title": {"type": "string"},
+        "severity": {"$ref": "#/$defs/severity"},
+        "category": {"type": "string"},
+        "status": {"type": "string", "minLength": 1, "maxLength": 64},
+        "from_attack_graph": {"type": "boolean"},
+        "details": {"type": "object"},
+        "evidence": {"type": "array", "items": {"type": "object"}},
+        "discovered_at": {"$ref": "#/$defs/timestamp"},
+        "first_seen": {"$ref": "#/$defs/timestamp"},
+        "last_seen": {"$ref": "#/$defs/timestamp"},
+        "alias_keys": {"type": "array", "items": {"type": "string", "minLength": 1}, "$comment": "Present only on a merged finding: the keys of every producer that recorded the same weakness (an alias family), in document order. The finding carries the family's canonical key."},
+        "knowledge": {"type": "object"},
+        "cvss_base": {"type": "number", "minimum": 0, "maximum": 10, "$comment": "Present only together with cvss_base_vector, which reproduces it."},
+        "cvss_base_vector": {"type": "string"},
+        "adscan_severity": {"$ref": "#/$defs/severity"},
+        "adscan_priority_score": {"type": "number", "minimum": 0},
+        "adscan_baseline_score": {"type": "number", "minimum": 0},
+        "adscan_severity_elevated": {"type": "boolean"}
+      }
+    },
+    "control_evidence": {
+      "type": "object",
+      "$comment": "A positive or neutral observation (a control verified in place, a check that ran and found the weakness absent). Never a finding.",
+      "required": ["id", "key", "title", "category", "status", "details"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "key": {"type": "string", "minLength": 1, "maxLength": 128},
+        "title": {"type": "string"},
+        "category": {"type": "string"},
+        "status": {"type": "string", "minLength": 1, "maxLength": 64},
+        "details": {"type": "object"},
+        "evidence": {"type": "array", "items": {"type": "object"}},
+        "discovered_at": {"$ref": "#/$defs/timestamp"},
+        "first_seen": {"$ref": "#/$defs/timestamp"},
+        "last_seen": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["id", "type", "message", "details", "timestamp"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "type": {"type": "string", "minLength": 1, "maxLength": 128},
+        "message": {"type": "string"},
+        "details": {"type": "object"},
+        "timestamp": {"$ref": "#/$defs/timestamp"}
+      }
+    },
+    "severity": {"enum": ["critical", "high", "medium", "low", "info"]}
+  }
+}

@@ -13,6 +13,7 @@ results; this module:
 
 from __future__ import annotations
 
+from adscan_core.domain_auth_state import is_authenticated_state
 from adscan_core.scan_policy import settings as policy_settings
 
 from dataclasses import dataclass
@@ -5082,7 +5083,7 @@ def execute_cracking(
                     shell.cracking("asreproast", domain, hash, failed=True)
             if (
                 hash_type == "asreproast"
-                and shell.domains_data[domain]["auth"] != "auth"
+                and not is_authenticated_state(shell.domains_data[domain]["auth"])
             ):
                 shell.ask_for_kerberoast_preauth(domain, shell.username or "")
             if hash_type == "kerberoast":

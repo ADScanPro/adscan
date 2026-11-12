@@ -23,9 +23,9 @@ beyond delegated calls into the exploitation service.
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_internal.services.ledger_guard import ledger_or_warn
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -497,7 +497,7 @@ def run_exploit_gpo_immediate_task_for_step(
         # graph already grounds the edge, so even an unlinked-but-writable GPO
         # is a valid target for the plant.
         try:
-            candidates = asyncio.run(
+            candidates = run_on_new_loop(
                 discover_writable_gpos(
                     workspace_dir=workspace_dir,
                     domain=target_domain,
@@ -549,7 +549,7 @@ def run_exploit_gpo_immediate_task_for_step(
 
         service = ExploitationService()
         try:
-            result: GPOImmediateTaskResult = asyncio.run(
+            result: GPOImmediateTaskResult = run_on_new_loop(
                 service.gpo.run_exploit_gpo_immediate_task(
                     ledger=ledger,
                     domain=target_domain,
@@ -664,7 +664,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             progress.add_task(
                 "Filtering attack_graph.json (linked-only).", total=None
             )
-            candidates = asyncio.run(
+            candidates = run_on_new_loop(
                 discover_writable_gpos(
                     workspace_dir=workspace_dir,
                     domain=domain,
@@ -685,7 +685,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             default=False,
         ):
             try:
-                candidates = asyncio.run(
+                candidates = run_on_new_loop(
                     discover_writable_gpos(
                         workspace_dir=workspace_dir,
                         domain=domain,
@@ -842,7 +842,7 @@ def _run_wizard(shell: Any) -> bool:  # noqa: PLR0911,PLR0912,PLR0915
             task = progress.add_task(
                 "Planting Immediate Scheduled Task.", total=None
             )
-            result = asyncio.run(
+            result = run_on_new_loop(
                 service.gpo.run_exploit_gpo_immediate_task(
                     ledger=ledger,
                     domain=domain,

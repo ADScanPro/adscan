@@ -1,12 +1,14 @@
 """Async SMB2 server that captures NTLMv1/v2 hashes without a relay target.
 
-Used by any ADscan flow that needs to listen on port 445 and capture the NTLM
-authentication from an incoming connection (e.g. active coercion, hash-grabbing
+Used by any ADscan flow that needs to capture the NTLM authentication from an
+incoming SMB connection (e.g. active coercion, hash-grabbing
 from triggered credentials) without relaying to a downstream target.
 
 Architecture
 ------------
-``SMBRelayServer`` (aiosmb) accepts connections and calls
+``SMBRelayServer`` (aiosmb, in handoff mode) serves the connections the
+listener broker routes to this capture (every caller no relay or Kerberos
+capture claims; the broker owns the port) and calls
 ``gssapi.authenticate_relay_server()`` on the per-connection GSSAPI object.
 ``_SPNEGOCaptureAdapter`` wraps asyauth's standalone ``SPNEGOserver`` +
 ``NTLMServerNative`` so the server generates its own NTLM challenge and
@@ -18,7 +20,7 @@ into ``capture_queue`` and ``extract_ntlm_hash`` turns it into a
 Comparison with ``SMBKrbCaptureListener`` (smb_krb_capture.py)
 ---------------------------------------------------------------
 Both modules expose the same async ``start() / stop()`` interface and accept
-an ``asyncio.Queue``.  The Kerberos listener uses the bare ``SMBServer`` (no
+an ``asyncio.Queue``.  The Kerberos listener is a raw stream handler (no
 relay machinery) and captures a raw SPNEGO blob; this module uses
 ``SMBRelayServer`` and captures a hashcat-format NTLM hash.
 
@@ -384,6 +386,12 @@ class SMBNtlmCaptureSource:
         self._server_task: asyncio.Task[object] | None = None
         self._server: object = None
         self._observer = InboundConnectionObserver()
+        self._claim: Any = None
+
+    @property
+    def served_address(self) -> str | None:
+        """The local address whose socket serves this capture (``None`` when down)."""
+        return getattr(self._claim, "served_address", None)
 
     @property
     def connection_stats(self) -> InboundConnectionStats:
@@ -396,7 +404,12 @@ class SMBNtlmCaptureSource:
         return self._observer.snapshot()
 
     async def start(self) -> None:
-        """Start the SMB capture listener.  Raises on bind failure."""
+        """Start the capture and claim its port from the listener broker.
+
+        Raises:
+            ListenerUnavailableError: the broker could not serve the port (a
+                classified, OS-aware reason; ``describe_start_error`` reads it).
+        """
         from badauth.protocols.ntlm.server.native import NTLMServerNative  # noqa: PLC0415
         from badauth.protocols.spnego.server.native import SPNEGOserver  # noqa: PLC0415
         from badauth.common.credentials.ntlm import NTLMCredential  # noqa: PLC0415
@@ -446,21 +459,42 @@ class SMBNtlmCaptureSource:
         settings.RequireSigning = False
         settings.shares = {}
 
-        self._server = SMBRelayServer(target, settings)
+        # Handoff mode: the listener broker owns the port and routes to this
+        # capture every connection no relay or Kerberos capture claims.
+        self._server = SMBRelayServer(target, settings, handoff=True)
         task, err = await self._server.run()
         if err is not None:
-            raise RuntimeError(
-                f"SMB NTLM capture listener failed to start on "
-                f"{self._config.listen_host}:{self._config.listen_port}: {err}"
-            )
+            raise RuntimeError(f"SMB NTLM capture server failed to start: {err}")
         self._server_task = task
+        from adscan_internal.services.listener_broker import (  # noqa: PLC0415
+            ClaimRole,
+            acquire_listener,
+        )
+
+        try:
+            self._claim = await acquire_listener(
+                port=self._config.listen_port,
+                consumer_id=f"capture:smb@{self._config.listen_host}",
+                handler=self._server.handle_stream,
+                role=ClaimRole.CAPTURE,
+                local_address=self._config.listen_host,
+            )
+        except BaseException:
+            await self._stop_server_task()
+            raise
         print_info_debug(
-            f"[smb-ntlm-capture] listener ready — "
-            f"{self._config.listen_host}:{self._config.listen_port}"
+            f"[smb-ntlm-capture] capturing on {self._claim.served_address}:"
+            f"{self._config.listen_port} (callback address {self._config.listen_host})"
         )
 
     async def stop(self) -> None:
-        """Stop the SMB capture listener."""
+        """Release the port claim, then stop the SMB capture server."""
+        claim, self._claim = self._claim, None
+        if claim is not None:
+            await claim.arelease()
+        await self._stop_server_task()
+
+    async def _stop_server_task(self) -> None:
         if self._server_task is not None:
             self._server_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

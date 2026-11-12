@@ -15,7 +15,7 @@ This module is the ONLY entry point for the new scanner. The legacy
 
 from __future__ import annotations
 
-import asyncio
+from adscan_core.async_bridge import run_on_new_loop
 import shlex
 import uuid
 from datetime import datetime, timezone
@@ -363,7 +363,7 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
     with ScanLogWriter(log_path) as scan_log:
         scan_log.subscribe(event_bus)
 
-        asyncio.run(
+        run_on_new_loop(
             _run_async(
                 shell=shell,
                 runner=CVEScanRunner(concurrency=concurrency),
@@ -734,7 +734,12 @@ def record_cve_graph_edge(
             target=result.host,
             technique_id=cve.id,
             evidence_path=f"cves/{scan_id}/{cve.id}/{result.host}.json",
-            extra={"aka": cve.aka, "cvss_v3": cve.cvss_v3},
+            extra={
+                "aka": cve.aka,
+                "cvss_v3": cve.cvss_v3,
+                # A score is never published without its vector.
+                "cvss_vector": cve.cvss_vector,
+            },
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)

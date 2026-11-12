@@ -26,15 +26,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
-from adscan_core.scan_policy.model import (
-    REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT,
-    REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK,
-    REVERT_RIGHT_WRITE_RBCD_DELEGATION,
+from adscan_core.scan_policy.revert_rights import (
+    ROLE_ADMINISTRATORS,
+    ROLE_DOMAIN_ADMINS,
+    ROLE_ENTERPRISE_ADMINS,
+    SCOPE_CA,
+    STATE_NOT_PERMITTED,
+    STATE_PERMITTED,
+    STATE_UNDETERMINABLE,
+    registered_revert_rights,
 )
-
-STATE_PERMITTED = "permitted"
-STATE_NOT_PERMITTED = "not_permitted"
-STATE_UNDETERMINABLE = "undeterminable"
 
 REASON_VERIFIED_ADMIN = "verified_admin"
 REASON_NO_CLEANUP_ACCOUNT = "no_cleanup_account"
@@ -42,20 +43,19 @@ REASON_LACKS_RIGHT = "lacks_right"
 REASON_NO_MEMBERSHIP_DATA = "no_membership_data"
 REASON_PRINCIPAL_NOT_FOUND = "principal_not_found"
 REASON_OTHER_DOMAIN = "other_domain"
+#: The account belongs to another forest: an administrator of one forest holds
+#: nothing across a forest trust, so this is an observation, not a gap in data.
+REASON_OTHER_FOREST = "other_forest"
 
-#: Directory roles of the TARGET domain that hold each right on every computer
-#: object of that domain by default. Deliberately narrow: a delegated right
-#: (Account Operators, an OU-level Delete grant) cannot be confirmed from group
-#: membership alone, so it is not counted, and the account reads as not
-#: verified rather than as able to undo the change.
-ROLE_DOMAIN_ADMINS = "domain_admins"
-ROLE_ENTERPRISE_ADMINS = "enterprise_admins"
-ROLE_ADMINISTRATORS = "administrators"
+#: Directory roles that hold each DIRECTORY right (domain or forest scope), read
+#: from the revert-right registry so a new token needs no edit here. Deliberately
+#: narrow: a delegated right (Account Operators, an OU-level Delete grant) cannot
+#: be confirmed from group membership alone, so it is not counted, and the account
+#: reads as not verified rather than as able to undo the change. A CA right is
+#: never answered here: the CA answers it (``revert_rights.decide_ca_right``).
 _ADMIN_ROLES = frozenset({ROLE_DOMAIN_ADMINS, ROLE_ENTERPRISE_ADMINS, ROLE_ADMINISTRATORS})
 RIGHT_GRANTING_ROLES: Mapping[str, frozenset[str]] = {
-    REVERT_RIGHT_DELETE_COMPUTER_ACCOUNT: _ADMIN_ROLES,
-    REVERT_RIGHT_WRITE_RBCD_DELEGATION: _ADMIN_ROLES,
-    REVERT_RIGHT_WRITE_KEY_CREDENTIAL_LINK: _ADMIN_ROLES,
+    r.token: r.granting_roles for r in registered_revert_rights() if r.scope != SCOPE_CA
 }
 
 #: Domain key the cleanup store uses for "any domain of the run".
@@ -166,13 +166,20 @@ def decide_revert_permission(
     membership_available: bool,
     principal_found: bool,
     roles: Iterable[str] = (),
+    same_forest: bool | None = None,
 ) -> RevertPermissionVerdict:
     """The decision table. Every branch that cannot establish the right refuses.
+
+    ``same_forest`` is set by a caller that resolved the account across domains
+    (its roles are then already the roles it holds in THIS domain, Enterprise
+    Admins included): ``False`` is an observation (another forest), ``True`` lets
+    an account of another domain of the forest be judged on those roles.
 
     | cleanup account for the domain | account's domain | membership data | account found | roles cover every right | verdict |
     |---|---|---|---|---|---|
     | none | | | | | not permitted (no cleanup account) |
-    | yes | another named domain | | | | undeterminable (other domain) |
+    | yes | another forest | | | | not permitted (other forest) |
+    | yes | another named domain, forest unresolved | | | | undeterminable (other domain) |
     | yes | this domain or any | missing | | | undeterminable (no membership data) |
     | yes | this domain or any | present | no | | undeterminable (principal not found) |
     | yes | this domain or any | present | yes | yes | permitted |
@@ -183,8 +190,10 @@ def decide_revert_permission(
     target = str(domain or "").strip().lower()
     if not name:
         return RevertPermissionVerdict(target, STATE_NOT_PERMITTED, REASON_NO_CLEANUP_ACCOUNT, "", wanted)
+    if same_forest is False:
+        return RevertPermissionVerdict(target, STATE_NOT_PERMITTED, REASON_OTHER_FOREST, name, wanted)
     home = str(principal_domain or "").strip().lower()
-    if home and home != ANY_DOMAIN and home != target:
+    if home and home != ANY_DOMAIN and home != target and same_forest is not True:
         return RevertPermissionVerdict(target, STATE_UNDETERMINABLE, REASON_OTHER_DOMAIN, name, wanted)
     if not membership_available:
         return RevertPermissionVerdict(target, STATE_UNDETERMINABLE, REASON_NO_MEMBERSHIP_DATA, name, wanted)
@@ -229,6 +238,27 @@ def conditional_line(titles: list[str]) -> str:
         f"anything, that the account is an administrator there, then undoes "
         f"{'its' if one else 'their'} change with it and re-reads to confirm. Where "
         f"it cannot confirm that, {'the step does' if one else 'those steps do'} not run."
+    )
+
+
+def conditional_ca_line(titles: list[str]) -> str:
+    """Certificate-issuing checks included because a cleanup account was supplied, or ``""``.
+
+    The undo of a certificate is its revocation, and the right that allows it
+    lives on each certification authority, not in a directory group, so the
+    sentence names the CA check rather than the administrator check.
+    """
+    if not titles:
+        return ""
+    one = len(titles) == 1
+    return (
+        f"{_n(len(titles), 'attack step', 'attack steps')} that request a certificate "
+        f"from your certification authority {'runs' if one else 'run'} because a "
+        f"cleanup account was supplied ({_names(titles)}). Before requesting one, "
+        "ADscan confirms on that CA, without changing anything, that the account can "
+        "revoke it, then revokes it with that account and re-reads the CA database to "
+        f"confirm. Where it cannot confirm that, {'the step does' if one else 'those steps do'} "
+        "not run."
     )
 
 
@@ -282,6 +312,12 @@ def verdict_line(verdict: RevertPermissionVerdict) -> str:
             f"In {domain}, no cleanup account was supplied, so the steps whose change "
             "only such an account can undo did not run there."
         )
+    if verdict.reason == REASON_OTHER_FOREST:
+        return (
+            f"In {domain}, {who} belongs to another forest, and an administrator of one "
+            "forest holds nothing across a forest trust, so the steps whose change only "
+            "such an account can undo did not run there."
+        )
     if verdict.reason == REASON_LACKS_RIGHT:
         return (
             f"In {domain}, {who} is not an administrator of the domain, so the steps "
@@ -300,6 +336,7 @@ __all__ = (
     "REASON_NO_CLEANUP_ACCOUNT",
     "REASON_NO_MEMBERSHIP_DATA",
     "REASON_OTHER_DOMAIN",
+    "REASON_OTHER_FOREST",
     "REASON_PRINCIPAL_NOT_FOUND",
     "REASON_VERIFIED_ADMIN",
     "RIGHT_GRANTING_ROLES",
@@ -308,6 +345,7 @@ __all__ = (
     "STATE_PERMITTED",
     "STATE_UNDETERMINABLE",
     "admin_roles_from_group_sids",
+    "conditional_ca_line",
     "conditional_line",
     "decide_revert_permission",
     "excluded_line",

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.unauth_users/1",
+  "title": "ADscan unauthenticated user inventory v1",
+  "description": "domains/<domain>/users.json: the domain accounts ADscan could list WITHOUT credentials (anonymous LDAP, SAMR and LSARPC RID cycling, merged into one record per account, with the probes that confirmed it in sources). It is a JSON array, so it carries no version marker: this schema is the version. Wrapping it in the inventory envelope (and adding the marker) is a breaking change reserved for the next engine major. Not to be confused with inventory/users.json, the authenticated collection (see adscan.inventory/1). Written by persist_unauth_users in adscan_internal/services/unauth_inventory.py. Declared objects may gain fields within a major; do not reject unknown keys.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["samaccountname", "sources"],
+    "properties": {
+      "samaccountname": {"type": "string", "minLength": 1},
+      "sources": {"type": "array", "items": {"type": "string"}, "$comment": "ldap, samr, rid_cycling (open vocabulary)."},
+      "rid": {"type": ["integer", "null"]},
+      "distinguished_name": {"type": "string"},
+      "description": {"type": "string"},
+      "full_name": {"type": "string"},
+      "comment": {"type": "string"},
+      "user_account_control": {"type": "integer"},
+      "last_logon_timestamp": {"type": ["string", "null"]},
+      "asreproast_eligible": {"type": "boolean"}
+    }
+  }
+}

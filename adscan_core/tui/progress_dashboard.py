@@ -831,7 +831,7 @@ class ProgressDashboard:
             return _LazyFooter(self._footer_provider)
         if self._budget_line:
             return Text(self._budget_line, style=COLOR_MUTED)
-        return None
+        return _LazyFooter(_scan_control_hint)
 
     # ------------------------------------------------------------------
     # LiveSession lifecycle
@@ -890,3 +890,19 @@ class _AsyncDashboardSession:
         if self._session is not None:
             await self._session.__aexit__(exc_type, exc, tb)
         return None
+
+
+def _scan_control_hint() -> Optional[RenderableType]:
+    """Default footer: the scan-control hint while a long step runs.
+
+    Tells the operator that Ctrl+C opens the options menu (stop this step, skip
+    the phase, stop the scan), and flips to "stopping" once a stop is pending.
+    Renders nothing outside a long step or without an operator.
+    """
+    try:
+        from adscan_core.scan_control.interrupts import hint_text  # noqa: PLC0415
+
+        text = hint_text()
+    except Exception:  # noqa: BLE001 - a hint must never break a frame
+        return None
+    return Text(text, style=COLOR_MUTED) if text else None

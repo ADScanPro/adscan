@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Literal
@@ -14,6 +13,7 @@ from adscan_internal.services.relay.core import (
     RelayRunConfig,
     RelayRunResult,
     RelayTarget,
+    report_relay_listener_unavailable,
 )
 from adscan_internal.services.relay.http_ntlm_source import (
     HTTPNtlmRelaySource,
@@ -41,6 +41,10 @@ class NativeRelayRunConfig:
     max_authentications: int = 1
     timeout_seconds: float = 120.0
     stop_on_first_success: bool = True
+    #: The coerced host(s) the relay waits for (IP and/or name). The listener
+    #: broker routes their connections to the relay and every other caller to
+    #: the background capture. Empty means any caller.
+    expected_sources: tuple[str, ...] = ()
 
 
 async def run_native_relay(
@@ -48,11 +52,22 @@ async def run_native_relay(
     targets: list[RelayTarget],
     config: NativeRelayRunConfig | None = None,
     success_event: asyncio.Event | None = None,
+    listener_ready: asyncio.Event | None = None,
 ) -> RelayRunResult:
     """Start a native relay listener and dispatch captured auth to targets.
 
     ``success_event`` (optional) is set by the engine the instant a target
     succeeds, so a concurrent coercion loop can stop firing immediately.
+
+    ``listener_ready`` (optional) is set once the listener is up, so a
+    coordinating coercion fires only at a live listener. It is never set when
+    the listener could not start: the run then returns a failed result straight
+    away.
+
+    The listener never binds the port itself: it claims it from the listener
+    broker, which routes the expected sources' connections here while the
+    background capture (poisoning, the write-share bait) keeps every other
+    caller. Capture and relay run at the same time on one port.
     """
 
     effective = config or NativeRelayRunConfig()
@@ -69,29 +84,17 @@ async def run_native_relay(
         ),
     )
 
-    from adscan_core.rich_output import (  # noqa: PLC0415
-        print_exception,
-        print_info_debug,
-        print_warning,
-    )
-    from adscan_core import telemetry  # noqa: PLC0415
+    from adscan_core.rich_output import print_info_debug  # noqa: PLC0415
 
     try:
         await source.start()
     except RelayListenerUnavailableError as exc:
-        # The listen port could not be bound (e.g. already held by the poisoning
-        # / capture listener). Turn it into a failed result so the ESC8 / RBCD
-        # caller continues to the next path instead of aborting the whole phase
-        # with a raw traceback. This is a vantage/data gap, never a defensive
-        # control claim (Exposure-Validation doctrine).
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_warning(
-            f"Relay listener could not start on port {exc.port} "
-            f"({exc.reason}). Skipping the relay attempt and continuing."
-        )
-        with contextlib.suppress(Exception):
-            await source.stop()
+        # The listen port could not be served (another local process holds it,
+        # or the privileged port was refused). A known limit of the scanning
+        # host, never a defensive-control claim (Exposure-Validation doctrine):
+        # one operator line, the traceback to the debug log only, and a failed
+        # result the caller classifies.
+        report_relay_listener_unavailable(exc, technique="relay")
         return RelayRunResult(
             results=(),
             timed_out=False,
@@ -99,14 +102,15 @@ async def run_native_relay(
             listener_error=exc.reason_summary,
         )
 
+    if listener_ready is not None:
+        listener_ready.set()
     try:
         return await engine.run()
     finally:
-        # Teardown trace: a freeze observed after a successful relay was traced to
-        # this listener shutdown blocking on stray half-open coerced connections
-        # (the coercion catalog fires many triggers, each opening a victim->listener
-        # SMB connection that never completes its session). These markers pinpoint
-        # whether the hang is in source.stop() vs downstream.
+        # Teardown trace: a freeze observed after a successful relay was traced
+        # to this listener shutdown blocking on stray half-open coerced
+        # connections. These markers pinpoint whether a hang is in
+        # source.stop() vs downstream.
         print_info_debug("relay-teardown run_native_relay finally: stopping relay source listener")
         await source.stop()
         print_info_debug("relay-teardown relay source listener stopped cleanly")
@@ -122,6 +126,7 @@ def _build_source(
         listen_host=config.listen_host,
         listen_port=port,
         protocol=config.source,
+        expected_sources=tuple(config.expected_sources),
     )
     if config.source == "smb":
         return SMBRelaySource(config=source_config, auth_queue=auth_queue)
@@ -131,6 +136,7 @@ def _build_source(
         http_config = HTTPNtlmRelaySourceConfig(
             listen_host=config.listen_host,
             listen_port=port,
+            expected_sources=tuple(config.expected_sources),
         )
         return HTTPNtlmRelaySource(config=http_config, auth_queue=auth_queue)
     raise ValueError(f"Unsupported relay source: {config.source}")

@@ -11,8 +11,10 @@ the last scan's latest view. Its own evidence is ``runs/<run_id>/``
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Iterator, Mapping, Optional, Sequence
 
@@ -58,6 +60,51 @@ class DomainUnavailable(RuntimeError):
 Connector = Callable[[str], ContextManager[ReadContext]]
 Executor = Callable[[str, dict[str, Any]], list[Any]]
 
+#: ``credential.source`` values of the result document.
+CREDENTIAL_SOURCE_WORKSPACE = "workspace"
+CREDENTIAL_SOURCE_OVERRIDE = "override"
+
+
+@dataclass(frozen=True)
+class ReadCredential:
+    """An account given for one recheck run (``--username`` / ``--password``).
+
+    Clients often disable the audit account once an engagement ends, which left
+    every read of a later recheck failing. This lets the retest bring its own
+    account. It is used for this run only: it goes through the same credential
+    SSOT as the workspace's account (one TGT pre-mint via
+    ``resolve_sweep_credential``, so the account lockout guard governs every
+    sign-in), and it is never written into the workspace, which a recheck
+    freezes.
+
+    Attributes:
+        username: The sAMAccountName, optionally qualified as ``user@domain``
+            or ``DOMAIN\\user``.
+        secret: A password or an NT hash; the transports route a hash on their
+            own, as they do for ``execute -p``.
+    """
+
+    username: str
+    secret: str = field(repr=False)
+
+    @property
+    def account(self) -> str:
+        """The bare account name (realm qualifier removed)."""
+        text = self.username.strip()
+        if "\\" in text:
+            return text.split("\\", 1)[1].strip()
+        return text.split("@", 1)[0].strip()
+
+    @property
+    def realm(self) -> str:
+        """The realm the qualifier names (``""`` when unqualified)."""
+        text = self.username.strip()
+        if "\\" in text:
+            return text.split("\\", 1)[0].strip()
+        if "@" in text:
+            return text.split("@", 1)[1].strip()
+        return ""
+
 
 @dataclass(frozen=True)
 class RecheckRequest:
@@ -66,6 +113,9 @@ class RecheckRequest:
     workspace: str
     target: RecheckTarget
     depth: str = DEPTH_OBSERVE
+    #: The account a ``--username`` override named (never its secret); empty
+    #: when the reads use the workspace's own account.
+    override_username: str = ""
 
 
 @dataclass
@@ -77,6 +127,8 @@ class RecheckReport:
     targets: list[TargetItem]
     walk: list[WalkStep] = field(default_factory=list)
     result_path: str = ""
+    #: The scan this recheck re-checked (the ledger's last non-recheck run).
+    parent_run_id: str = ""
 
     def count(self, transition: Transition) -> int:
         return sum(1 for r in self.decisions.results if r.transition is transition)
@@ -117,13 +169,35 @@ def _shell_domain(shell: Any, domain_id: str) -> str:
     return ""
 
 
-def shell_connector(shell: Any, observations: Optional[list[dict[str, Any]]] = None) -> Connector:
-    """Read-only LDAP connections built from the workspace's own credential.
+def _credential_domain(shell: Any, realm: str) -> str:
+    """The workspace domain a ``user@realm`` / ``REALM\\user`` qualifier names."""
+    token = str(realm or "").strip().rstrip(".").lower()
+    if not token:
+        return ""
+    for name, data in (getattr(shell, "domains_data", None) or {}).items():
+        netbios = str((data or {}).get("netbios") or "").strip().lower()
+        if str(name).strip().rstrip(".").lower() == token or (netbios and netbios == token):
+            return str(name)
+    return ""
+
+
+def shell_connector(
+    shell: Any,
+    observations: Optional[list[dict[str, Any]]] = None,
+    *,
+    credential: Optional[ReadCredential] = None,
+) -> Connector:
+    """Read-only LDAP connections, from the workspace's credential or an override.
 
     Per domain: DNS for the domain, the posture guard, ONE credential
     resolution through ``resolve_sweep_credential`` (a failed mint aborts that
     domain's reads, never retries), then ``ADscanLDAPConnection`` (LDAPS with
     the automatic LDAP fallback, posture-aware auth plan).
+
+    ``credential`` replaces the workspace's account for every domain this run
+    reads; a qualified name (``user@domain``) authenticates in that domain, which
+    must be one of the workspace's. It follows exactly the workspace account's
+    path, so the lockout guard and the pre-mint apply unchanged.
     """
 
     @contextmanager
@@ -143,8 +217,21 @@ def shell_connector(shell: Any, observations: Optional[list[dict[str, Any]]] = N
         if not domain:
             raise DomainUnavailable("domain_not_in_workspace")
         data = shell.domains_data.get(domain) or {}
-        user = str(data.get("username") or "").strip()
-        secret = str(data.get("password") or "")
+        auth_domain: Optional[str] = None
+        auth_kdc: Optional[str] = None
+        if credential is not None:
+            user = credential.account
+            secret = credential.secret
+            if credential.realm:
+                home = _credential_domain(shell, credential.realm)
+                if not home:
+                    raise DomainUnavailable("credential_domain_not_in_workspace")
+                if home != domain:
+                    auth_domain = home
+                    auth_kdc = str(resolve_dc_ip(shell.domains_data.get(home) or {}) or "").strip() or None
+        else:
+            user = str(data.get("username") or "").strip()
+            secret = str(data.get("password") or "")
         if not user or not secret:
             raise DomainUnavailable("no_credential")
         dc_ip = str(resolve_dc_ip(data) or "").strip()
@@ -154,11 +241,20 @@ def shell_connector(shell: Any, observations: Optional[list[dict[str, Any]]] = N
             shell.do_check_dns(domain, dc_ip)
         except Exception as exc:  # noqa: BLE001 - DNS setup is best-effort
             telemetry.capture_exception(exc)
-        _ensure_posture(shell, domain, dc_ip, user, secret)
+        if auth_domain is None:
+            # The authenticated posture probe signs in as ``user`` in THIS
+            # domain; an account from another domain would only spend a failed
+            # attempt there, so its reads go on the cached posture instead.
+            _ensure_posture(shell, domain, dc_ip, user, secret)
         if observations is not None:
             _collect_control_observations(shell, domain, domain_id, observations)
         sweep = resolve_sweep_credential(
-            shell, domain=domain, username=user, password=secret, kdc_ip=dc_ip
+            shell,
+            domain=domain,
+            username=user,
+            password=secret,
+            auth_domain=auth_domain,
+            kdc_ip=auth_kdc or dc_ip,
         )
         if sweep.aborted:
             raise DomainUnavailable("credential_rejected")
@@ -173,6 +269,8 @@ def shell_connector(shell: Any, observations: Optional[list[dict[str, Any]]] = N
             password=sweep.password,
             nt_hash=sweep.nt_hash,
             ccache_path=sweep.ccache_path,
+            auth_domain=auth_domain,
+            auth_kdc=auth_kdc,
             use_ldaps=True,
             use_kerberos=True if sweep.ccache_path else None,
             posture_snapshot=posture,
@@ -184,7 +282,7 @@ def shell_connector(shell: Any, observations: Optional[list[dict[str, Any]]] = N
             telemetry.capture_exception(exc)
             raise DomainUnavailable("connect_failed") from exc
         try:
-            yield ReadContext(conn=conn, domain_id=domain_id, domain_dn=conn.domain_dn)
+            yield ReadContext(conn=conn, domain_id=domain_id, domain_dn=conn.domain_dn, shell=shell)
         finally:
             connection.__exit__(None, None, None)
 
@@ -208,7 +306,6 @@ def _ensure_posture(shell: Any, domain: str, dc_ip: str, user: str, secret: str)
     from adscan_core import telemetry  # noqa: PLC0415
 
     try:
-        import asyncio  # noqa: PLC0415
 
         from adscan_internal.services.posture_orchestration import (  # noqa: PLC0415
             ensure_posture_fresh,
@@ -218,7 +315,7 @@ def _ensure_posture(shell: Any, domain: str, dc_ip: str, user: str, secret: str)
             ProbePhase,
         )
 
-        asyncio.run(
+        run_on_new_loop(
             ensure_posture_fresh(
                 shell,
                 domain=domain,
@@ -275,15 +372,20 @@ def _result_document(
                 "verdict": verdict.code if verdict else "",
                 "verdict_text": verdict.text if verdict else "",
                 "reason": verdict.reason if verdict else "",
+                "not_recheckable_reason": verdict.detail if verdict else "",
                 "transition": result.transition.value if result else "",
             }
         )
+    credential: dict[str, Any] = {"source": CREDENTIAL_SOURCE_WORKSPACE}
+    if request.override_username:
+        credential = {"source": CREDENTIAL_SOURCE_OVERRIDE, "username": request.override_username}
     return {
         "schema": RESULT_SCHEMA,
         "run_id": run_id,
         "plan": plan_document(request.target, request.depth, workspace=request.workspace, run_id=run_id),
         "recorded_at": recorded_at,
         "recorded_at_frame": frame,
+        "credential": credential,
         "items": items,
         "reads": [
             {
@@ -349,6 +451,10 @@ def execute_recheck(
             paths = walk_mod.canonical_paths(str(workspace_dir), domains)
             if target.level == LEVEL_PATH:
                 resolved = walk_mod.find_path(paths, target.path)
+                # The plan and the result record the full path id, whatever
+                # form was typed (a prefix, or a legacy P- label).
+                target = replace(target, path=resolved.path_id)
+                request = replace(request, target=target)
                 step_ids = walk_mod.path_step_item_ids(str(workspace_dir), resolved)
                 path_steps = lambda _token: step_ids  # noqa: E731
                 summary = resolved.record
@@ -392,7 +498,13 @@ def execute_recheck(
 
         vantage = Vantage.AUTH
         decisions = build_recheck_decisions(targets, outcomes, vantage=vantage, walk=walk, run_id=run_id)
-        recorded_at, frame = stamp() if stamp else ("", {})
+        # Without a stamp source the recording instant is the host clock, and no
+        # clock frame was established: say so rather than leave it blank.
+        recorded_at, frame = (
+            stamp()
+            if stamp
+            else (datetime.now(timezone.utc).isoformat(), {"frame": "unverified", "stepped": False})
+        )
         store.apply_run(
             RunRecord(
                 run_id=run_id,
@@ -444,7 +556,7 @@ def execute_recheck(
             )
         rel = str((folder / RESULT_FILENAME).relative_to(Path(workspace_dir)))
         return RecheckReport(run_id=run_id, decisions=decisions, targets=list(targets), walk=walk,
-                             result_path=rel)
+                             result_path=rel, parent_run_id=_parent_run_id(store))
     finally:
         store.close()
 
@@ -455,7 +567,10 @@ def verdict_label(code: str) -> str:
 
 
 __all__ = (
+    "CREDENTIAL_SOURCE_OVERRIDE",
+    "CREDENTIAL_SOURCE_WORKSPACE",
     "DomainUnavailable",
+    "ReadCredential",
     "RESULT_FILENAME",
     "RecheckReport",
     "RecheckRequest",

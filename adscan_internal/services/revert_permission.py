@@ -28,6 +28,9 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from adscan_core import telemetry
+from adscan_core.reporting.attack_path_execution_events import (
+    NOT_EXECUTED_REVERT_NOT_PERMITTED,
+)
 from adscan_core.rich_output import print_exception, print_info, print_info_debug
 from adscan_core.scan_policy.model import ENV_MANUAL_CLEANUP
 from adscan_core.scan_policy.resolve import (
@@ -38,7 +41,6 @@ from adscan_core.scan_policy.revert_permission import (
     REASON_NO_CLEANUP_ACCOUNT,
     STATE_UNDETERMINABLE,
     RevertPermissionVerdict,
-    admin_roles_from_group_sids,
     decide_revert_permission,
     verdict_line,
 )
@@ -50,8 +52,9 @@ DOMAIN_VERDICT_KEY = "revert_permission"
 _SHELL_CACHE_ATTR = "_revert_permission_verdicts"
 #: Shell attribute: declined writes, for the disclosure.
 _SHELL_REFUSALS_ATTR = "_revert_permission_refusals"
-#: Edge note written on a step declined for want of a verified cleanup account.
-NOT_EXECUTED_REASON = "revert_not_permitted"
+#: Edge note written on a step declined for want of a verified cleanup account
+#: (worded for the run view by ``attack_path_execution_events.DECLINED_REASONS``).
+NOT_EXECUTED_REASON = NOT_EXECUTED_REVERT_NOT_PERMITTED
 
 
 def revert_permission_context() -> RevertPermissionContext:
@@ -89,37 +92,22 @@ def refresh_policy_revert_permission(shell: Any) -> None:
         print_exception(exception=exc)
 
 
-def _membership_inputs(shell: Any, *, domain: str, principal: str) -> tuple[bool, bool, frozenset[str]]:
-    """``(membership_available, principal_found, roles)`` from the membership SSOT."""
-    from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
-        _expand_group_ancestors,
-    )
-    from adscan_internal.services.membership_snapshot import (  # noqa: PLC0415
-        load_membership_snapshot,
-    )
+def directory_rights(rights: Iterable[str]) -> list[str]:
+    """``rights`` narrowed to the DIRECTORY ones (domain / forest scope).
 
-    snapshot = load_membership_snapshot(shell, domain)
-    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("user_to_groups"), dict):
-        return False, False, frozenset()
-    domain_sid = str(snapshot.get("domain_sid") or "")
-    label_to_sid = snapshot.get("label_to_sid") or {}
-    if not domain_sid or not isinstance(label_to_sid, dict):
-        return False, False, frozenset()
-    label = f"{principal.strip().upper()}@{domain.strip().upper()}"
-    direct = snapshot["user_to_groups"].get(label)
-    if direct is None:
-        return True, False, frozenset()
-    group_to_parents = snapshot.get("group_to_parents") or {}
-    cache: dict[str, set[str]] = {}
-    groups: set[str] = set()
-    for group in direct or ():
-        group_label = str(group or "").strip().upper()
-        if not group_label:
+    A CA right (revoking a certificate) is answered by the CA itself at the
+    issuance seam (``adcs.reversal_capability``), never by a directory group, so
+    it never reaches the per-domain verdict.
+    """
+    from adscan_core.scan_policy.revert_rights import SCOPE_CA, revert_right  # noqa: PLC0415
+
+    out = []
+    for token in rights:
+        right = revert_right(token)
+        if right is not None and right.scope == SCOPE_CA:
             continue
-        groups.add(group_label)
-        groups.update(_expand_group_ancestors(domain, group_label, group_to_parents, cache))
-    sids = [str(label_to_sid.get(g) or "") for g in groups]
-    return True, True, admin_roles_from_group_sids(sids, domain_sid=domain_sid)
+        out.append(str(token))
+    return sorted(set(out))
 
 
 def verify_cleanup_account(
@@ -139,15 +127,25 @@ def verify_cleanup_account(
         return cache[key]
     principal, home = "", ""
     available, found, roles = False, False, frozenset()
+    shared: bool | None = None
     try:
         from adscan_internal.services.cleanup_credential_loader import (  # noqa: PLC0415
             cleanup_account_identity,
+        )
+        from adscan_internal.services.revert_right_probes import (  # noqa: PLC0415
+            ProbeAccount,
+            directory_facts,
         )
 
         identity = cleanup_account_identity(domain)
         if identity is not None:
             principal, home = identity
-            available, found, roles = _membership_inputs(shell, domain=domain, principal=principal)
+            # Roles from the account's SIDs as its home domain's DC computes them
+            # (or the collected snapshot), across domains of the forest: one
+            # derivation with the pre-scan checklist.
+            facts = directory_facts(shell, ProbeAccount(principal, home), domain)
+            available, found, roles = facts.directory_data, facts.found, facts.roles
+            shared = facts.same_forest
     except Exception as exc:  # noqa: BLE001 - an unreadable input counts as not undoable
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -160,6 +158,7 @@ def verify_cleanup_account(
         membership_available=available,
         principal_found=found,
         roles=roles,
+        same_forest=shared,
     )
     cache[key] = verdict
     _persist_verdict(shell, verdict)
@@ -249,10 +248,15 @@ def verdicts_for_report(shell: Any) -> list[RevertPermissionVerdict]:
         if changes is None:
             out.append(verdict)
             continue
+        directory_kinds = {
+            kind
+            for kind, token in CLEANUP_ACCOUNT_REVERT_RIGHTS.items()
+            if directory_rights([token])
+        }
         mine = [
             c
             for c in changes
-            if str(c.get("kind") or "") in CLEANUP_ACCOUNT_REVERT_RIGHTS
+            if str(c.get("kind") or "") in directory_kinds
             and str(c.get("domain") or "").strip().lower() == verdict.domain
         ]
         reverted = sum(
@@ -291,7 +295,7 @@ def record_domain_verdicts(shell: Any, domains: Iterable[str]) -> None:
             CLEANUP_ACCOUNT_REVERT_RIGHTS,
         )
 
-        rights = sorted(set(CLEANUP_ACCOUNT_REVERT_RIGHTS.values()))
+        rights = directory_rights(CLEANUP_ACCOUNT_REVERT_RIGHTS.values())
         existing = {v.domain: v for v in persisted_verdicts(getattr(shell, "domains_data", None))}
         for domain in domains:
             name = str(domain or "").strip().lower()
@@ -310,7 +314,7 @@ def record_domain_verdicts(shell: Any, domains: Iterable[str]) -> None:
         print_exception(exception=exc)
 
 
-def _policy_accepts_manual_cleanup(shell: Any) -> bool | None:
+def policy_accepts_manual_cleanup(shell: Any) -> bool | None:
     """True / False for an active policy, ``None`` when no policy is in force."""
     from adscan_core.scan_policy import gate  # noqa: PLC0415
 
@@ -344,10 +348,12 @@ def cleanup_write_permitted(
             CLEANUP_ACCOUNT_REVERT_RIGHTS,
         )
 
-        rights = sorted({CLEANUP_ACCOUNT_REVERT_RIGHTS[k] for k in kinds if k in CLEANUP_ACCOUNT_REVERT_RIGHTS})
+        rights = directory_rights(
+            CLEANUP_ACCOUNT_REVERT_RIGHTS[k] for k in kinds if k in CLEANUP_ACCOUNT_REVERT_RIGHTS
+        )
         if not rights:
             return True
-        accepts = _policy_accepts_manual_cleanup(shell)
+        accepts = policy_accepts_manual_cleanup(shell)
         if accepts is None or accepts:
             return True
         verdict = verify_cleanup_account(shell, domain=domain, rights=rights)
@@ -389,6 +395,8 @@ __all__ = [
     "DOMAIN_VERDICT_KEY",
     "NOT_EXECUTED_REASON",
     "cleanup_write_permitted",
+    "directory_rights",
+    "policy_accepts_manual_cleanup",
     "persisted_verdicts",
     "record_domain_verdicts",
     "in_scope_run_domains",

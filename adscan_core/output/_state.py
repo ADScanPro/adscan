@@ -645,6 +645,126 @@ def flush_deferred_background_console() -> int:
     return len(entries)
 
 
+# ---------------------------------------------------------------------------
+# Operator hold — the scan-control menu owns the terminal for a moment
+# ---------------------------------------------------------------------------
+#
+# Why this exists. The Ctrl+C operator menu (``adscan_core.scan_control``)
+# renders on its own thread while the scan keeps working. Without a hold, the
+# scan's ``print_*`` output would paint over the menu, and a prompt the scan
+# reaches would read stdin at the same time as the menu. While a hold is
+# active, every ``print`` from a thread OTHER than the owner is captured
+# (telemetry still mirrored) and replayed when the hold is released, and every
+# centralized prompt helper on another thread waits for the release. Same
+# single interception point as the background-thread silence above.
+
+_HOLD_LOCK = threading.Lock()
+_HOLD_OWNER: Optional[int] = None
+_HOLD_RELEASED = threading.Event()
+_HOLD_RELEASED.set()
+_HOLD_BUFFER: list[tuple[tuple[Any, ...], Dict[str, Any]]] = []
+
+# Thread ident -> depth of centralized prompts currently waiting for input.
+_PROMPT_DEPTH_LOCK = threading.Lock()
+_PROMPT_DEPTH: Dict[int, int] = {}
+
+
+def hold_visible_console() -> bool:
+    """Give the visible console to the CURRENT thread until released.
+
+    Returns ``False`` (and holds nothing) when another hold is active.
+    """
+    global _HOLD_OWNER
+    with _HOLD_LOCK:
+        if _HOLD_OWNER is not None:
+            return False
+        _HOLD_OWNER = threading.get_ident()
+        _HOLD_RELEASED.clear()
+        return True
+
+
+def release_visible_console() -> int:
+    """End the hold, replay the captured output, wake waiting prompts.
+
+    Must be called by the thread that holds the console. Returns how many
+    captured renderables were replayed. Never raises.
+    """
+    global _HOLD_OWNER
+    with _HOLD_LOCK:
+        entries = list(_HOLD_BUFFER)
+        _HOLD_BUFFER.clear()
+        _HOLD_OWNER = None
+        _HOLD_RELEASED.set()
+    if not entries:
+        return 0
+    console = _get_console()
+    with _explicit_telemetry_mirror():
+        for args, kwargs in entries:
+            try:
+                console.print(*args, **kwargs)
+            except Exception:  # noqa: BLE001
+                pass
+    return len(entries)
+
+
+def visible_console_held_elsewhere() -> bool:
+    """True when another thread holds the visible console."""
+    owner = _HOLD_OWNER
+    return owner is not None and owner != threading.get_ident()
+
+
+def wait_for_visible_console(timeout: Optional[float] = None) -> bool:
+    """Block while another thread holds the console. Returns True once free."""
+    if not visible_console_held_elsewhere():
+        return True
+    return _HOLD_RELEASED.wait(timeout)
+
+
+def _capture_held_output(args: tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    try:
+        from rich.control import Control  # noqa: PLC0415
+
+        if args and all(isinstance(arg, Control) for arg in args):
+            # A Live refresh tick: meaningless once replayed.
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    with _HOLD_LOCK:
+        _HOLD_BUFFER.append((args, dict(kwargs)))
+
+
+@contextmanager
+def centralized_prompt_active():
+    """Mark the current thread as waiting on a centralized prompt.
+
+    Waits first for an operator hold held by another thread, so two prompts
+    never read stdin at once. Read by the scan-control SIGINT handler: a Ctrl+C
+    while the MAIN thread sits in a (cooked-mode) prompt keeps its old meaning,
+    cancelling that prompt.
+    """
+    wait_for_visible_console()
+    ident = threading.get_ident()
+    with _PROMPT_DEPTH_LOCK:
+        _PROMPT_DEPTH[ident] = _PROMPT_DEPTH.get(ident, 0) + 1
+    try:
+        yield
+    finally:
+        with _PROMPT_DEPTH_LOCK:
+            depth = _PROMPT_DEPTH.get(ident, 1) - 1
+            if depth <= 0:
+                _PROMPT_DEPTH.pop(ident, None)
+            else:
+                _PROMPT_DEPTH[ident] = depth
+
+
+def prompt_active_on_thread(ident: Optional[int]) -> bool:
+    """Whether thread ``ident`` is currently inside a centralized prompt."""
+    if ident is None:
+        return False
+    with _PROMPT_DEPTH_LOCK:
+        return _PROMPT_DEPTH.get(ident, 0) > 0
+
+
 class _TeeConsole(Console):
     """Visible :class:`rich.console.Console` that mirrors print to telemetry.
 
@@ -666,6 +786,14 @@ class _TeeConsole(Console):
         # applied to ALL background threads at once.
         if _is_background_console_thread():
             _capture_background_console(_current_background_label(), args, kwargs)
+            if not _skip_auto_mirror.get():
+                self._mirror_to_telemetry(args, kwargs)
+            return
+
+        # Operator hold: another thread (the Ctrl+C menu) owns the terminal.
+        # Capture, keep the telemetry record, and replay on release.
+        if _HOLD_OWNER is not None and threading.get_ident() != _HOLD_OWNER:
+            _capture_held_output(args, kwargs)
             if not _skip_auto_mirror.get():
                 self._mirror_to_telemetry(args, kwargs)
             return

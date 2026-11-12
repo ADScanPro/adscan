@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import weakref
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from adscan_core import telemetry
+from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
 from adscan_core.rich_output import print_exception, print_info_debug
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.cve_scanner.checks._os_patch_level import (
@@ -53,6 +55,8 @@ from adscan_internal.services.cve_scanner.checks._os_patch_level import (
 
 #: The host record file, under ``domains/<domain>/inventory/``.
 PATCH_LEVEL_RECORD_FILENAME = "host_patch_level.json"
+#: ``record_type`` of the file in the inventory envelope.
+PATCH_LEVEL_RECORD_TYPE = "host_patch_level"
 _RECORD_VERSION = 1
 
 
@@ -98,7 +102,11 @@ class HostPatchLevelCache:
         self._attempts: dict[str, dict[tuple[str, str], OSVersionRead]] = {}
         self._read_at: dict[str, str] = {}
         self._access_memo: dict[str, HostAccess | None] = {}
-        self._locks: dict[tuple[int, str], asyncio.Lock] = {}
+        # Locks per running loop, held weakly: an ``id()`` key is recycled once a
+        # loop is collected, which would hand a later loop a lock bound to a dead one.
+        self._locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
+            weakref.WeakKeyDictionary()
+        )
         self._dirty = False
 
     # ── identity ────────────────────────────────────────────────────────────
@@ -135,8 +143,11 @@ class HostPatchLevelCache:
     def _lock(self, key: str) -> asyncio.Lock:
         # Locks are per event loop: the CVE phase and the post-collection re-run
         # run on different loops, and an asyncio.Lock must not cross loops.
-        loop_id = id(asyncio.get_running_loop())
-        return self._locks.setdefault((loop_id, key), asyncio.Lock())
+        per_loop = self._locks.setdefault(asyncio.get_running_loop(), {})
+        lock = per_loop.get(key)
+        if lock is None:
+            lock = per_loop[key] = asyncio.Lock()
+        return lock
 
     # ── reads ───────────────────────────────────────────────────────────────
 
@@ -271,7 +282,19 @@ class HostPatchLevelCache:
                 existing[key] = record
             self._record_path.parent.mkdir(parents=True, exist_ok=True)
             self._record_path.write_text(
-                json.dumps({"version": _RECORD_VERSION, "hosts": existing}, indent=2, sort_keys=True),
+                json.dumps(
+                    {
+                        # The inventory envelope of the output contract
+                        # (schema inventory.v1.json); ``version`` stays for
+                        # this module's own reader.
+                        SCHEMA_VERSION_KEY: output_marker("inventory"),
+                        "record_type": PATCH_LEVEL_RECORD_TYPE,
+                        "version": _RECORD_VERSION,
+                        "hosts": existing,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
                 encoding="utf-8",
             )
             self._dirty = False

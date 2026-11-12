@@ -25,10 +25,12 @@ stops declaring it.
 
 The module lives in ``adscan_core`` because the host launcher and the LITE
 container must import it (the PRO-only ``deliver`` module is stripped from the
-LITE image). It imports only the standard library. The value vocabularies it
-carries (deliverable slugs, framework keys, branding postures, ``--emit``
-values) are the CLI-facing mirror of the engine SSOTs; the contract test binds
-each one to its engine definition.
+LITE image). It imports only the standard library and the framework registry
+(``adscan_core.compliance_frameworks``). The value vocabularies it
+carries (deliverable slugs, branding postures, ``--emit`` values) are the
+CLI-facing mirror of the engine SSOTs, and the contract test binds each one to
+its engine definition. The framework keys are not mirrored: they are the
+registry's own.
 """
 
 from __future__ import annotations
@@ -36,6 +38,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
+
+from adscan_core.compliance_frameworks import FRAMEWORK_KEYS
 
 # ---------------------------------------------------------------------------
 # Value vocabularies (bound to the engine SSOTs by the contract test)
@@ -51,9 +55,19 @@ REPORT_DELIVERABLE_SLUGS: tuple[str, ...] = (
 )
 
 #: Public ``--only`` names that resolve to an internal slug. ``report`` is the
-#: name users are told to type; ``checklist`` is the retired standalone MITRE
-#: checklist, folded into the report. ``deliver.py`` imports this mapping.
-REPORT_ONLY_ALIASES: Mapping[str, str] = {"report": "executive", "checklist": "executive"}
+#: name users are told to type. ``deliver.py`` imports this mapping.
+REPORT_ONLY_ALIASES: Mapping[str, str] = {"report": "executive"}
+
+#: Retired ``--only`` names and what they render as now. The standalone MITRE
+#: Remediation Checklist was retired on 2026-11-11 (it was unreachable from the
+#: kit). A pinned ``--only checklist`` still resolves, to the report, with one
+#: notice line. It is never offered in help, choices or error text.
+RETIRED_REPORT_ONLY: Mapping[str, str] = {"checklist": "executive"}
+
+RETIRED_REPORT_ONLY_NOTICE: str = (
+    "The standalone checklist deliverable is retired; --only checklist renders "
+    "the Security Assessment Report instead."
+)
 
 #: The deliverable names shown in help text (public alias first).
 REPORT_PUBLIC_DELIVERABLES: tuple[str, ...] = (
@@ -67,9 +81,9 @@ REPORT_PUBLIC_DELIVERABLES: tuple[str, ...] = (
 #: Security Assessment Report alone. ``deliver`` defaults to the full kit.
 CI_DEFAULT_ONLY: str = "report"
 
-#: Compliance framework keys. Mirrors
-#: ``adscan_internal.cli.common._VALID_FRAMEWORK_KEYS``.
-REPORT_FRAMEWORK_KEYS: tuple[str, ...] = ("ens", "nis2", "iso27001", "dora", "pci_dss", "cis")
+#: Compliance framework keys, read from the framework registry
+#: (``adscan_core.compliance_frameworks``), the one place they are declared.
+REPORT_FRAMEWORK_KEYS: tuple[str, ...] = FRAMEWORK_KEYS
 
 #: Branding postures. Mirrors
 #: ``adscan_internal.services.report_branding.VALID_BRANDING_POSTURES``.
@@ -78,11 +92,87 @@ BRANDING_POSTURES: tuple[str, ...] = ("adscan", "cobrand", "whitelabel")
 #: Security Assessment Report output formats. ``deliver.py`` imports this.
 REPORT_EMIT_VALUES: tuple[str, ...] = ("pdf", "html", "data")
 
-#: The two themes advertised to customers. ``premium_dark`` and the short
-#: aliases (``dark``/``light``/``warm``) stay accepted for internal preview, and
-#: a ``.css`` path applies a bring-your-own skin, which is why the theme options
-#: carry no argparse ``choices`` (``deliver._resolve_theme`` validates them).
-REPORT_ADVERTISED_THEMES: tuple[str, ...] = ("editorial", "corporate_light")
+#: The themes a deliverable renders in: the single source of truth every surface
+#: reads (``deliver``, ``ci``, the REPL, the scan-config descriptor, the web
+#: schemas). A ``.css`` path applies a bring-your-own skin, which is why the
+#: theme options carry no argparse ``choices`` (:func:`resolve_report_theme`
+#: validates them).
+REPORT_THEMES: tuple[str, ...] = ("corporate_light", "editorial")
+
+#: Kept as the advertised name; the offered set and the rendered set are one.
+REPORT_ADVERTISED_THEMES: tuple[str, ...] = REPORT_THEMES
+
+#: What a deliverable renders in when no theme is chosen.
+REPORT_DEFAULT_THEME: str = "corporate_light"
+
+#: Short names an operator may type.
+REPORT_THEME_ALIASES: dict[str, str] = {"light": "corporate_light", "warm": "editorial"}
+
+#: Retired themes and what they render as now. The dark theme (``premium_dark``,
+#: alias ``dark``) was retired on 2026-11-11: it was unreadable in the report
+#: (light text on light panels) and no install was seen choosing it. A script, a
+#: stored web scan or an ``ADSCAN_PDF_THEME`` that still names it keeps working
+#: and renders the default theme, with one notice line.
+RETIRED_REPORT_THEMES: dict[str, str] = {
+    "premium_dark": REPORT_DEFAULT_THEME,
+    "dark": REPORT_DEFAULT_THEME,
+}
+
+RETIRED_REPORT_THEME_NOTICE: str = (
+    "The dark report theme is retired; the deliverables render with the "
+    "corporate_light theme instead."
+)
+
+#: The closed vocabulary a theme choice is reported in (telemetry, logs): one of
+#: the rendered themes, ``custom`` for a bring-your-own ``.css`` skin (never its
+#: path), or ``default`` when nothing was chosen.
+REPORT_THEME_TELEMETRY_VALUES: tuple[str, ...] = (*REPORT_THEMES, "custom", "default")
+
+
+@dataclass(frozen=True)
+class ReportThemeChoice:
+    """A theme request resolved to what will render.
+
+    Attributes:
+        theme: A name from :data:`REPORT_THEMES`, a ``.css`` path, or ``""``
+            when nothing was requested (the caller applies its default).
+        notice: The one line to print when a retired theme was requested.
+        custom: ``True`` for a bring-your-own ``.css`` skin.
+    """
+
+    theme: str
+    notice: str | None = None
+    custom: bool = False
+
+
+def resolve_report_theme(raw: str | None) -> ReportThemeChoice:
+    """Resolve a requested theme name to the theme that renders.
+
+    Aliases expand, a retired theme maps to its replacement with a notice, a
+    ``.css`` path is kept verbatim, and an unknown name falls back to
+    :data:`REPORT_DEFAULT_THEME` (the kit must always render).
+    """
+    token = (raw or "").strip()
+    if not token:
+        return ReportThemeChoice("")
+    if token.lower().endswith(".css"):
+        return ReportThemeChoice(token, custom=True)
+    key = token.lower()
+    if key in RETIRED_REPORT_THEMES:
+        return ReportThemeChoice(RETIRED_REPORT_THEMES[key], RETIRED_REPORT_THEME_NOTICE)
+    key = REPORT_THEME_ALIASES.get(key, key)
+    return ReportThemeChoice(key if key in REPORT_THEMES else REPORT_DEFAULT_THEME)
+
+
+def report_theme_telemetry_value(theme: str | None) -> str:
+    """The theme as one value of :data:`REPORT_THEME_TELEMETRY_VALUES`.
+
+    A custom skin is reported as ``custom``, never by its path.
+    """
+    choice = resolve_report_theme(theme)
+    if choice.custom:
+        return "custom"
+    return choice.theme or "default"
 
 _THEME_METAVAR = "{" + ",".join(REPORT_ADVERTISED_THEMES) + "}"
 
@@ -109,7 +199,9 @@ def parse_only_slugs(raw: str | None) -> tuple[str, ...]:
     tokens = [tok.strip().lower() for tok in raw.split(",") if tok.strip()]
     if not tokens:
         return REPORT_DELIVERABLE_SLUGS
-    normalised = [REPORT_ONLY_ALIASES.get(tok, tok) for tok in tokens]
+    normalised = [
+        REPORT_ONLY_ALIASES.get(tok, RETIRED_REPORT_ONLY.get(tok, tok)) for tok in tokens
+    ]
     invalid = [tok for tok in normalised if tok not in REPORT_DELIVERABLE_SLUGS]
     if invalid:
         allowed = ", ".join(list(REPORT_DELIVERABLE_SLUGS) + list(REPORT_ONLY_ALIASES))
@@ -189,9 +281,11 @@ REPORT_OPTIONS: tuple[ReportOption, ...] = (
         ("--frameworks",),
         "frameworks",
         "Compliance frameworks, comma-separated: "
-        f"{', '.join(REPORT_FRAMEWORK_KEYS)}. No default; a policy for a real "
-        "environment requires one. On `ci` the scan also maps its findings onto "
-        "them at scan end, with or without a report.",
+        f"{', '.join(REPORT_FRAMEWORK_KEYS)}, or none when the organisation "
+        "follows none of them (the report then carries no compliance mapping). "
+        "No default; a policy for a real environment requires an answer. On `ci` "
+        "the scan also maps its findings onto them at scan end, with or without "
+        "a report.",
         metavar="LIST",
     ),
     ReportOption(
@@ -435,7 +529,7 @@ def add_ci_report_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def report_deprecation_notices(ns: argparse.Namespace) -> list[str]:
-    """The warning lines for the retired report flags set on ``ns``."""
+    """The warning lines for the retired report flags and theme set on ``ns``."""
     notices: list[str] = []
     for flag in CI_RETIRED_REPORT_FLAGS:
         if flag.notice is None:
@@ -443,7 +537,26 @@ def report_deprecation_notices(ns: argparse.Namespace) -> list[str]:
         value = getattr(ns, flag.dest, flag.default)
         if value is not None and value != flag.default and str(value).strip():
             notices.append(flag.notice)
+    if retired_theme_requested(ns):
+        notices.append(RETIRED_REPORT_THEME_NOTICE)
+    if retired_only_requested(getattr(ns, "only", None)):
+        notices.append(RETIRED_REPORT_ONLY_NOTICE)
     return notices
+
+
+def retired_only_requested(raw: str | None) -> bool:
+    """Whether an ``--only`` value names a retired deliverable."""
+    if not raw:
+        return False
+    return any(tok.strip().lower() in RETIRED_REPORT_ONLY for tok in raw.split(","))
+
+
+def retired_theme_requested(ns: argparse.Namespace) -> bool:
+    """Whether ``--theme`` or ``--report-theme`` on ``ns`` names a retired theme."""
+    return any(
+        resolve_report_theme(getattr(ns, dest, None)).notice
+        for dest in ("theme", "report_theme")
+    )
 
 
 __all__ = (
@@ -452,6 +565,17 @@ __all__ = (
     "CI_RETIRED_REPORT_FLAGS",
     "REPORT_ADVERTISED_THEMES",
     "REPORT_DEFAULT_EMIT",
+    "REPORT_DEFAULT_THEME",
+    "REPORT_THEMES",
+    "REPORT_THEME_ALIASES",
+    "REPORT_THEME_TELEMETRY_VALUES",
+    "RETIRED_REPORT_ONLY",
+    "RETIRED_REPORT_ONLY_NOTICE",
+    "RETIRED_REPORT_THEMES",
+    "RETIRED_REPORT_THEME_NOTICE",
+    "ReportThemeChoice",
+    "resolve_report_theme",
+    "report_theme_telemetry_value",
     "REPORT_DELIVERABLE_SLUGS",
     "REPORT_EMIT_VALUES",
     "REPORT_FRAMEWORK_KEYS",
@@ -469,4 +593,6 @@ __all__ = (
     "parse_only_slugs",
     "report_deprecation_notices",
     "report_option_values",
+    "retired_only_requested",
+    "retired_theme_requested",
 )

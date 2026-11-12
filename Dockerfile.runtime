@@ -18,6 +18,12 @@
 # inline in runtime-common only when no prebuilt `install/` tree was seeded.
 ARG JOHN_SOURCE_STAGE=john_builder
 ARG FREERDP_SOURCE_STAGE=freerdp_none
+# FreeRDP: the SINGLE pin of its version + commit. The freerdp_compile builder stage
+# and runtime-common's inline fallback compile both re-declare these WITHOUT a
+# default, so they inherit these values. The build mirror keys its cache on the
+# first FREERDP_COMMIT=<hex> it finds in this file, which is this one.
+ARG FREERDP_VERSION=3.24.1
+ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
 ARG SLU_SOURCE_STAGE=slu_none
 # hashcat source selector (host-side build mirror, same pattern as John). amd64
 # ships the official prebuilt .7z at runtime, so on that arch the hashcat_builder
@@ -25,6 +31,14 @@ ARG SLU_SOURCE_STAGE=slu_none
 # on arm64 there is NO upstream release, so hashcat_builder compiles it from
 # source (SSE2->NEON via deps/sse2neon) and the runtime layer COPYs that tree.
 ARG HASHCAT_SOURCE_STAGE=hashcat_builder
+# extractous (MANSPIDER's document-text extractor): the SINGLE pin of its version.
+# PyPI publishes no linux/aarch64 wheel, so the arm64 leg would source-build it
+# (GraalVM native-image under QEMU, 1-3h) on every cold pip layer. The host build
+# mirror caches the built arm64 wheel per (version, arch); the manspider install
+# below prefers it via --find-links. Default stage is the EMPTY extractous_none:
+# nothing mirrored -> pip behaves exactly as before. amd64 never needs it.
+ARG EXTRACTOUS_VERSION=0.3.0
+ARG EXTRACTOUS_SOURCE_STAGE=extractous_none
 
 ###############################################################################
 # John the Ripper build stage (generic john binary + official converters)
@@ -308,31 +322,126 @@ ARG HASHCAT_SOURCE_STAGE
 FROM ${HASHCAT_SOURCE_STAGE} AS hashcat_source
 
 ###############################################################################
-# FreeRDP source selector (host-side build mirror — skips the cmake compile)
+# extractous wheel stages (host-side build mirror, per arch)
 #
-# FreeRDP is a multi-minute cmake build whose dependencies are entangled with
-# runtime-common's apt (X11/Wayland/codec -dev libs that ALSO provide the
-# runtime libs xfreerdp links against). So instead of a self-contained builder
-# stage like John, the compile stays INLINE in runtime-common and is made
-# CONDITIONAL: runtime-common COPYs an `install/` tree from `freerdp_source`,
-# and the inline step compiles only when that tree is absent.
+# extractous has no linux/aarch64 wheel on PyPI, so on arm64 `pip wheel` compiles
+# it from sdist (maturin auto-installs Rust, build.rs fetches GraalVM; 1-3h under
+# QEMU). On every other arch a published manylinux wheel exists, so the stage is a
+# NO-OP empty wheelhouse and amd64 is untouched.
 #
-#   FREERDP_SOURCE_STAGE=freerdp_none      → empty install/ → compile inline (default)
-#   FREERDP_SOURCE_STAGE=freerdp_prebuilt  → COPY the host-seeded install/ → skip compile
+#   extractous_compile  heavy toolchain stage; arm64 only does real work
+#   extractous_builder  thin image holding ONLY /wheelhouse (what the mirror
+#                       extracts with docker create/cp; also the --target the
+#                       build script compiles once per (version, arch))
+#   extractous_none     EMPTY /wheelhouse (default: pip falls back to its normal
+#                       resolution, i.e. today's behaviour)
+#   extractous_prebuilt COPY the host-seeded wheelhouse for ${TARGETARCH}
 #
-# Only the selected stage is built; the other is pruned. So freerdp_prebuilt
-# selection never requires a seeded artifact to be absent, and freerdp_none
-# selection never requires the seeded dir to exist.
-#
-# Multi-arch note: unlike John (per-arch host mirror, seeded via
-# build_mirror_ensure_arch), FreeRDP is EXCLUDED from per-arch multi-arch mirror
-# caching BY DESIGN — its inline cmake compile is entangled with runtime-common's
-# -dev libs, and a cross-arch builder stage would risk RDP runtime linkage drift
-# (needs separate L3 RDP validation). So in a multi-platform build FreeRDP always
-# compiles inline per-leg (freerdp_none). Deferred follow-up.
+# /wheelhouse carries a SHA256SUMS file (stable name, covers the wheel bytes); the
+# manspider install verifies it before using the wheel. The pip cache mount below
+# deliberately shares its id with the runtime-common pip layer, so a wheel that
+# layer already built is found in pip's cache instead of being compiled again.
 ###############################################################################
+FROM debian:trixie-slim AS extractous_compile
+ARG DEBIAN_FRONTEND=noninteractive
+ARG EXTRACTOUS_VERSION
+ARG TARGETARCH
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
+  set -eux; \
+  exarch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  mkdir -p /wheelhouse; \
+  if [ "${exarch}" != "arm64" ]; then \
+    echo "[extractous_compile] arch=${exarch}: PyPI ships a wheel; producing an EMPTY wheelhouse" >&2; \
+    exit 0; \
+  fi; \
+  export PIP_CACHE_DIR=/var/cache/adscan-pip; \
+  apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git unzip xz-utils bzip2 build-essential \
+      pkg-config cmake clang llvm libclang-dev libffi-dev libssl-dev zlib1g-dev \
+      python3 python3-pip python3-venv python3-dev \
+    && rm -rf /var/lib/apt/lists/*; \
+  python3 -m venv /venv; \
+  /venv/bin/python -m pip install --retries 8 --timeout 120 -U pip; \
+  /venv/bin/python -m pip wheel --retries 8 --timeout 120 --no-deps \
+    --wheel-dir /wheelhouse "extractous==${EXTRACTOUS_VERSION}"; \
+  test "$(ls /wheelhouse/extractous-${EXTRACTOUS_VERSION}-*.whl | wc -l)" = 1; \
+  ( cd /wheelhouse && sha256sum extractous-*.whl > SHA256SUMS )
+
+FROM debian:trixie-slim AS extractous_builder
+COPY --from=extractous_compile /wheelhouse /wheelhouse
+
+FROM debian:trixie-slim AS extractous_none
+RUN mkdir -p /wheelhouse
+
+FROM debian:trixie-slim AS extractous_prebuilt
+ARG TARGETARCH
+COPY extractous-prebuilt/${TARGETARCH}/wheelhouse /wheelhouse
+
+ARG EXTRACTOUS_SOURCE_STAGE
+FROM ${EXTRACTOUS_SOURCE_STAGE} AS extractous_source
+
+###############################################################################
+# FreeRDP stages (host-side build mirror, per arch — skips the cmake compile)
+#
+# FreeRDP is a multi-minute cmake build (about 478 objects; under QEMU on the
+# arm64 leg it is the slowest layer of runtime-common). It is compiled ONCE per
+# (commit, arch) in a dedicated builder stage and the install tree is cached on
+# the host mirror; runtime-common COPYs it from `freerdp_source`.
+#
+#   freerdp_compile   toolchain + the SAME FreeRDP -dev libs runtime-common
+#                     installs (same base image, so the same library versions),
+#                     the SAME cmake flags as the inline fallback below.
+#   freerdp_builder   thin image holding ONLY the install tree (what the mirror
+#                     extracts with docker create/cp; also the --target the build
+#                     script compiles once per arch via build_mirror_ensure_arch)
+#   freerdp_none      EMPTY install/ (default) -> runtime-common's inline compile
+#                     runs, exactly as before. This is also the fallback when the
+#                     builder stage fails.
+#   freerdp_prebuilt  COPY the host-seeded install/ for ${TARGETARCH}
+#
+# Linkage: the runtime stage keeps installing the same -dev packages (which pull
+# the runtime libs xfreerdp links against) and runs `ldconfig` + `xfreerdp
+# --version` right after, so an unresolved library fails the build loudly.
+# Keep the -dev list below in sync with the X11/codec block of runtime-common.
+###############################################################################
+FROM debian:trixie-slim AS freerdp_compile
+ARG DEBIAN_FRONTEND=noninteractive
+ARG FREERDP_VERSION
+ARG FREERDP_COMMIT
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update -y && apt-get install -y --no-install-recommends \
+      ca-certificates git build-essential cmake ninja-build pkg-config \
+      libssl-dev zlib1g-dev libkrb5-dev libicu-dev \
+      libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxkbcommon-dev \
+      libxkbfile-dev libxrandr-dev libxi-dev libxrender-dev libxv-dev \
+      libxfixes-dev libxdamage-dev libxtst-dev libfuse3-dev libpam0g-dev \
+      libasound2-dev libcups2-dev libpulse-dev libjpeg-dev libpng-dev \
+      libavutil-dev libavcodec-dev libswscale-dev libusb-1.0-0-dev \
+      libpcsclite-dev libsystemd-dev libwayland-dev wayland-protocols libepoxy-dev
+RUN set -eux; \
+  git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git /tmp/freerdp-src; \
+  test "$(git -C /tmp/freerdp-src rev-parse HEAD)" = "${FREERDP_COMMIT}"; \
+  cmake -S /tmp/freerdp-src -B /tmp/freerdp-build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/adscan/tools/freerdp/install \
+    -DBUILD_TESTING=OFF \
+    -DWITH_SERVER=OFF \
+    -DWITH_X11=ON \
+    -DWITH_WAYLAND=ON; \
+  cmake --build /tmp/freerdp-build --parallel "$(nproc)"; \
+  cmake --install /tmp/freerdp-build; \
+  test -x /opt/adscan/tools/freerdp/install/bin/xfreerdp
+
+FROM debian:trixie-slim AS freerdp_builder
+COPY --from=freerdp_compile /opt/adscan/tools/freerdp/install /opt/adscan/tools/freerdp/install
+
 FROM debian:trixie-slim AS freerdp_prebuilt
-COPY freerdp-prebuilt/install /opt/adscan/tools/freerdp/install
+ARG TARGETARCH
+COPY freerdp-prebuilt/${TARGETARCH}/install /opt/adscan/tools/freerdp/install
 
 FROM debian:trixie-slim AS freerdp_none
 RUN mkdir -p /opt/adscan/tools/freerdp/install
@@ -370,8 +479,8 @@ ARG JOHN_BLEEDING_JUMBO_COMMIT=d8f5b0138e6f9fe24ab453f886dcaa2abb2e5407
 ARG CREDSWEEPER_VERSION=1.18.3
 ARG HASHCAT_VERSION=7.1.2
 ARG LIGOLO_NG_VERSION=0.8.3
-ARG FREERDP_VERSION=3.24.1
-ARG FREERDP_COMMIT=b6e770ccba87c58ffd0a55366fef33361798e39c
+ARG FREERDP_VERSION
+ARG FREERDP_COMMIT
 ARG SLU_COMMIT=31132bd5da19787152a354e6adad18b2c8432e73
 ARG ADSCAN_RUNTIME_CONTRACT_VERSION="1"
 # Target architecture (amd64 / arm64), auto-provided by BuildKit for both
@@ -596,7 +705,9 @@ COPY --from=slu_source /usr/share/wordlists/statistically-likely-usernames /usr/
 # reuses already-downloaded wheels instead of re-fetching from PyPI. pip resolves
 # versions itself, so a changed pin fetches only the new wheel — no manual cache
 # key needed. `--no-cache-dir` is dropped precisely so the mount is populated.
+ARG EXTRACTOUS_VERSION
 RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
+  --mount=type=bind,from=extractous_source,source=/wheelhouse,target=/mnt/extractous-wheelhouse \
   set -eux; \
   export PIP_CACHE_DIR=/var/cache/adscan-pip; \
   # Several tool deps are git+https clones from GitHub (MANSPIDER). This layer runs BEFORE the External-tools layer that sets the
@@ -625,24 +736,20 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
   pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python -U pip; \
   pip_retry /opt/adscan/tool_venvs/impacket/venv/bin/python "impacket==0.13.1" "pycryptodome==3.23.0"; \
   \
-  # TODO(arm64-extractous-cache): MANSPIDER pulls extractous>=0.3.0,<0.4.0, which
-  # has NO linux/aarch64 wheel on PyPI for any version — so on the arm64 leg pip
-  # source-builds it (GraalVM native-image, ~2h under QEMU) on EVERY build. The
-  # amd64 leg installs the published manylinux wheel in seconds. To cache the arm64
-  # build once (per the John/hashcat mirror pattern): add an `extractous_builder`
-  # stage that `pip wheel "extractous>=0.3.0,<0.4.0" --wheel-dir /wheelhouse` for
-  # TARGETARCH (arm64 → the 2h GraalVM build; amd64 → a no-op empty wheelhouse),
-  # a per-arch `build_mirror_spec_extractous` (BM_SUBDIR=wheelhouse,
-  # BM_INTEGRITY=<the extractous-*.whl>, BM_CTX_PER_ARCH=1), wire it into both build
-  # scripts, COPY the wheelhouse here and pass `--find-links /wheelhouse` to the
-  # install below so pip prefers the cached wheel. Deferred: the extractous
-  # toolchain (GraalVM + Rust) is heavy to stand up correctly in an isolated
-  # builder stage and the 2h build is impractical to validate here; the manspider
-  # venv stays FULLY WORKING on arm64 today (it just source-builds extractous),
-  # which is the invariant not to break. amd64 is unaffected (published wheel).
+  # extractous has no linux/aarch64 wheel: the arm64 wheel comes from the host
+  # build mirror (extractous_source stage, bind-mounted below, never COPYed so it
+  # adds no image layer). The version is pinned explicitly so pip can never
+  # prefer a newer sdist over the mirrored wheel. An empty mirror (or amd64) means
+  # pip resolves extractous from PyPI exactly as before.
+  if [ -f /mnt/extractous-wheelhouse/SHA256SUMS ]; then \
+    ( cd /mnt/extractous-wheelhouse && sha256sum -c SHA256SUMS ); \
+  fi; \
   python3 -m venv /opt/adscan/tool_venvs/manspider/venv; \
   pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python -U pip; \
-  pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
+  pip_retry /opt/adscan/tool_venvs/manspider/venv/bin/python \
+    --find-links /mnt/extractous-wheelhouse \
+    "extractous==${EXTRACTOUS_VERSION}" \
+    "git+https://github.com/ADScanPro/MANSPIDER@cedb138"; \
   \
   python3 -m venv /opt/adscan/tool_venvs/credsweeper/venv; \
   pip_retry /opt/adscan/tool_venvs/credsweeper/venv/bin/python -U pip; \
@@ -1184,6 +1291,11 @@ ARG ADSCAN_IMAGE_CHANNEL="stable"
 # image would stop before the license does.
 ARG ADSCAN_IMAGE_EDITION=""
 ARG ADSCAN_BINARY_EXPIRES=""
+# PRO licence marker (`build_docker_pro_image.sh --licensed`): with it the engine
+# requires a licence from the licence server before any new assessment
+# (adscan_core/pro_license/evaluation.py PRO_LICENSE_MARKER). A FILE, like the
+# Enterprise marker, so `docker run -e` cannot remove the requirement.
+ARG ADSCAN_PRO_LICENSE_REQUIRED=""
 RUN set -eux; \
   chmod +x /usr/local/bin/adscan; \
   if [[ -n "${ADSCAN_RUNTIME_VERSION}" ]]; then \
@@ -1193,6 +1305,11 @@ RUN set -eux; \
     mkdir -p /usr/local/share/adscan; \
     printf 'enterprise\n' > /usr/local/share/adscan/edition; \
     chmod 0444 /usr/local/share/adscan/edition; \
+  fi; \
+  if [[ "${ADSCAN_PRO_LICENSE_REQUIRED}" == "1" ]]; then \
+    mkdir -p /usr/local/share/adscan; \
+    printf 'required\n' > /usr/local/share/adscan/pro-license; \
+    chmod 0444 /usr/local/share/adscan/pro-license; \
   fi
 
 # Bake build-time ARGs into the image ENV only at the end, after every

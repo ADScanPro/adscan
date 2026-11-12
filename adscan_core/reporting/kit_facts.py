@@ -166,11 +166,19 @@ def conformity_status_label(status: object) -> str:
 #: The control's only evidence was observed on some of the hosts it covers and
 #: not confirmed on the rest. Neither a pass nor a gap.
 INCOMPLETE_EVIDENCE_NOT_ASSESSED_REASON = "evidence_not_confirmed_on_every_host"
+#: The control's only evidence shows the duty separated by assignment while
+#: the system does not enforce it (AD CS role separation off, the two CA roles
+#: held by different principals). Recorded as an observation: neither a pass,
+#: because nothing stops a later grant from combining the roles, nor a gap.
+HELD_IN_PRACTICE_NOT_ASSESSED_REASON = "held_in_practice_not_enforced"
 
 NOT_ASSESSED_REASON_LABELS: dict[str, str] = {
     "excluded_by_scan_policy": "Not assessed, excluded by the scan policy",
     INCOMPLETE_EVIDENCE_NOT_ASSESSED_REASON: (
         "Not assessed, not confirmed on every host"
+    ),
+    HELD_IN_PRACTICE_NOT_ASSESSED_REASON: (
+        "Not assessed, held in practice but not enforced"
     ),
 }
 
@@ -189,6 +197,39 @@ VERIFIED_CLEAR_NOUN = "check"
 VERIFIED_CLEAR_SEPARATION_CLAUSE = (
     "The two totals count different sets and do not add up."
 )
+
+def verified_clear_score_note(compliance_score: object, verified_clear: object) -> str:
+    """The one sentence that reconciles the score with the verified-clear count.
+
+    Printed beside the score itself, where the two figures meet: "0% conformant"
+    one line from "3 checks verified clear" made a board member stop, and the
+    explanation sat in a note half a page further down. A score of zero with
+    clean checks means every control code those checks fall under also carries
+    a finding; any other score means some do. ``""`` when no check came back
+    clean, so a caller can print it unconditionally.
+    """
+    try:
+        count = int(verified_clear or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        return ""
+    try:
+        score = float(compliance_score or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    noun = verified_clear_phrase(count)
+    if score <= 0:
+        return (
+            f"The score is 0% although {noun}, because every control those checks "
+            "belong to also carries a finding. A control with a finding stays "
+            "non-conformant until that finding is fixed."
+        )
+    return (
+        f"The {noun} count toward a control's conformance only where that control "
+        "carries no finding."
+    )
+
 
 #: The unit the codes beside a verified-clear count are measured in. A
 #: DIFFERENT unit from the count itself, which is the whole reason this constant
@@ -699,8 +740,13 @@ def _load_snapshot_paths(workspace_dir: str, domain: str) -> list[dict[str, Any]
             payload = json.load(handle)
     except Exception:  # noqa: BLE001 - a missing / malformed snapshot is normal
         return []
-    paths = payload.get("paths") if isinstance(payload, dict) else None
-    return [p for p in (paths or []) if isinstance(p, dict)]
+    # Only the DOMAIN listing feeds a deliverable figure; an operator-scope
+    # listing is read as absent rather than stated as the domain's routes.
+    from adscan_core.reporting.attack_path_snapshot_scope import (  # noqa: PLC0415
+        domain_listing_snapshot_paths,
+    )
+
+    return domain_listing_snapshot_paths(payload)
 
 
 def _read_domain_auth(
@@ -856,7 +902,8 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
 
     Stamped this round:
 
-    * ``attack_path_totals`` — ``{paths_total, paths_executed}`` from the
+    * ``attack_path_totals`` — ``{paths_total, paths_executed}`` (both over
+      every reach class) from the
       ``attack_path_counts`` cardinality SSOT (never a raw inline path tally), so
       the SAR path count and the Coverage Report path count can be locked to ONE
       figure.
@@ -929,7 +976,11 @@ def build_kit_facts(report: dict[str, Any], workspace_dir: str) -> dict[str, Any
             ):
                 facts["attack_path_totals"] = {
                     "paths_total": totals.paths_total,
-                    "paths_executed": totals.effective_proven_full_domain_compromise,
+                    # Executed routes of EVERY reach class: the denominator the
+                    # SAR's "N of M validated attack paths ADscan executed" pairs
+                    # with the all-class ``paths_total``. Deliberately NOT the
+                    # domain-compromise proven figure, which is a subset.
+                    "paths_executed": totals.effective_paths_proven,
                     "paths_open_exposure": totals.paths_open_exposure,
                     "paths_full_domain_compromise": (
                         totals.effective_full_domain_compromise

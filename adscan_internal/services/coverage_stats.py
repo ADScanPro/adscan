@@ -58,6 +58,58 @@ def _adcs_esc_numbers(step_catalog: dict[str, Any]) -> list[int]:
     return sorted(numbers)
 
 
+def adcs_esc_split(step_catalog: dict[str, Any]) -> dict[str, list[int]]:
+    """ESC classes in the catalog, split by whether ADscan executes them.
+
+    ``classes`` is every ESC class number present; ``executed`` the ones with a
+    ``supported`` entry (ADscan runs them end to end); ``detected_only`` the
+    rest, which ADscan detects and maps but does not run. Variants
+    (``adcsesc6a``) collapse to their class, executed if any variant is.
+
+    This is the one derivation of the split. The README, COVERAGE.md, the site
+    data file and the coverage-matrix document all read it, because a span
+    alone ("ESC1-ESC17") reads as "all seventeen are exploited" whether or not
+    they are.
+    """
+    classes: set[int] = set()
+    executed: set[int] = set()
+    for key, entry in step_catalog.items():
+        if getattr(entry, "category", None) in STEP_CATEGORY_EXCLUDE:
+            continue
+        if not key.startswith(_ESC_KEY_PREFIX):
+            continue
+        m = re.match(r"(\d+)", key[len(_ESC_KEY_PREFIX):])
+        if not m:
+            continue
+        number = int(m.group(1))
+        classes.add(number)
+        if getattr(entry, "support_kind", None) == "supported":
+            executed.add(number)
+    return {
+        "classes": sorted(classes),
+        "executed": sorted(executed),
+        "detected_only": sorted(classes - executed),
+    }
+
+
+def esc_ranges(numbers: list[int]) -> list[str]:
+    """``[1..11, 13..17]`` -> ``["ESC1–ESC11", "ESC13–ESC17"]``; a gap stays a gap."""
+    out: list[str] = []
+    run: list[int] = []
+    for number in sorted(numbers):
+        if run and number != run[-1] + 1:
+            out.append(_esc_run(run))
+            run = []
+        run.append(number)
+    if run:
+        out.append(_esc_run(run))
+    return out
+
+
+def _esc_run(run: list[int]) -> str:
+    return f"ESC{run[0]}" if len(run) == 1 else f"ESC{run[0]}–ESC{run[-1]}"
+
+
 def _adcs_esc_span(step_catalog: dict[str, Any]) -> str:
     """Compute the ADCS ESC span string (e.g. ``ESC1–ESC17``) from the catalog.
 
@@ -649,6 +701,10 @@ def build_technique_stats() -> dict[str, Any]:
           - ``by_category``: technique count per (non-excluded) category, sorted
             by category name for deterministic output.
           - ``adcs_esc_span``: ``ESC<min>–ESC<max>`` computed from the catalog.
+          - ``adcs_esc_executed`` / ``adcs_esc_detected_only``: the ESC class
+            numbers ADscan executes end to end, and the ones it only detects
+            (:func:`adcs_esc_split`), with their ``*_count``. The span is the
+            envelope; these say which classes inside it are run.
     """
     # Lazy import: keeps the module free of a top-level ``pro`` dependency.
     from adscan_internal.pro.reporting.vuln_catalog import (  # noqa: PLC0415
@@ -673,6 +729,7 @@ def build_technique_stats() -> dict[str, Any]:
     technique_count = sum(by_category.values())
     finding_count = len(VULN_CATALOG)
     adcs_esc_span = _adcs_esc_span(ATTACK_STEP_CATALOG)
+    adcs_split = adcs_esc_split(ATTACK_STEP_CATALOG)
 
     return {
         "technique_count": technique_count,
@@ -680,6 +737,10 @@ def build_technique_stats() -> dict[str, Any]:
         "finding_count": finding_count,
         "by_category": by_category,
         "adcs_esc_span": adcs_esc_span,
+        "adcs_esc_executed": adcs_split["executed"],
+        "adcs_esc_detected_only": adcs_split["detected_only"],
+        "adcs_esc_executed_count": len(adcs_split["executed"]),
+        "adcs_esc_detected_only_count": len(adcs_split["detected_only"]),
     }
 
 

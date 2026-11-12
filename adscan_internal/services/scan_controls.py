@@ -912,6 +912,32 @@ def print_execution_decision(shell: Any) -> None:
         print_warning(MAP_ONLY_START_STATEMENT)
 
 
+def policy_launch_line(shell: Any, *, interactive: bool) -> str:
+    """The one line a scan prints at launch naming the policy it runs under.
+
+    ``Policy: Audit · 34 of 51 checks run · change it with `policy```. Counted
+    from the resolved policy on the shell (effective over selectable checks);
+    empty when the shell carries no policy. The hint is shown to an operator
+    only: an unattended run cannot type a command.
+    """
+    from adscan_core.scan_policy.policy import policy_display_name  # noqa: PLC0415
+
+    resolved = getattr(shell, "scan_policy", None)
+    definition = getattr(resolved, "definition", None)
+    if definition is None:
+        return ""
+    try:
+        name = policy_display_name(definition)
+        run = len(resolved.effective_ids)
+        total = run + len(resolved.excluded_ids) + len(resolved.dependency_excluded)
+    except Exception:  # noqa: BLE001 - a launch line never blocks a scan
+        return ""
+    line = f"Policy: {name} · {run} of {total} checks run"
+    if interactive:
+        line += " · change it with `policy`"
+    return line
+
+
 def is_unlimited(value: Any) -> bool:
     """True for the ``unlimited`` knob value."""
     return value == UNLIMITED

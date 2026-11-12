@@ -578,6 +578,25 @@ def _ntstatus_text(err: BaseException) -> str:
     return " ".join(parts)
 
 
+def _caller_operation_error(exc: BaseException) -> SMBTransportError:
+    """The exception for an operation the CALLER ran over an established session.
+
+    Same types the caller's ``except`` clauses already handle (the transport has
+    always translated them), but the transport renders nothing, emits no
+    posture signal and does not retry: the session itself worked, and whether
+    the operation's failure is an error is the caller's to decide. An expected
+    E_ACCESSDENIED from a CA read (a low-privilege scan account) used to print
+    "Error: GetCASecurity failed ..." with a traceback on every Audit run.
+    """
+    print_info_debug(
+        "[smb-transport] operation over an established session raised "
+        f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"
+    )
+    if isinstance(exc, asyncio.TimeoutError):
+        return SMBConnectionError(f"SMB operation timed out: {type(exc).__name__}")
+    return _translate_aiosmb_exception(exc)  # type: ignore[arg-type]
+
+
 def _translate_aiosmb_exception(exc: Exception) -> SMBTransportError:
     """Map an aiosmb / asyauth exception to an ADscan SMB domain exception.
 
@@ -1216,6 +1235,12 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
         factory = SMBConnectionFactory.from_url(url)
         connection = factory.get_connection()
         next_config: Optional["SMBConfig"] = None
+        # Set when the CALLER's own operation raised after a successful login:
+        # that is the caller's answer to report (an access-denied CA read, a
+        # refused pipe), not a failure of this transport. It is re-raised as
+        # before, but never printed as an error, never read as a posture
+        # signal and never retried (a context manager cannot yield twice).
+        caller_failed = False
 
         try:
             async with connection:
@@ -1255,7 +1280,11 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
                         used_kerberos_auth=effective_config.use_kerberos,
                         connection=connection,
                     )
-                    yield machine
+                    try:
+                        yield machine
+                    except BaseException:
+                        caller_failed = True
+                        raise
                 return  # success — caller exited the ``async with`` cleanly
         except _SelfHealRetrySentinel:
             # Internal sentinel — the ``async with connection`` block has
@@ -1268,6 +1297,8 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
             # Already classified + emitted in the inner block.
             raise
         except asyncio.TimeoutError as exc:
+            if caller_failed:
+                raise _caller_operation_error(exc) from exc
             # Network-level — not posture-relevant.
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -1276,6 +1307,8 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
                 f"after {effective_config.timeout}s"
             ) from exc
         except Exception as exc:
+            if caller_failed:
+                raise _caller_operation_error(exc) from exc
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             _emit_smb_failure_posture(

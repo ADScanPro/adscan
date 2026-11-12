@@ -101,8 +101,9 @@ def _feature_display_name(feature: str) -> str:
     return _FEATURE_DISPLAY_NAMES.get(feature, feature.replace("_", " ").title())
 
 
-def _primary_cta(placement: str = "pro_upsell_panel") -> Text:
-    # Short, clean text; the tracking parameters ride in the hyperlink target.
+def _primary_cta(placement: str | None = "pro_upsell_panel") -> Text:
+    # Short, clean /go text; the tracking parameters ride in the site redirect.
+    placement = placement or "pro_upsell_panel"
     return Text(
         cta_display(placement),
         style=cta_link_style(placement, f"{_BRAND_CYAN} on grey11"),
@@ -232,6 +233,82 @@ def _render_enterprise_panel_body() -> list[Text]:
     ]
 
 
+def _render_partner_panel_body() -> list[Text]:
+    """Body for the partner lane: a platform, PTaaS vendor or MSSP.
+
+    The operator said they would build ADscan into a service they sell. What they
+    need at a PRO wall is how a platform runs the engine and how the partner
+    terms work, not the per-engagement kit a consultant buys.
+    """
+    from adscan_core.operator_role import CtaLane
+    from adscan_core.outbound_links import cta_placement_for_lane
+
+    eyebrow = Text(
+        "PARTNERS · EMBED OR RESELL",
+        style=f"bold {_BRAND_CYAN}",
+    )
+    header = Text("ADscan inside your own service", style="bold")
+
+    capability = Text(
+        "Platforms run ADscan with 'adscan ci': your runner starts it at the "
+        "client site and your dashboard reads versioned JSON files with a "
+        "published schema. It is a PRO command, licensed to platforms and "
+        "MSSPs under partner terms."
+    )
+
+    guide = Text("How platforms integrate: ")
+    guide.append_text(_primary_cta("pro_gate_partner_guide"))
+    terms = Text("Partner terms and the application: ")
+    terms.append_text(_primary_cta(cta_placement_for_lane(CtaLane.PARTNER)))
+
+    return [
+        eyebrow,
+        Text(""),
+        header,
+        Text(""),
+        capability,
+        Text(""),
+        guide,
+        terms,
+    ]
+
+
+def _render_learning_panel_body(feature: str) -> list[Text]:
+    """Body for the learning lane: a student, CTF player or learner.
+
+    No sales ask. The command they typed is PRO, so the panel says so plainly
+    and points at what the free tier gives a learner: the interactive mode that
+    teaches each technique as it runs, and the lab walkthroughs.
+    """
+    from adscan_core.operator_role import CtaLane
+    from adscan_core.outbound_links import cta_placement_for_lane
+
+    eyebrow = Text(
+        "LEARNING · FREE TIER",
+        style=f"bold {_BRAND_CYAN}",
+    )
+    header = Text(f"'{feature}' is a PRO command", style="bold")
+
+    capability = Text(
+        "It is built for firms that deliver assessments to clients. You do not "
+        "need it to learn: 'adscan start' runs the same engine step by step and "
+        "explains each technique as it goes."
+    )
+
+    labs = Text("Lab walkthroughs, from a fresh box to Domain Admin: ")
+    labs.append_text(_primary_cta(cta_placement_for_lane(CtaLane.LEARN)))
+
+    return [
+        eyebrow,
+        Text(""),
+        header,
+        Text(""),
+        capability,
+        Text(""),
+        labs,
+    ]
+
+
 def render_pro_upsell_panel(
     feature: str,
     context: UpsellContext,
@@ -256,6 +333,10 @@ def render_pro_upsell_panel(
     the single Enterprise-platform body regardless of ``feature`` — the
     operator's role profile says they are a buyer evaluating their own
     estate, not a pentester who wants the CLI feature they just typed.
+    :attr:`~adscan_core.operator_role.CtaLane.PARTNER` renders the partner body
+    (integration guide and partner terms), and
+    :attr:`~adscan_core.operator_role.CtaLane.LEARN` a body with no sales ask
+    that points a learner at the free interactive mode and the labs.
 
     Args:
         feature: PRO verb that triggered the panel. Selects the panel body
@@ -284,6 +365,10 @@ def render_pro_upsell_panel(
 
     if lane is CtaLane.ENTERPRISE:
         parts = _render_enterprise_panel_body()
+    elif lane is CtaLane.PARTNER:
+        parts = _render_partner_panel_body()
+    elif lane is CtaLane.LEARN:
+        parts = _render_learning_panel_body(feature)
     elif feature in _AUTONOMOUS_MODE_FEATURES:
         parts = _render_autonomous_mode_panel_body(feature)
     else:

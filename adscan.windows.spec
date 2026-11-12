@@ -56,6 +56,9 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # ---------------------------------------------------------------------------
 _REQUIRED_DATA_DIRS = [
     ("adscan_internal/services/report_design/_css", "adscan_internal/services/report_design/_css"),
+    # The report faces (static woff2 + their OFL licences): every PDF is drawn
+    # from them, and no render may fetch a font over the network.
+    ("adscan_internal/services/report_design/_fonts", "adscan_internal/services/report_design/_fonts"),
     ("adscan_internal/assets/logos", "adscan_internal/assets/logos"),
     ("adscan_internal/assets/demo_workspace", "adscan_internal/assets/demo_workspace"),
     # The Client Deliverable Kit sample PDFs (LITE's PRO-upsell preview) —

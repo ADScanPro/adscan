@@ -33,12 +33,14 @@ __all__ = [
     "offer_cleanup_credential_prompt",
     "cleanup_account_principal",
     "cleanup_account_identity",
+    "cleanup_account_names",
     "cleanup_account_supplied",
     "describe_cleanup_accounts",
     "ask_for_cleanup_account",
     "save_cleanup_account",
     "remove_cleanup_accounts",
     "ANY_DOMAIN",
+    "install_forest_resolver",
 ]
 
 #: The REPL command that manages the saved account (named in operator hints).
@@ -83,6 +85,7 @@ def load_cleanup_credential_for_run(shell: Any) -> bool:
     Never raises.
     """
     loaded = False
+    install_forest_resolver(shell)
     try:
         reference: Optional[_store.CleanupCredentialReference] = getattr(
             getattr(shell, "scan_config", None), "cleanup_credential", None
@@ -111,6 +114,34 @@ def load_cleanup_credential_for_run(shell: Any) -> bool:
         print_exception(exception=exc)
     _refresh_policy(shell)
     return loaded
+
+
+def install_forest_resolver(shell: Any) -> None:
+    """Let one account saved for a forest root serve every domain of that forest.
+
+    Reads the forest from recorded data only (``forest_topology.known_forest_root``),
+    never the network, so a lookup stays cheap. Never raises.
+    """
+    try:
+        import weakref  # noqa: PLC0415
+
+        from adscan_internal.services.forest_topology import (  # noqa: PLC0415
+            known_forest_root,
+        )
+
+        try:
+            ref: Any = weakref.ref(shell) if shell is not None else None
+        except TypeError:  # an object without weak-reference support is held directly
+            ref = (lambda held=shell: held) if shell is not None else None
+
+        def _resolve(domain: str) -> Optional[str]:
+            target = ref() if ref is not None else None
+            return known_forest_root(target, domain) if target is not None else None
+
+        _store.set_forest_root_resolver(_resolve)
+    except Exception as exc:  # noqa: BLE001 - without it, exact and wildcard lookups remain
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _refresh_policy(shell: Any) -> None:
@@ -144,6 +175,29 @@ def cleanup_account_identity(domain: str) -> Optional[tuple[str, str]]:
 def cleanup_account_supplied() -> bool:
     """Whether a cleanup account is configured for any domain of the run."""
     return bool(_store.configured_domains())
+
+
+def _bare_account_name(principal: str) -> str:
+    name = str(principal or "").strip()
+    if "\\" in name:
+        name = name.split("\\", 1)[1]
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    return name.casefold()
+
+
+def cleanup_account_names() -> frozenset[str]:
+    """The account names (no domain, case-folded) of every configured cleanup account.
+
+    For the password-guessing seams, which must never spend an attempt on the
+    account the client handed over to undo ADscan's changes. Every configured
+    account counts, whatever domain it was given for: excluding a same-named
+    account elsewhere costs one spray target, spraying the client's cleanup
+    account could lock it out. Never a secret.
+    """
+    names = {_bare_account_name(p) for p in _store.saved_workspace_principals().values()}
+    names |= {_bare_account_name(p) for p, _source in _store.run_provided_principals().values()}
+    return frozenset(n for n in names if n)
 
 
 def _announce_saved(domain: str) -> None:
@@ -180,6 +234,8 @@ def offer_cleanup_credential_prompt(shell: Any, *, domain: str) -> bool:
     whether a cleanup account is available for ``domain``.
     """
     from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+    install_forest_resolver(shell)
 
     try:
         if _store.has_cleanup_credential(domain):

@@ -114,6 +114,46 @@ _COMMAND_LINE_SUFFIX = " (command line)"
 _OPERATOR_NAME_MAX_LENGTH = 80
 
 
+def ensure_lab_policy_allowed(shell: Any) -> bool:
+    """Return True unless this run is a Lab / CTF one the appliance has turned off.
+
+    On the Enterprise edition a lab policy (the Lab / CTF built-in, one based on
+    it, or any policy for a lab environment, ``adscan_core.scan_policy.lab_policy``)
+    runs only when the client's administrator turned lab policies on. The web
+    platform and the host worker refuse such a scan first; this is the engine's
+    own check, so a direct ``adscan ci`` on the appliance cannot bypass them.
+    The refusal is written beside the run (exit 78), so the worker stores the
+    same sentence. Off the Enterprise edition it is always True.
+    """
+    from adscan_core.scan_policy.lab_policy import (
+        LAB_POLICY_DISABLED_MESSAGE,
+        REASON_LAB_POLICY_NOT_ENABLED,
+        gate_applies,
+        is_lab_policy,
+        lab_policies_available,
+    )
+
+    try:
+        if not gate_applies():
+            return True
+        from adscan_internal.services.scan_controls import workspace_environment
+
+        policy = getattr(shell, "scan_policy", None)
+        definition = getattr(policy, "definition", None)
+        lab_run = is_lab_policy(
+            base=getattr(definition, "base", ""), environment=workspace_environment(shell)
+        )
+        if not lab_run or lab_policies_available(gated=True):
+            return True
+    except Exception as exc:  # noqa: BLE001 — a check that cannot run must not pass
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    telemetry.capture("lab_policy_refused", properties={"command": "ci"})
+    print_error(LAB_POLICY_DISABLED_MESSAGE)
+    _write_refusal_marker(shell, REASON_LAB_POLICY_NOT_ENABLED, LAB_POLICY_DISABLED_MESSAGE)
+    return False
+
+
 def ensure_license_allows_new_scan(command_name: str, *, workspace_dir: str | None = None) -> bool:
     """Return True when a new assessment may start; print why when it may not.
 
@@ -133,7 +173,10 @@ def ensure_license_allows_new_scan(command_name: str, *, workspace_dir: str | No
     try:
         status = scan_launch_status(record=False)
         if not status.required:
-            return True
+            # Not Enterprise: the PRO licence decides (dormant until required).
+            from adscan_internal.cli.pro_license_gate import ensure_pro_license_allows_new_scan
+
+            return ensure_pro_license_allows_new_scan(command_name, workspace_dir=workspace_dir)
         record_engine_info()
         status = scan_launch_status(record=True)
     except Exception as exc:  # noqa: BLE001 — a verifier crash must not pass silently
@@ -217,6 +260,35 @@ def _root_dc_locator(shell: Any):
     return _locate
 
 
+def resolve_identity_for_admission(
+    shell: Any, domain_norm: str, *, dc_ip: str | None = None, known: Any = None
+) -> ForestIdentity:
+    """The forest identity of ``domain_norm`` for a licence admission.
+
+    Shared by the Enterprise environment ledger and the PRO domain registration
+    (``pro_license_gate``), so both identify a forest the same way: reuses a
+    confirmed identity from the session, otherwise asks the forest root
+    pre-authentication (CLDAP), and adds the root SID once an authenticated
+    phase has read it. Never raises (a name-only identity at worst).
+    """
+    if isinstance(known, ForestIdentity) and not known.provisional:
+        identity = known
+    else:
+        target_dc = dc_ip or _domain_dc_ip(shell, domain_norm)
+        from adscan_internal.services.forest_identity import resolve_forest_identity
+
+        identity = _run_blocking(
+            resolve_forest_identity(domain_norm, target_dc, locate_root_dc=_root_dc_locator(shell))
+        )
+    if identity.source != SOURCE_NAME_ONLY and identity.domain_dns_name == identity.forest_dns_name:
+        sid = str(
+            ((getattr(shell, "domains_data", None) or {}).get(domain_norm) or {}).get("domain_sid") or ""
+        ).strip()
+        if sid:
+            identity = replace(identity, root_sid=sid)
+    return identity
+
+
 def _write_refusal_marker(shell: Any, reason_code: str, message: str) -> None:
     _write_refusal_marker_in(getattr(shell, "current_workspace_dir", ""), reason_code, message)
 
@@ -252,9 +324,11 @@ def environment_refused_for_run(shell: Any) -> bool:
     ``adscan ci`` returns exit 78 then. A run that assessed its primary forest
     and was refused only a trusted one finished its licensed work normally.
     """
-    memo = _memo(shell)
-    refused = [entry for entry in memo.values() if not entry.get("allowed")]
-    admitted = [entry for entry in memo.values() if entry.get("allowed")]
+    from adscan_internal.cli.pro_license_gate import pro_admission_memo
+
+    entries = list(_memo(shell).values()) + list(pro_admission_memo(shell).values())
+    refused = [entry for entry in entries if not entry.get("allowed")]
+    admitted = [entry for entry in entries if entry.get("allowed")]
     return bool(refused) and not admitted
 
 
@@ -425,7 +499,10 @@ def ensure_environment_admitted(
         print_exception(exception=exc)
         return False
     if not status.required:
-        return True
+        # Not Enterprise: the PRO licence registers the domain (dormant until required).
+        from adscan_internal.cli.pro_license_gate import ensure_pro_domain_admitted
+
+        return ensure_pro_domain_admitted(shell, domain_norm, dc_ip=dc_ip, phase=phase)
     if not status.scans_allowed:
         print_error(status.display_message)
         return False
@@ -446,27 +523,9 @@ def ensure_environment_admitted(
             return True
 
     try:
-        known_identity = (previous or {}).get("identity")
-        if isinstance(known_identity, ForestIdentity) and not known_identity.provisional:
-            identity = known_identity
-        else:
-            target_dc = dc_ip or _domain_dc_ip(shell, domain_norm)
-            from adscan_internal.services.forest_identity import resolve_forest_identity
-
-            identity = _run_blocking(
-                resolve_forest_identity(
-                    domain_norm, target_dc, locate_root_dc=_root_dc_locator(shell)
-                )
-            )
-        if identity.source != SOURCE_NAME_ONLY and identity.domain_dns_name == identity.forest_dns_name:
-            sid = str(
-                ((getattr(shell, "domains_data", None) or {}).get(domain_norm) or {}).get(
-                    "domain_sid"
-                )
-                or ""
-            ).strip()
-            if sid:
-                identity = replace(identity, root_sid=sid)
+        identity = resolve_identity_for_admission(
+            shell, domain_norm, dc_ip=dc_ip, known=(previous or {}).get("identity")
+        )
         other_forests = {
             entry.get("forest")
             for key, entry in memo.items()
@@ -569,7 +628,12 @@ def record_scan_identity_usage(shell: Any) -> None:
     """
     try:
         status = scan_launch_status(record=False)
-        if not status.required or status.license is None:
+        if not status.required:
+            from adscan_internal.cli.pro_license_gate import record_pro_scan_bands
+
+            record_pro_scan_bands(shell)
+            return
+        if status.license is None:
             return
         policy = entitlement_policy(status.license)
         if policy is None or policy.mode != MODE_SCOPED:
@@ -611,10 +675,12 @@ def record_scan_identity_usage(shell: Any) -> None:
 __all__ = [
     "LICENSE_BLOCKED_EXIT_CODE",
     "LICENSE_REFUSAL_FILENAME",
+    "ensure_lab_policy_allowed",
     "PHASE_AUTH",
     "PHASE_UNAUTH",
     "ensure_environment_admitted",
     "ensure_license_allows_new_scan",
     "environment_refused_for_run",
     "record_scan_identity_usage",
+    "resolve_identity_for_admission",
 ]

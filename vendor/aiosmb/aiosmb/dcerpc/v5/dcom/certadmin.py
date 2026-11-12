@@ -14,6 +14,13 @@ This module implements the AD CS CA-administration DCOM surface ADscan needs:
     ManageCertificates.
   - ``ICertAdminD::ResubmitRequest`` (opnum 5) — force-issue a pending/denied
     request, used by ESC7 to issue the SubCA request the CA held for approval.
+  - ``ICertAdminD2::GetMyRoles`` (opnum 47), ``GetOfficerRights`` (opnum 42) and
+    ``GetCAProperty`` (opnum 32, read with ``CR_PROP_ROLESEPARATIONENABLED``;
+    the answer is ``CAINFO.lRoleSeparationEnabled``, MS-WCCE 3.2.1.4.3.2.23) —
+    side-effect-free READS that establish, BEFORE a certificate is requested,
+    whether the caller can revoke it on this CA (the officer bit, officer-rights
+    restrictions, role separation). All three need only Read on the CA, which
+    Enroll implies.
 
 All are Kerberos-native: activated from a ``DCOMConnection`` opened off an
 existing SMB connection (``DCOMConnection.from_smbconnection``), so they reuse
@@ -32,7 +39,7 @@ from aiosmb import logger
 from aiosmb.dcerpc.v5 import system_errors
 from aiosmb.dcerpc.v5.dcom.remunknown import IRemUnknown
 from aiosmb.dcerpc.v5.dcom.dcomrt import DCOMCALL, DCOMANSWER
-from aiosmb.dcerpc.v5.dtypes import DWORD, FILETIME, LONG, LPWSTR
+from aiosmb.dcerpc.v5.dtypes import BOOL, DWORD, FILETIME, LONG, LPWSTR
 from aiosmb.dcerpc.v5.rpcrt import DCERPCException
 from aiosmb.dcerpc.v5.uuid import string_to_bin, uuidtup_to_bin
 
@@ -322,6 +329,163 @@ class ICertAdminDRevokeCertificateResponse(DCOMANSWER):
 
 
 # =========================================================================
+# Reversal-capability reads (MS-CSRA GetMyRoles / GetOfficerRights /
+# GetCAProperty) — all three need only Read on the CA
+# =========================================================================
+
+#: CA access bits ([MS-CSRA] 3.1.1.7; certadm.h CA_ACCESS_*). GetMyRoles returns
+#: the CALLER's own roles over these bits; the CA evaluates nested and
+#: cross-domain group membership itself.
+CA_ACCESS_ADMIN = 0x00000001     # Manage CA (also needed to publish a CRL)
+CA_ACCESS_OFFICER = 0x00000002   # Issue and Manage Certificates (revoke)
+CA_ACCESS_AUDITOR = 0x00000004
+CA_ACCESS_OPERATOR = 0x00000008
+CA_ACCESS_READ = 0x00000100
+CA_ACCESS_ENROLL = 0x00000200
+
+#: [MS-WCCE] 3.2.1.4.3.2.23: CR_PROP_ROLESEPARATIONENABLED (PropID 23 = 0x17),
+#: requested with PROPTYPE_LONG (1). The CA does NOT answer with a bare LONG: it
+#: MUST return "the value through the lRoleSeparationEnabled field of a CAINFO
+#: (section 2.2.2.4) structure", carried in the CERTTRANSBLOB. Reading the first
+#: DWORD of the blob reads CAINFO.cbSize (40 on a current CA), never the flag.
+CR_PROP_ROLESEPARATIONENABLED = 0x17
+PROPTYPE_LONG = 0x1
+
+#: [MS-WCCE] 2.2.2.4 CAINFO, ten 4-byte little-endian fields in this order:
+#: cbSize, CAType, cCASignatureCerts, cCAExchangeCerts, cExitAlgorithms,
+#: lPropIDMax, lRoleSeparationEnabled, cKRACertUsedCount, cKRACertCount,
+#: fAdvancedServer. ``lRoleSeparationEnabled`` is the seventh field.
+CAINFO_ROLE_SEPARATION_OFFSET = 24
+CAINFO_MIN_SIZE_FOR_ROLE_SEPARATION = CAINFO_ROLE_SEPARATION_OFFSET + 4
+
+
+def parse_cainfo_role_separation(blob: bytes) -> int:
+    """``CAINFO.lRoleSeparationEnabled`` from a GetCAProperty(0x17) value blob.
+
+    The CA MUST return 0 (disabled) or 1 (enabled); the raw value is returned
+    unchanged so the caller decides what an unexpected value means (never "on").
+
+    Raises:
+        CertAdminSecurityError: the blob is too short to carry the field, or its
+            own ``cbSize`` says the structure ends before it.
+    """
+    data = bytes(blob or b'')
+    if len(data) < CAINFO_MIN_SIZE_FOR_ROLE_SEPARATION:
+        raise CertAdminSecurityError(
+            f'GetCAProperty(role separation) returned {len(data)} bytes, '
+            f'not a CAINFO structure carrying lRoleSeparationEnabled'
+        )
+    cb_size = int.from_bytes(data[0:4], 'little', signed=False)
+    if cb_size < CAINFO_MIN_SIZE_FOR_ROLE_SEPARATION:
+        raise CertAdminSecurityError(
+            f'GetCAProperty(role separation) returned a CAINFO of cbSize={cb_size}, '
+            f'too small to carry lRoleSeparationEnabled'
+        )
+    off = CAINFO_ROLE_SEPARATION_OFFSET
+    return int.from_bytes(data[off:off + 4], 'little', signed=True)
+
+
+class ICertAdminD2GetMyRoles(DCOMCALL):
+    """
+    ICertAdminD2::GetMyRoles DCOM call structure.
+
+    Defined in [MS-CSRA] section 3.1.4.2.16. Opnum 47 on the ICertAdminD2
+    vtable (... 42 GetOfficerRights, 43 SetOfficerRights, 44 GetConfigEntry,
+    45 SetConfigEntry, 46 ImportKey, 47 GetMyRoles, 48 DeleteRow).
+
+    Returns the caller's own CA roles (CA_ACCESS_* bits). Requires only Read.
+    """
+    opnum = 47
+    structure = (
+        ('pwszAuthority', LPWSTR),
+    )
+
+
+class ICertAdminD2GetMyRolesResponse(DCOMANSWER):
+    """ICertAdminD2::GetMyRoles response: the caller's role bits and the HRESULT."""
+    structure = (
+        ('pdwRoles', LONG),
+        ('ErrorCode', LONG),
+    )
+
+
+class ICertAdminD2GetOfficerRights(DCOMCALL):
+    """
+    ICertAdminD2::GetOfficerRights DCOM call structure.
+
+    Defined in [MS-CSRA] section 3.1.4.2.11. Opnum 42.
+
+    ``pfEnabled`` 0 means officer rights are unrestricted (the CA security
+    descriptor is the whole story); non-zero means a restriction list scopes
+    which subjects a Certificate Manager may act on, a second access check the
+    roles do not reflect. Requires only Read.
+    """
+    opnum = 42
+    structure = (
+        ('pwszAuthority', LPWSTR),
+    )
+
+
+class ICertAdminD2GetOfficerRightsResponse(DCOMANSWER):
+    """ICertAdminD2::GetOfficerRights response."""
+    structure = (
+        ('pfEnabled', BOOL),
+        ('pctbSD', CERTTRANSBLOB),
+        ('ErrorCode', LONG),
+    )
+
+
+class ICertAdminD2GetCAProperty(DCOMCALL):
+    """
+    ICertAdminD2::GetCAProperty DCOM call structure.
+
+    Defined in [MS-CSRA] section 3.1.4.2.2. Opnum 32 (31 PublishCRLs,
+    32 GetCAProperty, 33 SetCAProperty). Used with
+    ``CR_PROP_ROLESEPARATIONENABLED``. Requires only Read.
+    """
+    opnum = 32
+    structure = (
+        ('pwszAuthority', LPWSTR),
+        ('PropId', LONG),
+        ('PropIndex', LONG),
+        ('PropType', LONG),
+    )
+
+
+class ICertAdminD2GetCAPropertyResponse(DCOMANSWER):
+    """ICertAdminD2::GetCAProperty response: the value blob and the HRESULT."""
+    structure = (
+        ('pctbPropertyValue', CERTTRANSBLOB),
+        ('ErrorCode', LONG),
+    )
+
+
+def _blob_bytes(raw_pb) -> bytes:
+    """Flatten a CERTTRANSBLOB ``pb`` (list of ints / 1-byte bytes / bytes) to bytes."""
+    if raw_pb is None:
+        return b''
+    if isinstance(raw_pb, (bytes, bytearray)):
+        return bytes(raw_pb)
+    return b''.join(
+        el if isinstance(el, (bytes, bytearray)) else bytes([el & 0xFF])
+        for el in (raw_pb or [])
+    )
+
+
+def _check_hresult(resp, what: str, ca_name: str) -> None:
+    """Raise when the response carries a failing HRESULT (never read it as data)."""
+    try:
+        code = int(resp['ErrorCode'])
+    except Exception:
+        return
+    if code:
+        raise CertAdminSecurityError(
+            f'{what} failed for {ca_name}: HRESULT 0x{code & 0xffffffff:08x}',
+            error_code=code & 0xffffffff,
+        )
+
+
+# =========================================================================
 # ICertAdminD2 DCOM Interface (GetCASecurity read + SetCASecurity write)
 # =========================================================================
 
@@ -453,6 +617,125 @@ class ICertAdminD2(IRemUnknown):
         error_code = resp['ErrorCode']
         logger.info(f'SetCASecurity for {ca_name} returned ErrorCode={error_code}')
         return error_code
+
+    async def get_my_roles(self, ca_name: str) -> int:
+        """
+        Read the caller's own CA roles (MS-CSRA GetMyRoles, opnum 47).
+
+        Returns:
+            The CA_ACCESS_* bitmask the CA evaluated for the caller.
+
+        Raises:
+            CertAdminSecurityError: on any DCERPC-layer failure or failing HRESULT.
+        """
+        req = ICertAdminD2GetMyRoles()
+        req['pwszAuthority'] = ca_name + '\x00'
+        resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'GetMyRoles failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        _check_hresult(resp, 'GetMyRoles', ca_name)
+        roles = int(resp['pdwRoles']) & 0xffffffff
+        logger.debug(f'GetMyRoles for {ca_name} returned 0x{roles:08x}')
+        return roles
+
+    async def get_officer_rights(self, ca_name: str) -> tuple:
+        """
+        Read whether officer rights are restricted (MS-CSRA GetOfficerRights, opnum 42).
+
+        Returns:
+            ``(enabled, sd_bytes)``: ``enabled`` False means unrestricted; when
+            True, ``sd_bytes`` is the restriction security descriptor.
+
+        Raises:
+            CertAdminSecurityError: on any DCERPC-layer failure or failing HRESULT.
+        """
+        req = ICertAdminD2GetOfficerRights()
+        req['pwszAuthority'] = ca_name + '\x00'
+        resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'GetOfficerRights failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        _check_hresult(resp, 'GetOfficerRights', ca_name)
+        enabled = bool(int(resp['pfEnabled']))
+        sd_bytes = _blob_bytes(resp['pctbSD']['pb']) if enabled else b''
+        return enabled, sd_bytes
+
+    async def _get_ca_property_blob(
+        self, ca_name: str, prop_id: int, prop_type: int, prop_index: int = 0
+    ) -> bytes:
+        """The raw ``pctbPropertyValue`` blob of MS-CSRA GetCAProperty (opnum 32)."""
+        req = ICertAdminD2GetCAProperty()
+        req['pwszAuthority'] = ca_name + '\x00'
+        req['PropId'] = int(prop_id)
+        req['PropIndex'] = int(prop_index)
+        req['PropType'] = int(prop_type)
+        resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'GetCAProperty failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        _check_hresult(resp, 'GetCAProperty', ca_name)
+        return _blob_bytes(resp['pctbPropertyValue']['pb'])
+
+    async def get_role_separation_enabled(self, ca_name: str) -> int:
+        """
+        Read whether role separation is enforced on the CA (``CAINFO.lRoleSeparationEnabled``).
+
+        [MS-WCCE] 3.2.1.4.3.2.23: GetCAProperty(CR_PROP_ROLESEPARATIONENABLED,
+        PROPTYPE_LONG) carries the answer inside a CAINFO structure (2.2.2.4),
+        not as a bare LONG. Requires only Read.
+
+        Returns:
+            The field as the CA sent it (0 = off, 1 = on).
+
+        Raises:
+            CertAdminSecurityError: on a DCERPC failure, failing HRESULT, or a
+                blob that does not carry the field.
+        """
+        blob = await self._get_ca_property_blob(
+            ca_name, CR_PROP_ROLESEPARATIONENABLED, PROPTYPE_LONG
+        )
+        value = parse_cainfo_role_separation(blob)
+        logger.debug(f'GetCAProperty(role separation) for {ca_name} returned {value}')
+        return value
+
+    async def get_ca_property_long(self, ca_name: str, prop_id: int, prop_index: int = 0) -> int:
+        """
+        Read a LONG CA property returned as a bare LONG (MS-CSRA GetCAProperty, opnum 32).
+
+        NOT for the properties [MS-WCCE] 3.2.1.4.3.2 returns inside a CAINFO
+        structure (role separation, CA type, certificate counts, advanced
+        server): their first DWORD is ``CAINFO.cbSize``. Role separation is read
+        with :meth:`get_role_separation_enabled`.
+
+        Raises:
+            CertAdminSecurityError: on a DCERPC failure, failing HRESULT, or a
+                value blob that is not a 4-byte LONG.
+        """
+        req = ICertAdminD2GetCAProperty()
+        req['pwszAuthority'] = ca_name + '\x00'
+        req['PropId'] = int(prop_id)
+        req['PropIndex'] = int(prop_index)
+        req['PropType'] = PROPTYPE_LONG
+        resp, err = await self._request(req, IID_ICertAdminD2, self.get_iPid())
+        if err is not None:
+            raise CertAdminSecurityError(
+                f'GetCAProperty failed for {ca_name}: {_describe_dcerpc_error(err)}',
+                error_code=_dcerpc_error_code(err),
+            ) from err
+        _check_hresult(resp, 'GetCAProperty', ca_name)
+        value = _blob_bytes(resp['pctbPropertyValue']['pb'])
+        if len(value) < 4:
+            raise CertAdminSecurityError(
+                f'GetCAProperty for {ca_name} returned {len(value)} bytes, not a LONG',
+            )
+        return int.from_bytes(value[:4], 'little', signed=True)
 
     async def _request(self, req, iid, uuid):
         """Internal DCOM request wrapper (parity with ICertRequestD)."""

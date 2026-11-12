@@ -29,9 +29,14 @@ class ProxyChainError(Exception):
 
 
 class UniServer:
-	def __init__(self, target:UniTarget, packetizer:Packetizer, bindtype:int = None):
+	def __init__(self, target:UniTarget, packetizer:Packetizer, bindtype:int = None, handoff:bool = False):
 		self.target = target
 		self.bindtype = bindtype
+		# ADSCAN: handoff mode. The server binds nothing; connections accepted by
+		# an external owner of the port (ADscan's listener broker) are fed in
+		# through ``handle_accepted_stream`` and dispatched exactly as if this
+		# server had accepted them (same packetizer, same TLS handshake).
+		self.handoff = handoff
 		self.packetizer = packetizer
 		self.bind_progress_evt = asyncio.Event()
 		self.connection_queue = asyncio.Queue()
@@ -230,6 +235,23 @@ class UniServer:
 			if remote_writer is not None:
 				remote_writer.close()
 			raise
+
+	async def handle_accepted_stream(self, reader, writer):
+		"""Serve one connection accepted by an external listener (handoff mode)."""
+		if self.target.protocol == UniProto.SERVER_SSL_TCP:
+			await self.__handle_connection_ssl(reader, writer)
+		else:
+			await self.__handle_connection(reader, writer)
+
+	async def __handoff_queue(self):
+		while True:
+			connection = await self.connection_queue.get()
+			yield connection
+
+	async def tcp_dispatcher_handoff(self, connection_callback:Callable[[UniConnection], None]):
+		while True:
+			connection = await self.connection_queue.get()
+			asyncio.create_task(connection_callback(connection))
 
 	async def __handle_connection(self, reader, writer):
 		packetizer = copy.deepcopy(self.packetizer)
@@ -444,6 +466,9 @@ class UniServer:
 						connection = await self.connection_queue.get()
 						yield connection
 					
+				elif self.handoff is True and self.target.protocol in [UniProto.SERVER_TCP, UniProto.SERVER_SSL_TCP]:
+					async for connection in self.__handoff_queue():
+						yield connection
 				else:
 					if self.target.protocol in [UniProto.SERVER_TCP, UniProto.SERVER_SSL_TCP]:
 						if self.target.protocol == UniProto.SERVER_TCP:
@@ -538,6 +563,8 @@ class UniServer:
 					
 					dispatcher_task = asyncio.create_task(self.tcp_dispatcher(server, connection_callback))
 
+				elif self.handoff is True and self.target.protocol in [UniProto.SERVER_TCP, UniProto.SERVER_SSL_TCP]:
+					dispatcher_task = asyncio.create_task(self.tcp_dispatcher_handoff(connection_callback))
 				else:
 					if self.target.protocol in [UniProto.SERVER_TCP, UniProto.SERVER_SSL_TCP]:
 						if self.target.protocol == UniProto.SERVER_TCP:

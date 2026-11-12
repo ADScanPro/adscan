@@ -34,6 +34,8 @@ Design (all four properties hold by construction):
 
 from __future__ import annotations
 
+from adscan_core.scan_control import ScanAbortRequested
+from adscan_core.async_bridge import run_on_new_loop
 import difflib
 import os
 from dataclasses import dataclass, field
@@ -642,7 +644,6 @@ def _establish_domain_context(shell: Any, config: ExecuteConfig) -> bool:
 
     # Posture preflight — idempotent, best-effort, adapts auth automatically.
     try:
-        import asyncio  # noqa: PLC0415
 
         from adscan_internal.services.posture_orchestration import (  # noqa: PLC0415
             ensure_posture_fresh,
@@ -660,7 +661,7 @@ def _establish_domain_context(shell: Any, config: ExecuteConfig) -> bool:
             )
             phase = ProbePhase.AUTH
         if dc_ip:
-            asyncio.run(
+            run_on_new_loop(
                 ensure_posture_fresh(
                     shell,
                     domain=domain,
@@ -1226,6 +1227,13 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
     except KeyboardInterrupt:
         print_warning("Execution interrupted.")
         exit_code = 130
+    except ScanAbortRequested:
+        # The scan control plane stopped the verb (SIGINT or a platform stop
+        # request): its finally blocks ran, what it found is kept.
+        print_warning("Execution stopped before it finished; results so far are kept.")
+        from adscan_core.ci_exit_codes import CI_EXIT_ASSESSMENT_INCOMPLETE  # noqa: PLC0415
+
+        exit_code = CI_EXIT_ASSESSMENT_INCOMPLETE
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         # Always write the full traceback to adscan.debug.log (DEBUG-on-disk,

@@ -1696,6 +1696,155 @@ def emit_esc9_hardened_positive(
         print_info_debug(f"[positive-control] ESC9 hardened positive emit failed: {exc}")
 
 
+def _holder_resolver(domain: str, nodes: Any) -> Callable[[str], Any]:
+    """Return ``sid -> Holder`` over this run's collected nodes.
+
+    The name comes from the collected directory object (humanized through the
+    prose SSOT), then the well-known / domain-relative SID table; an unresolved
+    SID keeps an empty name and is never printed raw. "Tier 0 by definition" is
+    the Privilege Tier SSOT read on the principal's OWN identity (its SID), not
+    its memberships: the built-in administration identities, never a name match.
+    """
+    from adscan_core.reporting.ca_role_separation import Holder  # noqa: PLC0415
+    from adscan_core.reporting.principal_display import (  # noqa: PLC0415
+        resolve_sid_display_name,
+    )
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        PrivilegeTier,
+        privilege_tier_for_principal,
+    )
+
+    by_sid: dict[str, Any] = {}
+    for node in nodes or ():
+        for value in (
+            getattr(node, "object_id", None),
+            (getattr(node, "properties", None) or {}).get("objectid"),
+        ):
+            text = str(value or "").strip().upper()
+            if text.startswith("S-1-"):
+                by_sid.setdefault(text, node)
+
+    def _resolve(sid: str) -> Any:
+        key = str(sid or "").strip().upper()
+        name = ""
+        node = by_sid.get(key)
+        if node is not None:
+            name = humanize_principal_for_prose(
+                label=str(getattr(node, "name", "") or ""),
+                samaccountname=str(getattr(node, "samaccountname", "") or ""),
+                kind=str(getattr(node, "kind", "") or ""),
+                report_domain=domain,
+            )
+        if not name:
+            name = resolve_sid_display_name(key) or ""
+        try:
+            tier = privilege_tier_for_principal((), sid=key)
+        except Exception:  # noqa: BLE001 - an unclassifiable SID is counted
+            tier = None
+        return Holder(
+            sid=key,
+            name=name,
+            tier0_by_definition=tier is PrivilegeTier.TIER0_DIRECT,
+        )
+
+    return _resolve
+
+
+def emit_ca_role_separation_evidence(shell: Any, domain: str, nodes: Any) -> None:
+    """Record the AD CS segregation-of-duties reading for the domain.
+
+    Decided by :mod:`adscan_core.reporting.ca_role_separation` from what the
+    collector read on each CA this domain owns (the role-separation flag and the
+    CA's own security descriptor, both on the one administration interface the
+    ESC7 read already opens). When the scan account could not read the flag,
+    the value the cleanup account's reversal-capability probe read in this run
+    for the same in-scope CA is used; no new sign-in is made here.
+
+    Statuses: ``observed`` (every CA enforces it), ``contradicted`` (a CA does
+    not and one delegated principal holds both roles, named), ``incomplete``
+    (a CA could not be read, or the roles are separated only by assignment,
+    flagged ``holds_in_practice``) and ``not_assessed`` (nothing could be read).
+    Not a finding in any case. Best-effort: never raises.
+    """
+    recorder = _resolve_recorder()
+    if recorder is None:
+        return
+    domain_name = str(domain or "").strip()
+    if not domain_name:
+        return
+    try:
+        from adscan_core.reporting.ca_role_separation import (  # noqa: PLC0415
+            CATEGORY,
+            CONTROL_KEY,
+            build_segregation_evidence,
+            reading_from_properties,
+        )
+
+        node_list = list(nodes or ())
+        resolve_holder = _holder_resolver(domain_name, node_list)
+        cleanup_flag = _cleanup_probe_flag_reader(shell, domain_name)
+        readings = []
+        for node in node_list:
+            if str(getattr(node, "kind", "") or "") != "EnterpriseCA":
+                continue
+            props = getattr(node, "properties", None) or {}
+            ca_name = str(getattr(node, "name", "") or "").split("@", 1)[0].strip()
+            ca_host = str(props.get("dns_hostname") or "").strip()
+            reading = reading_from_properties(
+                ca_name,
+                ca_host,
+                props,
+                resolve_holder=resolve_holder,
+                fallback_flag=cleanup_flag(ca_host, ca_name),
+            )
+            if reading is not None:
+                readings.append(reading)
+        evidence = build_segregation_evidence(readings)
+        if evidence is None:
+            return
+        recorder(
+            shell,
+            domain_name,
+            key=CONTROL_KEY,
+            title=evidence.title,
+            category=CATEGORY,
+            status=evidence.status,
+            details=evidence.details(),
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[positive-control] CA role separation emit failed: {exc}")
+
+
+def _cleanup_probe_flag_reader(shell: Any, domain: str) -> Callable[[str, str], Optional[int]]:
+    """``(ca_host, ca_name) -> flag`` from the cleanup probe, in-scope domains only."""
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            domain_in_engagement_scope,
+        )
+
+        in_scope = bool(domain_in_engagement_scope(shell, domain))
+    except Exception as exc:  # noqa: BLE001 - unknown scope reads as out of scope
+        telemetry.capture_exception(exc)
+        in_scope = False
+
+    def _read(ca_host: str, ca_name: str) -> Optional[int]:
+        if not in_scope or not ca_host or not ca_name:
+            return None
+        try:
+            from adscan_internal.services.revert_right_probes import (  # noqa: PLC0415
+                session_ca_role_separation,
+            )
+
+            return session_ca_role_separation(shell, ca_host=ca_host, ca_name=ca_name)
+        except Exception as exc:  # noqa: BLE001 - no fallback is a plain "not read"
+            telemetry.capture_exception(exc)
+            return None
+
+    return _read
+
+
 def emit_enumerated_surface_positives(
     shell: Any, domain: str, census: Optional[Mapping[str, Any]]
 ) -> None:
@@ -1753,6 +1902,7 @@ def emit_enumerated_surface_positives(
 
 
 __all__ = [
+    "emit_ca_role_separation_evidence",
     "emit_enumerated_surface_positives",
     "emit_posture_positives",
     "emit_password_policy_positive",

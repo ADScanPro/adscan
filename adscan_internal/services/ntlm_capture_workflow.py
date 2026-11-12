@@ -482,6 +482,17 @@ class NativeListenerCapture:
         # describe_start_error() classifies it for the caller.
         self._start_error: BaseException | None = None
 
+    @property
+    def served_address(self) -> str | None:
+        """The local address whose shared socket serves this capture.
+
+        The listener broker binds the wildcard whenever it can, so this is
+        usually ``0.0.0.0`` even when ``listen_host`` names one callback address.
+        ``None`` before a successful :meth:`start`.
+        """
+        source = self._source
+        return getattr(source, "served_address", None) if source is not None else None
+
     def connection_stats(self) -> InboundConnectionSummary:
         """Return the inbound-connection tally observed by the listener.
 
@@ -574,38 +585,33 @@ class NativeListenerCapture:
         :meth:`start` did not fail. Walks the exception cause chain for an
         ``OSError`` errno so a wrapped bind error is still classified.
         """
-        import errno as _errno  # noqa: PLC0415
+        from adscan_internal.services.listener_broker import (  # noqa: PLC0415
+            ListenerUnavailableError,
+            classify_bind_error,
+        )
 
         exc = self._start_error
         if exc is None:
             return "none", ""
         host, port = self.listen_host, self.listen_port
-        found: int | None = None
-        seen: set[int] = set()
-        cur: BaseException | None = exc
-        while cur is not None and id(cur) not in seen:
-            seen.add(id(cur))
-            if isinstance(cur, OSError) and cur.errno is not None:
-                found = cur.errno
-                break
-            cur = cur.__cause__ or cur.__context__
-        if found == _errno.EACCES:
+        code, reason = classify_bind_error(exc, port=port)
+        if code == "eacces":
             return "eacces", (
-                f"permission denied binding privileged port {port} on {host} "
-                f"(EACCES). The runtime runs as a non-root container user and "
-                f"lacks privileged-port access; it needs CAP_NET_BIND_SERVICE so "
-                f"the coercion-based NTLM capture listener can bind."
+                f"permission denied opening privileged port {port} on {host} for the "
+                f"NTLM capture listener: {reason}."
             )
-        if found == _errno.EADDRINUSE:
+        if code == "eaddrinuse":
             return "eaddrinuse", (
-                f"port {port} on {host} is already in use (EADDRINUSE) — another "
-                f"service or a stale listener holds it; free it and retry."
+                f"port {port} on {host} is already in use (EADDRINUSE): another "
+                "service outside ADscan holds it; free it and retry."
             )
-        if found == _errno.EADDRNOTAVAIL:
+        if code == "eaddrnotavail":
             return "eaddrnotavail", (
                 f"listener IP {host} is not available inside the runtime "
-                f"(EADDRNOTAVAIL) — the interface is missing in the container."
+                f"(EADDRNOTAVAIL): the interface is missing in the container."
             )
+        if isinstance(exc, ListenerUnavailableError) and exc.code not in ("", "other"):
+            return exc.code, exc.reason
         from rich.markup import escape  # noqa: PLC0415
 
         return "other", escape(f"{type(exc).__name__}: {exc}")

@@ -622,8 +622,9 @@ MANUAL_RODC_PRP = (
 # when a record reaches the report without them.
 MANUAL_ISSUED_CERTIFICATE = (
     "Your certification authority issued this certificate during the assessment. It stays "
-    "valid for authentication until it expires or is revoked, and revoking it requires "
-    "certificate-manager rights on the CA, so your team has to complete this step.\n"
+    "valid for authentication until it expires or is revoked. ADscan did not revoke it, "
+    "because no account it held could revoke it on this CA when the revocation ran, so your "
+    "team has to complete this step.\n"
     "Run the commands below on the CA server, or on any host with the Certification "
     "Authority tools installed, as a member of the CA's Certificate Managers group (or the "
     "CA host's local Administrators):\n"

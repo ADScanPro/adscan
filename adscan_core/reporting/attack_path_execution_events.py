@@ -106,6 +106,67 @@ def not_needed_reason(notes: Mapping[str, Any] | None) -> str:
     return reason if reason in NOT_NEEDED_REASONS else ""
 
 
+# ── Steps declined before acting: the change could not be shown undoable ─────
+#: A certificate step: no account could be established, by the CA itself, to
+#: revoke the certificate there (reversible by construction, § 5.1).
+NOT_EXECUTED_REVERSAL_NOT_PROVEN: Final[str] = "reversal_not_proven"
+#: A directory change: the policy allows no manual cleanup and the cleanup
+#: account could not be confirmed to undo it in that domain.
+NOT_EXECUTED_REVERT_NOT_PERMITTED: Final[str] = "revert_not_permitted"
+
+#: Every "declined before acting" reason, worded once for the run view, the
+#: run record and the web relay. Never a failure (nothing was attempted) and
+#: never "the step stopped": the step was deliberately not run.
+DECLINED_REASONS: Final[Mapping[str, Mapping[str, str]]] = {
+    NOT_EXECUTED_REVERSAL_NOT_PROVEN: {
+        "headline": (
+            "Not run. ADscan could not confirm that an account can revoke the "
+            "certificate on this CA, so it requested none."
+        ),
+        "detail": (
+            "The weakness is still reported. An account holding \"Issue and Manage "
+            "Certificates\" on the CA closes this gap."
+        ),
+    },
+    NOT_EXECUTED_REVERT_NOT_PERMITTED: {
+        "headline": (
+            "Not run. The scan policy accepts no manual cleanup, and the cleanup "
+            "account could not be confirmed to undo this change."
+        ),
+        "detail": "The weakness is still reported.",
+    },
+}
+
+
+def declined_reason(notes: Mapping[str, Any] | None, reasons: Any = ()) -> str:
+    """The "declined before acting" reason of a step, or ``""``.
+
+    Read from the step's notes (``not_executed_reason``) or, when a branch
+    reported it as the step's reason, from ``reasons``.
+    """
+    if isinstance(notes, Mapping):
+        reason = str(notes.get(NOT_EXECUTED_REASON_KEY) or "").strip().lower()
+        if reason in DECLINED_REASONS:
+            return reason
+    for item in reasons or ():
+        token = str(item or "").strip().lower()
+        if token in DECLINED_REASONS:
+            return token
+    return ""
+
+
+def declined_explanation(reason: str) -> dict[str, str]:
+    """The run-summary explanation of a step declined before acting."""
+    entry = DECLINED_REASONS.get(str(reason or "").strip().lower()) or {}
+    return {
+        "code": "",
+        "reason_code": str(reason or ""),
+        "headline": str(entry.get("headline") or "Not run in this execution."),
+        "detail": str(entry.get("detail") or ""),
+        "next_step": "",
+    }
+
+
 def not_needed_explanation(reason: str) -> dict[str, str]:
     """The run-summary explanation shape for a step that was not needed."""
     entry = NOT_NEEDED_REASONS.get(str(reason or "").strip().lower()) or {}
@@ -175,6 +236,9 @@ def outcome_from_status(status: Any, notes: Mapping[str, Any] | None = None) -> 
     if token not in _ATTEMPTED_STATUSES and not_needed_reason(notes):
         # Put back to "discovered" with the reason: deliberately not run.
         return OUTCOME_NOT_NEEDED
+    if token not in _ATTEMPTED_STATUSES and declined_reason(notes):
+        # Declined before acting (the change could not be shown undoable).
+        return OUTCOME_SKIPPED
     if token == "closed_by_configuration":
         return OUTCOME_CLOSED_BY_CONFIGURATION
     if token == "not_vulnerable":
@@ -272,7 +336,12 @@ __all__ = [
     "OUTCOME_CLOSED_BY_CONFIGURATION",
     "OUTCOME_NOT_NEEDED",
     "OUTCOME_NOT_REACHED",
+    "DECLINED_REASONS",
     "NOT_EXECUTED_REASON_KEY",
+    "NOT_EXECUTED_REVERSAL_NOT_PROVEN",
+    "NOT_EXECUTED_REVERT_NOT_PERMITTED",
+    "declined_explanation",
+    "declined_reason",
     "NOT_NEEDED_CREDENTIAL_ALREADY_HELD",
     "NOT_NEEDED_REASONS",
     "not_needed_reason",

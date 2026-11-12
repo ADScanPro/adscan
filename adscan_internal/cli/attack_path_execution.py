@@ -11,6 +11,7 @@ The goal is to reuse this flow from multiple places (e.g. Phase 2 summary,
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 
 from adscan_internal.services.ledger_guard import ledger_or_warn
@@ -42,6 +43,8 @@ from adscan_internal import (
     print_warning_debug,
     telemetry,
 )
+from adscan_core.engagement.identity import attack_path_id_for_record
+from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
 from adscan_core.path_offer import build_path_offer_context
 from adscan_core.reporting.path_node_kinds import derive_path_node_kinds
 from adscan_core.reporting.step_outcome_note import (
@@ -1002,6 +1005,11 @@ def persist_attack_path_snapshot(
                         summary.get("id")
                         or f"{scope}:{index}:{summary.get('source')}->{summary.get('target')}"
                     ),
+                    # The public path id (the ordered-route fingerprint): the id
+                    # the report prints, the web CTEM keys on and
+                    # ``adscan recheck --path`` resolves. ``id`` above is a
+                    # listing-local token and is not stable across runs.
+                    "path_id": attack_path_id_for_record(summary, domain),
                     "index": index,
                     "source": str(summary.get("source") or ""),
                     "target": str(summary.get("target") or ""),
@@ -1045,7 +1053,8 @@ def persist_attack_path_snapshot(
                 ]
 
         payload = {
-            "schema_version": "1.0",
+            # Owned by the output contract (schema attack_paths_snapshot.v1.json).
+            SCHEMA_VERSION_KEY: output_marker("attack_paths_snapshot"),
             "generated_at": datetime.now(UTC).isoformat(),
             "domain": domain,
             "scope": scope,
@@ -5565,7 +5574,6 @@ def _probe_ticket_network_logon(
     auth/connect failure (the caller classifies whether it is a logon-type
     denial worth caching vs a transient error).
     """
-    import asyncio  # noqa: PLC0415
 
     from adscan_internal.services.smb_transport import (  # noqa: PLC0415
         SMBConfig,
@@ -5588,7 +5596,7 @@ def _probe_ticket_network_logon(
             return False, str(exc)
 
     try:
-        return asyncio.run(_run())
+        return run_on_new_loop(_run())
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
 
@@ -11190,6 +11198,13 @@ def resolve_collapsed_pivot_targets(
     return [via_accounts[idx]]
 
 
+def _scan_control_should_stop() -> bool:
+    """Whether the scan control plane asked the current work to stop."""
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
+    return scan_control().should_stop()
+
+
 def execute_selected_attack_path(
     shell: Any,
     domain: str,
@@ -11562,6 +11577,56 @@ def _execute_selected_attack_path_impl(
                 actor=actor,
             )
 
+        def _decline_unless_reversal_proven(
+            action_key: str,
+            from_label: str,
+            to_label: str,
+            ca_target: Any,
+        ) -> bool:
+            """True when the certificate step must not run: nobody can revoke here.
+
+            Reversible by construction (§ 5.1): under a policy that accepts no
+            manual cleanup, an AD CS step runs only once an account is established,
+            by the CA itself, to hold the right to revoke the certificate on THIS
+            CA. Asked here, before the step writes anything (ESC4's template,
+            ESC9's UPN) and before any coercion (ESC8, ESC11); the enrollment seam
+            asks again as the backstop. A declined step keeps its status and
+            carries ``reversal_not_proven``, so the finding is still reported and
+            the route stays mapped.
+            """
+            from adscan_internal.services.adcs.reversal_capability import (  # noqa: PLC0415
+                NOT_EXECUTED_REASON as _REVERSAL_NOT_PROVEN,
+                issuance_permitted,
+            )
+
+            try:
+                ca_name, ca_host, ca_fqdn = ca_target
+            except (TypeError, ValueError):
+                return False
+            if issuance_permitted(
+                shell,
+                domain=domain,
+                ca_name=str(ca_name or ""),
+                ca_host=str(ca_fqdn or ca_host or ""),
+                surface="attack_path",
+                technique=str(action_key or "").upper(),
+            ):
+                return False
+            try:
+                update_edge_status_by_labels(
+                    shell,
+                    domain,
+                    from_label=from_label,
+                    relation=str(action_key or "").upper(),
+                    to_label=to_label,
+                    status="theoretical",
+                    notes={"not_executed_reason": _REVERSAL_NOT_PROVEN, "ca_name": str(ca_name or "")},
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+            return True
+
         def _handle_failed_adcs_step(
             action: str,
             from_label: str,
@@ -11587,6 +11652,27 @@ def _execute_selected_attack_path_impl(
 
             evidence = getattr(esc_result, "evidence", None)
             evidence = evidence if isinstance(evidence, dict) else {}
+
+            # Declined before any write: no account could be established to revoke
+            # the certificate on that CA (reversible by construction § 5.1). Not an
+            # attempt and not a failure: the step keeps its status and the finding
+            # is still reported; the refusal line was already printed once.
+            if evidence.get("not_executed_reason"):
+                declined_notes = dict(notes)
+                declined_notes["not_executed_reason"] = str(evidence["not_executed_reason"])
+                try:
+                    update_edge_status_by_labels(
+                        shell,
+                        domain,
+                        from_label=from_label,
+                        relation=action,
+                        to_label=to_label,
+                        status="theoretical",
+                        notes=declined_notes,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    telemetry.capture_exception(exc)
+                return
 
             # Strong certificate binding refused the PKINIT certificate (KB5014754):
             # the ESC9/ESC10 implicit-mapping (or ESC14 weak-mapping) EXISTENCE
@@ -11636,6 +11722,14 @@ def _execute_selected_attack_path_impl(
                 notes_with_reason[REASON_CODE_KEY] = (
                     ReasonCode.CERT_ISSUED_NOT_AUTHED.value
                 )
+            else:
+                # The cause the ESC runner recorded (e.g. the relay listener
+                # could not open its port) travels with the step, so the reason
+                # SSOT classifies it instead of reading "no cause recorded".
+                # Nothing is invented: no recorded error, no note.
+                recorded_error = str(getattr(esc_result, "error", None) or "").strip()
+                if recorded_error and not notes_with_reason.get("error"):
+                    notes_with_reason["error"] = recorded_error
             try:
                 update_edge_status_by_labels(
                     shell,
@@ -12593,6 +12687,15 @@ def _execute_selected_attack_path_impl(
                 continue
             if idx < resume_from_step_idx:
                 continue
+            # Scan control checkpoint between attack steps: a skipped phase or a
+            # stopped scan executes no further step of this path. The path's
+            # own cleanup and status recording below still run; the abort is
+            # raised at the next pipeline boundary.
+            if _scan_control_should_stop():
+                print_info_debug(
+                    f"[attack-path] stopping before step {idx}: scan control stop requested"
+                )
+                break
             action = str(step.get("action") or "").strip()
             key = action.lower()
             if key in non_executable_actions:
@@ -15378,6 +15481,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
 
                 esc1_templates = _resolve_adcs_template_candidates(
                     shell,
@@ -15605,6 +15710,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
 
                 esc3_agent_templates = _extract_cert_templates_by_role(
                     details,
@@ -15892,6 +15999,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
 
                 # ESC4 is disruptive: it modifies a certificate template in AD.
                 # Require explicit operator confirmation.
@@ -16168,6 +16277,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
 
                 esc13_templates = _resolve_adcs_template_candidates(
                     shell,
@@ -16373,6 +16484,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -16555,6 +16668,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -16737,6 +16852,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 from adscan_internal.cli.privileged_target_selection import (
                     resolve_privileged_target_user,
                 )
@@ -16919,6 +17036,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 ca_name, ca_host, ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 execution_started = True
                 with _active_step_context(
                     action=action_name,
@@ -17050,7 +17169,7 @@ def _execute_selected_attack_path_impl(
                     run_cross_org_tgt_delegation_step,
                 )
 
-                crossorg_result = asyncio.run(
+                crossorg_result = run_on_new_loop(
                     run_cross_org_tgt_delegation_step(
                         shell,
                         trusting_domain=trusting_domain,
@@ -17331,6 +17450,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -17539,6 +17660,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -17825,6 +17948,8 @@ def _execute_selected_attack_path_impl(
                     )
                     return execution_started
                 esc_ca_name, esc_ca_host, esc_ca_fqdn = esc_ca_target
+                if _decline_unless_reversal_proven(key, from_label, to_label, esc_ca_target):
+                    return execution_started
                 esc_templates = _resolve_adcs_template_candidates(
                     shell,
                     domain=domain,
@@ -21598,12 +21723,20 @@ def _offer_attack_paths_for_execution_summaries_impl(
         # the policy excluded were offered for execution, one preselected).
         # ``offer_indices`` maps each offered option back to its summary index,
         # so the numbering still matches the listing.
+        #
+        # ``max_display`` bounds what a human reads in a menu. An unattended run
+        # has no reader, so its candidate window is the WHOLE list: capping it
+        # would leave mapped routes beyond the first ``max_display`` silently
+        # never attempted, a bound nobody declared (Exposure-Validation prefers
+        # complete over fast). The listing panel above still shows the top
+        # ``max_display`` with "Showing N/M".
+        candidate_window = len(summaries) if non_interactive else max_display
         offer_indices = [
             idx
-            for idx, summary in enumerate(summaries[:max_display])
+            for idx, summary in enumerate(summaries[:candidate_window])
             if _path_offerable_for_execution(summary)
         ]
-        not_offered = min(max_display, len(summaries)) - len(offer_indices)
+        not_offered = min(candidate_window, len(summaries)) - len(offer_indices)
         if not offer_indices:
             if not_offered:
                 print_info(
@@ -21692,7 +21825,7 @@ def _offer_attack_paths_for_execution_summaries_impl(
                         **build_path_offer_context(
                             summaries,
                             offer_indices,
-                            max_display=max_display,
+                            max_display=candidate_window,
                             offerable=_path_offerable_for_execution,
                             domain=domain,
                         ),
@@ -22443,6 +22576,23 @@ def _finalize_post_execution_snapshot(
         print_exception(exception=exc)
 
 
+def _print_cleanup_capability_once(shell: Any) -> None:
+    """Before the first attack step of a session, state what the cleanup account can undo.
+
+    Runs once per session and only when a cleanup account is configured. By the
+    time attack paths are offered the directory is collected, so every in-scope
+    domain and CA has a row. Printed, never asked: ``adscan ci`` is unattended.
+    Never raises.
+    """
+    try:
+        from adscan_internal.services.cleanup_capability import print_once  # noqa: PLC0415
+
+        print_once(shell)
+    except Exception as exc:  # noqa: BLE001 - a disclosure never blocks the run
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def offer_attack_paths_for_execution_summaries(
     shell: Any,
     domain: str,
@@ -22497,6 +22647,7 @@ def offer_attack_paths_for_execution_summaries(
     # ``finally`` skips the regeneration so we do not force the exact expensive
     # recompute the deferral avoided.
     refresh_deferred: list[bool] = []
+    _print_cleanup_capability_once(shell)
     try:
         executed = _offer_attack_paths_for_execution_summaries_impl(
             shell,

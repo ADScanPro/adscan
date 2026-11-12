@@ -218,6 +218,11 @@ def _build() -> tuple[Detector, ...]:
         _d("adcs.esc12", C_ADCS, "adcs_esc12", "adcsesc12",
            reobserve=REOBSERVE_PROBE, instrumented=True),
         _d("adcs.ntauth", C_ADCS, "adcs_orphaned_ca_ntauth", reobserve=REOBSERVE_OBJECT),
+        # Segregation of duties on each CA (role separation, read from the CA
+        # over CSRA with its role holders). Governance evidence with no finding
+        # of its own, so it observes only its positive.
+        _d("adcs.role_separation", C_ADCS, "", "", "ca_role_separation_enforced",
+           reobserve=REOBSERVE_PROBE),
         _d("adcs.relay_to_web_enrollment", C_ADCS, "", "coerceandrelayntlmtoadcs"),
         # -- domain policy reads --------------------------------------------
         _d("policy.password", C_ANALYSIS, "weak_password_policy", "",

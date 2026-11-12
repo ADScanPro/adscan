@@ -246,6 +246,65 @@ def path_key(steps: Any, *, nodes: Any = None, domain: str = "") -> str:
     return compute_attack_path_fingerprint(steps=steps, nodes=nodes, domain=domain)
 
 
+# ---------------------------------------------------------------------------
+# The public attack-path id: one id for the report, the web, recheck and files.
+# ---------------------------------------------------------------------------
+
+#: Key under which a path record carries its id (the full route fingerprint).
+PATH_ID_KEY = "path_id"
+
+#: Characters of the id a document prints. ``recheck --path`` takes any
+#: unambiguous prefix of 8 or more, so the printed form is always accepted.
+PATH_ID_DISPLAY_LENGTH = 12
+
+
+def derive_attack_path_id(record: Mapping[str, Any], domain: str) -> str:
+    """Derive the path id of one attack-path record from its route.
+
+    The one derivation of the arguments :func:`compute_attack_path_fingerprint`
+    takes from a record: ``details.nodes`` before ``nodes``, and the route-level
+    facts (source, target, title) only when the record has no hops. The web
+    ingestion keys ``attack_path_records`` with exactly this.
+    """
+    details = record.get("details") if isinstance(record.get("details"), Mapping) else {}
+    return compute_attack_path_fingerprint(
+        steps=record.get("steps"),
+        nodes=details.get("nodes") or record.get("nodes") or [],
+        domain=domain,
+        source=record.get("source") or details.get("source"),
+        target=details.get("target") or record.get("target"),
+        title=record.get("title"),
+    )
+
+
+def attack_path_id_for_record(record: Mapping[str, Any], domain: str) -> str:
+    """The id of one attack-path record: its ordered-route fingerprint.
+
+    The one path identifier every surface agrees on. The web keys its
+    ``attack_path_records`` with it, ``recheck --path`` resolves it, the
+    attack-path snapshot and the report data carry it, and the report prints its
+    first :data:`PATH_ID_DISPLAY_LENGTH` characters. A record that already
+    carries :data:`PATH_ID_KEY` (stamped by :func:`stamp_attack_path_ids`) is
+    trusted; otherwise the id is derived (:func:`derive_attack_path_id`).
+    """
+    stamped = str(record.get(PATH_ID_KEY) or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", stamped):
+        return stamped
+    return derive_attack_path_id(record, domain)
+
+
+def display_path_id(path_id: str) -> str:
+    """The printed form of a path id (its first :data:`PATH_ID_DISPLAY_LENGTH` characters)."""
+    return str(path_id or "").strip().lower()[:PATH_ID_DISPLAY_LENGTH]
+
+
+def stamp_attack_path_ids(records: Iterable[Any], domain: str) -> None:
+    """Stamp :data:`PATH_ID_KEY` on every record that lacks it (in place, idempotent)."""
+    for record in records:
+        if isinstance(record, dict) and not record.get(PATH_ID_KEY):
+            record[PATH_ID_KEY] = derive_attack_path_id(record, domain)
+
+
 def object_ids(nodes: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     """Map each node's graph id to its stable object id."""
     out: dict[str, str] = {}

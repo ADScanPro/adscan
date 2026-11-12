@@ -19,7 +19,7 @@ catalog and regenerate.
 
 <!-- BEGIN GENERATED: technique-inventory -->
 
-**108 techniques** across 15 categories · 69 executed end to end · AD CS ESC1–ESC17 · 94 reported finding types.
+**108 techniques** across 15 categories · 69 executed end to end · AD CS ESC1–ESC17 (13 classes executed, 4 detected only) · 94 reported finding types.
 
 ### ACL / ACE Abuse (18)
 

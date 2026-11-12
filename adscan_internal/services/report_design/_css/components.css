@@ -219,6 +219,9 @@ table.adscan-table tr:last-child td { border-bottom: none; }
 }
 .ds-step-txt { font-size: 8.5pt; color: var(--text-2); line-height: 1.5; }
 .ds-step-status { margin-left: 2mm; vertical-align: 0.4mm; }
+/* Why an attempted step did not complete (shared reason SSOT). New rule, so
+   scoped under the opt-in document class. */
+.ds-doc .ds-step-reason { margin-top: 0.8mm; font-size: 8pt; color: var(--text-3); line-height: 1.5; }
 
 /* ── Route line — source → target ─────────────────────────────────────────
    Set in the sans, not the display serif: principal names arrive from the

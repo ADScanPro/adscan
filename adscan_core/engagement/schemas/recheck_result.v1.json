@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.recheck_result/1",
+  "title": "ADscan recheck result v1",
+  "description": "runs/<run_id>/recheck_result.json: what one adscan recheck run decided for every item it targeted, the reads it performed and, for a walk or an exercise, where the route went. adscan recheck --json prints this document on stdout. Written by one writer (_result_document in adscan_internal/services/recheck/runner.py). Declared objects may gain fields within the major; do not reject unknown keys. Names AD objects (labels, object ids), so it is client data.",
+  "type": "object",
+  "required": ["schema", "run_id", "plan", "recorded_at", "recorded_at_frame", "items", "reads", "walk", "control_observations"],
+  "properties": {
+    "schema": {"const": "adscan.recheck_result/1"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 64},
+    "plan": {
+      "type": "object",
+      "$comment": "The adscan.run_plan/1 document of this run (kind recheck); validate it with run_plan.v1.json. A --path target is recorded as the full path id, whatever form was typed."
+    },
+    "recorded_at": {"type": "string", "minLength": 10, "maxLength": 64},
+    "recorded_at_frame": {
+      "type": "object",
+      "$comment": "Which clock recorded_at came from (adscan_core/reporting/clock_frame.py): the host clock may be stepped to a domain controller.",
+      "required": ["frame", "stepped"],
+      "properties": {
+        "frame": {"enum": ["target_agreed", "unverified", "mixed"]},
+        "stepped": {"type": "boolean"}
+      }
+    },
+    "credential": {
+      "type": "object",
+      "$comment": "Which account the reads used: the workspace's own account, or the one given with --username for this run only (never stored in the workspace). Never carries a secret.",
+      "required": ["source"],
+      "properties": {
+        "source": {"enum": ["workspace", "override"]},
+        "username": {"type": "string", "maxLength": 512}
+      }
+    },
+    "items": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+    "reads": {"type": "array", "items": {"$ref": "#/$defs/read"}},
+    "walk": {"type": "array", "items": {"$ref": "#/$defs/walk_step"}},
+    "control_observations": {
+      "type": "array",
+      "$comment": "Hardened controls the recheck's reads observed (positive evidence), kept here and never written into the scan's report.",
+      "items": {"$ref": "#/$defs/control_observation"}
+    }
+  },
+  "$defs": {
+    "item_id": {"type": "string", "pattern": "^[0-9a-f]{8,64}$"},
+    "item": {
+      "type": "object",
+      "required": ["item_id", "kind", "key", "domain_id", "object_id", "label", "check_id", "verdict", "verdict_text", "reason", "transition"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/item_id"},
+        "kind": {"type": "string", "$comment": "finding or step (open vocabulary)."},
+        "key": {"type": "string", "$comment": "The finding catalog key, or the step's relation."},
+        "domain_id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "object_id": {"type": ["string", "null"], "$comment": "The affected object (a SID, wk:<SID> or guid:<GUID>); null for a domain-level item."},
+        "label": {"type": "string"},
+        "check_id": {"type": ["string", "null"], "$comment": "The read-only check that observes the item; null when it has none in this release."},
+        "verdict": {"enum": ["re_observed", "closed_observed", "re_executed", "stopped", "not_rechecked", ""]},
+        "verdict_text": {"type": "string", "$comment": "The verdict in words, with its reason."},
+        "reason": {"type": "string", "$comment": "Why an item was not re-checked or where a walk stopped (open vocabulary, for example read_failed:credential_rejected)."},
+        "not_recheckable_reason": {"type": "string", "$comment": "Added within major 1 (additive, optional). The declared reason this item cannot be re-checked read-only (its detector has no read-only check, or that check never decides this key), in words; empty when that is not why it was not re-checked. verdict_text then carries the same sentence."},
+        "transition": {"enum": ["new", "still_present", "remediated", "reopened", "not_reevaluated", "terminal_unchanged", ""], "$comment": "The ledger change this run applied; empty when it applied none."}
+      }
+    },
+    "read": {
+      "type": "object",
+      "required": ["check_id", "domain_id", "status", "scope", "examined", "reason"],
+      "properties": {
+        "check_id": {"type": "string", "minLength": 1},
+        "domain_id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "status": {"enum": ["ran", "partial", "skipped", "failed", "not_applicable"]},
+        "scope": {"enum": ["domain", "object"]},
+        "examined": {"type": ["integer", "null"], "minimum": 0, "$comment": "Objects read for an object-scoped read; null for a domain-wide read."},
+        "reason": {"type": "string"}
+      }
+    },
+    "walk_step": {
+      "type": "object",
+      "required": ["item_id", "outcome", "reason"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/item_id"},
+        "outcome": {"enum": ["completed", "stopped", "not_walked"]},
+        "reason": {"type": "string"}
+      }
+    },
+    "control_observation": {
+      "type": "object",
+      "required": ["domain_id", "key", "last_seen"],
+      "properties": {
+        "domain_id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "key": {"type": "string", "minLength": 1},
+        "title": {"type": "string"},
+        "observed_state": {"type": "string"},
+        "last_seen": {"type": "string"}
+      }
+    }
+  }
+}

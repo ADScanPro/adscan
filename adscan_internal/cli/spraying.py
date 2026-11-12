@@ -11,6 +11,8 @@ The service layer (adscan_internal.spraying) performs the tool execution and bas
 
 from __future__ import annotations
 
+from adscan_core.domain_auth_state import is_authenticated_state
+from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 
 import json
@@ -2104,10 +2106,9 @@ def validate_domain_reuse_with_ntlm_hash(
     # credential-checking auth per user with NO NTLM<->Kerberos re-attempt — so
     # each user's badPwdCount rises at most once, the same lockout-safety invariant
     # the native password spray relies on.
-    import asyncio
 
     try:
-        hits, outcomes = asyncio.run(
+        hits, outcomes = run_on_new_loop(
             _run_native_domain_spray(
                 domain=domain,
                 dc_ip=str(dc_ip),
@@ -5329,7 +5330,7 @@ def ask_for_spraying(shell: SprayShell, domain: str) -> None:
         default=decision.confirm_default,
     )
     if wants_spraying:
-        if shell.domains_data[domain]["auth"] == "auth":
+        if is_authenticated_state(shell.domains_data[domain]["auth"]):
             shell.ask_for_pass_policy(domain)
         # Phase 4 uses the coverage-driven continue-loop (maximum coverage for ci,
         # default-yes guided flow for interactive start). The legacy do_spraying
@@ -7583,7 +7584,7 @@ def spraying_with_blank_password(
 
     try:
         with dashboard.live_session(), live_counter_checked_by_caller():
-            asyncio.run(_run())
+            run_on_new_loop(_run())
             try:
                 dashboard.update(
                     done=state["tested"], success=len(hits), error=state["errors"], in_flight=0
@@ -8974,7 +8975,6 @@ def execute_domain_spray_native(
         _spinner_label_parts.append(f"on {marked_domain}")
         _spinner_label = " ".join(_spinner_label_parts)
 
-        import asyncio  # noqa: PLC0415
 
         print_info_debug(
             f"[spray] Native domain spray on {marked_domain}: "
@@ -8988,7 +8988,7 @@ def execute_domain_spray_native(
             spinner="dots",
         ):
             _native_started_at = _spray_monotonic()
-            hit_usernames, outcome_counts = asyncio.run(
+            hit_usernames, outcome_counts = run_on_new_loop(
                 _run_native_domain_spray(
                     domain=domain,
                     dc_ip=dc_ip,
@@ -9085,7 +9085,7 @@ def do_computer_pre2k_spraying(shell: SprayShell, domain: str) -> None:
 
     marked_domain = mark_sensitive(domain, "domain")
     auth_mode = shell.domains_data.get(domain, {}).get("auth")
-    if auth_mode != "auth":
+    if not is_authenticated_state(auth_mode):
         print_warning(
             f"Computer pre2k checks require an authenticated session for {marked_domain}."
         )
@@ -9302,7 +9302,7 @@ def _drop_owned_with_summary(
     should be told rather than left to infer it. The kept list is unaffected by
     the summary, so the spray set is unchanged.
     """
-    items = list(names)
+    items = _drop_cleanup_accounts(shell, domain, names, context=context)
     owned = _owned_usernames(shell, domain)
     if not owned:
         return items, OwnedPrincipalDrop(list_size=len(items))
@@ -9327,6 +9327,65 @@ def _drop_owned_with_summary(
             + ", ".join(mark_sensitive(str(name), "user") for name in dropped)
         )
     return kept, drop
+
+
+#: Shell attribute: domains whose cleanup-account exclusion was already announced.
+_CLEANUP_EXCLUSION_NOTED_ATTR = "_spray_cleanup_exclusion_noted"
+
+
+def _drop_cleanup_accounts(shell: "SprayShell", domain: str, names, *, context: str) -> list[str]:
+    """``names`` minus the client's cleanup accounts, announced once per domain.
+
+    The account the client supplied to undo ADscan's changes is never a spray
+    target: a failed guess would raise its ``badPwdCount`` and could lock out
+    the one account the cleanup depends on. It is left out before anything
+    else counts the list, so the eligibility funnel reads as if it was never
+    listed, and the operator is told why it is missing.
+    """
+    items = list(names)
+    try:
+        from adscan_internal.services.cleanup_credential_loader import (  # noqa: PLC0415
+            cleanup_account_names,
+        )
+
+        reserved = cleanup_account_names()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store leaves nothing to drop
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return items
+    if not reserved:
+        return items
+
+    def _is_reserved(name) -> bool:
+        bare = str(name or "").strip()
+        bare = bare.split("\\", 1)[-1].split("@", 1)[0]
+        return bare.casefold() in reserved
+
+    kept = [name for name in items if not _is_reserved(name)]
+    dropped = [name for name in items if _is_reserved(name)]
+    if not dropped:
+        return kept
+    noted = getattr(shell, _CLEANUP_EXCLUSION_NOTED_ATTR, None)
+    if not isinstance(noted, set):
+        noted = set()
+        try:
+            setattr(shell, _CLEANUP_EXCLUSION_NOTED_ATTR, noted)
+        except Exception:  # noqa: BLE001 - a read-only shell just announces again
+            pass
+    key = str(domain or "").strip().lower()
+    if key not in noted:
+        noted.add(key)
+        accounts = ", ".join(mark_sensitive(str(name), "user") for name in dropped)
+        print_info(
+            f"Left out of password spraying in {mark_sensitive(domain, 'domain')}: {accounts}. "
+            "It is the cleanup account, used only to undo ADscan's changes, so no "
+            "password is ever guessed against it."
+        )
+    print_info_debug(
+        f"[spray] {context}: excluded {len(dropped)} cleanup account(s) for "
+        f"{mark_sensitive(domain, 'domain')}"
+    )
+    return kept
 
 
 def _drop_owned(shell: "SprayShell", domain: str, names, *, context: str) -> list[str]:
@@ -9965,6 +10024,11 @@ def _spray_mined_base_word(shell: "SprayShell", domain: str) -> None:
         )
 
 
+#: Scan-control identity of the password-spraying selector loop (one long step).
+SPRAY_STEP_ID = "password_spraying"
+SPRAY_STEP_LABEL = "Password spraying"
+
+
 def run_spray_coverage(
     shell: "SprayShell",
     domain: str,
@@ -10024,77 +10088,86 @@ def run_spray_coverage(
         print_info(decision.note)
         return queue
 
-    # Step 2 — coverage-aware selector loop.
+    # Step 2 — coverage-aware selector loop. One long scan-control step: Ctrl+C
+    # offers "stop this step and keep what it found", checked between spray
+    # rounds so a stop never leaves a password half-sent to an account list.
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
     ci_done: set[str] = set()
     last_overview: "dict | None" = None
-    for _iteration in range(_SPRAY_SELECTOR_MAX_ITER):
-        if not entered_pwned and _domain_is_pwned(shell, domain):
-            print_info(_spray_stopped_on_compromise_note(domain))
-            break
-        overview = _compute_spray_coverage_overview(shell, domain)
-        if overview is None:
-            # Coverage could not be computed (no user list / policy). Interactive
-            # falls back to the legacy menu once; ci has nothing safe to do - but
-            # it says so instead of returning silently.
-            if interactive:
-                do_spraying(shell, domain)
-            else:
-                print_info(
-                    "Password spraying skipped: no user list or account-lockout "
-                    "policy is available yet, so no spray can be run safely."
-                )
-            break
-        last_overview = overview
-        # A spray type the scan policy excludes is never presented, auto-picked
-        # or dispatched: drop it from the selector rows up front (the dispatch
-        # seam still refuses, as defence in depth).
-        rows = [r for r in overview["rows"] if _spray_choice_allowed(shell, r["type"])]
-        overview = {**overview, "rows": rows}
-
-        # Nothing sprayable right now — every account is locked, near lockout, or
-        # owned. Re-prompting an empty selector is noise; finish the phase. (ci
-        # already terminates here because _ci_pick_spray finds no eligible type;
-        # this makes the interactive path stop too instead of looping on "Done".)
-        if not overview["eligibility"].eligible_users:
-            print_info(
-                "No eligible users remain (all locked, near lockout, or owned) — "
-                "password spraying complete."
-            )
-            break
-
-        if interactive:
-            has_pending = bool(
-                _load_pending_spraying_password_candidates(shell, domain=domain)
-            )
-            has_reuse = bool(
-                _load_pending_domain_reuse_candidates(shell, domain=domain)
-            )
-            choice = _interactive_select_spray(
-                shell, domain, overview, has_pending=has_pending, has_reuse=has_reuse
-            )
-            if choice is None:
+    with scan_control().step(
+        SPRAY_STEP_ID, label=SPRAY_STEP_LABEL, long=True, unit="spray rounds", domain=domain
+    ) as spray_step:
+        for _iteration in range(_SPRAY_SELECTOR_MAX_ITER):
+            if spray_step.should_stop():
                 break
-            row = next((r for r in rows if r["type"] == choice), None)
-            if row is not None and row["pct"] < 100 and row["eligible"] <= 0:
-                print_warning(
-                    "No users are currently eligible for this spray — all are within "
-                    "the lockout safety margin. Re-run after the observation window resets."
-                )
-                continue
-        else:
-            choice = _ci_pick_spray(rows, ci_done)
-            if choice is None:
-                break  # every type covered or no eligible users -> phase done
-            ci_done.add(choice)
+            if not entered_pwned and _domain_is_pwned(shell, domain):
+                print_info(_spray_stopped_on_compromise_note(domain))
+                break
+            overview = _compute_spray_coverage_overview(shell, domain)
+            if overview is None:
+                # Coverage could not be computed (no user list / policy). Interactive
+                # falls back to the legacy menu once; ci has nothing safe to do - but
+                # it says so instead of returning silently.
+                if interactive:
+                    do_spraying(shell, domain)
+                else:
+                    print_info(
+                        "Password spraying skipped: no user list or account-lockout "
+                        "policy is available yet, so no spray can be run safely."
+                    )
+                break
+            last_overview = overview
+            # A spray type the scan policy excludes is never presented, auto-picked
+            # or dispatched: drop it from the selector rows up front (the dispatch
+            # seam still refuses, as defence in depth).
+            rows = [r for r in overview["rows"] if _spray_choice_allowed(shell, r["type"])]
+            overview = {**overview, "rows": rows}
 
-        try:
-            _dispatch_spray_choice(
-                shell, domain, choice, overview=overview, interactive=interactive
-            )
-        except Exception as exc:  # noqa: BLE001 — one spray must not abort the loop
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            print_error(f"Spray '{choice}' failed; continuing.")
+            # Nothing sprayable right now — every account is locked, near lockout, or
+            # owned. Re-prompting an empty selector is noise; finish the phase. (ci
+            # already terminates here because _ci_pick_spray finds no eligible type;
+            # this makes the interactive path stop too instead of looping on "Done".)
+            if not overview["eligibility"].eligible_users:
+                print_info(
+                    "No eligible users remain (all locked, near lockout, or owned) — "
+                    "password spraying complete."
+                )
+                break
+
+            if interactive:
+                has_pending = bool(
+                    _load_pending_spraying_password_candidates(shell, domain=domain)
+                )
+                has_reuse = bool(
+                    _load_pending_domain_reuse_candidates(shell, domain=domain)
+                )
+                choice = _interactive_select_spray(
+                    shell, domain, overview, has_pending=has_pending, has_reuse=has_reuse
+                )
+                if choice is None:
+                    break
+                row = next((r for r in rows if r["type"] == choice), None)
+                if row is not None and row["pct"] < 100 and row["eligible"] <= 0:
+                    print_warning(
+                        "No users are currently eligible for this spray — all are within "
+                        "the lockout safety margin. Re-run after the observation window resets."
+                    )
+                    continue
+            else:
+                choice = _ci_pick_spray(rows, ci_done)
+                if choice is None:
+                    break  # every type covered or no eligible users -> phase done
+                ci_done.add(choice)
+
+            try:
+                _dispatch_spray_choice(
+                    shell, domain, choice, overview=overview, interactive=interactive
+                )
+            except Exception as exc:  # noqa: BLE001 — one spray must not abort the loop
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                print_error(f"Spray '{choice}' failed; continuing.")
 
     # Seed the deferred queue from the final near-threshold exclusions (best-effort).
     try:

@@ -15,7 +15,8 @@ Decisions this module encodes:
   (``detectors.py``), never through a scan phase it did not run. The spec lookup
   is derived per item: the detector's check id at the item's base scope and
   vantage. An item whose detector has no read-only check in this release has no
-  spec, so it can never close; it is reported "not re-checked".
+  spec, so it can never close; it is reported "not re-checked" with the reason
+  the recheck declares for that detector (``TargetItem.not_recheckable_reason``).
 * **Presence propagates, absence does not.** A step found present proves the
   finding it backs (the catalog ``vuln_key`` join) is present too; a step found
   closed says nothing about the finding's other affected objects, so the finding
@@ -131,9 +132,20 @@ WALK_STOPPED = "stopped"
 WALK_NOT_WALKED = "not_walked"
 
 _HEX_ID = re.compile(r"^[0-9a-f]{8,64}$")
+#: The ``P-XXXXXXXX`` label the legacy Word report printed for a path. Accepted
+#: by ``--path`` for compatibility and resolved to the path id (the route
+#: fingerprint), which is what the run plan and the result document record.
+_LEGACY_PATH_LABEL = re.compile(r"^p-[0-9a-f]{8}$")
+#: A full ledger item id (``identity.step_id`` and friends: a 64-hex digest).
+_STEP_ITEM_ID = re.compile(r"^[0-9a-f]{64}$")
 _FINDING_TOKEN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _OBJECT_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$")
 _DOMAIN_TOKEN = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,252}$")
+
+
+def is_legacy_path_label(token: str) -> bool:
+    """Whether ``token`` is a legacy ``P-XXXXXXXX`` path label (case-insensitive)."""
+    return bool(_LEGACY_PATH_LABEL.match(str(token or "").strip().lower()))
 
 
 class RecheckError(ValueError):
@@ -172,8 +184,13 @@ def validate_target(target: RecheckTarget, depth: str) -> None:
             raise RecheckError("--finding needs a finding key (for example kerberoast) or a finding id.")
     if target.level == LEVEL_STEP and not _HEX_ID.match(target.step.strip().lower()):
         raise RecheckError("--step needs a step id (at least 8 hex characters).")
-    if target.level == LEVEL_PATH and not _HEX_ID.match(target.path.strip().lower()):
-        raise RecheckError("--path needs a path id (at least 8 hex characters).")
+    if target.level == LEVEL_PATH and not (
+        _HEX_ID.match(target.path.strip().lower()) or is_legacy_path_label(target.path)
+    ):
+        raise RecheckError(
+            "--path needs a path id: the id the report prints next to each path "
+            "(at least 8 hex characters), or a P-XXXXXXXX label from an older report."
+        )
     if target.objects and target.level != LEVEL_FINDING:
         raise RecheckError("--object narrows a finding; use it with --finding.")
     for value in target.objects:
@@ -248,6 +265,10 @@ class TargetItem:
         check_id: The detector check whose read observes it; ``None`` when the
             detector has no read-only check in this release.
         finding_keys: For a step, the finding keys it backs (``vuln_key``).
+        not_recheckable_reason: The declared reason this item cannot be
+            re-checked read-only (its detector has no observer, or its
+            observer never decides this key), as operator copy; ``""`` when
+            nothing is declared.
     """
 
     item_id: str
@@ -261,6 +282,7 @@ class TargetItem:
     check_id: Optional[str]
     finding_keys: tuple[str, ...] = ()
     disposition: str = ""
+    not_recheckable_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -269,7 +291,9 @@ class ReadOutcome:
 
     ``examined_ids`` is ``None`` for a domain-wide read, else the objects read.
     ``present`` maps a finding key or a step relation (lowercase) to the object
-    ids where the condition holds (a domain-scoped finding uses its domain id).
+    ids where the condition holds (a domain-scoped finding uses its domain id),
+    or to the ledger item ids of the steps still present when several steps
+    share one object.
     """
 
     check_id: str
@@ -289,16 +313,32 @@ class WalkStep:
     reason: str = ""
 
 
+def _sentence_tail(sentence: str) -> str:
+    """``sentence`` continued after a colon: its first letter lowered, unless an acronym."""
+    if len(sentence) > 1 and (sentence[1].islower() or sentence[1] == " "):
+        return sentence[0].lower() + sentence[1:]
+    return sentence
+
+
 @dataclass(frozen=True)
 class Verdict:
-    """What the operator is told about one item."""
+    """What the operator is told about one item.
+
+    ``reason`` is the stable code; ``detail`` is the declared reason the item
+    cannot be re-checked read-only, set only when that is why it was not
+    (the read ran, or there is no read), and preferred over the code's generic
+    label in :attr:`text`.
+    """
 
     code: str
     reason: str = ""
+    detail: str = ""
 
     @property
     def text(self) -> str:
         label = VERDICT_LABELS.get(self.code, self.code)
+        if self.detail:
+            return f"{label}: {_sentence_tail(self.detail)}"
         if not self.reason:
             return label
         return f"{label}: {REASON_LABELS.get(self.reason, self.reason.replace('_', ' '))}"
@@ -326,12 +366,32 @@ def _is_present(item: TargetItem, outcome: Optional[ReadOutcome]) -> bool:
     keys = (item.key.lower(), *item.finding_keys) if item.kind != "finding" else (item.key,)
     for key in keys:
         holders = outcome.present.get(key) or frozenset()
+        # An observer that can tell steps sharing one object apart (several
+        # principals holding a right over the same target) names the step
+        # itself by its item id.
+        if item.item_id in holders:
+            return True
         if item.object_id is None:
-            if holders:
+            # A step relation can share its spelling with a finding key
+            # (``DCSync`` / ``dcsync``): a present step's item id is never
+            # evidence that the domain-scoped finding is present.
+            if any(not _STEP_ITEM_ID.match(str(h)) for h in holders):
                 return True
         elif item.object_id in holders:
             return True
     return False
+
+
+def _finding_keys_of(check_id: Optional[str]) -> frozenset[str]:
+    """The finding keys the detector family ``check_id`` observes."""
+    if not check_id:
+        return frozenset()
+    from adscan_core.engagement.detectors import DETECTORS  # noqa: PLC0415
+
+    for detector in DETECTORS:
+        if detector.check_id == check_id:
+            return frozenset(detector.finding_keys)
+    return frozenset()
 
 
 def _reason_for(result: ItemResult, outcome: Optional[ReadOutcome]) -> str:
@@ -346,6 +406,19 @@ def _reason_for(result: ItemResult, outcome: Optional[ReadOutcome]) -> str:
     if outcome is not None and outcome.status is CheckStatus.SKIPPED and outcome.reason:
         return f"{REASON_NOT_READ}:{outcome.reason}"
     return REASON_NOT_READ
+
+
+def _declared_detail(item: TargetItem, outcome: Optional[ReadOutcome]) -> str:
+    """The item's declared reason, when the read ran and still did not decide it.
+
+    A read that failed, was skipped or never ran keeps its own, run-specific
+    reason: the declared one would hide what went wrong in this run.
+    """
+    if not item.not_recheckable_reason or outcome is None:
+        return ""
+    if outcome.status not in {CheckStatus.RAN, CheckStatus.PARTIAL}:
+        return ""
+    return item.not_recheckable_reason
 
 
 def build_recheck_decisions(
@@ -393,10 +466,16 @@ def build_recheck_decisions(
     present_findings: set[tuple[str, str]] = set()
     for item in targets:
         step = walked.get(item.item_id)
-        if (step is not None and step.outcome == WALK_COMPLETED) or _is_present(item, outcome_of(item)):
+        executed = step is not None and step.outcome == WALK_COMPLETED
+        if executed or _is_present(item, outcome_of(item)):
             present_ids.add(item.item_id)
             for key in item.finding_keys:
-                present_findings.add((key, item.domain_id))
+                # A read that observes the finding itself already decided it
+                # through the scan's finding gate (a domain controller's
+                # inherent DCSync is a step, never a finding): a step it reads
+                # present does not override that. An executed step does.
+                if executed or key not in _finding_keys_of(item.check_id):
+                    present_findings.add((key, item.domain_id))
     for item in targets:
         if item.kind == "finding" and (item.key, item.domain_id) in present_findings:
             present_ids.add(item.item_id)
@@ -452,9 +531,11 @@ def build_recheck_decisions(
         elif step is not None and step.outcome == WALK_NOT_WALKED:
             verdict = Verdict(VERDICT_NOT_RECHECKED, step.reason or REASON_NOT_WALKED)
         elif item.check_id is None:
-            verdict = Verdict(VERDICT_NOT_RECHECKED, REASON_NO_READ_ONLY_CHECK)
+            verdict = Verdict(VERDICT_NOT_RECHECKED, REASON_NO_READ_ONLY_CHECK, item.not_recheckable_reason)
         else:
-            verdict = Verdict(VERDICT_NOT_RECHECKED, _reason_for(result, outcome))
+            verdict = Verdict(
+                VERDICT_NOT_RECHECKED, _reason_for(result, outcome), _declared_detail(item, outcome)
+            )
         verdicts[item.item_id] = verdict
         if result.transition is Transition.NOT_REEVALUATED:
             if verdict.reason == REASON_NO_READ_ONLY_CHECK:
@@ -482,11 +563,15 @@ def build_recheck_decisions(
             )
         )
         if item.check_id is None:
-            verdicts[item.item_id] = Verdict(VERDICT_NOT_RECHECKED, REASON_NO_READ_ONLY_CHECK)
+            verdicts[item.item_id] = Verdict(
+                VERDICT_NOT_RECHECKED, REASON_NO_READ_ONLY_CHECK, item.not_recheckable_reason
+            )
         elif covered:
             verdicts[item.item_id] = Verdict(VERDICT_CLOSED_OBSERVED)
         else:
-            verdicts[item.item_id] = Verdict(VERDICT_NOT_RECHECKED, REASON_NOT_READ)
+            verdicts[item.item_id] = Verdict(
+                VERDICT_NOT_RECHECKED, REASON_NOT_READ, _declared_detail(item, outcome)
+            )
     return RecheckDecisions(observed=observed, coverage=coverage, results=results, verdicts=verdicts)
 
 
@@ -508,6 +593,8 @@ __all__ = (
     "LEVEL_FINDING",
     "LEVEL_PATH",
     "LEVEL_STEP",
+    "REASON_LABELS",
+    "REASON_NO_READ_ONLY_CHECK",
     "RESULT_SCHEMA",
     "ReadOutcome",
     "RecheckDecisions",
@@ -526,6 +613,7 @@ __all__ = (
     "WALK_STOPPED",
     "WalkStep",
     "build_recheck_decisions",
+    "is_legacy_path_label",
     "is_open",
     "parse_filter",
     "plan_document",

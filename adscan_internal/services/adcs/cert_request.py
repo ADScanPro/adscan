@@ -849,6 +849,10 @@ class CertRequestResult:
     private_key_pem: Optional[bytes] = None
     issued_eku_oids: list[str] = dc_field(default_factory=list)
     issued_application_policy_oids: list[str] = dc_field(default_factory=list)
+    #: Set when the request was NOT sent because a precondition failed before
+    #: any write (``reversal_not_proven``: no account could be established to
+    #: revoke the certificate on this CA). Distinct from a CA refusal.
+    not_executed_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1562,6 +1566,29 @@ async def _resolve_impersonation_sid(config: CertRequestConfig) -> CertRequestCo
     return config
 
 
+async def _require_reversal_capability(config: CertRequestConfig) -> Optional[str]:
+    """``None`` to proceed, else the refusal token (``reversal_not_proven``).
+
+    A request without a session shell (``ledger_shell``) is one the caller
+    declared touches no live CA, so it is not gated.
+    """
+    shell = getattr(config, "ledger_shell", None)
+    if shell is None:
+        return None
+    from adscan_internal.services.adcs.reversal_capability import (  # noqa: PLC0415
+        require_reversal_capability,
+    )
+
+    return await require_reversal_capability(
+        shell,
+        domain=config.ledger_domain or config.effective_target_domain,
+        ca_name=config.ca_name,
+        ca_host=config.ca_fqdn or config.ca_host,
+        surface="cert_request",
+        technique=config.ledger_technique or "",
+    )
+
+
 async def request_certificate_native(
     config: CertRequestConfig, output_dir: Path
 ) -> CertRequestResult:
@@ -1577,6 +1604,13 @@ async def request_certificate_native(
     """
     try:
         config = await _resolve_impersonation_sid(config)
+        # Reversible by construction (§ 5.1): the right to REVOKE this certificate
+        # on this CA is established BEFORE it is requested, never discovered after.
+        refusal = await _require_reversal_capability(config)
+        if refusal is not None:
+            return CertRequestResult(
+                success=False, error=refusal, not_executed_reason=refusal
+            )
         return await _do_request_certificate(config, output_dir)
     except Exception as exc:
         telemetry.capture_exception(exc)

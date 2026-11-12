@@ -38,6 +38,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from adscan_core.compliance_frameworks import FRAMEWORK_KEYS
+from adscan_core.report_options import REPORT_DEFAULT_THEME as _REPORT_DEFAULT_THEME
+from adscan_core.report_options import REPORT_THEMES as _REPORT_THEMES
+
 
 def _warn(message: str) -> None:
     """Emit an operator-facing warning (best-effort, never blocks plan build)."""
@@ -237,8 +241,8 @@ _EVERY = _ALL_AUTH | _ALL_UNAUTH
 #
 # The trust / attack-path policy choices mirror
 # :mod:`adscan_internal.services.scan_config`; the reporting frameworks/theme
-# choices mirror the deliver/ci CLI valid sets
-# (``adscan_internal.cli.deliver._VALID_FRAMEWORK_KEYS`` / ``_VALID_REPORT_THEMES``).
+# choices come from the framework registry (``adscan_core.compliance_frameworks``)
+# and the theme choices mirror ``deliver._VALID_REPORT_THEMES``.
 # The contract test asserts both, so the CLI flags, the engine, and the web
 # form can never drift.
 # ---------------------------------------------------------------------------
@@ -264,21 +268,13 @@ ATTACK_PATH_POLICY_CHOICES: tuple[str, ...] = (
     "selected",
     "interactive",
 )
-REPORT_FRAMEWORK_CHOICES: tuple[str, ...] = (
-    "ens",
-    "nis2",
-    "iso27001",
-    "dora",
-    "pci_dss",
-    # CIS Windows Server Benchmark — technical hardening, not a regulation.
-    "cis",
-)
-REPORT_THEME_CHOICES: tuple[str, ...] = (
-    "corporate_light",
-    "premium_dark",
-    "editorial",
-)
-REPORT_THEME_DEFAULT: str = "corporate_light"
+# Read from the framework registry (adscan_core.compliance_frameworks), the one
+# place the framework list is declared.
+REPORT_FRAMEWORK_CHOICES: tuple[str, ...] = FRAMEWORK_KEYS
+# The theme SSOT (adscan_core is importable everywhere the descriptor is read,
+# the appliance backend included).
+REPORT_THEME_CHOICES: tuple[str, ...] = _REPORT_THEMES
+REPORT_THEME_DEFAULT: str = _REPORT_DEFAULT_THEME
 
 # CVE-verification target scope (the ``audit_extras`` phase option). Mirrors
 # :mod:`adscan_internal.services.scan_config` (``CVE_TARGET_SCOPES``). The

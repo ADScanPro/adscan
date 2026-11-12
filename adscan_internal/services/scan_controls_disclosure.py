@@ -113,6 +113,20 @@ def _pacing_block(shell: Any, domain: str | None = None) -> dict[str, Any]:
     )
 
 
+def _reversal_capability_block(shell: Any) -> dict[str, Any] | None:
+    """The cleanup-account capability block this run established, or ``None``.
+
+    The run records it once the directory is collected (``cleanup_capability``);
+    the disclosure reads that FINAL record. One taken before collection, or none
+    at all, is established now, read-only (``capability_block_for_report``).
+    """
+    from adscan_internal.services.cleanup_capability import (  # noqa: PLC0415
+        capability_block_for_report,
+    )
+
+    return capability_block_for_report(shell)
+
+
 def build_blocks(
     shell: Any, *, listings: Mapping[str, Iterable[Any]] | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -157,6 +171,8 @@ def build_blocks(
         execution_decision=execution_decision(shell),
         password_attempts=resolve_password_attempt_rules(shell).to_dict(),
         revert_verdicts=[v.to_dict() for v in verdicts_for_report(shell)],
+        reversal_capability=_reversal_capability_block(shell),
+        agreed_policy=getattr(getattr(shell, "scan_config", None), "agreed_policy", None),
     )
     if listings:
         # Display metadata only (never the path set or a status), the same
@@ -169,6 +185,18 @@ def build_blocks(
             total += count_routes_not_executed(batch)
         policy_block["routes_not_executed"] = total
     return policy_block, pacing_block
+
+
+def _in_engagement_scope(shell: Any, domain: str) -> bool:
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            domain_in_engagement_scope,
+        )
+
+        return bool(domain_in_engagement_scope(shell, domain))
+    except Exception as exc:  # noqa: BLE001 - unknown scope: state nothing for it
+        telemetry.capture_exception(exc)
+        return False
 
 
 def stamp_scan_controls_disclosure(
@@ -195,6 +223,11 @@ def stamp_scan_controls_disclosure(
             domain_pacing = _pacing_block(shell, domain)
             domain_policy = dict(policy_block)
             domain_policy["pacing_applied"] = scan_pacing_disclosure_view(domain_pacing)
+            if not _in_engagement_scope(shell, domain):
+                # What the cleanup account can undo is a statement about the
+                # in-scope forests; a domain the engagement does not cover
+                # (a trust partner only mapped) carries none.
+                domain_policy.pop("reversal_capability", None)
             record_scan_policy_coverage(shell, domain, block=domain_policy)
             record_scan_pacing(shell, domain, block=domain_pacing)
 

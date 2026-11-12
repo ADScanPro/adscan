@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from adscan_core.cross_loop_lock import CrossLoopLock
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -812,8 +813,14 @@ def _clock_synced_at(shell: Any) -> dict:
     return memo
 
 
-def _clock_lock_for(shell: Any, domain_norm: str) -> "asyncio.Lock | None":
-    """Return (lazily creating) the per-domain asyncio lock, or None on failure."""
+def _clock_lock_for(shell: Any, domain_norm: str) -> "CrossLoopLock | None":
+    """Return (lazily creating) the per-domain clock lock, or None on failure.
+
+    A :class:`CrossLoopLock`, not an ``asyncio.Lock``: this guard is reached from
+    a fresh ``asyncio.run`` loop per sync call (``do_ensure_clock_synced_fresh``)
+    and from worker threads, and an asyncio lock raises "bound to a different
+    event loop" for a waiter from any loop but the first.
+    """
     locks = getattr(shell, _CLOCK_LOCKS_ATTR, None)
     if not isinstance(locks, dict):
         locks = {}
@@ -823,7 +830,7 @@ def _clock_lock_for(shell: Any, domain_norm: str) -> "asyncio.Lock | None":
             return None
     lock = locks.get(domain_norm)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = CrossLoopLock()
         locks[domain_norm] = lock
     return lock
 

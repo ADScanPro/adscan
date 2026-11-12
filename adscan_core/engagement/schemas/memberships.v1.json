@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.memberships/1",
+  "title": "ADscan group membership snapshot v1",
+  "description": "domains/<domain>/memberships.json: the MemberOf graph of one domain as collected (nodes and edges), plus the memberships an attack step created or proved at run time (runtime_memberships) and the derived lookup maps the attack-path engine reads (user_to_groups, group_to_parents, ...). Written by the collector and updated through one writer when a run proves a membership (adscan_internal/services/membership_snapshot.py). Version marker: schema_version, 'membership-1.<minor>'; version is the engine's internal layout counter. nodes, edges and generated_at are present once the domain was collected; a file a run created before any collection carries only the runtime memberships and the lookup maps. The implicit primary-group membership (Domain Users) is not always an edge: read user_to_groups when present. Declared objects may gain fields within a major; do not reject unknown keys. Node properties and edge notes are opaque.",
+  "type": "object",
+  "required": ["schema_version", "domain"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^membership-1\\.[0-9]+$"},
+    "version": {"type": "integer"},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 255},
+    "generated_at": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nodes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/node"}},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}},
+    "runtime_memberships": {"type": "array", "items": {"$ref": "#/$defs/runtime_membership"}},
+    "user_to_groups": {"$ref": "#/$defs/label_to_labels"},
+    "computer_to_groups": {"$ref": "#/$defs/label_to_labels"},
+    "group_to_parents": {"$ref": "#/$defs/label_to_labels"},
+    "label_to_sid": {"$ref": "#/$defs/label_to_string"},
+    "sid_to_label": {"$ref": "#/$defs/label_to_string"},
+    "group_labels": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "label_to_labels": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+    "label_to_string": {"type": "object", "additionalProperties": {"type": "string"}},
+    "node": {
+      "type": "object",
+      "required": ["kind", "label"],
+      "additionalProperties": true,
+      "$comment": "The collector's graph payload of a directory object. A light endpoint node for a group of another collected domain carries only its identity.",
+      "properties": {
+        "kind": {"type": "string"},
+        "label": {"type": "string"},
+        "name": {"type": "string"},
+        "objectId": {"type": ["string", "null"]},
+        "properties": {"type": "object"},
+        "highvalue": {"type": "boolean"},
+        "isTierZero": {"type": "boolean"}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": ["from", "to", "relation"],
+      "properties": {
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "relation": {"type": "string"},
+        "edge_type": {"type": "string"},
+        "status": {"type": "string"},
+        "notes": {"type": "object"},
+        "id": {"type": "string"},
+        "category": {"type": ["string", "null"]},
+        "vuln_key": {"type": ["string", "null"]},
+        "discovered_at": {"type": "string"},
+        "first_seen": {"type": "string"},
+        "last_seen": {"type": "string"}
+      }
+    },
+    "runtime_membership": {
+      "type": "object",
+      "$comment": "A membership an attack step created (and ADscan will revert) or proved effective. user or computer names the member.",
+      "required": ["group"],
+      "properties": {
+        "user": {"type": "string"},
+        "computer": {"type": "string"},
+        "group": {"type": "string"},
+        "source": {"type": "string"},
+        "evidence": {"type": "object"},
+        "origin_kind": {"type": "string"},
+        "origin_technique": {"type": "string"},
+        "origin_relation": {"type": "string"},
+        "cleanup_behavior": {"type": "string"},
+        "managed_by_adscan": {"type": "boolean"}
+      }
+    }
+  }
+}

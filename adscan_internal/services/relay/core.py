@@ -15,32 +15,35 @@ from typing import Any, Protocol
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import mark_sensitive, print_error_debug
-from adscan_core.rich_output import print_exception
+from adscan_core.rich_output import print_exception, print_warning
+from adscan_internal.services.listener_broker import (  # noqa: F401 - re-exported
+    ListenerUnavailableError,
+    describe_listener_bind_error,
+)
 
 
-class RelayListenerUnavailableError(Exception):
-    """The relay listener could not bind its host/port (a vantage/data gap).
+#: The listener-unavailable error lives with the listener broker, the SSOT of
+#: every inbound bind; the relay name is kept for its callers.
+RelayListenerUnavailableError = ListenerUnavailableError
 
-    Raised when the listen socket cannot be opened — most commonly
-    ``EADDRINUSE`` because another ADscan listener (NBT-NS/LLMNR poisoning, the
-    shared SMB capture listener) already holds the port. This is a DATA/VANTAGE
-    gap, NOT a defensive control: it never claims the environment blocked the
-    attack (Exposure-Validation doctrine). The relay runner converts it into a
-    failed :class:`RelayRunResult` so execution continues to the next path
-    instead of aborting the whole phase with a raw traceback.
+
+def report_relay_listener_unavailable(
+    exc: RelayListenerUnavailableError, *, technique: str
+) -> None:
+    """Tell the operator once, in one line, that a relay listener did not start.
+
+    Shared by every relay or capture listener that raises
+    :class:`RelayListenerUnavailableError`, so each states it the same way. The
+    traceback goes to the debug log and the session recording only.
     """
 
-    def __init__(self, *, host: str, port: int, reason: str) -> None:
-        self.host = host
-        self.port = port
-        self.reason = reason
-        super().__init__(self.reason_summary)
-
-    @property
-    def reason_summary(self) -> str:
-        """One-line, client-safe reason (no defensive-control claim)."""
-
-        return f"relay listener port {self.port} unavailable — {self.reason}"
+    print_exception(exception=exc, visible=False)
+    label = str(technique or "relay").strip() or "relay"
+    print_warning(
+        f"{label}: the relay listener could not open port {exc.port} "
+        f"({exc.reason}). The step was not run against the target; this is a "
+        "limit of the scanning host, not a finding about the environment."
+    )
 
 
 @dataclass(frozen=True)

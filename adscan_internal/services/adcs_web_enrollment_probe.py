@@ -142,6 +142,29 @@ class WebEnrollmentProbeResult:
     or both requests returned 401). Only ``True`` suppresses ESC8; ``None``
     never does (preserves the pre-EPA behaviour for unauthenticated scans).
     """
+    # True when the scheme's ``/certsrv`` request got an HTTP answer at all
+    # (any status). With ``*_refused`` it lets a consumer tell a CERTAIN
+    # "not exploitable" from a timeout or a broken TLS session.
+    https_answered: bool = False
+    http_answered: bool = False
+
+    @property
+    def esc8_absence_certain(self) -> bool:
+        """Whether the probe PROVED no relayable web enrollment endpoint.
+
+        True only when every scheme either refused the connection or answered
+        without an NTLM/Negotiate offer an attacker can relay to (HTTPS with
+        Extended Protection enforced counts as not relayable). A timeout, an
+        unresolved host or a request with no answer leaves it False: a re-check
+        must never close ESC8 on a read that did not complete.
+        """
+        if self.web_enrollment_enabled or self.could_not_verify:
+            return False
+        https_closed = self.https_refused or (
+            self.https_answered and (not self.https_ntlm or self.epa_enforced is True)
+        )
+        http_closed = self.http_refused or (self.http_answered and not self.http_ntlm)
+        return https_closed and http_closed
 
 
 @dataclass
@@ -281,6 +304,8 @@ class ADCSWebEnrollmentProbe:
             epa_enforced=epa_enforced,
             https_refused=https.tcp_refused,
             http_refused=http.tcp_refused,
+            https_answered=https.status is not None,
+            http_answered=http.status is not None,
         )
 
     async def _probe_epa_over_https(

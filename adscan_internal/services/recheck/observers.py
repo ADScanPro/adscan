@@ -9,10 +9,29 @@ detector the scan uses, so ``observe`` and the scan cannot disagree:
   ``analyze_weak_password_policy`` / ``analyze_machine_account_quota``;
 * ``ldap.roastable_accounts``: the accounts publishing a service principal name or
   not requiring pre-authentication (domain-wide), or the named accounts by SID
-  (per object), graded by ``roasting_exposure_from_attrs``.
+  (per object), graded by ``roasting_exposure_from_attrs``;
+* ``adcs.esc1`` .. ``adcs.esc15`` (template and CA configuration): the PKI
+  objects, their ACLs and the CA-host values re-read with the AD CS collector's
+  own reads and graded by its own detection seam (``adcs_observers``);
+* ``ldap.object_acl`` / ``ldap.laps`` / ``ldap.replication_rights`` /
+  ``ldap.gmsa``: the recorded targets' security descriptors re-read and graded
+  by the effective-rights SSOT (``acl_observers``);
+* ``posture.*`` (LDAP signing and channel binding, SMB signing, NTLM, LDAPS,
+  Kerberos RC4 / AES): the scan's posture probe, forced, graded by the scan's
+  own posture-to-finding rules (``posture_observers``).
 
-Every other detector has no read-only check in this release; its items are
-reported "not re-checked: no read-only check" and never closed.
+Every detector is decided once: it has an observer here, or it is declared in
+``not_recheckable.NOT_RECHECKABLE`` with the reason it has none (re-exported
+below). Its items are reported "not re-checked" with that reason and never
+closed. ``tests/unit/services/recheck/test_recheck_coverage_declared.py`` fails
+on a detector in neither map, or in both.
+
+**An observer grades with the scan's own function, never a copy.** Each one
+declares the scan read and grading seam it reuses in ``SCAN_GRADERS``
+(``module:attribute``); the same test checks that every entry resolves to an
+object defined outside this package and that the observer's module imports it.
+A new observer that needs a rule the scan keeps inline first moves that rule
+into a reusable function in the scan module, then calls it from both sides.
 
 An observer never writes. It receives an open connection and returns a
 :class:`adscan_core.engagement.recheck.ReadOutcome`; a failure is an outcome with
@@ -26,6 +45,16 @@ from typing import Any, Callable, Mapping, Optional
 
 from adscan_core.engagement.model import CheckStatus
 from adscan_core.engagement.recheck import ReadOutcome
+from adscan_internal.services.recheck.acl_observers import ACL_OBSERVERS, ACL_SCAN_GRADERS
+from adscan_internal.services.recheck.adcs_observers import ADCS_OBSERVERS, ADCS_SCAN_GRADERS
+from adscan_internal.services.recheck.not_recheckable import (
+    NOT_RECHECKABLE,
+    NOT_RECHECKABLE_KEYS,
+)
+from adscan_internal.services.recheck.posture_observers import (
+    POSTURE_OBSERVERS,
+    POSTURE_SCAN_GRADERS,
+)
 
 CHECK_PASSWORD_POLICY = "policy.password"
 CHECK_MACHINE_ACCOUNT_QUOTA = "policy.machine_account_quota"
@@ -56,6 +85,10 @@ class ReadContext:
     domain_id: str
     domain_dn: str
     cache: dict[str, Any] = field(default_factory=dict)
+    #: The workspace shell, when the run has one. The AD CS observers need it
+    #: for the scan's recorded graph, the engagement-scope host verdict and the
+    #: CA-host credential; without it they decide only what LDAP can.
+    shell: Any = None
 
 
 Observer = Callable[[ReadContext, Optional[frozenset[str]]], ReadOutcome]
@@ -191,6 +224,33 @@ OBSERVERS: Mapping[str, Observer] = {
     CHECK_PASSWORD_POLICY: observe_password_policy,
     CHECK_MACHINE_ACCOUNT_QUOTA: observe_machine_account_quota,
     CHECK_ROASTABLE: observe_roastable_accounts,
+    # AD CS template and CA configuration (ESC1-9, 11, 13, 15): see
+    # ``adcs_observers`` for which families are covered and why the rest are not.
+    **ADCS_OBSERVERS,
+    # Directory rights: object ACEs, LAPS read, replication, gMSA retrieval.
+    **ACL_OBSERVERS,
+    # The domain controller's posture (LDAP signing / channel binding, SMB
+    # signing, NTLM, LDAPS, Kerberos RC4 / AES), re-probed by the scan's probe.
+    **POSTURE_OBSERVERS,
+}
+
+
+_DOMAIN_POLICY_DECODER = "adscan_internal.services.collector.ldap_collector:domain_policy_from_attrs"
+
+#: The scan's own read and grading seam each observer reuses (``module:attribute``).
+SCAN_GRADERS: Mapping[str, tuple[str, ...]] = {
+    CHECK_PASSWORD_POLICY: (
+        _DOMAIN_POLICY_DECODER,
+        "adscan_internal.services.collector.audit_analyzer:analyze_weak_password_policy",
+    ),
+    CHECK_MACHINE_ACCOUNT_QUOTA: (
+        _DOMAIN_POLICY_DECODER,
+        "adscan_internal.services.collector.audit_analyzer:analyze_machine_account_quota",
+    ),
+    CHECK_ROASTABLE: ("adscan_internal.services.collector.ldap_collector:roasting_exposure_from_attrs",),
+    **ADCS_SCAN_GRADERS,
+    **ACL_SCAN_GRADERS,
+    **POSTURE_SCAN_GRADERS,
 }
 
 
@@ -216,7 +276,10 @@ __all__ = (
     "CHECK_MACHINE_ACCOUNT_QUOTA",
     "CHECK_PASSWORD_POLICY",
     "CHECK_ROASTABLE",
+    "NOT_RECHECKABLE",
+    "NOT_RECHECKABLE_KEYS",
     "OBSERVERS",
+    "SCAN_GRADERS",
     "ReadContext",
     "has_read_only_check",
     "run_observer",

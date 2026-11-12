@@ -821,6 +821,15 @@ def run_native_collection(
         # attack graph — nothing the persist calls below produce — so running them
         # here is correct. Opt-out: ADSCAN_NO_ESC15_CONFIRM.
         _populate_adcs_metadata(shell, target_domain, collector_result)
+        # What the client's cleanup account can undo, now that this domain's
+        # SID, memberships and CAs are known: the first point where the checklist
+        # is complete, and BEFORE the AD CS confirmations below request any
+        # certificate. Records the block the report and the web read.
+        from adscan_internal.services.cleanup_capability import (  # noqa: PLC0415
+            refresh_after_collection,
+        )
+
+        refresh_after_collection(shell, target_domain)
         _run_esc15_confirmation_phase(
             shell,
             target_domain,
@@ -1579,6 +1588,26 @@ def _persist_collector_findings(
         _tel.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"[intelligence] endpoint protection positives emit failed: {exc}")
+
+    # ── AD CS segregation of duties (role separation on each owned CA) ──────
+    # Governance evidence, never a finding: read from the CA's own flag and
+    # security descriptor, which the ADCS collector read on the ESC7 interface
+    # (or, for the flag only, what the cleanup account's reversal-capability
+    # probe read in this run; ``refresh_after_collection`` ran just above).
+    try:
+        from adscan_internal.services.positive_control_evidence import (
+            emit_ca_role_separation_evidence,
+        )
+
+        emit_ca_role_separation_evidence(
+            shell, domain, list(getattr(result, "nodes", {}).values())
+        )
+    except Exception as exc:  # noqa: BLE001 — evidence emit never breaks persistence
+        from adscan_internal import telemetry as _tel
+
+        _tel.capture_exception(exc)
+        print_exception(exception=exc)
+        print_info_debug(f"[intelligence] CA role separation emit failed: {exc}")
 
     # ── SMBv1 POSITIVE evidence (active NT LM 0.12 negotiate probe) ────────
     # The SMB negotiate stage probes SMBv1 per host; a host that answered and

@@ -362,8 +362,10 @@ BUILTIN_DESCRIPTIONS: dict[str, str] = {
     BASE_AUDIT: (
         "The attack steps whose changes roll back on their own, and the "
         "vulnerability checks that send no unguarded password attempts, at the Normal "
-        "pace. Steps that need a manual cleanup, cannot be undone or send unguarded "
-        "password attempts stay off until you turn them on."
+        "pace. Steps whose change only a cleanup account can undo, such as those that "
+        "request a certificate from your CA, run when you supply one and ADscan "
+        "confirms it can undo that change. Steps that need a manual cleanup, cannot be "
+        "undone or send unguarded password attempts stay off until you turn them on."
     ),
     BASE_PRODUCTION_SENSITIVE: (
         # The level name is the one SAFE_FOR_PRODUCTION_PACING_LEVEL resolves to.

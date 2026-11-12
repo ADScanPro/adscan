@@ -16,9 +16,10 @@ from adscan_internal.services.collector.models import (
     PasswordSettingsObject,
 )
 from adscan_core.engagement.coverage_io import stamp_artifact_run_id
+from adscan_core.engagement.output_formats import output_marker
 from adscan_internal.workspaces import domain_subpath, write_json_file
 
-INVENTORY_SCHEMA_VERSION = "inventory-1.0"
+INVENTORY_SCHEMA_VERSION = output_marker("inventory")  # owned by the output contract
 
 #: Raw AD CS escalation rows (one per principal x object). Execution reads them
 #: through :func:`adscan_internal.services.attack_graph_service.load_adcs_attack_step_records`.

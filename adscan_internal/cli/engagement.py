@@ -17,8 +17,6 @@ creates a ledger: a workspace with no recorded run says so and exits 2.
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +29,7 @@ from adscan_core.engagement.store import (
     open_store,
     store_path,
 )
+from adscan_core.output.machine_output import machine_readable_stdout, write_machine_document
 from adscan_core.paths import get_workspaces_dir
 from rich.table import Table
 
@@ -78,10 +77,26 @@ def _domain(value: Any) -> str | None:
     return text or None
 
 
+#: Ledger item kinds each ``--kind`` selects (``None`` = every kind).
+_KIND_FILTER: dict[str, tuple[str, ...] | None] = {
+    "findings": ("finding",),
+    "steps": ("step",),
+    "all": None,
+}
+
+
+def _selected(row: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Whether ``row`` matches ``--kind`` and ``--domain`` (table and JSON alike)."""
+    kinds = _KIND_FILTER[args.kind]
+    if kinds is not None and row.get("kind") not in kinds:
+        return False
+    domain = _domain(args.domain)
+    return domain is None or row.get("domain_id") == domain
+
+
 def _status_rows(store: Any, args: argparse.Namespace) -> list[dict[str, Any]]:
-    kinds = {"findings": ("finding",), "steps": ("step",), "all": None}[args.kind]
     rows = store.items(domain_id=_domain(args.domain))
-    return [r for r in rows if kinds is None or r["kind"] in kinds]
+    return [r for r in rows if _selected(r, args)]
 
 
 def _table(title: str, columns: list[str], rows: list[list[str]]) -> Table:
@@ -94,9 +109,8 @@ def _table(title: str, columns: list[str], rows: list[list[str]]) -> Table:
 
 
 def _emit_json(doc: Any) -> None:
-    # Machine output on stdout for scripts (as ``doctor --json`` does).
-    sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True, default=str) + "\n")
-    sys.stdout.flush()
+    """The one document a ``--json`` run writes to stdout (human output is on stderr)."""
+    write_machine_document(doc, default=str)
 
 
 def _print_status(rows: list[dict[str, Any]]) -> None:
@@ -158,7 +172,18 @@ def _print_history(items: dict[str, Any]) -> None:
 
 
 def handle_engagement_command(args: argparse.Namespace) -> int:
-    """``adscan engagement ...`` (container). 0 on success, 2 on a user error."""
+    """``adscan engagement ...`` (container). 0 on success, 2 on a user error.
+
+    With ``--json`` stdout carries the JSON document alone; every message,
+    an error included, goes to stderr.
+    """
+    if getattr(args, "json", False):
+        with machine_readable_stdout():
+            return _handle_engagement_command(args)
+    return _handle_engagement_command(args)
+
+
+def _handle_engagement_command(args: argparse.Namespace) -> int:
     workspace = get_workspaces_dir() / str(args.workspace)
     if not workspace.is_dir():
         print_error(f"No workspace named '{mark_sensitive(str(args.workspace), 'workspace')}'.")
@@ -181,10 +206,10 @@ def handle_engagement_command(args: argparse.Namespace) -> int:
             return 0
         if args.action == "status":
             if args.json:
+                # The ledger document, narrowed to the same selection the table
+                # shows: --kind (findings by default) and --domain.
                 doc = store.export_document(generated_at=_now())
-                domain = _domain(args.domain)
-                if domain:
-                    doc["items"] = [i for i in doc["items"] if i["domain_id"] == domain]
+                doc["items"] = [i for i in doc["items"] if _selected(i, args)]
                 _emit_json(doc)
             else:
                 _print_status(_status_rows(store, args))

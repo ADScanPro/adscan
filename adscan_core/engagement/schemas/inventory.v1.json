@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.inventory/1",
+  "title": "ADscan directory inventory v1",
+  "description": "domains/<domain>/inventory/*.json: what the scan read from one domain, one file per object family. Every file shares one envelope (schema_version, domain, generated_at, record_type) and record_type says which body follows: 'nodes' (users.json, groups.json, computers.json, ous.json, gpos.json, containers.json, domains.json, the adcs_*.json object files, well_known_principals.json, foreign_security_principals.json, objects.json), 'edges' (memberships.json, acls.json, gpo_links.json, trusts.json, dcsync_rights.json, adcs_attack_steps.json, relationships.json), 'policy' (domain_policy.json), 'psos' (password_settings_objects.json), 'password_compliance' (password_compliance.json), 'dcsync_dump' (dcsync_dump.json), 'defensive_posture' (defensive_posture.json) and 'host_patch_level' (host_patch_level.json). index.json carries no record_type and lists the files the collector wrote. Version marker: schema_version, 'inventory-1.<minor>'. Declared objects may gain fields within a major; do not reject unknown keys. properties and notes are opaque. dcsync_dump.json holds NT hashes: it never leaves the node unless the data policy allows secrets.",
+  "type": "object",
+  "oneOf": [
+    {"$ref": "#/$defs/nodes_file"},
+    {"$ref": "#/$defs/edges_file"},
+    {"$ref": "#/$defs/policy_file"},
+    {"$ref": "#/$defs/psos_file"},
+    {"$ref": "#/$defs/password_compliance_file"},
+    {"$ref": "#/$defs/dcsync_dump_file"},
+    {"$ref": "#/$defs/defensive_posture_file"},
+    {"$ref": "#/$defs/host_patch_level_file"},
+    {"$ref": "#/$defs/index_file"}
+  ],
+  "$defs": {
+    "marker": {"type": "string", "pattern": "^inventory-1\\.[0-9]+$"},
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "count": {"type": "integer", "minimum": 0},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 255},
+    "nullable_string": {"type": ["string", "null"]},
+    "nullable_bool": {"type": ["boolean", "null"]},
+    "nullable_int": {"type": ["integer", "null"]},
+    "attr_changes": {
+      "type": "array",
+      "$comment": "[attribute, ISO time of the last change, replication version]; version 1 means set at provisioning and never changed.",
+      "items": {"type": "array"}
+    },
+    "nodes_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "count", "records"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "nodes"},
+        "count": {"$ref": "#/$defs/count"},
+        "records": {"type": "array", "items": {"$ref": "#/$defs/node_record"}},
+        "coverage_run_id": {"type": "string", "maxLength": 64}
+      }
+    },
+    "node_record": {
+      "type": "object",
+      "required": ["object_id", "kind", "name"],
+      "properties": {
+        "object_id": {"type": "string"},
+        "kind": {"type": "string", "$comment": "Directory object class (User, Group, Computer, ...; open vocabulary)."},
+        "name": {"type": "string"},
+        "domain": {"$ref": "#/$defs/nullable_string"},
+        "samaccountname": {"$ref": "#/$defs/nullable_string"},
+        "distinguished_name": {"$ref": "#/$defs/nullable_string"},
+        "enabled": {"$ref": "#/$defs/nullable_bool"},
+        "highvalue": {"type": "boolean"},
+        "properties": {"type": "object"},
+        "privilege_class": {"type": "string"},
+        "privilege_tier": {"type": "string", "$comment": "tier0_direct, tier0_escalation_capable, tier1, tier2."},
+        "privilege_tier_basis": {"type": "string", "$comment": "How a computer's tier was inferred (deterministic membership or a heuristic)."}
+      }
+    },
+    "edges_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "count", "records"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "edges"},
+        "count": {"$ref": "#/$defs/count"},
+        "records": {"type": "array", "items": {"$ref": "#/$defs/edge_record"}},
+        "coverage_run_id": {"type": "string", "maxLength": 64}
+      }
+    },
+    "edge_record": {
+      "type": "object",
+      "required": ["source_object_id", "target_object_id", "relation"],
+      "properties": {
+        "source_object_id": {"type": "string"},
+        "source_name": {"type": "string"},
+        "source_kind": {"type": "string"},
+        "target_object_id": {"type": "string"},
+        "target_name": {"type": "string"},
+        "target_kind": {"type": "string"},
+        "relation": {"type": "string", "minLength": 1},
+        "source": {"$ref": "#/$defs/nullable_string"},
+        "method": {"$ref": "#/$defs/nullable_string"},
+        "notes": {"type": ["object", "null"]}
+      }
+    },
+    "policy_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "policy"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "policy"},
+        "policy": {
+          "type": "object",
+          "$comment": "The default domain password and lockout policy. null means the attribute could not be read, which is different from an explicit zero (lockout_threshold 0 means lockout is disabled).",
+          "properties": {
+            "min_pwd_length": {"$ref": "#/$defs/nullable_int"},
+            "lockout_threshold": {"$ref": "#/$defs/nullable_int"},
+            "lockout_window_minutes": {"$ref": "#/$defs/nullable_int"},
+            "max_pwd_age_days": {"$ref": "#/$defs/nullable_int"},
+            "pwd_history_length": {"$ref": "#/$defs/nullable_int"},
+            "machine_account_quota": {"$ref": "#/$defs/nullable_int"},
+            "complexity_enabled": {"$ref": "#/$defs/nullable_bool"},
+            "reversible_encryption_enabled": {"$ref": "#/$defs/nullable_bool"},
+            "pwd_policy_last_changed": {"$ref": "#/$defs/nullable_string"},
+            "pwd_attrs_when_changed": {"$ref": "#/$defs/attr_changes"}
+          }
+        }
+      }
+    },
+    "psos_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "count", "psos"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "psos"},
+        "count": {"$ref": "#/$defs/count"},
+        "psos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "distinguished_name", "applies_to"],
+            "properties": {
+              "name": {"type": "string"},
+              "distinguished_name": {"type": "string"},
+              "precedence": {"$ref": "#/$defs/nullable_int"},
+              "min_pwd_length": {"$ref": "#/$defs/nullable_int"},
+              "max_pwd_age_days": {"$ref": "#/$defs/nullable_int"},
+              "min_pwd_age_days": {"$ref": "#/$defs/nullable_int"},
+              "lockout_threshold": {"$ref": "#/$defs/nullable_int"},
+              "lockout_observation_window_minutes": {"$ref": "#/$defs/nullable_int"},
+              "lockout_duration_minutes": {"$ref": "#/$defs/nullable_int"},
+              "pwd_history_length": {"$ref": "#/$defs/nullable_int"},
+              "complexity_enabled": {"$ref": "#/$defs/nullable_bool"},
+              "reversible_encryption_enabled": {"$ref": "#/$defs/nullable_bool"},
+              "applies_to": {"type": "array", "items": {"type": "string"}},
+              "pwd_policy_last_changed": {"$ref": "#/$defs/nullable_string"},
+              "pwd_attrs_when_changed": {"$ref": "#/$defs/attr_changes"}
+            }
+          }
+        }
+      }
+    },
+    "password_compliance_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "totals", "entries"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "password_compliance"},
+        "policy_pwd_last_changed": {"$ref": "#/$defs/nullable_string"},
+        "policy_never_modified": {"$ref": "#/$defs/nullable_bool"},
+        "policy_pwd_attrs": {"$ref": "#/$defs/attr_changes"},
+        "psos_count": {"$ref": "#/$defs/count"},
+        "totals": {
+          "type": "object",
+          "properties": {
+            "users": {"$ref": "#/$defs/count"},
+            "users_with_predates_policy": {"$ref": "#/$defs/count"},
+            "users_with_over_max_age": {"$ref": "#/$defs/count"},
+            "users_with_never_expires": {"$ref": "#/$defs/count"}
+          }
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["samaccountname"],
+            "properties": {
+              "samaccountname": {"type": "string"},
+              "object_id": {"$ref": "#/$defs/nullable_string"},
+              "distinguished_name": {"$ref": "#/$defs/nullable_string"},
+              "enabled": {"$ref": "#/$defs/nullable_bool"},
+              "is_admin_like": {"type": "boolean"},
+              "pwd_last_set_filetime": {"$ref": "#/$defs/nullable_int"},
+              "pwd_last_set_iso": {"$ref": "#/$defs/nullable_string"},
+              "pwd_age_days": {"$ref": "#/$defs/nullable_int"},
+              "applied_policy_name": {"$ref": "#/$defs/nullable_string"},
+              "applied_policy_dn": {"$ref": "#/$defs/nullable_string"},
+              "applied_policy_when_changed": {"$ref": "#/$defs/nullable_string"},
+              "pwd_predates_policy": {"$ref": "#/$defs/nullable_bool"},
+              "pwd_over_max_age": {"$ref": "#/$defs/nullable_bool"},
+              "pwd_never_expires": {"$ref": "#/$defs/nullable_bool"},
+              "risk_level": {"$ref": "#/$defs/nullable_string"},
+              "notes": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "dcsync_dump_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "count", "entries"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "dcsync_dump"},
+        "count": {"$ref": "#/$defs/count"},
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["samaccountname", "nt_hash"],
+            "properties": {
+              "samaccountname": {"type": "string"},
+              "domain": {"type": "string"},
+              "rid": {"$ref": "#/$defs/nullable_int"},
+              "lm_hash": {"$ref": "#/$defs/nullable_string"},
+              "nt_hash": {"type": "string"},
+              "is_blank": {"type": "boolean"},
+              "is_machine_account": {"type": "boolean"},
+              "plaintext_recovered": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "defensive_posture_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "record_type", "hosts"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "record_type": {"const": "defensive_posture"},
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$comment": "Read posture_assessed before concluding anything from an empty products list: false means ADscan could not tell, never that the host is unprotected.",
+            "required": ["host_object_id", "products", "posture_assessed"],
+            "properties": {
+              "host_object_id": {"type": "string"},
+              "dns_name": {"$ref": "#/$defs/nullable_string"},
+              "products": {"type": "array", "items": {"type": "object"}},
+              "posture_assessed": {"type": "boolean"},
+              "ppl_enabled": {"$ref": "#/$defs/nullable_bool"},
+              "lsass_pid_visible": {"$ref": "#/$defs/nullable_bool"},
+              "observed_at": {"$ref": "#/$defs/nullable_string"},
+              "lsa_protection": {"type": "string"},
+              "credential_guard": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "host_patch_level_file": {
+      "type": "object",
+      "required": ["schema_version", "record_type", "hosts"],
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "record_type": {"const": "host_patch_level"},
+        "version": {"type": "integer", "$comment": "Internal record version, kept for the engine's own reader."},
+        "hosts": {
+          "type": "object",
+          "$comment": "Keyed by host. build and ubr are null when the operating-system version could not be read; reason then says why.",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "aliases": {"type": "array", "items": {"type": "string"}},
+              "build": {"$ref": "#/$defs/nullable_int"},
+              "ubr": {"$ref": "#/$defs/nullable_int"},
+              "access": {"$ref": "#/$defs/nullable_string"},
+              "reason": {"type": "string"},
+              "read_at": {"type": "string"},
+              "last_attempt_reason": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "index_file": {
+      "type": "object",
+      "required": ["schema_version", "domain", "generated_at", "files", "totals"],
+      "not": {"required": ["record_type"]},
+      "properties": {
+        "schema_version": {"$ref": "#/$defs/marker"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "generated_at": {"$ref": "#/$defs/timestamp"},
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["type", "count"],
+            "properties": {
+              "type": {"type": "string"},
+              "count": {"$ref": "#/$defs/count"}
+            }
+          }
+        },
+        "totals": {
+          "type": "object",
+          "properties": {
+            "files": {"$ref": "#/$defs/count"},
+            "nodes": {"$ref": "#/$defs/count"},
+            "edges": {"$ref": "#/$defs/count"}
+          }
+        }
+      }
+    }
+  }
+}

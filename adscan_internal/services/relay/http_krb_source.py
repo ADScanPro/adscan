@@ -57,6 +57,9 @@ class HTTPKrbListenerConfig:
     listen_host: str = "0.0.0.0"
     listen_port: int = 80
     timeout_seconds: float = 120.0
+    #: The coerced host(s) whose connections this listener wants (IP or name).
+    #: Empty means any caller.
+    expected_sources: tuple[str, ...] = ()
 
 
 class HTTPKrbListener:
@@ -80,13 +83,23 @@ class HTTPKrbListener:
     ) -> None:
         self._config = config
         self._queue = auth_queue
-        self._server: asyncio.Server | None = None
+        self._claim = None
 
     async def start(self) -> None:
-        self._server = await asyncio.start_server(
-            self._handle,
-            self._config.listen_host,
-            self._config.listen_port,
+        """Claim the HTTP port from the listener broker (raises when refused)."""
+        from adscan_internal.services.listener_broker import (  # noqa: PLC0415
+            ClaimRole,
+            acquire_listener,
+        )
+
+        expected = tuple(item for item in self._config.expected_sources if item)
+        self._claim = await acquire_listener(
+            port=self._config.listen_port,
+            consumer_id=f"capture:http-krb:{id(self):x}",
+            handler=self._handle,
+            role=ClaimRole.TARGETED if expected else ClaimRole.UNTARGETED,
+            expected_sources=expected,
+            local_address=self._config.listen_host,
         )
         print_info(
             f"Kerberos relay listener ready — HTTP "
@@ -94,12 +107,10 @@ class HTTPKrbListener:
         )
 
     async def stop(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
-        with contextlib.suppress(Exception):
-            await self._server.wait_closed()
-        self._server = None
+        claim, self._claim = self._claim, None
+        if claim is not None:
+            with contextlib.suppress(Exception):
+                await claim.arelease()
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

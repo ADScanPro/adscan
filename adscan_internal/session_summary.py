@@ -63,6 +63,12 @@ class AttackPathVerdict:
       not evidence of a defence.
     - ``"exploited"`` — at least one exploited path (``exploited > 0``). The
       victory / PRO-CTA branch.
+
+    ``exploited`` counts routes of ANY reach class walked end to end, because it
+    is subtracted from an all-class ``total``. Whether the run proved a FULL
+    DOMAIN COMPROMISE is a separate question, answered by
+    :attr:`proves_domain_compromise`: a walked Tier 0 foothold (a session on a
+    domain controller, control pending) is an exploited route and is not one.
     """
 
     kind: str
@@ -70,6 +76,19 @@ class AttackPathVerdict:
     total: int
     exploited: int
     unvalidated: int
+    #: Routes to full domain compromise (``domain_breaker``) walked end to end.
+    full_compromise_proven: int = 0
+    #: The promote oracle (``auth == "pwned"``) for the verdict's domain(s).
+    domain_compromised: bool = False
+
+    @property
+    def proves_domain_compromise(self) -> bool:
+        """True only when the run proved control of the domain itself.
+
+        Gates any wording that says the domain was compromised. An exploited
+        foothold route on its own never satisfies it.
+        """
+        return self.domain_compromised or self.full_compromise_proven > 0
 
 
 def select_attack_path_verdict(
@@ -78,6 +97,7 @@ def select_attack_path_verdict(
     scan_mode: str | None,
     reachable: int = 0,
     domain_compromised: bool = False,
+    full_compromise_proven: int = 0,
 ) -> AttackPathVerdict:
     """Select the end-of-scan attack-path verdict from snapshot metrics.
 
@@ -99,6 +119,9 @@ def select_attack_path_verdict(
         domain_compromised: The promote oracle (``auth == "pwned"``). A domain
             ADscan proved compromised is never reported as "no paths"/0, even if
             partial artifacts momentarily leave both k and reachability at 0.
+        full_compromise_proven: Routes to full domain compromise walked end to
+            end. Carried on the verdict so a surface can tell a proven domain
+            compromise from an exploited foothold; it does not change ``kind``.
 
     Returns:
         An :class:`AttackPathVerdict` describing which branch to render and the
@@ -133,6 +156,8 @@ def select_attack_path_verdict(
         total=effective_total,
         exploited=exploited,
         unvalidated=unvalidated,
+        full_compromise_proven=max(0, int(full_compromise_proven)),
+        domain_compromised=bool(domain_compromised),
     )
 
 
@@ -503,11 +528,16 @@ def resolve_attack_path_verdict(
     count (k when complete, the reachable-set cardinality when sampled) and the
     promote oracle (``auth == "pwned"``). The proven ``exploited`` count is the
     snapshot-sourced effective figure, so it is not lost when k collapses.
+
+    ``exploited`` is the ANY-class walked count (it is subtracted from the
+    all-class ``total``); the domain-compromise proven count travels separately
+    as ``full_compromise_proven``, so the verdict never words a walked foothold
+    as a compromised domain.
     """
     totals = resolve_client_path_totals(shell, domains=domains)
     metrics = AttackPathSnapshotMetrics(
         total=totals.paths_total,
-        exploited=totals.effective_proven_full_domain_compromise,
+        exploited=totals.effective_paths_proven,
         unsupported=totals.paths_not_assessed,
     )
     return select_attack_path_verdict(
@@ -522,6 +552,7 @@ def resolve_attack_path_verdict(
             totals.effective_full_domain_compromise or totals.reachable_tier0_assets
         ),
         domain_compromised=_verdict_domain_compromised(shell, domains),
+        full_compromise_proven=totals.effective_proven_full_domain_compromise,
     )
 
 

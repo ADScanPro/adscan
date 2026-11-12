@@ -31,6 +31,7 @@ __all__ = [
     "VERIFY_CERTIFICATE_REVOKED",
     "revoked_certificate_note",
     "revoke_ledger_certificate",
+    "smb_config_for_candidate",
 ]
 
 #: Ledger ``verification_method`` for a revocation confirmed by re-reading the CA.
@@ -52,7 +53,10 @@ def revoked_certificate_note(*, ca_config: str) -> str:
     )
 
 
-def _smb_config_for(candidate: Any, *, ca_host: str, dc_ip: Optional[str], posture: Any) -> Any:
+def smb_config_for_candidate(
+    candidate: Any, *, ca_host: str, dc_ip: Optional[str], posture: Any
+) -> Any:
+    """An SMB config that signs in to the CA as ``candidate`` (None for an AES key)."""
     from adscan_internal.services.adcs.ca_admin import _build_ca_smb_config  # noqa: PLC0415
     from adscan_internal.services.revert_credentials import (  # noqa: PLC0415
         KIND_AES128,
@@ -136,7 +140,9 @@ def revoke_ledger_certificate(
     ca_config = f"{ca_host}\\{ca_name}"
 
     def _attempt(candidate: Any, attempt_ledger: Any, _final: bool) -> None:
-        smb_config = _smb_config_for(candidate, ca_host=ca_host, dc_ip=dc_ip, posture=posture)
+        smb_config = smb_config_for_candidate(
+            candidate, ca_host=ca_host, dc_ip=dc_ip, posture=posture
+        )
         if smb_config is None:
             raise RuntimeError("credential kind not usable against the CA")
         ok, error = _revoke_once(smb_config, ca_name=ca_name, serial=serial)

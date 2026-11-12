@@ -14,6 +14,8 @@ import json
 import shlex
 
 from adscan_core.subprocess_env import get_clean_env_for_compilation
+from adscan_core.scan_control import scan_control
+from adscan_core.scan_control.isolation import terminal_isolated_subprocess_kwargs
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.smb_guest_auth_service import is_guest_alias
 from adscan_internal.workspaces import write_json_file
@@ -201,6 +203,10 @@ class RcloneShareMappingService(BaseService):
         mapped_file_entries = 0
 
         for host, share in normalized_targets:
+            # Scan control checkpoint: stop listing new shares once the operator
+            # stopped the step; what was listed so far is kept.
+            if scan_control().should_stop():
+                break
             command = self._build_lsjson_command(
                 rclone_path=rclone_path,
                 host=host,
@@ -212,6 +218,8 @@ class RcloneShareMappingService(BaseService):
             executor_kwargs: dict[str, Any] = {
                 "timeout": timeout_seconds,
                 "ignore_errors": True,
+                # rclone never reads the terminal: out of Ctrl+C's reach.
+                **terminal_isolated_subprocess_kwargs(),
             }
             if rclone_env is not None:
                 executor_kwargs["env"] = rclone_env

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
@@ -60,6 +61,20 @@ def membership_snapshot_path(shell: object, domain: str) -> str:
     domains_dir = getattr(shell, "domains_dir", "domains")
     path = domain_subpath(workspace_cwd, domains_dir, domain, "memberships.json")
     return path
+
+
+def _write_membership_snapshot(path: str, data: dict[str, Any], *, domain: str) -> None:
+    """Persist a runtime update of ``memberships.json`` in the current format.
+
+    The one write path for every runtime membership change. It stamps the
+    output-contract marker (schema ``memberships.v1.json``) and names the
+    domain, so a snapshot a run creates before any collection is still a valid,
+    versioned document.
+    """
+    data[SCHEMA_VERSION_KEY] = output_marker("memberships")
+    if not str(data.get("domain") or "").strip():
+        data["domain"] = str(domain or "")
+    write_json_file(path, data)
 
 
 def _canonical_membership_label(domain: str, value: str) -> str:
@@ -301,7 +316,7 @@ def add_runtime_user_group_membership(
     if not changed:
         return False
 
-    write_json_file(path, data)
+    _write_membership_snapshot(path, data, domain=domain)
     _invalidate_membership_snapshot_cache(domain)
     _invalidate_pac_for_membership_change(
         domain=domain,
@@ -483,7 +498,7 @@ def add_runtime_computer_group_membership(
     if not changed:
         return False
 
-    write_json_file(path, data)
+    _write_membership_snapshot(path, data, domain=domain)
     _invalidate_membership_snapshot_cache(domain)
     print_info_debug(
         "[membership] runtime computer membership persisted: "
@@ -795,7 +810,7 @@ def remove_runtime_user_group_membership(
     if not changed:
         return False
 
-    write_json_file(path, data)
+    _write_membership_snapshot(path, data, domain=domain)
     _invalidate_membership_snapshot_cache(domain)
     _invalidate_pac_for_membership_change(
         domain=domain,

@@ -48,6 +48,8 @@ imports. It is safe to use from launcher code, services and CLI alike.
 
 from __future__ import annotations
 
+import threading
+
 import asyncio
 import os
 import sys
@@ -63,7 +65,12 @@ if TYPE_CHECKING:
     from rich.console import RenderableType
 
 
-__all__ = ["LiveSession", "LiveSessionConfig"]
+__all__ = [
+    "LiveSession",
+    "LiveSessionConfig",
+    "pause_active_live_sessions",
+    "resume_live_sessions",
+]
 
 
 # Env var honoured by the legacy widgets (``trust_enum_live``, etc.) — kept
@@ -282,6 +289,12 @@ class LiveSession:
         # Captured ``(args, kwargs)`` entries retrieved when the buffer is
         # popped (capture stopped) but not yet re-printed to scrollback.
         self._deferred_log_entries: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        # Pause state for the scan-control operator menu (see
+        # :func:`pause_active_live_sessions`). Guarded by its own lock because
+        # the menu pauses from a different thread than the one updating.
+        self._pause_lock = threading.RLock()
+        self._paused: bool = False
+        self._saved_vertical_overflow: Any = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -362,10 +375,15 @@ class LiveSession:
             self._is_live = False
             self._stop_deferred_capture(retain=False)
             self._inline_log(self._renderable)
+            return self
+        _register_active_session(self)
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
         """Tear Live down, then run summary / interrupt / deferred-log flush."""
+        _unregister_active_session(self)
+        with self._pause_lock:
+            self._paused = False
         try:
             if self._live is not None:
                 # Flush the last cached frame so the alt-screen captures
@@ -575,6 +593,41 @@ class LiveSession:
     # Update / announce API
     # ------------------------------------------------------------------
 
+    def pause(self) -> bool:
+        """Stop rendering and give the terminal back, keeping the session open.
+
+        Used by the scan-control operator menu: Rich ``Live.stop()`` pops the
+        alt-screen and restores ``sys.stdout``, so a prompt can render on the
+        real terminal. Updates arriving while paused are kept and shown on
+        :meth:`resume`. Returns whether the session was actually paused.
+        Thread-safe and idempotent; never raises.
+        """
+        with self._pause_lock:
+            if self._paused or self._live is None or not self._is_live:
+                return False
+            try:
+                self._saved_vertical_overflow = self._live.vertical_overflow
+                self._live.stop()
+            except Exception:  # noqa: BLE001 - a failed pause leaves Live as is
+                return False
+            self._paused = True
+            return True
+
+    def resume(self) -> None:
+        """Start rendering again after :meth:`pause` (thread-safe, never raises)."""
+        with self._pause_lock:
+            if not self._paused:
+                return
+            self._paused = False
+            live = self._live
+            if live is None:
+                return
+            with suppress(Exception):
+                if self._saved_vertical_overflow is not None:
+                    live.vertical_overflow = self._saved_vertical_overflow
+                live.update(self._renderable)
+                live.start(refresh=True)
+
     def update(self, renderable: "RenderableType", *, refresh: bool = False) -> None:
         """Replace the live renderable.
 
@@ -585,6 +638,10 @@ class LiveSession:
                 :meth:`rich.live.Live.update`.
         """
         self._renderable = renderable
+        if self._paused:
+            # The operator menu has the terminal: keep the latest frame and
+            # show it when the session resumes.
+            return
         if self._live is not None:
             with suppress(Exception):
                 self._live.update(renderable, refresh=refresh)
@@ -720,7 +777,7 @@ class LiveSession:
         }.get(severity, "cyan")
         with suppress(Exception):
             region.update(Text(message, style=style))
-            if self._live is not None:
+            if self._live is not None and not self._paused:
                 with suppress(Exception):
                     self._live.refresh()
 
@@ -739,3 +796,41 @@ class LiveSession:
         # ``print_*`` output; we keep stdout to match the rest of
         # ADscan's logging conventions.
         print(line, file=sys.stdout, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Active-session registry (scan-control operator menu)
+# ---------------------------------------------------------------------------
+#
+# The Ctrl+C operator menu (``adscan_core.scan_control.interrupts``) must take
+# the terminal from whatever Live view is rendering, possibly on another thread.
+# Every live ``LiveSession`` registers here on entry and leaves on exit, so the
+# menu can pause them all (innermost first) and resume them afterwards.
+
+_ACTIVE_SESSIONS_LOCK = threading.Lock()
+_ACTIVE_SESSIONS: list["LiveSession"] = []
+
+
+def _register_active_session(session: "LiveSession") -> None:
+    with _ACTIVE_SESSIONS_LOCK:
+        if session not in _ACTIVE_SESSIONS:
+            _ACTIVE_SESSIONS.append(session)
+
+
+def _unregister_active_session(session: "LiveSession") -> None:
+    with _ACTIVE_SESSIONS_LOCK:
+        if session in _ACTIVE_SESSIONS:
+            _ACTIVE_SESSIONS.remove(session)
+
+
+def pause_active_live_sessions() -> list["LiveSession"]:
+    """Pause every rendering session, innermost first; return the paused ones."""
+    with _ACTIVE_SESSIONS_LOCK:
+        sessions = list(reversed(_ACTIVE_SESSIONS))
+    return [session for session in sessions if session.pause()]
+
+
+def resume_live_sessions(sessions: list["LiveSession"]) -> None:
+    """Resume sessions paused by :func:`pause_active_live_sessions` (outermost first)."""
+    for session in reversed(sessions):
+        session.resume()

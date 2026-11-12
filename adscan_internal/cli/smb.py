@@ -10,7 +10,10 @@ extraction operations (dumps), see `dumps.py`.
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_async_sync, run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
+from adscan_core.scan_control import scan_control
+from adscan_core.scan_control.isolation import terminal_isolated_subprocess_kwargs
 
 from typing import Any
 from collections import Counter
@@ -895,7 +898,6 @@ def execute_smb_rid_cycling(
         is denied at the SMB layer (mirrors the legacy
         STATUS_NO_LOGON_SERVERS retry).
     """
-    import asyncio
 
     from adscan_internal.services.native_lsarpc_service import (
         SID_TYPE_USER,
@@ -929,7 +931,7 @@ def execute_smb_rid_cycling(
         marked_domain = mark_sensitive(domain, "domain")
 
         try:
-            entries, status, error = asyncio.run(_drive(max_rid))
+            entries, status, error = run_on_new_loop(_drive(max_rid))
         except (SMBAuthError, SMBAccessDeniedError) as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -975,7 +977,7 @@ def execute_smb_rid_cycling(
         if max_rid < 10000:
             print_info("Enumerating users by RID")
             try:
-                expanded_entries, expanded_status, _ = asyncio.run(_drive(10000))
+                expanded_entries, expanded_status, _ = run_on_new_loop(_drive(10000))
                 if expanded_status == "done":
                     expanded_users = [
                         e
@@ -1773,7 +1775,6 @@ def run_smb_descriptions(shell: Any, *, domain: str) -> None:
     text block from the native SAMR records so the downstream Rich rendering
     and CredSweeper integration stay byte-identical with the legacy path.
     """
-    import asyncio
 
     from adscan_internal.services.native_samr_service import (
         enumerate_samr_users_via,
@@ -1813,7 +1814,7 @@ def run_smb_descriptions(shell: Any, *, domain: str) -> None:
             return users, desc_status, desc_err
 
     try:
-        users, status, error = asyncio.run(_run())
+        users, status, error = run_on_new_loop(_run())
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_error("Error executing native SAMR for SMB descriptions.")
@@ -2421,7 +2422,6 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
     output users.txt is written via the same shell helpers as the legacy
     path, so downstream consumers (spraying, ASREP, etc.) are unaffected.
     """
-    import asyncio
 
     from adscan_internal.services.unauth_enrichment_service import (
         _open_null_smb_connection,
@@ -2452,7 +2452,7 @@ def run_smb_null_enum_users(shell: Any, *, domain: str) -> None:
             )
 
     try:
-        samr_users, status, error = asyncio.run(_run())
+        samr_users, status, error = run_on_new_loop(_run())
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -2879,7 +2879,6 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
     NetExec-shaped stdout so the credential ingestion / report-update /
     ambiguous-domain prompts remain byte-identical with the legacy path.
     """
-    import asyncio
     import subprocess
 
     from adscan_internal.rich_output import mark_sensitive
@@ -2925,18 +2924,7 @@ def run_gpp_autologin(shell: Any, *, target_domain: str) -> None:
     )
 
     try:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                result = ex.submit(
-                    asyncio.run, _harvest_gpp_for_domain(shell, target_domain=target_domain)
-                ).result()
-        else:
-            result = asyncio.run(_harvest_gpp_for_domain(shell, target_domain=target_domain))
+        result = run_async_sync(_harvest_gpp_for_domain(shell, target_domain=target_domain))
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -3043,7 +3031,6 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
     ingestion, report-field updates, and ambiguous-domain confirmation
     flow remain byte-identical with the legacy path.
     """
-    import asyncio
     import subprocess
 
     from adscan_internal.rich_output import mark_sensitive
@@ -3089,18 +3076,7 @@ def run_gpp_passwords(shell: Any, *, target_domain: str) -> None:
     )
 
     try:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                result = ex.submit(
-                    asyncio.run, _harvest_gpp_for_domain(shell, target_domain=target_domain)
-                ).result()
-        else:
-            result = asyncio.run(_harvest_gpp_for_domain(shell, target_domain=target_domain))
+        result = run_async_sync(_harvest_gpp_for_domain(shell, target_domain=target_domain))
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -5596,6 +5572,13 @@ def _write_rclone_files_from_manifest(
     return manifest_path
 
 
+def _report_share_progress(done: int, total: int) -> None:
+    """Tell the running scan-control step how far the share hunt got."""
+    step = scan_control().current_step()
+    if step is not None:
+        step.progress(done=done, total=total)
+
+
 def _run_rclone_copy_loot_download(
     *,
     shell: Any,
@@ -5668,6 +5651,7 @@ def _run_rclone_copy_loot_download(
     copied_targets = 0
     failed_targets = 0
     partial_targets = 0
+    stopped_targets = 0
     print_info_debug(
         f"rclone {operation_label} tuning: "
         f"targets={len(target_pairs)} workers={tuning.target_workers} "
@@ -5677,6 +5661,10 @@ def _run_rclone_copy_loot_download(
 
     def _download_one_target(target: tuple[str, str]) -> dict[str, Any]:
         host, share = target
+        # Scan control checkpoint: an operator "stop this step" (or a skipped
+        # phase / stopped scan) launches no new download; in-flight ones drain.
+        if scan_control().should_stop():
+            return {"status": "stopped", "host": host, "share": share, "rc": None}
         remote = service.build_smb_remote(
             host=host,
             share=share,
@@ -5700,7 +5688,13 @@ def _run_rclone_copy_loot_download(
             f"command={command}"
         )
         rclone_env = service.build_rclone_env(obscured_password)
-        run_kwargs: dict[str, Any] = {"timeout": 1200, "ignore_errors": True}
+        run_kwargs: dict[str, Any] = {
+            "timeout": 1200,
+            "ignore_errors": True,
+            # rclone never reads the terminal: keep it out of Ctrl+C's reach so
+            # the operator menu can let it finish (scan control plane).
+            **terminal_isolated_subprocess_kwargs(),
+        }
         if rclone_env is not None:
             run_kwargs["env"] = rclone_env
         result = shell.run_command(command, **run_kwargs)
@@ -5746,7 +5740,11 @@ def _run_rclone_copy_loot_download(
                 host = str(result.get("host", ""))
                 share = str(result.get("share", ""))
                 rc = result.get("rc")
+                if status == "stopped":
+                    stopped_targets += 1
+                    continue
                 completed += 1
+                _report_share_progress(completed, len(target_pairs))
                 if status == "copied":
                     copied_targets += 1
                 elif status == "partial":
@@ -5778,6 +5776,7 @@ def _run_rclone_copy_loot_download(
         "copied_targets": copied_targets,
         "partial_targets": partial_targets,
         "failed_targets": failed_targets,
+        "stopped_targets": stopped_targets,
     }
 
 
@@ -5866,6 +5865,8 @@ def _run_rclone_copy_mapped_loot_download(
         (host, share), remote_paths = target
         if not remote_paths:
             return {"status": "skipped", "host": host, "share": share, "rc": 0}
+        if scan_control().should_stop():
+            return {"status": "stopped", "host": host, "share": share, "rc": None}
         remote = service.build_smb_remote(
             host=host,
             share=share,
@@ -5895,7 +5896,13 @@ def _run_rclone_copy_mapped_loot_download(
             f"command={command}"
         )
         rclone_env = service.build_rclone_env(obscured_password)
-        run_kwargs: dict[str, Any] = {"timeout": 1200, "ignore_errors": True}
+        run_kwargs: dict[str, Any] = {
+            "timeout": 1200,
+            "ignore_errors": True,
+            # rclone never reads the terminal: keep it out of Ctrl+C's reach so
+            # the operator menu can let it finish (scan control plane).
+            **terminal_isolated_subprocess_kwargs(),
+        }
         if rclone_env is not None:
             run_kwargs["env"] = rclone_env
         result = shell.run_command(command, **run_kwargs)
@@ -5926,7 +5933,7 @@ def _run_rclone_copy_mapped_loot_download(
                 host = str(result.get("host", ""))
                 share = str(result.get("share", ""))
                 rc = result.get("rc")
-                if status in {"copied", "skipped"}:
+                if status in {"copied", "skipped", "stopped"}:
                     if status == "copied":
                         copied_targets += 1
                     continue
@@ -6966,7 +6973,6 @@ def run_smb_share_tree_mapping_with_spider_plus(
     ``spider_plus`` subprocess). ``spider_plus`` remains only as the on-disk
     storage-bucket / JSON-schema identifier for backward compatibility.
     """
-    import asyncio
 
     from adscan_internal.services.share_mapping_service import ShareMappingService
 
@@ -7037,7 +7043,7 @@ def run_smb_share_tree_mapping_with_spider_plus(
     )
 
     try:
-        walk_summary = asyncio.run(
+        walk_summary = run_on_new_loop(
             _native_build_share_tree_host_json(
                 shell,
                 domain=domain,

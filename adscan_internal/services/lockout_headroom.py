@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from adscan_core import telemetry
+from adscan_core.domain_auth_state import AUTHENTICATED_DOMAIN_STATES
 from adscan_core.auth_attempt_guard import (
     LIVE_SKIPPED,
     LiveHeadroom,
@@ -62,7 +63,7 @@ __all__ = [
 #: Where the guard's live verdicts are recorded per domain in ``domains_data``.
 LOCKOUT_PROTECTION_KEY = "lockout_protection"
 
-_AUTHENTICATED_STATES = frozenset({"auth", "pwned"})
+_AUTHENTICATED_STATES = AUTHENTICATED_DOMAIN_STATES
 
 
 @dataclass(frozen=True)

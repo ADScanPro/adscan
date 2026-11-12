@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 from adscan_core.rich_output import (
     print_error,
@@ -34,6 +35,10 @@ from adscan_internal.services.adidns import ADIDNSConfig, adidns_a_record_scope
 from adscan_internal.services.coercion.runner import (
     NativeCoercionRunConfig,
     run_native_coercion,
+)
+from adscan_internal.services.relay.core import (
+    RelayListenerUnavailableError,
+    report_relay_listener_unavailable,
 )
 from adscan_internal.services.relay.smb_krb_capture import (
     SMBKrbCaptureConfig,
@@ -69,6 +74,8 @@ class KrbCaptureRequest:
         capture_timeout: Seconds to wait for the coerced authentication.
         coercion: Optional explicit coercion config; when ``None`` a default is
             built (all methods, SMB listener auth) targeting the alias.
+        shell: Optional active shell (kept for callers; the listener broker
+            shares the port with the background capture on its own).
     """
 
     domain: str
@@ -79,6 +86,7 @@ class KrbCaptureRequest:
     listener_port: int = 445
     capture_timeout: float = 120.0
     coercion: NativeCoercionRunConfig | None = None
+    shell: Any = None
 
 
 @dataclass
@@ -191,6 +199,9 @@ async def coerce_and_capture(req: KrbCaptureRequest) -> KrbCaptureResult:
                     listen_host=req.listener_host,
                     listen_port=req.listener_port,
                     timeout_seconds=req.capture_timeout,
+                    # The coerced target is the caller we want; the listener
+                    # broker keeps every other caller on the background capture.
+                    expected_sources=(req.coerce_target_ip,),
                 ),
                 queue,
             )
@@ -212,6 +223,16 @@ async def coerce_and_capture(req: KrbCaptureRequest) -> KrbCaptureResult:
                 )
             finally:
                 await listener.stop()
+    except RelayListenerUnavailableError as exc:
+        # Our own listener could not open the port: nothing was coerced. A limit
+        # of the scanning host, stated once, never a claim about the target.
+        report_relay_listener_unavailable(exc, technique="Kerberos coercion capture")
+        return KrbCaptureResult(
+            spnego_blob=None,
+            is_kerberos=False,
+            relay_alias=alias_fqdn,
+            error=exc.reason_summary,
+        )
     except asyncio.TimeoutError:
         print_info_debug(
             "[krb-capture] no authentication captured within "

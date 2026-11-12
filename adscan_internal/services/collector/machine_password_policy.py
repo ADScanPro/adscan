@@ -22,8 +22,6 @@ unparseable template returns ``None`` and never breaks collection.
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -212,30 +210,20 @@ def collect_machine_password_policy_sync(
     Mirrors ``collect_domain_hosts`` so the synchronous collector orchestrator can
     call it without owning an event loop. Best-effort: returns ``None`` on failure.
     """
+    from adscan_core.async_bridge import run_in_worker_thread  # noqa: PLC0415
+
     specs = list(gpo_specs)
-    holder: dict[str, MachinePasswordPolicy | None] = {}
-
-    def _run() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            holder["r"] = loop.run_until_complete(
-                read_machine_password_policy(
-                    smb_config=smb_config,
-                    dc_unc_host=dc_unc_host,
-                    domain_fqdn=domain_fqdn,
-                    gpo_specs=specs,
-                )
-            )
-        finally:
-            loop.close()
-
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(_run).result()
+        return run_in_worker_thread(
+            read_machine_password_policy(
+                smb_config=smb_config,
+                dc_unc_host=dc_unc_host,
+                domain_fqdn=domain_fqdn,
+                gpo_specs=specs,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — best-effort, never break collection
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_info_debug(f"machine-pwd-policy: sync wrapper failed: {exc}")
         return None
-    return holder.get("r")

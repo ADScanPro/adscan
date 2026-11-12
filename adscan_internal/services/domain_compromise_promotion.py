@@ -303,11 +303,17 @@ def promote_to_pwned(
             ):
                 # Branch the CTA by the operator's role. A buyer testing their OWN
                 # estate (internal security / sysadmin-blue-team / CISO) sees the
-                # Enterprise demo lane; a consultant / unknown role sees /pro (the
-                # safe default). See ``operator_role_cta``.
+                # Enterprise demo lane; a platform/PTaaS/MSSP that embeds or
+                # resells sees the partner door; a learner sees the lab
+                # walkthroughs (no sales ask); a consultant / unknown role sees
+                # /pro (the safe default). See ``operator_role_cta``.
                 from adscan_internal.services.operator_role_cta import (  # noqa: PLC0415
+                    CtaLane,
                     is_enterprise_lane,
+                    resolve_cta_lane,
                 )
+
+                _victory_lane = resolve_cta_lane()
 
                 if tier.is_pro():
                     # A PRO user already owns the deliverable kit: no upsell.
@@ -316,6 +322,25 @@ def promote_to_pwned(
                         "[/bold green]\n\n"
                         "Domain Admin access confirmed. Document it before the "
                         "engagement window closes."
+                    )
+                elif _victory_lane is CtaLane.PARTNER:
+                    victory_message = (
+                        "[bold green]You've just proven full domain compromise."
+                        "[/bold green]\n\n"
+                        "Domain Admin access confirmed. If your platform or service "
+                        "should deliver this to its own clients, ADscan can run "
+                        "inside it under partner terms.\n"
+                        "Partner terms and the application → "
+                        f"{cta_markup('victory_partner')}"
+                    )
+                elif _victory_lane is CtaLane.LEARN:
+                    victory_message = (
+                        "[bold green]You've just proven full domain compromise."
+                        "[/bold green]\n\n"
+                        "Domain Admin access confirmed. Every step that got you "
+                        "here is in this session's output.\n"
+                        "Lab walkthroughs that explain each step of a path like this → "
+                        f"{cta_markup('victory_learn')}"
                     )
                 elif is_enterprise_lane():
                     victory_message = (

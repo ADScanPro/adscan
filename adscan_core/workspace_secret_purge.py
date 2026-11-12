@@ -71,12 +71,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from adscan_core.credential_envelope import ENVELOPE_PREFIX
 from adscan_core.credential_origins import NON_COMPROMISE_ORIGINS
 from adscan_core.graph_secret_refs import (
     SECRET_NOTE_KEYS,
@@ -226,6 +227,11 @@ class PurgeResult:
 
 
 # ── matching ────────────────────────────────────────────────────────────────
+#: A sealed credential (``adscan_core.credential_envelope``): prefix, hex key or
+#: vault id, base64url body.
+_ENVELOPE_RE = re.compile(re.escape(ENVELOPE_PREFIX) + r"[0-9a-f]{8,64}:[A-Za-z0-9_-]+")
+
+
 @dataclass
 class SecretMatcher:
     """Finds recorded secret values in text, longest value first."""
@@ -235,6 +241,10 @@ class SecretMatcher:
     short_hex_values: frozenset[str]
     count: int
     skipped: dict[str, int]
+    #: Remove every encrypted envelope as well. Off only for the credential
+    #: store files, whose secret fields the store clearing already decides
+    #: (and where a kept starting credential may itself be an envelope).
+    envelopes: bool = True
 
     @classmethod
     def build(cls, values: Iterable[str], *, identifiers: Iterable[str]) -> "SecretMatcher":
@@ -275,19 +285,30 @@ class SecretMatcher:
         )
 
     def sub(self, text: str) -> tuple[str, int]:
-        """Return ``text`` with every recorded value replaced, and the count."""
+        """Return ``text`` with every recorded value replaced, and the count.
+
+        An encrypted credential envelope (``enc:v1:...``) is replaced wherever it
+        appears, recorded or not: by construction it is a stored secret, and the
+        purge removes encrypted copies exactly as it removes clear ones.
+        """
+        envelope_hits = 0
+        if self.envelopes:
+            text, envelope_hits = _ENVELOPE_RE.subn(REMOVED_MARKER, text)
         stripped = text.strip()
         if stripped and (stripped in self.short_values or stripped.lower() in self.short_hex_values):
-            return REMOVED_MARKER, 1
+            return REMOVED_MARKER, 1 + envelope_hits
         if self.long_pattern is None:
-            return text, 0
-        return self.long_pattern.subn(REMOVED_MARKER, text)
+            return text, envelope_hits
+        new, hits = self.long_pattern.subn(REMOVED_MARKER, text)
+        return new, hits + envelope_hits
 
     def search_bytes(self, data: bytes) -> bool:
-        """Whether ``data`` holds a long recorded value (UTF-8 or UTF-16LE)."""
+        """Whether ``data`` holds a long recorded value or an envelope (UTF-8 or UTF-16LE)."""
+        text = data.decode("utf-8", errors="ignore")
+        if self.envelopes and _ENVELOPE_RE.search(text):
+            return True
         if self.long_pattern is None:
             return False
-        text = data.decode("utf-8", errors="ignore")
         if self.long_pattern.search(text):
             return True
         if b"\x00" in data:
@@ -678,6 +699,9 @@ def _rewrite_json(
     elif path.name.startswith("attack_paths_snapshot"):
         doc = redact_secrets_deep(doc)
     mark_removed_deep(doc)
+    if _matches(relpath, _VARIABLES_FILES):
+        # The store clearing above decided this file's secret fields.
+        matcher = replace(matcher, envelopes=False)
     doc, _hits = scrub_document(doc, matcher)
     if doc == before:
         return False, clearing

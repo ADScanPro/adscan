@@ -1,6 +1,7 @@
 """Role-aware commercial CTA lane — re-exported from the ``adscan_core`` SSOT.
 
-The mapping from operator role to CTA lane (``/pro`` vs the Enterprise demo)
+The mapping from operator role to CTA lane (``/pro``, the Enterprise demo, the
+partner door, or the learning lane)
 moved to :mod:`adscan_core.operator_role` so the host launcher, the container
 runtime, and any core panel renderer share one implementation. This module is
 kept as a stable import path for existing internal call sites (the

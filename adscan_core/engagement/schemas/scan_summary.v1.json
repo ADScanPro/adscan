@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.scan_summary/1",
+  "title": "ADscan scan summary v1",
+  "description": "scan_summary.json: the outcome and timing of one scan: whether the goal was met, whether a domain was compromised, how long that took and how many attack paths the report states. Durations are measured on a monotonic clock, so they stay correct when the host clock is stepped to a domain controller during the scan. Written by one writer (write_scan_summary in adscan_internal/services/scan_outcome_telemetry.py). Version marker: schema_version, '1.<minor>'; a file without it was written before the contract existed (ADscan 14.0.0 and earlier). Declared objects may gain fields within a major; do not reject unknown keys. Carries no secret.",
+  "type": "object",
+  "required": ["schema_version", "machine", "domain", "adscan_version", "scanned_at", "goal_met", "domain_compromised", "compromise_status", "time_to_compromise_minutes", "time_to_first_cred_minutes", "duration_minutes", "attack_paths_count", "path_state", "flags"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "machine": {"type": ["string", "null"], "$comment": "Workspace name."},
+    "domain": {"type": ["string", "null"]},
+    "adscan_version": {"type": "string"},
+    "scanned_at": {"type": "string", "minLength": 10, "maxLength": 64},
+    "goal_met": {"type": "boolean"},
+    "domain_compromised": {"type": "boolean"},
+    "compromise_status": {"type": ["string", "null"], "$comment": "none, domain, ... (open vocabulary)."},
+    "time_to_compromise_minutes": {"$ref": "#/$defs/minutes"},
+    "time_to_first_cred_minutes": {"$ref": "#/$defs/minutes"},
+    "duration_minutes": {"$ref": "#/$defs/minutes"},
+    "attack_paths_count": {"type": ["integer", "null"], "minimum": 0},
+    "path_state": {"type": ["string", "null"], "$comment": "Most advanced path lifecycle state reached: theoretical, foothold_obtained, post_ex_in_progress, domain_compromised."},
+    "flags": {
+      "type": "object",
+      "$comment": "Lab capture flags found (user, root, system); presence only, never the value.",
+      "properties": {
+        "user": {"type": "boolean"},
+        "root": {"type": "boolean"},
+        "system": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "minutes": {"type": ["number", "null"], "minimum": 0}
+  }
+}

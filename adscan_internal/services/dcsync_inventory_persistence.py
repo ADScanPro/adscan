@@ -31,9 +31,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from adscan_core.engagement.output_formats import is_readable_marker, output_marker
 from adscan_internal.workspaces import domain_subpath, write_json_file
 
-INVENTORY_SCHEMA_VERSION = "inventory-1.0"
+INVENTORY_SCHEMA_VERSION = output_marker("inventory")  # owned by the output contract
 EMPTY_NT_HASH = "31d6cfe0d16ae931b73c59d7e0c089c0"
 DUMP_FILENAME = "dcsync_dump.json"
 
@@ -75,9 +76,10 @@ def _load_recorded_entries(path: str, domain_key: str) -> dict[str, dict]:
         return {}
     if not isinstance(payload, dict):
         return {}
-    if str(payload.get("schema_version") or "") != INVENTORY_SCHEMA_VERSION:
-        # A register written by a newer/unknown schema is left unread instead of
-        # being half-interpreted against this one's field meanings.
+    if not is_readable_marker("inventory", payload.get("schema_version")):
+        # A register written in another major (or with no marker) is left unread
+        # instead of being half-interpreted against this one's field meanings.
+        # Any minor of this major only adds fields, so it is read.
         return {}
     file_domain = _normalize_domain(payload.get("domain")) or domain_key
     raw_entries = payload.get("entries")

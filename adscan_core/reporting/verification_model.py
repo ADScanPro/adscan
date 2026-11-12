@@ -68,6 +68,7 @@ __all__ = [
     "DEFAULT_REQUIREMENTS",
     "PRINCIPAL_TOKENS",
     "PLATFORMS",
+    "TERMINAL_PLATFORMS",
     "VERIFICATION_KINDS",
     "command_comment_violations",
     "commands_text",
@@ -76,6 +77,7 @@ __all__ = [
     "join_wrapped_comments",
     "legacy_text_from_items",
     "legacy_text_to_items",
+    "normalize_terminal_platform",
     "normalize_verification",
     "reference_from_url",
     "render_verification",
@@ -85,8 +87,33 @@ __all__ = [
 
 #: The two lists a verification block carries.
 VERIFICATION_KINDS: tuple[str, ...] = ("verify", "exploit")
-#: Where a command is run.
+#: Where a verification command is run (the catalog's ``verify`` / ``exploit``).
 PLATFORMS: tuple[str, ...] = ("windows", "linux")
+#: Every console a client-facing command can be shown in, which picks the
+#: terminal style it renders with (``report_design.terminal`` in the reports,
+#: ``TerminalBlock`` in the web). The style follows what the command IS, never
+#: the document it appears in:
+#:
+#: * ``windows``: PowerShell or cmd on the client's Windows estate.
+#: * ``sql``: a SQL Server query, shown in the same Windows chrome (sqlcmd).
+#: * ``linux``: a shell command, the ``adscan <subcommand>`` launcher included.
+#: * ``adscan``: a verb typed INSIDE the ADscan workbench that ``adscan start``
+#:   opens (a ``PentestShell.do_<verb>``). Where a surface already knows which
+#:   kind a command is (the cheatsheet's ``RecipeKind``), that is the source,
+#:   never a guess from the text.
+TERMINAL_PLATFORMS: tuple[str, ...] = ("windows", "sql", "linux", "adscan")
+
+
+def normalize_terminal_platform(value: Any, *, default: str = "windows") -> str:
+    """Return ``value`` as one of :data:`TERMINAL_PLATFORMS`, else ``default``.
+
+    The default is Windows because every client command a deliverable carried
+    before the platform field existed was a PowerShell command.
+    """
+    key = str(value or "").strip().lower()
+    return key if key in TERMINAL_PLATFORMS else default
+
+
 #: Who it is written for: a sysadmin checks with native tooling, a pentester
 #: reproduces with the standard offensive tool for the technique.
 AUDIENCES: tuple[str, ...] = ("sysadmin", "pentester")

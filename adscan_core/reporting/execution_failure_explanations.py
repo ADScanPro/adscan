@@ -37,6 +37,7 @@ from adscan_core.reporting.attack_step_reason_codes import (
     normalize_reason_code,
     reason_code_client_note,
 )
+from adscan_core.reporting.step_outcome_note import step_outcome_note
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,9 @@ _AUTH = ReasonCode.AUTH_FAILED
 _UNREACHABLE = ReasonCode.TARGET_UNREACHABLE
 _REJECTED = ReasonCode.REJECTED
 _NOT_AUTOMATED = ReasonCode.NOT_AUTOMATED
+_PRECONDITION = ReasonCode.PRECONDITION_MISSING
+_NO_CALLBACK = ReasonCode.COERCION_NO_CALLBACK
+_LISTENER = ReasonCode.LISTENER_UNAVAILABLE
 
 # Ordered: the first entry whose code or alias appears in the text wins, so the
 # more specific codes come first (a PKINIT error before a generic logon failure).
@@ -252,7 +256,12 @@ _ENTRIES: tuple[_Entry, ...] = (
     ),
     _Entry(
         "CR_DISP_UNDER_SUBMISSION",
-        ("UNDER_SUBMISSION", "REQUEST IS PENDING", "TAKEN UNDER SUBMISSION"),
+        (
+            "UNDER_SUBMISSION",
+            "REQUEST IS PENDING",
+            "TAKEN UNDER SUBMISSION",
+            "PENDING MANAGER APPROVAL",
+        ),
         _REJECTED,
         "The certificate request is waiting for approval.",
         "The template requires a certificate manager to approve each request, so "
@@ -331,7 +340,7 @@ _ENTRIES: tuple[_Entry, ...] = (
     # ── SMB / NTSTATUS ──────────────────────────────────────────────────────
     _Entry(
         "STATUS_ACCOUNT_LOCKED_OUT",
-        ("0XC0000234",),
+        ("0XC0000234", "LOCKED_OUT"),
         _AUTH,
         "The account is locked out.",
         "The host refused sign-in because the account is locked.",
@@ -381,7 +390,13 @@ _ENTRIES: tuple[_Entry, ...] = (
     ),
     _Entry(
         "STATUS_ACCESS_DENIED",
-        ("0XC0000022", "ACCESS_DENIED", "ACCESS IS DENIED"),
+        (
+            "0XC0000022",
+            "ACCESS_DENIED",
+            "ACCESS IS DENIED",
+            "STAGING_ACL_DENIED",
+            "NETLOGON_WRITE_DENIED_MXAC",
+        ),
         _REJECTED,
         "The host denied access for this account.",
         "The account signed in but does not hold the right the step needs on the "
@@ -428,7 +443,12 @@ _ENTRIES: tuple[_Entry, ...] = (
     ),
     _Entry(
         "NETWORK_UNREACHABLE",
-        ("NETWORK IS UNREACHABLE", "NO ROUTE TO HOST", "HOST IS UNREACHABLE"),
+        (
+            "NETWORK IS UNREACHABLE",
+            "NO ROUTE TO HOST",
+            "HOST IS UNREACHABLE",
+            "NOT REACHABLE FROM THE CURRENT VANTAGE",
+        ),
         _UNREACHABLE,
         "The target is not reachable from this vantage point.",
         "There is no network route from the scanning host to the target.",
@@ -447,7 +467,16 @@ _ENTRIES: tuple[_Entry, ...] = (
     ),
     _Entry(
         "no_usable_execution_context",
-        ("missing stored credential", "missing execution user context", "no stored domain credential"),
+        (
+            "missing stored credential",
+            "missing execution user context",
+            "no stored domain credential",
+            "missing credential",
+            "missing_execution_credential",
+            "missing_execution_password",
+            "no usable execution credential",
+            "no owned SPN-bearing trustee member",
+        ),
         _AUTH,
         "No stored credential can run this step.",
         "ADscan holds no credential for the account this step must run as.",
@@ -463,8 +492,21 @@ _ENTRIES: tuple[_Entry, ...] = (
         "Complete the access step that grants it on this host, then retry the path.",
     ),
     _Entry(
+        "scoped_ticket_only",
+        ("only a scoped service ticket is available",),
+        _AUTH,
+        "The only credential held for this host opens a different service.",
+        "A ticket valid for a single service on this host was available, and "
+        "this step needs another service on it.",
+        "Obtain a credential valid for the service this step uses, then retry "
+        "the path.",
+    ),
+    _Entry(
         "proven_access_holder_unresolved",
-        ("the account holding the proven access could not be resolved",),
+        (
+            "the account holding the proven access could not be resolved",
+            "session user is not resolvable",
+        ),
         _AUTH,
         "The account holding the proven access could not be identified.",
         "A preceding step proved this access on the host, but ADscan could not "
@@ -475,12 +517,123 @@ _ENTRIES: tuple[_Entry, ...] = (
     ),
     _Entry(
         "missing_target_host",
-        ("missing pdc ip", "missing adcs/ca info"),
+        (
+            "missing pdc ip",
+            "missing adcs/ca info",
+            "missing pdc info",
+            "missing pdc/ca info",
+            "missing_pdc",
+            "missing source host details",
+            "missing from/to details",
+            "missing_from_to_details",
+            "target_missing",
+            "target_not_resolvable_host",
+            "host_unresolved",
+            "is not a resolvable host",
+            "host is not resolvable",
+            "host not resolvable",
+            "could not resolve victim host",
+        ),
         _UNREACHABLE,
         "The step's target could not be resolved.",
         "The data needed to address the target of this step was not collected in "
         "this scan.",
         "Re-run collection for this domain, then retry the path.",
+    ),
+    _Entry(
+        "no_eligible_target",
+        (
+            "no impersonation target selected",
+            "missing_target_user",
+            "missing_target_principal",
+            "missing_target_selector",
+            "invalid_target_user",
+            "invalid_target_principal",
+            "no privileged user found that can be delegated",
+        ),
+        _PRECONDITION,
+        "No account this step could act on was available.",
+        "The step needs a target account that meets its conditions, and none was "
+        "found or selected in this run.",
+        "Review which accounts qualify as the target of this step, then retry "
+        "the path.",
+    ),
+    _Entry(
+        "not_implemented",
+        ("not implemented yet",),
+        _NOT_AUTOMATED,
+        "This step is not automated and was not run.",
+        "The technique is mapped for this route, and the scan does not carry it "
+        "out on its own.",
+        "Validate the step by hand with its manual command.",
+    ),
+    # ── Relay / capture listener on the scanning host ───────────────────────
+    # Before the coercion entry: when our own listener never opened, nothing
+    # was coerced, so "the target never authenticated back" would be false.
+    _Entry(
+        "relay_listener_unavailable",
+        ("relay listener port", "listener_unavailable"),
+        _LISTENER,
+        "The scanning host could not open the listener this step needs.",
+        "The local port was already in use on the scanning host or could not be "
+        "opened there, so the step stopped before the target was asked to "
+        "authenticate. This is a limit of the assessment host, not a finding "
+        "about the environment.",
+        "Free the port on the scanning host, then retry the step.",
+    ),
+    # ── Coercion ────────────────────────────────────────────────────────────
+    _Entry(
+        "no_authentication_captured",
+        (
+            "no authentication captured",
+            "did not reach the listener",
+            "coercion_no_callback",
+        ),
+        _NO_CALLBACK,
+        "The target never authenticated back after the coercion request.",
+        "The request was sent, and no sign-in from the target reached the "
+        "scanning host during the step.",
+        "Check that the target can reach the scanning host, then retry the step.",
+    ),
+    # ── Step access verification (structured verifier tokens) ───────────────
+    # The attack-step verifier stamps one of these on ``fail_reason``. They come
+    # last so a protocol code carried alongside (a logon failure, an access
+    # denial) explains the step more precisely when present.
+    _Entry(
+        "host_offline",
+        ("filtered_port",),
+        _UNREACHABLE,
+        "The target host did not answer on the port the step needs.",
+        "The host was offline, or the port was filtered between the scanning "
+        "host and the target.",
+        "Check that the host is up and reachable from this vantage point, then "
+        "retry the step.",
+    ),
+    _Entry(
+        "service_down",
+        ("closed_port",),
+        _UNREACHABLE,
+        "The service the step needs is not running on the host.",
+        "The host answered, and the port for this service was closed.",
+        "Confirm the service is enabled on the target, then retry the step.",
+    ),
+    _Entry(
+        "no_privilege",
+        (),
+        _REJECTED,
+        "The account signed in and lacks the access the step needs.",
+        "The host accepted the credential and then refused the operation for "
+        "this account.",
+        "Confirm the account's rights on the target, or run the step as an "
+        "account that holds them.",
+    ),
+    _Entry(
+        "auth_failed",
+        ("mssql_login_failed", "login failed for user"),
+        _AUTH,
+        "The host did not accept the credential for this account.",
+        "The sign-in was refused, so the step could not act on the target.",
+        "Refresh the stored credential for this account and retry the step.",
     ),
 )
 
@@ -590,10 +743,342 @@ def failure_view(*sources: Any, reason_code: Any = None) -> dict[str, str]:
     return {"code": "", "reason_code": "", "headline": "", "detail": "", "next_step": ""}
 
 
+# ── Attempted steps: one reason for every one, and a measurable unknown ─────
+
+#: Step statuses that mean "the step was run and did not complete". The display
+#: layer folds all of them into ``attempted``. Two are deliberately absent:
+#: ``partial`` (a partially validated step proved something) and ``aborted``
+#: (abandoned after an earlier step failed, so this step itself never ran).
+ATTEMPTED_STEP_STATUSES: frozenset[str] = frozenset({"attempted", "failed", "error"})
+
+#: Note keys where an attack-step branch records why it stopped. The resolver
+#: reads only these, never the whole notes dict: an edge also carries titles,
+#: choke-point prose and collector notes, and a protocol token appearing in one
+#: of those is not the cause of this step.
+FAILURE_NOTE_KEYS: tuple[str, ...] = (
+    "error",
+    "error_code",
+    "failure",
+    "failure_reason",
+    "fail_reason",
+    "verify_detail",
+    "ptc_error",
+    "reason",
+    "message",
+    "detail",
+    "exception",
+)
+
+_ROASTING_RELATIONS = frozenset({"kerberoasting", "asreproasting", "timeroasting"})
+
+
+def is_attempted_step_status(status: Any) -> bool:
+    """Return whether ``status`` is a run-and-did-not-complete step status."""
+
+    return str(status or "").strip().lower() in ATTEMPTED_STEP_STATUSES
+
+
+@dataclass(frozen=True)
+class StepFailureReason:
+    """Why one attempted step did not complete, as every surface states it."""
+
+    #: The cause category (a :class:`ReasonCode` value). Never empty.
+    reason_code: str
+    #: The client sentence. Never empty.
+    client_note: str
+    #: The technical code it was derived from ("" when none).
+    code: str
+    #: False when no category explains the step (``cause_not_recorded``).
+    mapped: bool
+    #: Sanitized shape of the raw cause, for measurement. "" when mapped.
+    cause_signature: str = ""
+
+    def view(self) -> dict[str, Any]:
+        """The client view, the same shape as ``reason_code_view``."""
+
+        return {
+            "has_reason": True,
+            "reason_code": self.reason_code,
+            "client_note": self.client_note,
+        }
+
+
+def _failure_texts(notes: Any) -> list[Any]:
+    if not isinstance(notes, dict):
+        return []
+    return [notes.get(key) for key in FAILURE_NOTE_KEYS if notes.get(key) not in (None, "", [], {})]
+
+
+def _explanation_note(explanation: FailureExplanation) -> str:
+    return f"{explanation.headline} {explanation.detail}".strip()
+
+
+def _structural_reason(relation: str, notes: dict[str, Any]) -> str:
+    """A cause the notes prove by their shape rather than by an error text."""
+
+    rel = str(relation or "").strip().lower()
+    if rel in _ROASTING_RELATIONS:
+        attempts = notes.get("attempts")
+        if isinstance(attempts, list) and any(
+            isinstance(attempt, dict) and str(attempt.get("wordlist") or "").strip()
+            for attempt in attempts
+        ):
+            # A crack attempt is only recorded once the hash is in hand.
+            return ReasonCode.CRACK_FAILED.value
+    if notes.get("ptc_success") is False:
+        # Pass-the-Certificate only runs on an issued certificate.
+        return ReasonCode.CERT_ISSUED_NOT_AUTHED.value
+    return ""
+
+
+def _unexplained_note(notes: dict[str, Any]) -> str:
+    """The client sentence of an attempted step no category explains.
+
+    An executor that wrote a client-facing outcome sentence for the step
+    (``step_outcome_note``, e.g. "The command run through the session did not
+    run as <user>") has stated what happened, so that sentence is the reason.
+    Printing the neutral "recorded no cause" note beside it would contradict
+    it. Otherwise the neutral ``cause_not_recorded`` note.
+    """
+
+    return step_outcome_note(notes) or reason_code_client_note(
+        ReasonCode.CAUSE_NOT_RECORDED.value
+    )
+
+
+def resolve_step_failure_reason(
+    status: Any,
+    notes: Any = None,
+    *,
+    relation: str = "",
+    sources: Iterable[Any] = (),
+    known_identifiers: Iterable[Any] = (),
+) -> StepFailureReason | None:
+    """Return why an attempted step did not complete, or ``None`` if it was not attempted.
+
+    The one resolver the run recorder, the reports and the web edge detail call,
+    so an attempted step carries a reason category wherever a client meets it.
+    Resolution order:
+
+    1. a valid ``reason_code`` a branch stamped on the notes;
+    2. a recognised protocol code or readiness token in the failure note keys
+       (or in ``sources``, e.g. the reasons a run observed);
+    3. a cause the notes prove by their shape (a crack attempt on a roasted
+       hash, a failed Pass-the-Certificate);
+    4. otherwise ``cause_not_recorded``, with the sanitized raw cause in
+       ``cause_signature`` so the unexplained causes can be counted and mapped.
+
+    ``known_identifiers`` are the step's own names (source, target, actor,
+    host); they are masked out of ``cause_signature``.
+    """
+
+    if not is_attempted_step_status(status):
+        return None
+    notes = notes if isinstance(notes, dict) else {}
+    explicit = normalize_reason_code(notes.get("reason_code"))
+    sources = list(sources or ())
+    texts = [*_failure_texts(notes), *sources]
+    unknown = ReasonCode.CAUSE_NOT_RECORDED.value
+    if explicit and explicit != unknown:
+        return StepFailureReason(
+            reason_code=explicit,
+            client_note=reason_code_client_note(explicit),
+            code="",
+            mapped=True,
+        )
+    if explicit == unknown and not sources:
+        # The latest attempt recorded a cause nothing explains. Notes merge
+        # across attempts, so an older attempt's cause may still sit on the
+        # edge; the stamp is what says it no longer applies.
+        return StepFailureReason(
+            reason_code=unknown,
+            client_note=_unexplained_note(notes),
+            code="",
+            mapped=False,
+            cause_signature=failure_cause_signature(*texts, known_identifiers=known_identifiers),
+        )
+    explanation = explain_failure(*texts)
+    if explanation is not None:
+        return StepFailureReason(
+            reason_code=explanation.reason_code,
+            client_note=_explanation_note(explanation),
+            code=explanation.code,
+            mapped=True,
+        )
+    structural = _structural_reason(relation, notes)
+    if structural:
+        return StepFailureReason(
+            reason_code=structural,
+            client_note=reason_code_client_note(structural),
+            code="",
+            mapped=True,
+        )
+    return StepFailureReason(
+        reason_code=unknown,
+        client_note=_unexplained_note(notes),
+        code="",
+        mapped=False,
+        cause_signature=failure_cause_signature(*texts, known_identifiers=known_identifiers),
+    )
+
+
+def step_status_reason_view(
+    status: Any,
+    notes: Any = None,
+    *,
+    relation: str = "",
+) -> dict[str, Any] | None:
+    """The client view of an attempted step's reason; ``None`` when not attempted.
+
+    What the PDF report, the free report, the writeup and the web CTEM edge
+    detail render. An attempted step always gets a view (``has_reason`` True).
+    """
+
+    reason = resolve_step_failure_reason(status, notes, relation=relation)
+    return reason.view() if reason is not None else None
+
+
+def stamp_failure_reason_code(
+    status: Any,
+    notes: dict[str, Any] | None,
+    *,
+    relation: str = "",
+) -> dict[str, Any] | None:
+    """Return ``notes`` with this attempt's reason code stamped, for persistence.
+
+    Edge notes merge across attempts, so the stamp records what THIS write
+    says. A mapped cause is written. ``cause_not_recorded`` is written only
+    when this write carries a cause of its own that nothing explains, so a
+    stale cause from an earlier attempt stops applying. A write that carries
+    no cause at all (a status-only update) leaves the edge's code alone.
+    Returns the input unchanged when there is nothing to stamp.
+    """
+
+    if not is_attempted_step_status(status):
+        return notes
+    current = notes if isinstance(notes, dict) else {}
+    if normalize_reason_code(current.get("reason_code")):
+        return notes
+    reason = resolve_step_failure_reason(status, current, relation=relation)
+    if reason is None:
+        return notes
+    if not reason.mapped and not _failure_texts(current):
+        return notes
+    return {**current, "reason_code": reason.reason_code}
+
+
+# ── Sanitized cause signature (measurement only) ─────────────────────────────
+
+_SIGNATURE_MAX = 200
+_QUOTED_RE = re.compile(r"""(['"`])(?:(?!\1).){1,200}\1""")
+_SID_RE = re.compile(r"\bS-1-[0-9-]{3,}\b", re.IGNORECASE)
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b")
+_IPV6_RE = re.compile(r"\b[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}\b", re.IGNORECASE)
+_UPN_RE = re.compile(r"[^\s@<>()\[\]{},;]+@[^\s@<>()\[\]{},;]+")
+_DOWNLEVEL_RE = re.compile(r"\b[\w.-]+\\{1,2}[\w.$-]+")
+_PATH_RE = re.compile(r"(?<![\w.])(?:[A-Za-z]:\\|\\\\|/)[^\s,;)]*")
+_DOTTED_RE = re.compile(r"\b[\w-]+(?:\.[\w-]+)+\b")
+_LONG_HEX_RE = re.compile(r"\b(?:0x)?[0-9a-f]{12,}\b", re.IGNORECASE)
+_BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+
+
+def _mask_blob(match: re.Match[str]) -> str:
+    token = match.group(0)
+    # A protocol token or an exception name (letters and underscores only) is
+    # what classifies a failure; keep it. Mixed letters and digits, or base64
+    # padding, is key or ticket material.
+    has_digit = any(ch.isdigit() for ch in token)
+    has_alpha = any(ch.isalpha() for ch in token)
+    if (has_digit and has_alpha) or any(ch in "+/=" for ch in token):
+        return "<blob>"
+    return token
+_NUMBER_RE = re.compile(r"(?<![0-9A-Za-z_])\d{4,}(?![0-9A-Za-z_])")
+_KEYVALUE_RE = re.compile(
+    r"\b(password|passwd|pwd|secret|hash|nthash|key|token|ticket|ccache)\s*[=:]\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def _drop_marked_spans(text: str) -> str:
+    from adscan_core.sensitive import (  # noqa: PLC0415 - keep the module import-light
+        SENSITIVE_MARKERS,
+        strip_sensitive_markers,
+    )
+
+    for start, end in SENSITIVE_MARKERS.values():
+        text = re.sub(re.escape(start) + ".*?" + re.escape(end), "<value>", text, flags=re.DOTALL)
+    return strip_sensitive_markers(text)
+
+
+def failure_cause_signature(*sources: Any, known_identifiers: Iterable[Any] = ()) -> str:
+    """Return a sanitized, aggregatable shape of a raw failure cause.
+
+    Built for counting unexplained causes in the run record and in telemetry,
+    so it keeps what classifies a failure (exception names, protocol tokens,
+    the sentence a branch wrote) and removes what identifies a client or a
+    secret: values the code marked sensitive, quoted values, SIDs, IP
+    addresses, principals, paths, host and domain names, long hex and base64
+    runs, ``password=``-style pairs, long numbers, and the step's own names
+    passed in ``known_identifiers``. Never raises; ``"no_cause_recorded"``
+    when there is no text at all.
+    """
+
+    try:
+        texts = list(_iter_texts(sources))
+        if not texts:
+            return "no_cause_recorded"
+        text = " | ".join(texts)
+        text = _drop_marked_spans(text)
+        from adscan_core.native_secret_scrub import (  # noqa: PLC0415
+            scrub_native_secrets,
+        )
+
+        text = scrub_native_secrets(text)
+        for identifier in sorted(
+            {str(value).strip() for value in known_identifiers if str(value or "").strip()},
+            key=len,
+            reverse=True,
+        ):
+            for variant in {identifier, identifier.split("@", 1)[0]}:
+                if len(variant) >= 3:
+                    text = re.sub(
+                        rf"(?<![\w]){re.escape(variant)}(?![\w])",
+                        "<name>",
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+        text = _KEYVALUE_RE.sub(r"\1=<value>", text)
+        text = _QUOTED_RE.sub("<value>", text)
+        text = _SID_RE.sub("<sid>", text)
+        text = _UPN_RE.sub("<principal>", text)
+        text = _DOWNLEVEL_RE.sub("<principal>", text)
+        text = _IPV4_RE.sub("<ip>", text)
+        text = _IPV6_RE.sub("<ip>", text)
+        text = _PATH_RE.sub("<path>", text)
+        text = _LONG_HEX_RE.sub("<hex>", text)
+        text = _DOTTED_RE.sub("<host>", text)
+        text = _BLOB_RE.sub(_mask_blob, text)
+        text = _NUMBER_RE.sub("<n>", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > _SIGNATURE_MAX:
+            text = text[: _SIGNATURE_MAX - 3].rstrip() + "..."
+        return text or "no_cause_recorded"
+    except Exception:  # noqa: BLE001 - measurement never breaks a run
+        return "signature_unavailable"
+
+
 __all__ = [
+    "ATTEMPTED_STEP_STATUSES",
+    "FAILURE_NOTE_KEYS",
     "FailureExplanation",
     "KNOWN_FAILURE_CODES",
+    "StepFailureReason",
     "explain_by_code",
     "explain_failure",
+    "failure_cause_signature",
     "failure_view",
+    "is_attempted_step_status",
+    "resolve_step_failure_reason",
+    "stamp_failure_reason_code",
+    "step_status_reason_view",
 ]

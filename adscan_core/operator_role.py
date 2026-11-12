@@ -44,12 +44,19 @@ operator is:
   blue team, or a security manager / CISO — is pointed at the **Enterprise demo**
   (``/get-a-demo``). The pitch is continuous validation + a board/auditor-ready
   report, not a CLI to run themselves.
-* a **consultant / pentester** (consultancy, MSSP, freelance) is pointed at
-  **/pro** — the paid CLI is their tool.
-* everyone else — student / CTF, "something else", "prefer not to say", or an
-  UNKNOWN role (not answered yet, corrupt profile) — defaults to **/pro**. Most
-  operators are pentesters, /pro is the light safe ask, and the Enterprise demo
-  is only offered on a POSITIVE buyer signal, never by default.
+* a **consultant / pentester** who audits clients' AD (consultancy, MSSP,
+  freelance) is pointed at **/pro** — the paid CLI is their firm's tool.
+* a **platform, PTaaS vendor or MSSP that wants to embed or resell ADscan** in
+  its own service is pointed at **/partners** (the application form, and the
+  platform-integration guide on the PRO gate). That conversation is partner
+  terms, not a seat of the CLI.
+* a **student / CTF player / learner** gets **no sales door**: their lane
+  points at the docs and the lab walkthroughs, and the two hints that only ever
+  carry a sales ask stay silent for them.
+* everyone else — "something else", "prefer not to say", or an UNKNOWN role
+  (not answered yet, corrupt profile) — defaults to **/pro**. Most operators
+  are pentesters, /pro is the light safe ask, and the Enterprise demo is only
+  offered on a POSITIVE buyer signal, never by default.
 
 **Windows-no-role exception.** When the role is UNKNOWN *and* the host is
 Windows, the lane defaults to **Enterprise** instead of /pro: a Windows host
@@ -57,8 +64,9 @@ almost certainly means a sysadmin running ADscan on their own domain-joined
 machine, not a pentester. An EXPLICIT non-buyer role (e.g. a consultant on
 Windows) still wins — it stays on /pro. Linux with no role is unchanged (/pro).
 
-This module owns the mapping so the two CTA call sites (the session-summary hint
-and the domain-compromise victory panel) cannot drift apart.
+This module owns the role -> lane mapping; ``adscan_core.outbound_links``
+owns the lane x surface -> link mapping (``cta_placement_for_lane``), so no
+call site picks a door on its own.
 """
 
 from __future__ import annotations
@@ -78,6 +86,10 @@ ROLE_PROFILE_KEYS: frozenset[str] = frozenset(
     {
         # v2 set (asked at startup)
         "consultancy_pentester",
+        # Added 2026-11-12: a platform / PTaaS / MSSP that embeds or resells.
+        # An older build reads this key back as ``None`` (unknown), so a profile
+        # written by a newer container degrades to the safe default there.
+        "platform_partner",
         "internal_security",
         "sysadmin_blue_team",
         "security_manager_ciso",
@@ -101,6 +113,14 @@ _BUYER_ROLES: frozenset[str] = frozenset(
         "security_manager_ciso",
     }
 )
+
+#: The role that opens the partner door (/partners): it would build ADscan into
+#: a service it sells, so the conversation is partner terms, not the PRO CLI.
+_PARTNER_ROLES: frozenset[str] = frozenset({"platform_partner"})
+
+#: The roles with no sales door: learning, labs and CTFs. Their lane points at
+#: the docs and the lab walkthroughs.
+_LEARNING_ROLES: frozenset[str] = frozenset({"student_ctf"})
 
 
 def _profile_path() -> Path:
@@ -142,7 +162,8 @@ def operator_runs_own_estate() -> bool | None:
     * ``True`` — a buyer role (:data:`_BUYER_ROLES`): internal security, a
       sysadmin / blue team, a security manager or CISO. The estate is theirs.
     * ``False`` — an explicit non-buyer role: a consultant or pentester, a
-      student, "something else", "prefer not to say". A third party operated it.
+      platform or MSSP partner, a student, "something else", "prefer not to
+      say". A third party operated it.
     * ``None`` — no role captured, or a role this build does not recognise.
 
     This deliberately does NOT apply the Windows tie-break
@@ -166,22 +187,32 @@ class CtaLane(str, Enum):
 
     PRO = "pro"
     ENTERPRISE = "enterprise"
+    #: Platform, PTaaS or MSSP that embeds or resells ADscan -> /partners.
+    PARTNER = "partner"
+    #: Student, CTF or learning -> docs and labs, no commercial ask.
+    LEARN = "learn"
 
 
 def resolve_cta_lane() -> CtaLane:
     """Return the CTA lane for the persisted operator role.
 
     Reads the local role profile; a buyer role (own-estate) resolves to
-    :attr:`CtaLane.ENTERPRISE`. An explicit non-buyer role resolves to
-    :attr:`CtaLane.PRO`. When no role is set (None / unknown), the host OS is
-    the tie-breaker: a Windows host defaults to :attr:`CtaLane.ENTERPRISE`
-    (almost certainly a sysadmin on their own domain-joined machine), a
-    non-Windows host to :attr:`CtaLane.PRO`. Never raises.
+    :attr:`CtaLane.ENTERPRISE`, the platform/PTaaS/MSSP role to
+    :attr:`CtaLane.PARTNER`, the student/CTF role to :attr:`CtaLane.LEARN`,
+    and any other explicit role to :attr:`CtaLane.PRO`. An explicit role wins
+    on every OS. When no role is set (None / unknown), the host OS is the
+    tie-breaker: a Windows host defaults to :attr:`CtaLane.ENTERPRISE` (almost
+    certainly a sysadmin on their own domain-joined machine), a non-Windows host
+    to :attr:`CtaLane.PRO`. Never raises.
     """
     try:
         role = get_operator_role()
         if role in _BUYER_ROLES:
             return CtaLane.ENTERPRISE
+        if role in _PARTNER_ROLES:
+            return CtaLane.PARTNER
+        if role in _LEARNING_ROLES:
+            return CtaLane.LEARN
         if role is not None:
             # An explicit non-buyer role wins, even on Windows.
             return CtaLane.PRO

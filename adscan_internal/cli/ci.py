@@ -195,11 +195,16 @@ def _build_ci_loot_card(
             ws_dir, domains_dir, domain, ATTACK_PATH_SNAPSHOT_FILENAME
         )
         if os.path.exists(snap_path):
+            from adscan_core.reporting.attack_path_snapshot_scope import (
+                domain_listing_snapshot_paths,
+            )
+
             with open(snap_path, "r", encoding="utf-8") as fh:
                 snap = _json.load(fh)
-            for path in snap.get("paths", []) or []:
-                if not isinstance(path, dict):
-                    continue
+            # Only the DOMAIN listing: an operator-scope snapshot holds the
+            # routes from the run's own accounts, a subset the card must not
+            # present as the domain's ADCS exposure.
+            for path in domain_listing_snapshot_paths(snap):
                 relations = path.get("relations") or []
                 if isinstance(relations, list) and any(
                     _ADCS_ESC_RELATION_RE.match(str(rel or "")) for rel in relations
@@ -236,39 +241,20 @@ def _build_ci_loot_card(
         pass
 
     # --- technical report findings: critical / high rollup -----------------
+    # The SAME histogram the recap panel prints and the client report counts
+    # (``summarize_findings``: alias-collapsed, reportable findings only, on the
+    # contextual band the scan authored). The card used to bucket the raw
+    # recorded ``severity`` itself, so it read "0 / 8" a few lines above a recap
+    # reading "2 critical · 9 high" for the same run.
     try:
-        import json as _json
+        from adscan_core.reporting.technical_report import summarize_findings
 
-        tr_path = os.path.join(ws_dir, "technical_report.json")
-        if os.path.exists(tr_path):
-            with open(tr_path, "r", encoding="utf-8") as fh:
-                tr = _json.load(fh)
-            tr_domains = tr.get("domains", {}) if isinstance(tr, dict) else {}
-            entry = (
-                tr_domains.get(domain, {}) if isinstance(tr_domains, dict) else {}
-            ) or {}
-            findings = entry.get("findings")
-            # Collapse alias-family duplicates so the rollup counts a weakness
-            # once, matching what the report shows.
-            from adscan_core.reporting.finding_aliases import (
-                collapse_finding_aliases,
-            )
-
-            iterable = (
-                findings.values()
-                if isinstance(findings, dict)
-                else collapse_finding_aliases(findings)
-            )
-            for finding in iterable:
-                if not isinstance(finding, dict):
-                    continue
-                sev = str(finding.get("severity") or "").strip().lower()
-                if sev == "critical":
-                    critical += 1
-                elif sev == "high":
-                    high += 1
-    except Exception:  # noqa: BLE001
-        pass
+        _findings = summarize_findings(shell, domain=domain)  # type: ignore[arg-type]
+        critical = int(_findings.critical)
+        high = int(_findings.high)
+    except Exception as exc:  # noqa: BLE001 - the card must never break the run
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
     return SessionLootCard(
         domain=domain,
@@ -754,6 +740,12 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     )
 
     load_cleanup_credential_for_run(shell)
+    # With an account set, state what it can undo in scope (printed, never asked:
+    # ``ci`` is unattended). A fresh workspace knows no domain yet; the checklist
+    # is printed again before the first attack step, once the directory is read.
+    from adscan_internal.services.cleanup_capability import print_once  # noqa: PLC0415
+
+    print_once(shell, force=True)
 
     # --- Premium session header ---
     _ci_domain = str(getattr(args, "domain", "") or "")
@@ -842,6 +834,18 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         deps.exit(2)
         return 2
     print_execution_decision(shell)
+    # Lab / CTF on the Enterprise appliance: refused unless the client's
+    # administrator turned it on (adscan_core.scan_policy.lab_policy). Exit 78
+    # with the reason beside the run, like a license refusal, so the worker
+    # stores the same sentence.
+    from adscan_internal.cli.enterprise_license_gate import (  # noqa: PLC0415
+        LICENSE_BLOCKED_EXIT_CODE as _LAB_REFUSED_EXIT,
+        ensure_lab_policy_allowed,
+    )
+
+    if not ensure_lab_policy_allowed(shell):
+        deps.exit(_LAB_REFUSED_EXIT)
+        return _LAB_REFUSED_EXIT
     try:
         shell.save_workspace_data()
     except Exception as exc:  # noqa: BLE001 - persisting the pace is best-effort
@@ -1000,6 +1004,14 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     import_before_run(shell.current_workspace_dir, at=_dt.now(_tz.utc).isoformat())
     start_run_coverage(shell, authenticated=args.mode == "auth")
     success = _run_auto_auth() if args.mode == "auth" else _run_auto_unauth()
+    # A scan stopped by SIGINT or the platform's "stop the scan" ran its normal
+    # finalisation (artifacts, coverage gap), but it is not a successful
+    # assessment: exit with the incomplete status and render no deliverable.
+    from adscan_core.scan_control import scan_control as _scan_control  # noqa: PLC0415
+
+    operator_stopped = _scan_control().last_scan_aborted
+    if operator_stopped:
+        success = False
     # The license refused every environment this run tried to assess (its
     # environment entitlement is used up): no report, and exit 78 below so the
     # appliance worker stores the license reason. A refused TRUSTED forest
@@ -1152,6 +1164,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         license_blocked_exit_code=LICENSE_BLOCKED_EXIT_CODE,
         assessment_gap=assessment_gap,
         deliverable_failed=deliverable_requested and not report_file_path,
+        operator_stopped=operator_stopped,
     )
     if exit_code == 0 and should_validate_flags:
         print_success("CI scan finished successfully with flags validated.")
@@ -1169,6 +1182,12 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         print_error(
             "CI scan stopped: the license does not allow assessing this target "
             "(see the license message above)."
+        )
+    elif operator_stopped and exit_code == CI_EXIT_ASSESSMENT_INCOMPLETE:
+        print_error(
+            "CI scan stopped before it finished (interrupt or platform request). "
+            "Results collected so far are in the workspace and the coverage record "
+            "declares what was not assessed. No report was generated."
         )
     elif exit_code == CI_EXIT_ASSESSMENT_INCOMPLETE:
         print_error(
@@ -1288,8 +1307,12 @@ def resolve_ci_exit_code(
     license_blocked_exit_code: int,
     assessment_gap: tuple[str, ...],
     deliverable_failed: bool = False,
+    operator_stopped: bool = False,
 ) -> int:
     """Return ``adscan ci``'s exit status for how the run ended.
+
+    ``operator_stopped`` (the scan control plane stopped the scan: a SIGINT or
+    the platform's stop request) reads as an incomplete assessment, never 0.
 
     ``success`` is already False when ``assessment_gap`` is non-empty (the
     handler clears it), so an incomplete assessment can never read 0: that
@@ -1305,7 +1328,7 @@ def resolve_ci_exit_code(
         CI_EXIT_DELIVERABLE_FAILED,
     )
 
-    if success and assessment_gap:
+    if success and (assessment_gap or operator_stopped):
         success = False
     if success:
         if should_validate_flags and not flags_valid:
@@ -1315,7 +1338,7 @@ def resolve_ci_exit_code(
         return 0
     if environment_refused:
         return license_blocked_exit_code
-    if assessment_gap:
+    if assessment_gap or operator_stopped:
         return CI_EXIT_ASSESSMENT_INCOMPLETE
     return 1
 
@@ -1395,7 +1418,7 @@ def run_generate_report(
         report_format: Format to generate. Public CLI flows pass "pdf".
         report_profile: Report profile ("full", "technical", "executive")
         frameworks: Compliance frameworks the operator explicitly selected.
-            Valid values: "ens", "nis2", "iso27001", "dora", "pci_dss", "cis".
+            Valid values: ``adscan_core.compliance_frameworks.FRAMEWORK_KEYS``.
             There is NO default: an empty selection renders no compliance
             mapping, and an AUDIT engagement refuses to render at all until the
             operator chooses (see
@@ -1404,7 +1427,7 @@ def run_generate_report(
         engine: PDF engine ("chromium" — the only supported engine). Empty = env/default.
         renderer: Attack-path renderer ("graphviz" | "cytoscape"). Empty = env/default.
         template: Report template ("legacy" | "premium"). Empty = env/default.
-        theme: Report theme ("premium_dark" | "corporate_light" | ""). Empty = env/default.
+        theme: Report theme ("corporate_light" | "editorial" | ""). Empty = env/default.
 
     Returns:
         Path to generated report file, or None on failure
@@ -1462,6 +1485,7 @@ def run_generate_report(
     from adscan_internal.services.compliance_scope import (
         announce_compliance_scope,
         missing_framework_error,
+        persist_compliance_decision,
         resolve_compliance_scope,
     )
 
@@ -1479,6 +1503,9 @@ def run_generate_report(
         )
         return None
     announce_compliance_scope(scope)
+    # Record the decision this render runs under, so the report states an
+    # explicit "no framework applies" as the assessor's decision.
+    persist_compliance_decision(scope)
     frameworks = scope.as_list()
 
     report_path = Path(report_file)
@@ -1732,6 +1759,14 @@ def _ci_deliver_namespace(
     )
     # ``ci`` already said it once, before the scan (see _announce_report_options).
     setattr(ns, "_branding_notice_shown", True)
+    # Telemetry tells a scan's report apart from a ``deliver`` run.
+    setattr(ns, "_report_entry", "ci")
+    # A retired theme was announced before the scan too; do not repeat it, but
+    # keep the fact for the theme telemetry.
+    from adscan_core.report_options import retired_theme_requested
+
+    if retired_theme_requested(ns):
+        setattr(ns, "_retired_theme_notice_shown", True)
     return ns
 
 

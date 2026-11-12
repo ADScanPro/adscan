@@ -24,14 +24,21 @@ from adscan_core.reporting.cleanup_remediation import (
     remediation_steps as _split_remediation_steps,
 )
 from adscan_core.rich_output import print_exception
+from adscan_core.engagement.output_formats import (
+    SCHEMA_VERSION_KEY,
+    is_readable_marker,
+    output_marker,
+)
 
 _LEDGER_FILENAME = "environment_changes.json"
 # Schema 1.0 → 1.1 adds the verified-revert taxonomy fields (verified_at,
 # verification_method, manual_reason, remediation_command, remediation_object_dn,
 # revert_attempts, min_credential_principal) and the reverted_confirmed /
 # manual_required terminal states. Old 1.0 workspaces are backfilled on _load.
-_SCHEMA_VERSION = "1.1"
-_LEGACY_SCHEMA_VERSION = "1.0"
+# The value is owned by the output contract (adscan_core/engagement/
+# output_formats.py, schema environment_changes.v1.json): bump it there.
+_SCHEMA_VERSION = output_marker("environment_changes")
+
 
 # Re-exported taxonomy constants (the ledger module is the historical import
 # point; cleanup_taxonomy is the SSOT). New code may import either.
@@ -810,6 +817,7 @@ class EnvironmentChangeLedger:
     def flush(self) -> None:
         """Write current state to disk. Called automatically by mutating methods."""
         try:
+            self._state[SCHEMA_VERSION_KEY] = _SCHEMA_VERSION
             write_json_file(self._path, self._state)
         except Exception as exc:  # pylint: disable=broad-except
             telemetry.capture_exception(exc)
@@ -821,9 +829,10 @@ class EnvironmentChangeLedger:
         if os.path.exists(self._path):
             try:
                 data = read_json_file(self._path)
-                if isinstance(data, dict) and data.get("schema_version") in (
-                    _SCHEMA_VERSION,
-                    _LEGACY_SCHEMA_VERSION,
+                # Any minor of this major is read: rejecting one would replace
+                # the session's record of what it changed with an empty ledger.
+                if isinstance(data, dict) and is_readable_marker(
+                    "environment_changes", data.get(SCHEMA_VERSION_KEY)
                 ):
                     _backfill_schema_1_1(data)
                     self._state = data

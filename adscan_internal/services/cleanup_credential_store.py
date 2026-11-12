@@ -40,7 +40,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 from adscan_core import telemetry
 from adscan_core.rich_output import mark_sensitive, print_info, print_warning
@@ -67,6 +67,7 @@ __all__ = [
     "WORKSPACE_VARIABLES_KEY",
     "ANY_DOMAIN",
     "set_cleanup_credential",
+    "set_forest_root_resolver",
     "save_workspace_credential",
     "forget_workspace_credentials",
     "saved_workspace_principals",
@@ -318,16 +319,48 @@ def restore_workspace_state(raw: object, *, present: bool, reset: bool) -> None:
         _PROMPT_DECLINED = declined
 
 
+#: ``domain -> forest root`` (no network), installed by the engine so ONE account
+#: saved for a forest root serves every domain of that forest. ``None`` until
+#: installed: then only the exact domain and the any-domain entry are consulted.
+_FOREST_ROOT_RESOLVER: Optional[Callable[[str], Optional[str]]] = None
+
+
+def set_forest_root_resolver(resolver: Optional[Callable[[str], Optional[str]]]) -> None:
+    """Install (or clear) the forest lookup used by :func:`_lookup`."""
+    global _FOREST_ROOT_RESOLVER
+    _FOREST_ROOT_RESOLVER = resolver
+
+
+def _forest_key(domain: str) -> Optional[str]:
+    resolver = _FOREST_ROOT_RESOLVER
+    if resolver is None or _domain_key(domain) == ANY_DOMAIN:
+        return None
+    try:
+        root = resolver(domain)
+    except Exception:  # noqa: BLE001 - an unknown forest falls back to the wildcard
+        return None
+    key = _domain_key(root or "")
+    return key if key != ANY_DOMAIN and key != _domain_key(domain) else None
+
+
 def _lookup(domain: str) -> Optional[ClientCleanupCredential]:
-    """Run-provided first, then saved; an exact domain before the any-domain one."""
+    """Run-provided first, then saved; exact domain, then its forest root, then any domain.
+
+    One cleanup account per forest is the specified shape (an Enterprise Admin of
+    the forest root administers every domain of its forest), so an account saved
+    for the forest root is the one a child domain uses unless the child has its
+    own. An account of another forest is never reached this way.
+    """
     key = _domain_key(domain)
+    forest = _forest_key(domain)
     with _LOCK:
         return (
             _STORE.get(key)
             or _SAVED.get(key)
+            or (forest and (_STORE.get(forest) or _SAVED.get(forest)))
             or _STORE.get(ANY_DOMAIN)
             or _SAVED.get(ANY_DOMAIN)
-        )
+        ) or None
 
 
 def has_cleanup_credential(domain: str) -> bool:

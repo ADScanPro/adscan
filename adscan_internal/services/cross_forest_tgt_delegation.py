@@ -129,6 +129,7 @@ async def execute_cross_org_tgt_delegation(
                 listener_host=listener_host,
                 adidns=adidns,
                 capture_timeout=capture_timeout,
+                shell=shell,
             )
         )
     except Exception as exc:  # noqa: BLE001

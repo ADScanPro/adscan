@@ -425,7 +425,7 @@ def _generate_demo_pdf(
         engine="chromium",
         renderer="cytoscape",
         template="premium",
-        theme="premium_dark",
+        theme="corporate_light",
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(pdf_bytes)

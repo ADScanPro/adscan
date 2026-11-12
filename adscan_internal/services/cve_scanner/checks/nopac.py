@@ -28,6 +28,7 @@ Restrictive-AD constraints (per ``adscan-ad-constraints``):
 
 from __future__ import annotations
 
+from adscan_core.async_bridge import run_on_new_loop
 import asyncio
 from binascii import unhexlify
 from typing import TYPE_CHECKING, Any, Callable
@@ -182,7 +183,7 @@ def _request_tgt_pair_native(
         no_pac = await _one(request_pac=False)
         return with_pac, no_pac
 
-    return asyncio.run(_both())
+    return run_on_new_loop(_both())
 
 
 def _extract_tgt_from_ccache(ccache_bytes: bytes) -> bytes:

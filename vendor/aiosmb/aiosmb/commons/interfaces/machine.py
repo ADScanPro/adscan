@@ -1606,6 +1606,47 @@ class SMBMachine:
 		except Exception as e:
 			return None, e
 
+	async def get_ca_security_and_role_separation_dcom(self, ca_name: str) -> Tuple[dict, Union[Exception, None]]:
+		"""
+		Read a CA's security descriptor AND its role-separation flag on ONE ICertAdminD2.
+
+		Two side-effect-free MS-CSRA reads over the same activation, run
+		SEQUENTIALLY (never concurrently: one SMB connection is not safe across
+		concurrent DCE-RPC operations): GetCASecurity (opnum 36) and
+		GetCAProperty(CR_PROP_ROLESEPARATIONENABLED) (opnum 32, the
+		CAINFO.lRoleSeparationEnabled field, [MS-WCCE] 3.2.1.4.3.2.23). Each read
+		is attempted on its own, so a refused security read (the normal answer to
+		an account that is not a CA administrator) still leaves the flag, which
+		only needs Read. A read that failed carries its error and NO value.
+
+		Returns:
+			({"security", "security_error", "role_separation",
+			  "role_separation_error"}, None), or (None, Exception) when the
+			interface could not be activated at all.
+		"""
+		facts = {
+			'security': None, 'security_error': None,
+			'role_separation': None, 'role_separation_error': None,
+		}
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdmin, IID_ICertAdminD2)
+				if err is not None:
+					raise err
+				async with ICertAdminD2(iInterface) as cert_admin:
+					try:
+						facts['security'] = await cert_admin.get_ca_security(ca_name)
+					except Exception as e:
+						facts['security_error'] = e
+					try:
+						# CAINFO.lRoleSeparationEnabled, never the blob's first DWORD.
+						facts['role_separation'] = await cert_admin.get_role_separation_enabled(ca_name)
+					except Exception as e:
+						facts['role_separation_error'] = e
+					return facts, None
+		except Exception as e:
+			return None, e
+
 	async def set_ca_security_dcom(self, ca_name: str, sd_bytes: bytes) -> Tuple[int, Union[Exception, None]]:
 		"""
 		Write a CA's authoritative security descriptor via DCOM (ICertAdminD2 SetCASecurity).
@@ -1630,6 +1671,76 @@ class SMBMachine:
 				async with ICertAdminD2(iInterface) as cert_admin:
 					error_code = await cert_admin.set_ca_security(ca_name, sd_bytes)
 					return error_code, None
+		except Exception as e:
+			return None, e
+
+	async def get_my_ca_roles_dcom(self, ca_name: str) -> Tuple[int, Union[Exception, None]]:
+		"""
+		Read the caller's own CA roles via DCOM (ICertAdminD2 GetMyRoles, opnum 47).
+
+		Side-effect-free MS-CSRA read that needs only Read on the CA (implied by
+		Enroll). The CA evaluates the caller's nested and cross-domain group
+		membership itself. Kerberos-native, packet privacy forced.
+
+		Returns:
+			(roles, None) on success: CA_ACCESS_* bits (0x2 = officer)
+			(None, Exception) on failure
+		"""
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdmin, IID_ICertAdminD2)
+				if err is not None:
+					raise err
+				async with ICertAdminD2(iInterface) as cert_admin:
+					return await cert_admin.get_my_roles(ca_name), None
+		except Exception as e:
+			return None, e
+
+	async def get_ca_reversal_facts_dcom(self, ca_name: str) -> Tuple[dict, Union[Exception, None]]:
+		"""
+		Read, on ONE activated ICertAdminD2, the facts that decide whether the
+		caller can revoke a certificate on this CA before one is requested.
+
+		Three side-effect-free MS-CSRA reads, run SEQUENTIALLY over the one
+		connection (never concurrently: one SMB connection is not safe across
+		concurrent DCE-RPC operations): GetMyRoles (opnum 47),
+		GetCAProperty(CR_PROP_ROLESEPARATIONENABLED) (opnum 32) and
+		GetOfficerRights (opnum 42). Each read is attempted on its own, so one
+		refused read leaves the others intact; a read that failed carries its
+		error and NO value (an error is never read as a negative).
+
+		Returns:
+			({"roles", "roles_error", "role_separation", "role_separation_error",
+			  "officer_rights_enabled", "officer_rights_error"}, None), or
+			(None, Exception) when the interface could not be activated at all.
+		"""
+		facts = {
+			'roles': None, 'roles_error': None,
+			'role_separation': None, 'role_separation_error': None,
+			'officer_rights_enabled': None, 'officer_rights_error': None,
+		}
+		try:
+			async with DCOMConnection.from_smbconnection(self.connection) as dcom:
+				iInterface, err = await dcom.CoCreateInstanceEx(CLSID_ICertAdmin, IID_ICertAdminD2)
+				if err is not None:
+					raise err
+				async with ICertAdminD2(iInterface) as cert_admin:
+					try:
+						facts['roles'] = await cert_admin.get_my_roles(ca_name)
+					except Exception as e:
+						facts['roles_error'] = e
+					try:
+						# CAINFO.lRoleSeparationEnabled ([MS-WCCE] 3.2.1.4.3.2.23),
+						# never the blob's first DWORD (CAINFO.cbSize).
+						facts['role_separation'] = await cert_admin.get_role_separation_enabled(ca_name)
+					except Exception as e:
+						facts['role_separation_error'] = e
+					try:
+						enabled, _sd = await cert_admin.get_officer_rights(ca_name)
+						facts['officer_rights_enabled'] = enabled
+					except Exception as e:
+						facts['officer_rights_error'] = e
+					return facts, None
 		except Exception as e:
 			return None, e
 

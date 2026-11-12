@@ -32,6 +32,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
 from adscan_core.lab_context import build_workspace_telemetry_fields
 from adscan_core.version_context import get_installed_version
 from adscan_internal import telemetry
@@ -510,6 +511,8 @@ def build_scan_summary(shell: Any, command_name: str) -> dict[str, Any]:
     # goal_met: domain compromise is the strong oracle; path_state terminal is a fallback.
     goal_met = domain_compromised or path_state == "domain_compromised"
     return {
+        # Owned by the output contract (schema scan_summary.v1.json).
+        SCHEMA_VERSION_KEY: output_marker("scan_summary"),
         "machine": getattr(shell, "current_workspace", None),
         "domain": _resolve_domain_for_posture(shell),
         "adscan_version": get_installed_version(),

@@ -28,6 +28,7 @@ from adscan_core.reporting.unauthenticated_reach import (
     UNAUTHENTICATED_ENTRY_AFFECTED_SCOPE_PHRASE,
     UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE,
 )
+from adscan_core.reporting.folded_route_count import folded_route_count
 
 
 _SHARE_ACCESS_RELATION_KEYS = {
@@ -910,6 +911,9 @@ def print_attack_paths_summary(
         tier for tier in DISPLAY_TIER_ORDER if visible_by_class[tier] > 0
     ]
 
+    # A domain listing folds same-story routes from several entry points into
+    # one row; say how many routes the rows stand for, in the shared wording.
+    _fold = folded_route_count(ordered_paths)
     summary_text = Text()
     if show_sections:
         for idx, tier in enumerate(DISPLAY_TIER_ORDER):
@@ -930,9 +934,13 @@ def print_attack_paths_summary(
         summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['success']}")
         if show_count < total:
             summary_text.append(f"/{total}", style="dim")
+        if _fold.folded:
+            summary_text.append(
+                f" ({_fold.routes:,} counting each entry point)", style="dim"
+            )
     else:
         summary_text.append("Attack Paths Found: ", style="bold white")
-        summary_text.append(str(total), style=f"bold {BRAND_COLORS['warning']}")
+        summary_text.append(_fold.phrase(), style=f"bold {BRAND_COLORS['warning']}")
         summary_text.append("  ")
         summary_text.append("Showing: ", style="bold white")
         summary_text.append(str(show_count), style=f"bold {BRAND_COLORS['info']}")

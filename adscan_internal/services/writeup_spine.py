@@ -88,6 +88,9 @@ from typing import Any
 
 from adscan_core import telemetry, tier
 from adscan_core.credential_origins import NOT_RECOVERED_ORIGINS, ORIGIN_ADSCAN_PROVISIONED
+from adscan_core.reporting.execution_failure_explanations import (
+    resolve_step_failure_reason,
+)
 from adscan_core.reporting.attack_step_reason_codes import (
     REASON_CODE_KEY,
     normalize_reason_code as _normalize_reason_code,
@@ -572,6 +575,10 @@ class SpineStep:
     #: honest "what and why" instead of a bare "ran, did not complete". Empty when
     #: the step recorded no structured reason.
     reason_code: str = ""
+    #: The client sentence for that reason (the specific explanation when the
+    #: cause maps to one, else the category note). Every attempted step has
+    #: one; empty for any other outcome.
+    reason_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1806,6 +1813,9 @@ def _build_steps(
         if proof:
             outcome = "success"
         attribution = () if proof else origins.attribution_for(relation)
+        # Why an attempted step did not complete, from the shared reason SSOT
+        # the reports and the web CTEM read; None for any other outcome.
+        _step_reason = resolve_step_failure_reason(outcome, details, relation=relation)
         # The catalog's manual-command/narrative templates substitute {dc_ip} /
         # {domain} placeholders from ``details`` — a raw step from the graph
         # rarely carries them, so they are stamped in here from what the spine
@@ -1872,7 +1882,10 @@ def _build_steps(
                 == "unauth_enrichment",
                 unauthenticated_reachable=step_unauth,
                 reached_via=step_reached_via,
-                reason_code=_normalize_reason_code(details.get(REASON_CODE_KEY)),
+                reason_code=_step_reason.reason_code
+                if _step_reason is not None
+                else _normalize_reason_code(details.get(REASON_CODE_KEY)),
+                reason_note=_step_reason.client_note if _step_reason is not None else "",
             )
         )
     return steps
@@ -2149,7 +2162,12 @@ def _route_status_reason(path: dict[str, Any]) -> str:
                 # LAST attempted step that carries one.
                 details = step.get("details")
                 details = details if isinstance(details, dict) else {}
-                note = reason_code_client_note(details.get(REASON_CODE_KEY))
+                reason = resolve_step_failure_reason(
+                    step_status, details, relation=last_relation
+                )
+                # A cause nothing explains keeps the honest "stopped at X"
+                # fallback below, which at least names where the route ended.
+                note = reason.client_note if reason is not None and reason.mapped else ""
                 if note:
                     last_reason_note = note
         if last_reason_note:
@@ -4051,7 +4069,7 @@ def _render_step(step: SpineStep, *, fill: CommandFill | None = None) -> list[st
         # but not authenticated with) over the generic dead-end phrase: it tells
         # the reader WHY the step stopped and that ADscan still executed and holds
         # the material, instead of a bare "ran, did not complete".
-        reason_note = reason_code_client_note(step.reason_code)
+        reason_note = step.reason_note or reason_code_client_note(step.reason_code)
         facts.append(reason_note or _DEAD_END_PHRASES[step.outcome])
         if step.credential_attribution:
             facts.append(_attribution_phrase(step))

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.license_register/1",
+  "title": "ADscan PRO licence register export v1",
+  "description": "The output of `adscan license register export` (JSON form): what one engine installation recorded under its PRO licence, for the quarterly reconciliation between a partner and ADscan. It never carries a domain name, a host, a user or a finding: a domain is its one-way per-partner domain code. entries is one row per domain code (registered rows carry the licence server's signed receipt, which verifies independently of the exporter; pending rows are a declaration). assessments is one usage line per assessment of a code: run_kind full_scan or recheck, the run, for a recheck the scan it re-checked, the identity band and the date. engagements is what those lines count as under the licence's retest window: a recheck never opens an engagement; a full scan inside the window of the engagement already open for its code is a retest of it; at or after the window's end it opens a new one. The licence server counts its own records with the same rule. Written by one writer (register_export in adscan_core/pro_license/client.py). Version marker: schema_version, '1.<minor>'; adscan_register is the legacy integer marker kept for readers of the first export. Declared objects may gain fields within a major; do not reject unknown keys. receipt and usage are opaque.",
+  "type": "object",
+  "required": ["schema_version", "adscan_register", "exported_at", "retest_window_days", "entries", "assessments", "engagements", "unattached_rechecks"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "adscan_register": {"const": 1},
+    "exported_at": {"$ref": "#/$defs/timestamp"},
+    "installation_id": {"$ref": "#/$defs/nullable_string"},
+    "license_id": {"$ref": "#/$defs/nullable_string"},
+    "edition": {"$ref": "#/$defs/nullable_string", "$comment": "pro_trial, pro_partner, pro or pro_engagement."},
+    "partner_tag": {"$ref": "#/$defs/nullable_string"},
+    "retest_window_days": {"$ref": "#/$defs/window"},
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+    "assessments": {"type": "array", "items": {"$ref": "#/$defs/assessment"}},
+    "engagements": {"type": "array", "items": {"$ref": "#/$defs/engagement"}},
+    "unattached_rechecks": {
+      "type": "array",
+      "items": {"type": "string"},
+      "$comment": "Run ids of rechecks whose code has no engagement in this register (a workspace assessed before the licence was activated). Never billable."
+    },
+    "usage": {"type": "object", "$comment": "Offline engagement licences only: the environment ledger's usage for the licence term."}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nullable_string": {"type": ["string", "null"]},
+    "nullable_timestamp": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+    "window": {"type": "integer", "minimum": 0, "maximum": 730},
+    "domain_code": {"type": "string", "minLength": 4},
+    "run_kind": {"enum": ["full_scan", "recheck"]},
+    "entry": {
+      "type": "object",
+      "required": ["domain_code", "status", "receipt_verified"],
+      "properties": {
+        "domain_code": {"$ref": "#/$defs/domain_code"},
+        "code_basis": {"$ref": "#/$defs/nullable_string", "$comment": "root_guid, domain_guid or name."},
+        "band": {"$ref": "#/$defs/nullable_string"},
+        "first_seen": {"$ref": "#/$defs/nullable_timestamp"},
+        "status": {"$ref": "#/$defs/nullable_string", "$comment": "pending, registered or refused."},
+        "registered_at": {"$ref": "#/$defs/nullable_timestamp"},
+        "receipt_id": {"$ref": "#/$defs/nullable_string"},
+        "receipt": {"oneOf": [{"type": "object"}, {"type": "null"}]},
+        "receipt_verified": {"type": "boolean"}
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "required": ["domain_code", "run_kind", "assessed_at", "run_id"],
+      "properties": {
+        "domain_code": {"$ref": "#/$defs/domain_code"},
+        "run_kind": {"$ref": "#/$defs/run_kind"},
+        "assessed_at": {"$ref": "#/$defs/timestamp"},
+        "run_id": {"type": "string"},
+        "parent_run_id": {"$ref": "#/$defs/nullable_string", "$comment": "For a recheck, the run id of the scan it re-checked; null for a full scan."},
+        "band": {"$ref": "#/$defs/nullable_string", "$comment": "Identity band; pending until counted at the end of the scan."},
+        "retest_window_days": {"oneOf": [{"$ref": "#/$defs/window"}, {"type": "null"}], "$comment": "The licence window in force when a full scan ran; null for a recheck."}
+      }
+    },
+    "engagement": {
+      "type": "object",
+      "required": ["domain_code", "opened_at", "opened_by_run_id", "retest_window_days", "retest_until", "retest_run_ids", "recheck_run_ids"],
+      "properties": {
+        "domain_code": {"$ref": "#/$defs/domain_code"},
+        "opened_at": {"$ref": "#/$defs/timestamp"},
+        "opened_by_run_id": {"type": "string"},
+        "retest_window_days": {"$ref": "#/$defs/window"},
+        "retest_until": {"$ref": "#/$defs/timestamp", "$comment": "First instant at which a full scan of the code opens a new engagement."},
+        "band": {"$ref": "#/$defs/nullable_string"},
+        "retest_run_ids": {"type": "array", "items": {"type": "string"}},
+        "recheck_run_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

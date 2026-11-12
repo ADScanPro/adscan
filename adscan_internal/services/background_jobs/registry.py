@@ -32,7 +32,6 @@ _SCHEMA_VERSION = "1.0"
 JobState = Literal["pending", "running", "done", "failed", "stopped"]
 _TERMINAL_STATES: frozenset[str] = frozenset({"done", "failed", "stopped"})
 
-
 def _utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 

@@ -58,7 +58,7 @@ class DirEnumState:
 
 
 class SMBServerConnection:
-	def __init__(self, settings, connection, connection_id, shutdown_evt = asyncio.Event()):
+	def __init__(self, settings, connection, connection_id, shutdown_evt = None):
 		self.settings = settings
 		self.gssapi = self.settings.create_new_gssapi(connection)
 		self.connection_id = connection_id
