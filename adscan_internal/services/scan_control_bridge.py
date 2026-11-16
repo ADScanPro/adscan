@@ -145,6 +145,16 @@ def record_operator_stop(stop: OperatorStop, *, shell: Any = None) -> None:
 def _detail_sentence(stop: OperatorStop) -> str:
     """The operator-facing "what did not finish" line for the recap and ``ci``."""
     label = stop.label or "the scan"
+    from adscan_core.reporting.operator_stop_coverage import (  # noqa: PLC0415
+        SOURCE_ENGAGEMENT_SCOPE,
+    )
+
+    if stop.source == SOURCE_ENGAGEMENT_SCOPE:
+        # Nobody stopped it: the scope excludes the account the scan signs in with.
+        return (
+            f"stopped during {label}: the account the scan signs in with is "
+            "excluded from the engagement scope"
+        )
     if stop.examined is not None and stop.total:
         unit = f" {stop.unit}" if stop.unit else ""
         return f"stopped by the operator during {label}, after {stop.examined} of {stop.total}{unit}"

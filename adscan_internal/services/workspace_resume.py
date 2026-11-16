@@ -126,18 +126,19 @@ def inspect_workspace(shell: Any, domain: str) -> WorkspaceSnapshot:
 
 
 def _count_graph_size(graph_path: Path) -> tuple[int, int]:
-    """Return ``(node_count, edge_count)`` from ``attack_graph.json`` or ``(0, 0)``."""
+    """Return ``(node_count, edge_count)`` from ``attack_graph.json`` or ``(0, 0)``.
+
+    Streamed (``graph_compact.count_graph_file``): opening a workspace never
+    parses a whole format-2 export just to count it.
+    """
+    from adscan_core.graph_compact import count_graph_file  # noqa: PLC0415
+
     if not graph_path.is_file():
         return (0, 0)
     try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        return count_graph_file(graph_path)
     except (OSError, ValueError):
         return (0, 0)
-    nodes = data.get("nodes")
-    edges = data.get("edges")
-    node_count = len(nodes) if isinstance(nodes, (dict, list)) else 0
-    edge_count = len(edges) if isinstance(edges, list) else 0
-    return (node_count, edge_count)
 
 
 def _is_entry_vectors_only_graph(graph_path: Path) -> bool:

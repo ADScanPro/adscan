@@ -15,9 +15,7 @@ canonical path that contains it.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Collection, Mapping, Optional, Sequence
 
 from adscan_core.engagement.identity import attack_path_id_for_record, normalize_identity_token
@@ -104,12 +102,9 @@ def find_path(paths: Sequence[ResolvedPath], token: str) -> ResolvedPath:
 
 
 def load_graph(workspace_dir: str, domain: str) -> Optional[dict[str, Any]]:
-    path = Path(workspace_dir) / "domains" / domain / "attack_graph.json"
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
+    from adscan_core.graph_file_reader import read_domain_graph
+
+    return read_domain_graph(workspace_dir, domain)
 
 
 def _label_index(nodes: Mapping[str, Any]) -> dict[str, list[str]]:
@@ -243,6 +238,17 @@ def walk_steps_from_outcomes(
     statement about the client's directory.
     """
     removed = {str(name).casefold() for name in removed_principals}
+    from adscan_core.engagement.recheck import (  # noqa: PLC0415
+        REASON_OUTSIDE_SCOPE,
+        REASON_SCOPE_UNCONFIRMED,
+    )
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        NOT_EXECUTED_OUTSIDE_SCOPE,
+        SCOPE_OUTCOME_UNCONFIRMED,
+    )
+    from adscan_internal.services.attack_path_execution_run import (  # noqa: PLC0415
+        SCOPE_OUTCOME_EXPLANATION_KEY,
+    )
     from adscan_core.reporting.attack_path_execution_events import (  # noqa: PLC0415
         OUTCOME_NOT_REACHED,
         OUTCOME_SAFETY_BLOCKED,
@@ -267,7 +273,21 @@ def walk_steps_from_outcomes(
                 out.append(WalkStep(step_id, WALK_NOT_WALKED, "reused_earlier_proof"))
             continue
         broken = True
-        if outcome.outcome == OUTCOME_SAFETY_BLOCKED:
+        if str(outcome.explanation.get("reason_code") or "") == NOT_EXECUTED_OUTSIDE_SCOPE:
+            # The engagement scope kept the step from running: said with the
+            # scope's own reason, never as a step this walk happened not to run.
+            unconfirmed = (
+                str(outcome.explanation.get(SCOPE_OUTCOME_EXPLANATION_KEY) or "")
+                == SCOPE_OUTCOME_UNCONFIRMED
+            )
+            out.append(
+                WalkStep(
+                    step_id,
+                    WALK_STOPPED,
+                    REASON_SCOPE_UNCONFIRMED if unconfirmed else REASON_OUTSIDE_SCOPE,
+                )
+            )
+        elif outcome.outcome == OUTCOME_SAFETY_BLOCKED:
             out.append(WalkStep(step_id, WALK_STOPPED, "not_run"))
         elif removed and _principal_token(getattr(outcome, "from_label", "")) in removed:
             out.append(WalkStep(step_id, WALK_STOPPED, "credential_removed"))

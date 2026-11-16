@@ -52,6 +52,15 @@ from adscan_internal.services.service_access_results import (
     summarize_service_access_categories,
     select_confirmed_service_access_followup_targets,
 )
+from adscan_core.scan_control.fanout import SweepCoverage
+from adscan_internal.services.sweep_stop import (
+    SERVICE_SWEEP_LABELS,
+    announce_not_checked,
+    checked_only,
+    finish_sweep_step,
+    service_sweep_step,
+    stop_ends_operation,
+)
 from adscan_internal.text_utils import strip_ansi_codes
 from adscan_internal.workspaces import resolve_workspace_cwd
 from adscan_internal.workspaces.computers import load_target_entries
@@ -148,6 +157,22 @@ def rdp_access(
             print_error(f"Interactive RDP is not available on this platform: {rdp_status.reason}")
         else:
             print_error("RDP client not found. Please install xfreerdp via 'adscan install'.")
+        return
+
+    # The RDP client is another process (a child here, or one the host helper
+    # starts), which the in-process socket guard cannot see: the host is asked
+    # of the engagement scope here, immediately before either is started.
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        subprocess_host_in_scope,
+    )
+
+    if not subprocess_host_in_scope(
+        shell,
+        host,
+        surface="rdp_interactive_session",
+        what="RDP session",
+        domain=str(domain or "").strip() or None,
+    ):
         return
 
     # Import GUI session check functions from adscan.py
@@ -404,8 +429,12 @@ def run_rdp_service_access_sweep(
     targets: str,
     prompt: bool = True,
     target_count: int = 1,
+    coverage: SweepCoverage | None = None,
 ) -> bool:
     """Enumerate RDP access using the native aardwolf async stack.
+
+    Runs as a long scan-control step: Ctrl+C can stop it, the hosts checked so
+    far are kept and the rest are named as not checked (``coverage``).
 
     Uses the native aardwolf CredSSP+NTLM client from the vendored skelsec
     stack (vendor/aardwolf/).
@@ -510,130 +539,143 @@ def run_rdp_service_access_sweep(
             return
         host_list = list(rdp_reach.reachable)
 
-    try:
-        rdp_results = run_on_new_loop(
-            scan_rdp_hosts(
-                host_list,
+    sweep_coverage = coverage if coverage is not None else SweepCoverage()
+    with service_sweep_step("rdp") as step:
+        try:
+            rdp_results = run_on_new_loop(
+                scan_rdp_hosts(
+                    host_list,
+                    domain=domain,
+                    username=username,
+                    secret=password,
+                    is_hash=is_hash,
+                    dc_ip=dc_ip,
+                    connect_timeout_s=connect_timeout,
+                    max_workers=workers,
+                    posture_snapshot=posture_snapshot,
+                    posture_sink=posture_sink,
+                    domain_for_posture=domain,
+                    should_stop=step.should_stop,
+                    coverage=sweep_coverage,
+                )
+            )
+            finish_sweep_step(step, sweep_coverage)
+        except Exception as exc:
+            telemetry.capture_exception(exc)
+            print_error("RDP enumeration failed.")
+            print_exception(show_locals=False, exception=exc)
+            return False
+
+        service_findings = [
+            ServiceAccessFinding(
+                service="rdp",
+                host=r.host,
+                username=username,
+                category="confirmed"
+                if r.confirmed
+                else ("ambiguous" if r.ambiguous else "denied"),
+                reason=r.error or ("CredSSP+NTLM accepted" if r.confirmed else ""),
+                status="TRUE" if r.confirmed else ("MAYBE" if r.ambiguous else "FALSE"),
+                backend="aardwolf",
+            )
+            for r in rdp_results
+            if r.verdict != "ERROR"
+        ]
+        for r in rdp_results:
+            if r.verdict == "ERROR":
+                print_info_debug(
+                    f"[rdp-aardwolf] error probing {mark_sensitive(r.host, 'hostname')}: {r.error}"
+                )
+
+        success_findings = [f for f in service_findings if f.category == "confirmed"]
+        if is_hash and not success_findings and service_findings:
+            print_warning(
+                "RDP pass-the-hash returned no confirmed hosts. "
+                "If NTLM is disabled by GPO on this network, PtH is not viable — "
+                "obtain a plaintext password or Kerberos key instead."
+            )
+        not_checked = len(sweep_coverage.not_checked)
+        render_service_access_results(
+            service="rdp",
+            username=username,
+            findings=service_findings,
+            total_targets=max(0, target_count - not_checked),
+            not_checked=not_checked,
+        )
+        announce_not_checked(label=SERVICE_SWEEP_LABELS["rdp"], coverage=sweep_coverage)
+        category_counts = summarize_service_access_categories(service_findings)
+        if (
+            category_counts["denied"]
+            or category_counts["transport"]
+            or category_counts["ambiguous"]
+        ):
+            print_info_debug(
+                "[rdp-aardwolf] unconfirmed result breakdown: "
+                f"denied={category_counts['denied']} "
+                f"transport={category_counts['transport']} "
+                f"ambiguous={category_counts['ambiguous']}"
+            )
+
+        found_privileged_hosts = False
+        for finding in success_findings:
+            found_privileged_hosts = True
+            try:
+                from adscan_internal.services.attack_graph_service import (
+                    upsert_netexec_privilege_edge,
+                )
+
+                upsert_netexec_privilege_edge(
+                    shell,
+                    domain,
+                    username=finding.username,
+                    relation="CanRDP",
+                    target_ip=finding.host,
+                    target_hostname=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+
+        normalized_target_entries = {
+            str(e).strip().lower() for e in target_entries if str(e).strip()
+        }
+        confirmed_targets = [
+            entry
+            for entry in target_entries
+            if str(entry).strip().lower()
+            in {
+                str(f.host).strip().lower() for f in success_findings if str(f.host).strip()
+            }
+        ]
+        if (
+            not confirmed_targets
+            and len(normalized_target_entries) == 1
+            and success_findings
+        ):
+            confirmed_targets = list(target_entries)
+
+        try:
+            record_service_access_probe_batch(
+                workspace_dir=workspace_cwd,
+                domains_dir=domains_dir,
                 domain=domain,
                 username=username,
-                secret=password,
-                is_hash=is_hash,
-                dc_ip=dc_ip,
-                connect_timeout_s=connect_timeout,
-                max_workers=workers,
-                posture_snapshot=posture_snapshot,
-                posture_sink=posture_sink,
-                domain_for_posture=domain,
-            )
-        )
-    except Exception as exc:
-        telemetry.capture_exception(exc)
-        print_error("RDP enumeration failed.")
-        print_exception(show_locals=False, exception=exc)
-        return False
-
-    service_findings = [
-        ServiceAccessFinding(
-            service="rdp",
-            host=r.host,
-            username=username,
-            category="confirmed"
-            if r.confirmed
-            else ("ambiguous" if r.ambiguous else "denied"),
-            reason=r.error or ("CredSSP+NTLM accepted" if r.confirmed else ""),
-            status="TRUE" if r.confirmed else ("MAYBE" if r.ambiguous else "FALSE"),
-            backend="aardwolf",
-        )
-        for r in rdp_results
-        if r.verdict != "ERROR"
-    ]
-    for r in rdp_results:
-        if r.verdict == "ERROR":
-            print_info_debug(
-                f"[rdp-aardwolf] error probing {mark_sensitive(r.host, 'hostname')}: {r.error}"
-            )
-
-    success_findings = [f for f in service_findings if f.category == "confirmed"]
-    if is_hash and not success_findings and service_findings:
-        print_warning(
-            "RDP pass-the-hash returned no confirmed hosts. "
-            "If NTLM is disabled by GPO on this network, PtH is not viable — "
-            "obtain a plaintext password or Kerberos key instead."
-        )
-    render_service_access_results(
-        service="rdp",
-        username=username,
-        findings=service_findings,
-        total_targets=target_count,
-    )
-    category_counts = summarize_service_access_categories(service_findings)
-    if (
-        category_counts["denied"]
-        or category_counts["transport"]
-        or category_counts["ambiguous"]
-    ):
-        print_info_debug(
-            "[rdp-aardwolf] unconfirmed result breakdown: "
-            f"denied={category_counts['denied']} "
-            f"transport={category_counts['transport']} "
-            f"ambiguous={category_counts['ambiguous']}"
-        )
-
-    found_privileged_hosts = False
-    for finding in success_findings:
-        found_privileged_hosts = True
-        try:
-            from adscan_internal.services.attack_graph_service import (
-                upsert_netexec_privilege_edge,
-            )
-
-            upsert_netexec_privilege_edge(
-                shell,
-                domain,
-                username=finding.username,
-                relation="CanRDP",
-                target_ip=finding.host,
-                target_hostname=None,
+                service="rdp",
+                targets=checked_only(target_entries, sweep_coverage),
+                confirmed_hosts=confirmed_targets,
+                source="run_rdp_service_access_sweep",
+                backend="aardwolf",
+                pivot_capable=is_service_pivot_capable("rdp"),
             )
         except Exception as exc:  # noqa: BLE001
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
+            print_info_debug(f"[rdp-aardwolf] failed to persist probe history: {exc}")
 
-    normalized_target_entries = {
-        str(e).strip().lower() for e in target_entries if str(e).strip()
-    }
-    confirmed_targets = [
-        entry
-        for entry in target_entries
-        if str(entry).strip().lower()
-        in {
-            str(f.host).strip().lower() for f in success_findings if str(f.host).strip()
-        }
-    ]
-    if (
-        not confirmed_targets
-        and len(normalized_target_entries) == 1
-        and success_findings
-    ):
-        confirmed_targets = list(target_entries)
-
-    try:
-        record_service_access_probe_batch(
-            workspace_dir=workspace_cwd,
-            domains_dir=domains_dir,
-            domain=domain,
-            username=username,
-            service="rdp",
-            targets=target_entries,
-            confirmed_hosts=confirmed_targets,
-            source="run_rdp_service_access_sweep",
-            backend="aardwolf",
-            pivot_capable=is_service_pivot_capable("rdp"),
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(f"[rdp-aardwolf] failed to persist probe history: {exc}")
+    if stop_ends_operation(step):
+        # A skipped phase or a stopped scan: what was checked is recorded; the
+        # follow-up prompts are not opened.
+        return found_privileged_hosts
 
     if prompt and success_findings:
         selected_followups, used_selector = (

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from adscan_internal import print_info_debug
-from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.rich_output import mark_sensitive, markup_object_label
 from adscan_internal.services.attack_graph_service import update_edge_status_by_labels
 
 
@@ -71,8 +71,8 @@ def set_active_step(
     setattr(shell, "_active_attack_graph_step", payload)
     try:
         marked_domain = mark_sensitive(domain, "domain")
-        marked_from = mark_sensitive(from_label, "node")
-        marked_to = mark_sensitive(to_label, "node")
+        marked_from = markup_object_label(from_label)
+        marked_to = markup_object_label(to_label)
         print_info_debug(
             "[attack-graph] Active step set: "
             f"domain={marked_domain} from={marked_from} relation={relation} to={marked_to}"
@@ -118,8 +118,8 @@ def clear_active_step(shell: Any) -> None:
         active = getattr(shell, "_active_attack_graph_step", None)
         if isinstance(active, ActiveAttackGraphStep):
             marked_domain = mark_sensitive(active.domain, "domain")
-            marked_from = mark_sensitive(active.from_label, "node")
-            marked_to = mark_sensitive(active.to_label, "node")
+            marked_from = markup_object_label(active.from_label)
+            marked_to = markup_object_label(active.to_label)
             print_info_debug(
                 "[attack-graph] Active step cleared: "
                 f"domain={marked_domain} from={marked_from} relation={active.relation} to={marked_to}"
@@ -162,8 +162,8 @@ def update_active_step_status(
 
     try:
         marked_domain = mark_sensitive(domain, "domain")
-        marked_from = mark_sensitive(active.from_label, "node")
-        marked_to = mark_sensitive(active.to_label, "node")
+        marked_from = markup_object_label(active.from_label)
+        marked_to = markup_object_label(active.to_label)
         print_info_debug(
             "[attack-graph] Active step status update: "
             f"domain={marked_domain} from={marked_from} relation={active.relation} to={marked_to} status={status}"

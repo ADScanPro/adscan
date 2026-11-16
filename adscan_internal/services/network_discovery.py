@@ -54,6 +54,10 @@ async def _infer_domain_from_smb_native(
     Returns ``(domain_fqdn, hostname)`` or ``(None, None)`` on failure. Only a
     dotted FQDN is returned as the domain (matching the legacy nxc contract).
     """
+    # An SMB session setup is host work (the directory plane's use of SMB is a
+    # negotiate for the time, and SYSVOL reads): asked before anything is opened.
+    if not _host_contact_in_scope(dc_ip, "smb", "SMB banner probe"):
+        return None, None
     try:
         from aiosmb.commons.connection.factory import SMBConnectionFactory
     except ImportError:
@@ -451,6 +455,8 @@ def _query_netbios_name_native(
     target = (target_ip or "").strip()
     if not target:
         return None
+    if not _netbios_query_in_scope(target):
+        return None
 
     txn_id = secrets.randbits(16)
     header = struct.pack(">HHHHHH", txn_id, 0x0000, 1, 0, 0, 0)
@@ -505,6 +511,44 @@ def _query_netbios_name_native(
     return None
 
 
+def _host_contact_in_scope(target: str, protocol: str, what: str) -> bool:
+    """May this module open ``protocol`` on ``target`` (host work, never a directory read)?
+
+    The probes of this module that are not part of the directory plane (LDAP,
+    Kerberos, DNS, time, SYSVOL): a NetBIOS node-status query on udp/137, an
+    SMB session setup that reads the server's NTLM challenge. Under an
+    engagement scope they are sent only to a host the scope lets be assessed.
+    A domain controller kept to directory reads, an excluded host and a host
+    the scope cannot place get no packet. Fails closed: a verdict that cannot
+    be computed sends nothing.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            asset_scope_recorded,
+            host_scope_verdict,
+        )
+
+        if not asset_scope_recorded():
+            return True
+        verdict = host_scope_verdict(None, host=target, contact=Contact(protocol))
+    except Exception as exc:  # noqa: BLE001 - an unknown verdict sends nothing
+        telemetry.capture_exception(exc)
+        print_exception(show_locals=False, exception=exc)
+        return False
+    if not verdict.allowed:
+        print_info_debug(
+            f"{what} to {mark_sensitive(target, 'ip')} not sent: the engagement scope does "
+            "not let this host be assessed (it is not a directory read)."
+        )
+    return bool(verdict.allowed)
+
+
+def _netbios_query_in_scope(target: str) -> bool:
+    """May a NetBIOS node-status query (udp/137) be sent to ``target``?"""
+    return _host_contact_in_scope(target, "netbios", "NBSTAT query")
+
+
 def extract_netbios(
     host: NetworkDiscoveryHost,
     domain: str,
@@ -539,6 +583,10 @@ def extract_netbios(
                 ip_candidate = (dcs[0] or "").strip()
 
         if ip_candidate:
+            # Sent only where the engagement scope lets the host be assessed
+            # (``_query_netbios_name_native`` asks). When it is not sent, what
+            # is lost is a NetBIOS name that differs from the domain's first
+            # label: the label below stands until the directory gives the name.
             netbios = _query_netbios_name_native(ip_candidate)
             if netbios:
                 return netbios

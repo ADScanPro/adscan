@@ -39,6 +39,7 @@ silently dropped.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Optional
 
 from adscan_internal import telemetry
@@ -58,10 +59,47 @@ from adscan_internal.services.adcs.esc14_confirmation import (
     esc14_confirmation_disabled,
     graph_has_esc14_edges,
 )
+from adscan_internal.services.graph_runtime_edits import apply_graph_edit
 from adscan_internal.services.adcs.scbe_observation import (
     observe_domain_scbe,
     resolve_reading_credential,
 )
+
+
+def _record_esc14_verdict(
+    shell: Any,
+    domain: str,
+    graph: Any,
+    scbe: ScbeVerdict,
+    *,
+    domain_has_weak_mapping: bool,
+    has_write_access: Callable[[dict[str, Any]], bool],
+    weak_mapping_targets: Sequence[Esc14WeakMappingTarget] = (),
+) -> Esc14ApplyResult:
+    """Apply the ESC14 verdicts through the runtime facade.
+
+    The unchanged pure function decides each edge's action; a removed edge is retired
+    and a kept one has its confirmation notes patched on, one overlay operation each.
+    """
+    result, _outcome = apply_graph_edit(
+        shell,
+        domain,
+        graph,
+        lambda view: apply_esc14_confirmation_to_graph(
+            view,
+            scbe,
+            domain_has_weak_mapping=domain_has_weak_mapping,
+            has_write_access=has_write_access,
+            weak_mapping_targets=tuple(weak_mapping_targets),
+        ),
+        edge_filter=_is_esc14_edge,
+        origin="esc14_confirmation",
+    )
+    return result
+
+
+def _is_esc14_edge(edge: Mapping[str, Any]) -> bool:
+    return str(edge.get("relation") or "").strip() == "ADCSESC14"
 
 
 def run_esc14_confirmation_phase(
@@ -80,10 +118,7 @@ def run_esc14_confirmation_phase(
     honest default) rather than dropping them.
     """
     try:
-        from adscan_internal.services.attack_graph_service import (
-            load_attack_graph,
-            save_attack_graph,
-        )
+        from adscan_internal.services.attack_graph_service import load_attack_graph
 
         graph = load_attack_graph(shell, domain)
         if not isinstance(graph, dict) or not graph_has_esc14_edges(graph):
@@ -110,13 +145,14 @@ def run_esc14_confirmation_phase(
             self_reason = ""
 
         if self_verdict is not None:
-            result = apply_esc14_confirmation_to_graph(
+            result = _record_esc14_verdict(
+                shell,
+                domain,
                 graph,
                 self_verdict,
                 domain_has_weak_mapping=False,
                 has_write_access=lambda _edge: False,
             )
-            save_attack_graph(shell, domain, graph)
             print_info_verbose(
                 f"ESC14 confirmation skipped for {marked_domain} ({self_reason}); "
                 f"{result.pending} candidate(s) left confirmation-pending."
@@ -157,14 +193,15 @@ def run_esc14_confirmation_phase(
         # A variant-A edge plants a STRONG explicit mapping the KDC honors even under
         # SCBE Full (lab-proven on a patched DC), so write access alone confirms it at
         # every SCBE level — no no-SID-extension / ESC9-shaped template is required.
-        result = apply_esc14_confirmation_to_graph(
+        result = _record_esc14_verdict(
+            shell,
+            domain,
             graph,
             scbe,
             domain_has_weak_mapping=bool(weak_mapping_targets),
             has_write_access=_has_write_access,
             weak_mapping_targets=tuple(weak_mapping_targets),
         )
-        save_attack_graph(shell, domain, graph)
 
         if scbe.state is ScbeState.HARDENED and not result.confirmed and not result.pending:
             # Record the control ONLY when EVERY ESC14 edge was removed. A variant-A

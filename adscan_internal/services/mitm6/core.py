@@ -144,6 +144,56 @@ def matches_filter(
     return True
 
 
+def victim_fqdn_in_asset_scope(fqdn: str) -> bool:
+    """Whether the engagement scope admits a DHCPv6 victim named by client FQDN.
+
+    No asset scope -> True (reply as before, FQDN or not). A scope recorded but
+    no FQDN to attribute -> False: an IPv6 client cannot be placed, so it is not
+    poisoned. Otherwise the host verdict for that FQDN (the same one every other
+    seam asks).
+    """
+
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+        host_scope_verdict,
+    )
+
+    if not asset_scope_recorded():
+        return True
+    name = (fqdn or "").strip().rstrip(".")
+    if not name:
+        return False
+    # A victim arrives one at a time and is known by its name alone: the
+    # session is told about it once (it remembers the answer), then judges it.
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(None, [name])
+    return host_scope_verdict(None, host=name).allowed
+
+
+def victim_address_in_asset_scope(victim_ip: str) -> bool:
+    """Whether the engagement scope admits a victim known only by its address.
+
+    No asset scope -> True. Otherwise the host verdict for the address: a host
+    allow-list refuses a link-local that names no in-scope host, while a
+    deny-only scope admits it unless the address is denied.
+    """
+
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+        host_scope_verdict,
+    )
+
+    if not asset_scope_recorded():
+        return True
+    addr = (victim_ip or "").strip()
+    if not addr:
+        return False
+    return host_scope_verdict(None, host=addr, connect_address=addr).allowed
+
+
 def autodetect_interface_addresses(interface_name: str) -> tuple[str, str, str] | None:
     """Return ``(mac, ipv4, ipv6_linklocal)`` for ``interface_name`` or ``None``.
 
@@ -172,6 +222,8 @@ __all__ = [
     "DNSObservation",
     "MITM6Callback",
     "matches_filter",
+    "victim_fqdn_in_asset_scope",
+    "victim_address_in_asset_scope",
     "autodetect_interface_addresses",
     "is_ipv6_address",
 ]

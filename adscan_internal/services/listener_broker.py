@@ -47,6 +47,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional, 
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_exception, print_info_debug
+from adscan_internal.rich_output import mark_sensitive
 
 #: Delivers one accepted connection to a consumer. Called on the accept thread:
 #: it must not block. Returns False when the consumer can no longer take
@@ -256,6 +257,54 @@ def normalize_peer(address: object) -> str:
     if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
         return str(parsed.ipv4_mapped)
     return str(parsed)
+
+
+#: ``peer_ip -> True`` when a connection from that source may be served. Installed
+#: by the engagement scope (``set_inbound_source_check``); ``None`` means no
+#: check is installed: the accept path does no lookup at all.
+InboundSourceCheck = Callable[[str], bool]
+
+_INBOUND_SOURCE_CHECK: Optional[InboundSourceCheck] = None
+_EXCLUDED_COUNTS: dict[str, int] = {}
+_EXCLUDED_LOCK = threading.Lock()
+
+
+def set_inbound_source_check(check: Optional[InboundSourceCheck]) -> None:
+    """Install (or clear, with ``None``) the check applied to every accepted source.
+
+    The check receives the normalised source address and returns True when the
+    connection may be served. A False answer closes the socket before any byte is
+    read and before routing. A check that raises closes the connection as well.
+    """
+    global _INBOUND_SOURCE_CHECK  # noqa: PLW0603 - one scope per process
+    _INBOUND_SOURCE_CHECK = check
+
+
+def excluded_source_counts() -> dict[str, int]:
+    """Connections closed because their source was excluded, per source address."""
+    with _EXCLUDED_LOCK:
+        return dict(_EXCLUDED_COUNTS)
+
+
+def reset_excluded_source_counts() -> None:
+    """Forget the closed-connection counters (a new engagement or a test)."""
+    with _EXCLUDED_LOCK:
+        _EXCLUDED_COUNTS.clear()
+
+
+def _is_exempt_source(peer_ip: str) -> bool:
+    """Loopback and this host's own addresses are never closed."""
+    try:
+        if ipaddress.ip_address(peer_ip).is_loopback:
+            return True
+    except ValueError:
+        return False
+    try:
+        from adscan_core.pal.net import interface_ipv4_addresses  # noqa: PLC0415
+
+        return peer_ip in set(interface_ipv4_addresses())
+    except Exception:  # noqa: BLE001 - unknown own addresses: do not exempt
+        return False
 
 
 def _wildcard_for(address: str) -> str:
@@ -597,6 +646,25 @@ class ListenerBroker:
 
     def _dispatch(self, bound: _Bound, conn: socket.socket, peer: Any) -> None:
         peer_ip = normalize_peer(peer[0] if isinstance(peer, tuple) and peer else peer)
+        check = _INBOUND_SOURCE_CHECK
+        if check is not None and not _is_exempt_source(peer_ip):
+            try:
+                served = bool(check(peer_ip))
+            except Exception:  # noqa: BLE001 - an unanswerable check fails closed
+                served = False
+            if not served:
+                with contextlib.suppress(OSError):
+                    conn.close()
+                with _EXCLUDED_LOCK:
+                    first = peer_ip not in _EXCLUDED_COUNTS
+                    _EXCLUDED_COUNTS[peer_ip] = _EXCLUDED_COUNTS.get(peer_ip, 0) + 1
+                if first:
+                    print_info_debug(
+                        f"listener-broker: :{bound.port} connection from "
+                        f"{mark_sensitive(peer_ip or '?', 'ip')} is outside the engagement "
+                        "scope; closed unread"
+                    )
+                return
         for _attempt in range(8):
             with self._lock:
                 candidates = [

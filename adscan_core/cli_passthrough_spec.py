@@ -122,6 +122,32 @@ def _report_option_passthrough_args() -> tuple[PassthroughArg, ...]:
     )
 
 
+def _scope_passthrough_args() -> tuple[PassthroughArg, ...]:
+    """The engagement-scope flags of ``ci``, from the shared scope-flag SSOT."""
+    from adscan_core.engagement_scope_cli import (  # noqa: PLC0415
+        SCOPE_ALLOW_FILE_FLAG,
+        SCOPE_ALLOW_FLAG,
+        SCOPE_DC_ACCESS_CHOICES,
+        SCOPE_DC_ACCESS_FLAG,
+        SCOPE_DENY_FILE_FLAG,
+        SCOPE_DENY_FLAG,
+        SCOPE_FLAG_HELP,
+        SCOPE_RERUN_RULE,
+    )
+
+    return (
+        PassthroughArg((SCOPE_ALLOW_FLAG,), SCOPE_FLAG_HELP[SCOPE_ALLOW_FLAG], metavar="VALUE[,VALUE...]"),
+        PassthroughArg((SCOPE_DENY_FLAG,), SCOPE_FLAG_HELP[SCOPE_DENY_FLAG], metavar="VALUE[,VALUE...]"),
+        PassthroughArg((SCOPE_ALLOW_FILE_FLAG,), SCOPE_FLAG_HELP[SCOPE_ALLOW_FILE_FLAG], metavar="PATH"),
+        PassthroughArg((SCOPE_DENY_FILE_FLAG,), SCOPE_FLAG_HELP[SCOPE_DENY_FILE_FLAG], metavar="PATH"),
+        PassthroughArg(
+            (SCOPE_DC_ACCESS_FLAG,),
+            f"{SCOPE_FLAG_HELP[SCOPE_DC_ACCESS_FLAG]} {SCOPE_RERUN_RULE}",
+            choices=SCOPE_DC_ACCESS_CHOICES,
+        ),
+    )
+
+
 # ── ci ────────────────────────────────────────────────────────────────────────
 # Mirrors the container ``ci`` subparser in ``adscan.py`` (``add_ci_subparser``).
 # Locked by tests/unit/launcher/test_passthrough_spec_contract.py.
@@ -224,6 +250,8 @@ CI_PASSTHROUGH = PassthroughCommand(
         # The deliverable options are not re-declared: they come from the shared
         # report-options model the container `ci` and `deliver` parsers register.
         *_report_option_passthrough_args(),
+        # The asset-level engagement scope, from the shared scope-flag SSOT.
+        *_scope_passthrough_args(),
         PassthroughArg(("--verbose", "-v"), "Verbose output."),
         PassthroughArg(("--debug", "-d"), "Debug output."),
     ),
@@ -241,6 +269,9 @@ CI_PASSTHROUGH = PassthroughCommand(
         "adscan ci auth --policy audit --domain corp.local --dc-ip 10.0.0.1 -u alice "
         "-p 'S3cr3t!' --generate-report --only report,playbook --frameworks nis2 "
         "--client 'Corp' --branding whitelabel --output ./deliverables",
+        "adscan ci auth --policy audit --domain corp.local --dc-ip 10.0.0.1 -u alice "
+        "-p 'S3cr3t!' --scope-allow 10.0.0.0/24 --scope-deny fs01.corp.local,10.0.0.40 "
+        "--scope-deny-file ./do-not-touch.txt",
     ),
 )
 
@@ -445,8 +476,8 @@ POLICY_PASSTHROUGH = PassthroughCommand(
         "adscan policy create 'Corp production'",
         "adscan policy edit 'Corp production' --pacing polite",
         "adscan policy use 'Corp production' -w Corp-Assessment",
-        "adscan policy show safe_for_production --checks",
-        "adscan policy create 'Corp production' --from safe_for_production "
+        "adscan policy show production_sensitive --checks",
+        "adscan policy create 'Corp production' --from production_sensitive "
         "--exclude step:kerberoasting --pacing polite --pacing-set max_parallel_hosts=2",
         "adscan policy export 'Corp production' --output corp-production.yaml",
         "adscan policy import corp-production.yaml -w Corp-Assessment",

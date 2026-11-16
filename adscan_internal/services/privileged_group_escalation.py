@@ -470,7 +470,7 @@ def _group_escalation_edge_exists(
 
 
 def derive_privileged_group_escalation_edges(
-    graph: dict[str, Any], *, domain_data: Any = None
+    graph: dict[str, Any], *, domain_data: Any = None, edge_index: Any = None
 ) -> int:
     """Derive one ``Group -> Domain`` escalation edge per privileged group node.
 
@@ -491,6 +491,8 @@ def derive_privileged_group_escalation_edges(
             resolve the recorded primary controller for a DC-targeted escalation
             — see :func:`resolve_escalation_target_node_id`, which degrades
             without it rather than guessing.
+        edge_index: The caller's ``attack_graph_service.EdgeUpsertIndex`` when
+            it is upserting the whole graph (the collector persist), else None.
 
     Returns:
         The number of edges created (0 when every edge already existed).
@@ -524,6 +526,9 @@ def derive_privileged_group_escalation_edges(
         before = len(graph.get("edges") or [])
         attack_graph_service.upsert_edge(
             graph,
+            # The collector persist passes its bulk index; the load-time
+            # backfill upserts a handful of edges and keeps the plain scan.
+            index=edge_index,
             from_id=str(node_id),
             to_id=target_node_id,
             relation=escalation.relation,

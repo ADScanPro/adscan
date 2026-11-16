@@ -7,10 +7,28 @@ encodes graph-edge severity (a different problem space).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+_PUBLIC_CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+
+def public_cve_reference(cve_id: str | None) -> str:
+    """The identifier an operator surface may print beside a CVE finding.
+
+    The rating ADscan shows is its own severity (``CLAUDE.md`` § "No CVSS on a
+    client surface"). A CVSS number is never printed: the catalog carries one
+    for every probe, including probes that are not CVEs at all
+    (``ADSCAN-PRINTERBUG-SURFACE``), and those numbers are not verified against
+    the published scores. What IS an external anchor anyone can check is the
+    public CVE identifier, so that is what surfaces: ``CVE-2021-34527`` for a
+    real CVE, an empty string for an ADscan-defined check.
+    """
+    value = str(cve_id or "").strip().upper()
+    return value if _PUBLIC_CVE_ID.match(value) else ""
 
 
 class Severity(str, Enum):

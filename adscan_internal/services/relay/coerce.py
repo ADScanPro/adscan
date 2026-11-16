@@ -126,6 +126,7 @@ async def run_native_coerce_and_relay(
             ),
             success_event=relay_success_event,
             listener_ready=listener_ready,
+            shell=config.shell,
         )
     )
     coercion_task: asyncio.Task | None = None
@@ -182,6 +183,7 @@ async def run_native_coerce_and_relay(
                 target_host=coercion_target_host,
                 target_name=coercion_target_name,
                 config=coercion_cfg,
+                shell=config.shell,
             )
         )
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from typing import Any
 
 from adscan_core import telemetry
 from adscan_internal.rich_output import print_info, print_info_debug, mark_sensitive
@@ -44,6 +45,7 @@ from adscan_internal.services.relay.http_ntlm_source import (
     HTTPNtlmRelaySource,
     HTTPNtlmRelaySourceConfig,
 )
+from adscan_internal.services.relay.runner import relay_targets_in_scope
 from adscan_core.rich_output import print_exception
 
 
@@ -90,6 +92,8 @@ async def run_mitm6_wpad_relay(
     *,
     targets: list[RelayTarget],
     config: MITM6WpadRelayConfig,
+    shell: Any = None,
+    domain: str | None = None,
 ) -> RelayRunResult:
     """Run the full MITM6 → WPAD → HTTP NTLM relay chain.
 
@@ -103,6 +107,14 @@ async def run_mitm6_wpad_relay(
         f"domain={mark_sensitive(config.local_domain, 'domain')} "
         f"listener={mark_sensitive(config.listener_host, 'hostname')}:{config.listener_port}"
     )
+
+    in_scope_targets = relay_targets_in_scope(targets, shell=shell, domain=domain)
+    if targets and not in_scope_targets:
+        print_info_debug(
+            "[mitm6-wpad-relay] every relay destination is outside the engagement scope; not running"
+        )
+        return RelayRunResult(results=(), timed_out=False, authentications_seen=0)
+    targets = in_scope_targets
 
     auth_queue: asyncio.Queue = asyncio.Queue()
 

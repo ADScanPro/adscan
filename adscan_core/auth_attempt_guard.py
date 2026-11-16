@@ -60,6 +60,54 @@ guard fails closed: one failed sign-in per principal per hour.
    host-local accounts and SQL logins are never read (their lockout policy lives
    on the host), so rule 3 alone covers them.
 
+6. A GUEST sign-in (a name with no password, sent to obtain the server's guest
+   session) is its own kind of attempt, judged by :func:`check_guest_attempt`
+   and never by rule 4. Only a name the session DECLARED as its guest identity
+   for that realm (:func:`declare_guest_identity`), after establishing that no
+   account carries it, may sign in this way. A name the session has signed in
+   as with a secret, or that a server reported as a real account
+   (:func:`record_guest_identity_exists`), can never be declared. Rule 6 applies
+   only inside :func:`guest_sign_in`, which the guest transports set around
+   their own session setup: a declared name with an empty secret anywhere else
+   (LDAP, RDP, a direct factory) is still judged by rule 4. A guest sign-in
+   needs a domain: without one the server checks its own local accounts, which
+   no proof covers. Refused guest sign-ins are counted per realm and name and,
+   in a real environment, stop after a small bound (a refusal cannot tell
+   "guest disabled" from "an account with a password").
+
+   Worst case (generated name, no user inventory, no KDC answer, real
+   environment): the name is declared on its 32 random bits alone, and each
+   host contacted gets one NTLM sign-in as ``domain\\adscan-<8 hex>`` with an
+   empty password; the domain controller logs a failed logon for an unknown
+   user and moves no ``badPwdCount``. The name can only collide with an
+   account an earlier tool created with the same pattern (about k/2^32 for k
+   such accounts), and even then the failure bound stops the probes after a
+   few hosts.
+
+7. A sign-in the engagement scope keeps out is never sent, whatever its secret:
+   as an account the client excluded, or as a local account or SQL login of a
+   host the client excluded. The session supplies the check
+   (:func:`register_scope_provider`) from the scope SSOT, and the refusal
+   carries ``code = REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE`` so it is never worded as
+   a lockout risk. The account lists and the attack-step seams leave such
+   accounts out first; this is the backstop behind all of them. It is not about
+   lockout: it lives here because this is the one place every sign-in passes.
+
+8. ADscan's own posture probe is not a client account. The transport-policy
+   probes (LDAP signing, channel binding, NTLM over SMB) sign in as
+   ``adscan-probe-<8 hex>`` with a throwaway password so the domain controller's
+   answer reveals its policy; the name is random per probe and belongs to no
+   account. The scope seam cannot place it (no directory facts, no kind), so it
+   would be refused under every scope that carries a host entry. Rule 7 lets it
+   through, on the PRINCIPAL axis only, when ALL hold: the sign-in is inside
+   :func:`probe_sign_in` (set by the three probe call sites around their own
+   connect, never anywhere else), the name matches the synthetic pattern, a
+   domain is given, the realm is a domain (not a host-local or SQL realm), and
+   the session has no sign of an account by that name (a server report that it
+   exists, or a secret it accepted). Every other rule still judges it. The HOST
+   is never decided here: a domain-realm sign-in carries no host, which stays
+   the business of the egress and contact seams.
+
 What counts as a failure, an unusable account, or neither is decided by ONE
 classifier, :mod:`adscan_core.auth_outcome`: only a verdict the domain controller
 counted against ``badPwdCount`` is recorded as a failure, so a correct secret
@@ -81,12 +129,14 @@ import contextlib
 import contextvars
 import hashlib
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from adscan_core.reporting.engagement_scope import NOT_EXECUTED_OUTSIDE_SCOPE
 from adscan_core.sensitive import mark_sensitive
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -98,6 +148,7 @@ __all__ = [
     "LockoutBudget",
     "OUTCOME_FAILED",
     "OUTCOME_UNUSABLE",
+    "REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE",
     "FAIL_CLOSED_BUDGET",
     "UNKNOWN_WINDOW_SECONDS",
     "LOCAL_REALM_PREFIX",
@@ -105,6 +156,24 @@ __all__ = [
     "LIVE_SKIPPED",
     "LIVE_UNVERIFIED",
     "allow_empty_secret",
+    "check_guest_attempt",
+    "declare_guest_identity",
+    "guest_identity_known_to_exist",
+    "guest_hosts_not_checked",
+    "guest_sign_in",
+    "guest_sign_in_active",
+    "probe_sign_in",
+    "probe_sign_in_active",
+    "is_probe_identity",
+    "GUEST_BASIS_KDC_PROVEN",
+    "register_guest_gap_sink",
+    "is_declared_guest",
+    "normalize_principal",
+    "principal_known_by_live_read",
+    "record_guest_failure",
+    "record_guest_identity_exists",
+    "refuse_guest_identity",
+    "register_guest_exists_sink",
     "refusal_in_chain",
     "unknown_headroom",
     "budget_from_policy",
@@ -121,6 +190,7 @@ __all__ = [
     "unusable_reason",
     "register_live_headroom_provider",
     "register_policy_provider",
+    "register_scope_provider",
     "remaining_failures",
     "unregister_policy_provider",
     "reset_for_tests",
@@ -152,21 +222,40 @@ _LIVE_BATCH_SIZE = 100
 _DIGEST_KEY = os.urandom(32)
 
 
+#: ``AuthAttemptRefused.code`` of a sign-in the engagement scope keeps out (rule
+#: 6). The same token every surface uses for a step outside the scope.
+REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE = NOT_EXECUTED_OUTSIDE_SCOPE
+
+
 class AuthAttemptRefused(PermissionError):
-    """A sign-in was withheld because it could push the account toward lockout.
+    """A sign-in was withheld: it could lock the account, or the scope excludes it.
 
     Attributes:
         realm: Canonical realm (upper-case) the principal belongs to.
         principal: Normalized account name.
         reason: Operator-facing English sentence.
+        code: ``""`` for a lockout-protection refusal (rules 1 to 5), or
+            :data:`REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE` when the engagement scope
+            excludes the account or the host it is local to (rule 7). A caller
+            that words the outcome reads it, so an excluded account is never
+            reported as a lockout risk or a wrong password.
     """
 
-    def __init__(self, realm: str, principal: str, reason: str) -> None:
+    def __init__(self, realm: str, principal: str, reason: str, *, code: str = "") -> None:
         self.realm = realm
         self.principal = principal
         self.reason = reason
+        self.code = code
+        #: The engagement scope withheld the sign-in (never lockout protection).
+        #: Every site that words a refusal reads this, one sentence per cause.
+        self.outside_scope = code == REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE
         # Marked at the source: the message reaches the terminal (cleartext for
         # the operator) and the session recording (scrubbed by the sanitizer).
+        if code == REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE:
+            # The scope check words the whole sentence (the scope SSOT's own
+            # line, already marked): nothing about lockout is prefixed to it.
+            super().__init__(str(reason))
+            return
         super().__init__(
             f"Sign-in as {mark_sensitive(principal, 'user')}@{mark_sensitive(realm, 'domain')} "
             f"withheld to protect the account from lockout: {reason}"
@@ -390,6 +479,14 @@ LiveHeadroomSink = Callable[[str, str, str, LiveHeadroom], None]
 LIVE_SKIPPED = "skipped"
 LIVE_UNVERIFIED = "unverified"
 
+#: ``provider(realm, principal)`` returns the operator sentence saying why the
+#: engagement scope keeps this sign-in out (the account is excluded, or it is a
+#: local account of an excluded host), or ``None`` when the scope allows it.
+#: ``realm`` is canonical; a host-local account or a SQL login arrives with its
+#: :func:`local_realm` / :func:`sql_login_realm`. It returns ``None`` at once
+#: when the session has no asset scope, and must not raise then.
+ScopeProvider = Callable[[str, str], Optional[str]]
+
 
 @dataclass
 class _PrincipalState:
@@ -402,12 +499,19 @@ class _PrincipalState:
 
 _LOCK = threading.Lock()
 _STATES: dict[tuple[str, str], _PrincipalState] = {}
+#: Rule 6. (realm, name) -> how the name's absence was established.
+_GUEST_DECLARED: dict[tuple[str, str], "_GuestState"] = {}
+#: (realm, name) -> why the name is known to be a real account.
+_GUEST_EXISTS: dict[tuple[str, str], str] = {}
+#: (realm, name) -> why the session could not declare the name.
+_GUEST_REFUSED: dict[tuple[str, str], str] = {}
 _BUDGETS: dict[str, tuple[LockoutBudget, float]] = {}
 _PROVIDER: Optional[PolicyProvider] = None
 _CANONICALIZER: Optional[RealmCanonicalizer] = None
 
 _LIVE_PROVIDER: Optional[LiveHeadroomProvider] = None
 _LIVE_SINK: Optional[LiveHeadroomSink] = None
+_SCOPE_PROVIDER: Optional[ScopeProvider] = None
 #: (realm, principal) -> (headroom, monotonic time read). ``None`` headroom means
 #: the realm has no live read (lab).
 _LIVE_CACHE: dict[tuple[str, str], tuple[Optional[LiveHeadroom], float]] = {}
@@ -457,17 +561,33 @@ def register_live_headroom_provider(
         _LIVE_CACHE.clear()
 
 
+def register_scope_provider(provider: Optional[ScopeProvider]) -> None:
+    """Install the session's engagement-scope check for sign-ins (rule 7).
+
+    The scope is contractual: an account the client excluded is never signed in
+    as, and a host the client excluded never receives a local sign-in, whatever
+    code path built the attempt. The lists and the attack-step seams keep such
+    accounts out first; this is the backstop behind every one of them. ``None``
+    removes it.
+    """
+    global _SCOPE_PROVIDER  # noqa: PLW0603 - process-wide seam by design
+    with _LOCK:
+        _SCOPE_PROVIDER = provider
+
+
 def unregister_policy_provider() -> None:
     """Remove the session's providers; the fail-closed budget applies again.
 
-    The live read is part of the same session registration, so it goes too.
+    The live read and the engagement-scope check are part of the same session
+    registration, so they go too.
     """
-    global _PROVIDER, _CANONICALIZER, _LIVE_PROVIDER, _LIVE_SINK  # noqa: PLW0603
+    global _PROVIDER, _CANONICALIZER, _LIVE_PROVIDER, _LIVE_SINK, _SCOPE_PROVIDER  # noqa: PLW0603
     with _LOCK:
         _PROVIDER = None
         _CANONICALIZER = None
         _LIVE_PROVIDER = None
         _LIVE_SINK = None
+        _SCOPE_PROVIDER = None
         _BUDGETS.clear()
         _LIVE_CACHE.clear()
 
@@ -479,6 +599,11 @@ def reset_for_tests() -> None:
         _BUDGETS.clear()
         _LIVE_CACHE.clear()
         _LIVE_REPORTED.clear()
+        _GUEST_DECLARED.clear()
+        _GUEST_EXISTS.clear()
+        _GUEST_REFUSED.clear()
+    register_guest_exists_sink(None)
+    register_guest_gap_sink(None)
 
 
 @contextlib.contextmanager
@@ -696,6 +821,82 @@ def _live_refusal_reason(live: LiveHeadroom, *, known_good: bool) -> str:
     )
 
 
+def _check_engagement_scope(key: tuple[str, str]) -> None:
+    """Rule 7: refuse a sign-in the engagement scope keeps out.
+
+    Asked first and outside the lock: it does not depend on the ledger, and an
+    excluded account must not be signed in as even with a known-good secret. A
+    provider that fails is a refusal (the scope could not be read); it answers
+    ``None`` without work when the session has no asset scope.
+    """
+    provider = _SCOPE_PROVIDER
+    if provider is None:
+        return
+    if _probe_identity_permitted(key):
+        return
+    try:
+        reason = provider(key[0], key[1])
+    except Exception:  # noqa: BLE001 - an unreadable scope is never a permission
+        reason = (
+            "the engagement scope could not be read for this account, so the "
+            "sign-in is not sent"
+        )
+    if reason:
+        raise AuthAttemptRefused(
+            key[0], key[1], str(reason), code=REFUSAL_OUTSIDE_ENGAGEMENT_SCOPE
+        )
+
+
+#: The synthetic name ADscan's own posture probes sign in as (rule 8).
+_PROBE_NAME_RE = re.compile(r"^adscan-probe-[0-9a-f]{8}$")
+
+#: Context marker for the posture-probe sign-in in flight: ``(realm, principal)``.
+#: Set only by the probe call sites (``probe_sign_in``) around their own connect.
+_PROBE_SIGN_IN: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
+    "adscan_auth_guard_probe_sign_in", default=None
+)
+
+
+def is_probe_identity(principal: str) -> bool:
+    """True when ``principal`` has the shape of ADscan's synthetic probe name."""
+    return bool(_PROBE_NAME_RE.match(_normalize_principal(principal)))
+
+
+@contextlib.contextmanager
+def probe_sign_in(realm: str, principal: str) -> Iterator[None]:
+    """Mark ADscan's own posture-probe sign-in in flight (rule 8)."""
+    token = _PROBE_SIGN_IN.set(_key(realm, principal))
+    try:
+        yield
+    finally:
+        _PROBE_SIGN_IN.reset(token)
+
+
+def probe_sign_in_active(realm: str, principal: str) -> bool:
+    """True inside :func:`probe_sign_in` for exactly this realm and principal."""
+    active = _PROBE_SIGN_IN.get()
+    return active is not None and active == _key(realm, principal)
+
+
+def _probe_identity_permitted(key: tuple[str, str]) -> bool:
+    """Rule 8: may this sign-in skip the scope's PRINCIPAL check as a probe?
+
+    Only the declared probe sign-in, with the synthetic name, a domain realm
+    (never a host-local or SQL realm) and no sign of a real account by that
+    name. Anything else is judged by the scope like any other account.
+    """
+    realm, principal = key
+    if not realm or not principal or is_host_scoped_realm(realm):
+        return False
+    if _PROBE_SIGN_IN.get() != key or not _PROBE_NAME_RE.match(principal):
+        return False
+    with _LOCK:
+        if key in _GUEST_EXISTS:
+            return False
+        state = _STATES.get(key)
+        return state is None or not state.accepted_secrets
+
+
 def check_attempt(realm: str, principal: str, secret: Optional[str]) -> None:
     """Raise :class:`AuthAttemptRefused` when this sign-in must not be sent.
 
@@ -707,6 +908,7 @@ def check_attempt(realm: str, principal: str, secret: Optional[str]) -> None:
     key = _key(realm, principal)
     if not key[1]:
         return
+    _check_engagement_scope(key)
     if (secret is None or secret == "") and not _EMPTY_SECRET_ALLOWED.get():
         raise AuthAttemptRefused(
             key[0],
@@ -758,6 +960,269 @@ def check_attempt(realm: str, principal: str, secret: Optional[str]) -> None:
                 f"{state.failures} failed sign-in(s) already sent inside the lockout "
                 f"window, the most this scan allows ({budget.source})",
             )
+
+
+_GUEST_EXISTS_REASON = (
+    "the name belongs to an account in this domain, so a sign-in with no password "
+    "would be a failed sign-in on that account, not a guest session"
+)
+
+
+#: Why a guest sign-in without a domain is refused: the server then checks the
+#: name against ITS OWN local accounts, which no directory read or Kerberos
+#: answer covers.
+_GUEST_NO_REALM_REASON = (
+    "no domain was given, so the server would check the name against its own local "
+    "accounts, which no directory or Kerberos answer covers; the guest sign-in is not sent"
+)
+
+#: Context marker for the guest sign-in in flight: ``(realm, principal)``. Set
+#: only by the guest transports (``guest_sign_in``) around their own session
+#: setup, so a lower layer (badauth's NTLM AUTHENTICATE) applies rule 6 to that
+#: one exchange and never to "this name with an empty secret" elsewhere.
+_GUEST_SIGN_IN: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
+    "adscan_auth_guard_guest_sign_in", default=None
+)
+
+#: ``sink(realm, principal, reason)`` called when a name is found to be an
+#: account, so the session can persist it beyond this process.
+GuestExistsSink = Callable[[str, str, str], None]
+_GUEST_EXISTS_SINK: Optional[GuestExistsSink] = None
+
+
+@dataclass
+class _GuestState:
+    basis: str
+    failure_bound: Optional[int]
+    failures: int = 0
+    #: Hosts a guest sign-in was withheld from once the bound was reached.
+    withheld_targets: set[str] = field(default_factory=set)
+
+
+#: The one basis that proves a guest name is not an account: the domain
+#: controller's Kerberos service answered "unknown principal" for it. A refused
+#: guest sign-in for such a name moves no counter on any account, so the failure
+#: bound never applies to it; every weaker basis is bounded.
+GUEST_BASIS_KDC_PROVEN = "kerberos"
+
+#: ``sink(realm, principal, hosts_not_checked)``: called when the failure bound
+#: withholds a guest sign-in from a host it had not withheld one from before, so
+#: the session can declare the coverage gap.
+GuestGapSink = Callable[[str, str, int], None]
+_GUEST_GAP_SINK: Optional[GuestGapSink] = None
+
+
+def register_guest_gap_sink(sink: Optional[GuestGapSink]) -> None:
+    """Install the callable told how many hosts the guest failure bound left unchecked."""
+    global _GUEST_GAP_SINK  # noqa: PLW0603 - process-wide seam by design
+    _GUEST_GAP_SINK = sink
+
+
+def guest_hosts_not_checked(realm: str, principal: str) -> int:
+    """How many distinct hosts the guest failure bound withheld a guest sign-in from."""
+    key = _key(realm, principal)
+    with _LOCK:
+        state = _GUEST_DECLARED.get(key)
+        return len(state.withheld_targets) if state is not None else 0
+
+
+def normalize_principal(principal: str) -> str:
+    """The guard's own spelling of a principal (no ``DOMAIN\\``, no ``@realm``, lower case).
+
+    Any caller that compares a name to something the guard keys on uses this,
+    so the comparison and the ledger can never disagree on spelling.
+    """
+    return _normalize_principal(principal)
+
+
+def register_guest_exists_sink(sink: Optional[GuestExistsSink]) -> None:
+    """Install the callable told when a guest name turns out to be an account."""
+    global _GUEST_EXISTS_SINK  # noqa: PLW0603 - process-wide seam by design
+    _GUEST_EXISTS_SINK = sink
+
+
+def declare_guest_identity(
+    realm: str,
+    principal: str,
+    *,
+    basis: str,
+    failure_bound: Optional[int] = None,
+) -> None:
+    """Declare ``principal`` as this session's guest transport name for ``realm`` (rule 6).
+
+    The caller establishes first that no account carries the name; ``basis``
+    says how (``"directory"``, ``"kerberos"``, ``"random"``). Refused when the
+    session already knows the name as an account: it signed in as it with a
+    secret, or a server reported it as one. ``failure_bound`` is how many
+    refused guest sign-ins (STATUS_LOGON_FAILURE and the like, which cannot
+    tell "guest disabled" from "an account with a password") the session sends
+    before it stops asking; ``None`` means no bound.
+    """
+    key = _key(realm, principal)
+    if not key[1]:
+        return
+    if not key[0]:
+        raise AuthAttemptRefused(key[0], key[1], _GUEST_NO_REALM_REASON)
+    with _LOCK:
+        if key in _GUEST_EXISTS or key in _STATES:
+            reason = _GUEST_EXISTS.get(key) or _GUEST_EXISTS_REASON
+            raise AuthAttemptRefused(key[0], key[1], reason)
+        previous = _GUEST_DECLARED.get(key)
+        _GUEST_DECLARED[key] = _GuestState(
+            basis=str(basis or "unspecified"),
+            failure_bound=failure_bound,
+            failures=previous.failures if previous is not None else 0,
+        )
+        _GUEST_REFUSED.pop(key, None)
+
+
+def refuse_guest_identity(realm: str, principal: str, reason: str) -> None:
+    """Record why ``principal`` cannot be this session's guest name for ``realm``.
+
+    A guest sign-in with that name is then refused at the seam with this reason,
+    so the operator reads the real cause instead of a generic refusal.
+    """
+    key = _key(realm, principal)
+    if not key[1]:
+        return
+    with _LOCK:
+        _GUEST_DECLARED.pop(key, None)
+        _GUEST_REFUSED[key] = str(reason or "its absence from the directory was not established")
+
+
+def record_guest_identity_exists(realm: str, principal: str, reason: str = "") -> None:
+    """The name turned out to be a real account: revoke it and never declare it again.
+
+    The session's sink (``register_guest_exists_sink``) is told, so the fact
+    outlives this process.
+    """
+    key = _key(realm, principal)
+    if not key[1]:
+        return
+    text = str(reason or _GUEST_EXISTS_REASON)
+    with _LOCK:
+        _GUEST_DECLARED.pop(key, None)
+        _GUEST_EXISTS[key] = text
+    sink = _GUEST_EXISTS_SINK
+    if sink is not None:
+        try:
+            sink(key[0], key[1], text)
+        except Exception:  # noqa: BLE001 - persisting must never change the verdict
+            pass
+
+
+def record_guest_failure(realm: str, principal: str) -> None:
+    """Count one refused guest sign-in (a reply the domain may have counted)."""
+    key = _key(realm, principal)
+    if not key[1]:
+        return
+    with _LOCK:
+        state = _GUEST_DECLARED.get(key)
+        if state is not None:
+            state.failures += 1
+
+
+def is_declared_guest(realm: str, principal: str) -> bool:
+    """True when ``principal`` is this session's declared guest name for ``realm``."""
+    key = _key(realm, principal)
+    if not key[1]:
+        return False
+    with _LOCK:
+        return key in _GUEST_DECLARED and key not in _GUEST_EXISTS and key not in _STATES
+
+
+def guest_identity_known_to_exist(realm: str, principal: str) -> bool:
+    """True when the session knows ``principal`` is a real account in ``realm``."""
+    key = _key(realm, principal)
+    if not key[1]:
+        return False
+    with _LOCK:
+        return key in _GUEST_EXISTS or key in _STATES
+
+
+def principal_known_by_live_read(realm: str, principal: str) -> bool:
+    """True when the live ``badPwdCount`` read (rule 5) returned this principal.
+
+    The read only answers for accounts that exist, so a known answer proves the
+    name is an account. ``False`` says nothing (no read, a lab, or no answer).
+    """
+    key = _key(realm, principal)
+    if not key[1] or not key[0]:
+        return False
+    headroom = _live_headroom(key)
+    return bool(headroom is not None and headroom.known)
+
+
+@contextlib.contextmanager
+def guest_sign_in(realm: str, principal: str) -> Iterator[None]:
+    """Mark the guest sign-in in flight (rule 6) for the layers below the transport."""
+    token = _GUEST_SIGN_IN.set(_key(realm, principal))
+    try:
+        yield
+    finally:
+        _GUEST_SIGN_IN.reset(token)
+
+
+def guest_sign_in_active(realm: str, principal: str) -> bool:
+    """True inside :func:`guest_sign_in` for exactly this realm and principal."""
+    active = _GUEST_SIGN_IN.get()
+    return active is not None and active == _key(realm, principal)
+
+
+def check_guest_attempt(realm: str, principal: str, *, target: str = "") -> None:
+    """Raise :class:`AuthAttemptRefused` unless this guest sign-in may be sent (rule 6).
+
+    Call it immediately before a sign-in that sends ``principal`` with no
+    password to obtain a guest session. An empty name is a null session, which
+    carries no account and is not judged. A guest sign-in without a domain is
+    refused (the server would check its own local accounts).
+
+    The failure bound applies only when the name's absence rests on something
+    weaker than the KDC's "unknown principal" answer (``GUEST_BASIS_KDC_PROVEN``).
+    A sign-in it withholds is counted against ``target`` (the host), and the
+    session's gap sink is told, so the hosts left unchecked are declared.
+    """
+    key = _key(realm, principal)
+    if not key[1]:
+        return
+    if not key[0]:
+        raise AuthAttemptRefused(key[0], key[1], _GUEST_NO_REALM_REASON)
+    with _LOCK:
+        if key in _GUEST_EXISTS or key in _STATES:
+            raise AuthAttemptRefused(key[0], key[1], _GUEST_EXISTS.get(key) or _GUEST_EXISTS_REASON)
+        state = _GUEST_DECLARED.get(key)
+        if state is None:
+            reason = _GUEST_REFUSED.get(key) or (
+                "the name is not this session's declared guest identity, so no "
+                "account was confirmed absent and the guest sign-in is not sent"
+            )
+            raise AuthAttemptRefused(key[0], key[1], reason)
+        bounded = (
+            state.basis != GUEST_BASIS_KDC_PROVEN
+            and state.failure_bound is not None
+            and state.failures >= state.failure_bound
+        )
+        if not bounded:
+            return
+        host = str(target or "").strip().lower()
+        newly_withheld = bool(host) and host not in state.withheld_targets
+        if newly_withheld:
+            state.withheld_targets.add(host)
+        hosts = len(state.withheld_targets)
+        failures = state.failures
+    sink = _GUEST_GAP_SINK
+    if newly_withheld and sink is not None:
+        try:
+            sink(key[0], key[1], hosts)
+        except Exception:  # noqa: BLE001 - declaring the gap must never change the verdict
+            pass
+    raise AuthAttemptRefused(
+        key[0],
+        key[1],
+        f"guest probing stopped after {failures} refused guest sign-in(s): the guest "
+        "name's absence from the directory could not be confirmed, and a refusal cannot "
+        "tell 'guest disabled' from 'an account with a password'",
+    )
 
 
 def prefetch_live_headroom(realm: str, principals: "list[str] | tuple[str, ...]") -> None:

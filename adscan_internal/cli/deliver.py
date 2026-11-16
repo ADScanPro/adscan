@@ -46,6 +46,7 @@ quality gain.
 from __future__ import annotations
 
 from adscan_core.async_bridge import run_on_new_loop
+from adscan_core.memory_guard import MemoryCeilingReached, current_guard
 from adscan_core.report_options import (
     REPORT_DEFAULT_EMIT,
     REPORT_DEFAULT_THEME,
@@ -1452,7 +1453,15 @@ async def _render_kit(
     # instead of re-running to discover the next one. A failure here aborts the
     # kit — a requested deliverable is never quietly dropped, and with a staging
     # directory per run there is no earlier copy to fall back on anyway.
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    outcomes = await asyncio.gather(
+        *(_counted_render(task) for task in tasks), return_exceptions=True
+    )
+    # A render stopped at the memory ceiling is not a failed renderer: it is the
+    # report stage's stop, raised to its boundary (``run_deliver_sync``) so it is
+    # declared, never folded into "failed to render".
+    for outcome in outcomes:
+        if isinstance(outcome, MemoryCeilingReached):
+            raise outcome
     failures = [
         (item.filename, outcome)
         for item, outcome in zip(items, outcomes)
@@ -1473,6 +1482,26 @@ async def _render_kit(
         item.filename: outcome if isinstance(outcome, int) else 0
         for item, outcome in zip(items, outcomes)
     }
+
+
+async def _counted_render(task: Any) -> Any:
+    """Await one document's render, then account it to the report stage.
+
+    One finished document is one unit of the ``report`` memory stage; the check
+    runs on the event loop's thread, the stage boundary's thread. Without an
+    enclosing stage (a direct caller) it only awaits.
+    """
+    guard = current_guard()
+    if guard is not None:
+        try:
+            guard.check()
+        except BaseException:
+            task.close()
+            raise
+    result = await task
+    if guard is not None:
+        guard.tick()
+    return result
 
 
 def _generate_affected_assets_appendix(
@@ -3024,7 +3053,19 @@ def run_deliver_sync(args: argparse.Namespace) -> int:
         # All interactive prompts run HERE, outside the event loop. See
         # _prefill_interactive_inputs for why (questionary + asyncio.run).
         _prefill_interactive_inputs(args)
-        rc = run_on_new_loop(run_deliver(args))
+        # The render runs under the ``report`` memory boundary: on a machine too
+        # small for the workspace it stops cleanly and declares the stop instead
+        # of being killed mid-render (``services.report_memory``).
+        from adscan_internal.services.report_memory import render_bounded
+
+        stopped, rc = render_bounded(
+            lambda: run_on_new_loop(run_deliver(args)),
+            workspace_dir=lambda: getattr(args, "_kit_workspace", None)
+            or getattr(args, "workspace", None),
+            shell=getattr(args, "_shell", None),
+        )
+        if stopped:
+            return 1
     except FrameworkSelectionCancelled:
         print_warning(
             "Deliver cancelled: no compliance framework was selected, so "

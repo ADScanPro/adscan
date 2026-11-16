@@ -100,6 +100,28 @@ class WriteShareBaitJobRuntime:
         icon UNC (which points at ``listener_ip``) is planted — a bait pointing at
         a dead listener captures nothing.
         """
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            require_host_in_scope,
+        )
+        from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+            prepare_targets_for_scope,
+        )
+
+        # The bait is PLANTED on this host's share (an environment modification),
+        # so an excluded host is refused before the listener is even acquired.
+        # Captures arriving FROM an excluded source are closed by the listener
+        # broker's inbound-source check, not here.
+        prepare_targets_for_scope(self.shell, [self.target_host], domain=self.domain)
+        if not require_host_in_scope(
+            self.shell,
+            host=self.target_host,
+            surface="writeshare_bait",
+            what="Write-share bait",
+            domain=self.domain,
+        ):
+            self.start_failure = "the target host is outside the engagement scope"
+            return False
+
         broker = get_or_create_capture_broker(self.shell)
         if not broker.acquire(
             self._consumer_id, bind_ip=self.listener_bind_ip, on_capture=self._on_capture

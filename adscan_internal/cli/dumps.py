@@ -117,12 +117,29 @@ from adscan_internal.services.exploitation.host_fingerprint_service import (
 from adscan_internal.services.host_reachability_filter import (
     filter_reachable_hosts,
     print_reachability_summary,
+    scope_excluded_hosts,
     render_no_reachable_panel,
 )
 from adscan_internal.services.smb_privilege import (
     SMBPrivilegeStatus,
     check_smb_privilege_batch,
     local_account_privilege_config,
+)
+from adscan_core.scan_control.fanout import SweepCoverage, run_stoppable_fanout
+from adscan_internal.services.engagement_scope_targets import (
+    fanout_scope_gate,
+    host_contact_gate,
+    prepare_targets_for_scope,
+)
+from adscan_internal.services.engagement_scope import (
+    partition_targets_in_scope,
+    require_host_in_scope,
+)
+from adscan_internal.services.sweep_stop import (
+    announce_not_checked,
+    finish_sweep_step,
+    note_outside_scope,
+    sweep_step,
 )
 from adscan_internal.services.exploitation.lsass_orchestrator import (
     LsassMethod,
@@ -1198,6 +1215,27 @@ def _load_native_bulk_hosts(path: str) -> list[str]:
             f"Could not read native dump target file: {mark_sensitive(path, 'path')}"
         )
     return hosts
+
+
+#: Engagement-scope surface name of every credential dump (``scope.json`` refusals).
+_DUMP_SCOPE_SURFACE = "credential_dump"
+
+
+def _dump_host_in_scope(shell: Any, host: str, domain: str, dump_label: str) -> bool:
+    """Engagement-scope gate of a single-host dump, asked before any contact.
+
+    A dump is host assessment, so the purpose is the ordinary host purpose: a
+    domain controller the scope keeps to directory reads is refused here too.
+    Returns False after the scope SSOT told the operator why.
+    """
+    prepare_targets_for_scope(shell, [host], domain=str(domain or "").strip() or None)
+    return require_host_in_scope(
+        shell,
+        host=host,
+        surface=_DUMP_SCOPE_SURFACE,
+        what=f"{dump_label} dump",
+        domain=str(domain or "").strip() or None,
+    )
 
 
 def _resolve_native_bulk_hosts(
@@ -2862,6 +2900,8 @@ def run_dump_registries(
     if not pdc_ip:
         print_error("Registry dump requires a PDC IP. Run enumeration first.")
         return
+    if not _dump_host_in_scope(shell, pdc_hostname or pdc_ip, domain, "Registry"):
+        return
 
     marked_domain = mark_sensitive(domain, "domain")
     marked_pdc = mark_sensitive(pdc_ip, "ip")
@@ -3406,8 +3446,16 @@ async def _run_native_dump_batch(
     paying the SMB + dump cost (especially important for LSASS which can spend
     30s+ in remote-registry timeouts on an unreachable target).
     """
+    prepare_targets_for_scope(shell, hosts, domain=domain)
+    hosts = partition_targets_in_scope(
+        shell,
+        hosts,
+        surface=_DUMP_SCOPE_SURFACE,
+        what=f"{dump_kind.upper()} bulk dump",
+        domain=domain,
+    ).allowed
     if hosts:
-        reach = await filter_reachable_hosts(hosts, port=445)
+        reach = await filter_reachable_hosts(hosts, port=445, scope_surface=_DUMP_SCOPE_SURFACE)
         print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
         if not reach.reachable:
             render_no_reachable_panel(
@@ -3420,9 +3468,20 @@ async def _run_native_dump_batch(
 
     concurrency = _native_dump_concurrency(dump_kind)
     semaphore = _paced_semaphore(concurrency)
+    # The hosts passed the engagement scope at the start of the batch: each is
+    # asked about again right before its dump (a host kept out gets no result).
+    batch_gate = host_contact_gate(
+        shell,
+        hosts,
+        surface=_DUMP_SCOPE_SURFACE,
+        what=f"{dump_kind.upper()} bulk dump",
+        domain=domain,
+    )
 
-    async def _run_one(host: str) -> tuple[str, Any]:
+    async def _run_one(host: str) -> tuple[str, Any] | None:
         async with semaphore:
+            if not await asyncio.to_thread(batch_gate.admits, host):
+                return None
             svc = NativeDumpService()
             config = _build_smb_config_from_shell(shell, host, domain)
             workspace_dir = _native_host_workspace_dir(shell, domain, host)
@@ -3442,7 +3501,8 @@ async def _run_native_dump_batch(
                 raise ValueError(f"Unsupported native dump kind: {dump_kind}")
             return host, result
 
-    return list(await asyncio.gather(*(_run_one(host) for host in hosts)))
+    outcomes = await asyncio.gather(*(_run_one(host) for host in hosts))
+    return [outcome for outcome in outcomes if outcome is not None]
 
 
 async def _run_native_dump_batch_live(
@@ -3452,8 +3512,14 @@ async def _run_native_dump_batch_live(
     hosts: list[str],
     dump_kind: str,
     on_result: Any,  # Callable[[str, Any], tuple[int, list[str]]]
+    should_stop: Any = None,
+    coverage: SweepCoverage | None = None,
 ) -> list[tuple[str, Any]]:
-    """Generic live bulk runner using asyncio.as_completed.
+    """Generic live bulk runner over a stoppable fan-out.
+
+    Honours the scan control plane: after a stop (``should_stop``, default the
+    running step's) no new host is dumped, hosts in flight get a short grace,
+    and only the dumped hosts are returned; ``coverage`` names the rest.
 
     Streams ✓/✗ status lines and credential rows as each host completes
     instead of waiting for the full gather to finish.
@@ -3467,11 +3533,24 @@ async def _run_native_dump_batch_live(
     against an offline workstation can waste 30s+ in remote-registry timeouts.
     """
 
+    # Engagement scope first: an excluded host gets neither the 445 probe below
+    # nor a dump, and is never counted as targeted or failed.
+    prepare_targets_for_scope(shell, hosts, domain=domain)
+    scope = partition_targets_in_scope(
+        shell,
+        hosts,
+        surface=_DUMP_SCOPE_SURFACE,
+        what=f"{dump_kind.upper()} bulk dump",
+        domain=domain,
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    hosts = scope.allowed
+
     # Pre-flight reachability filter: skip offline hosts before paying the
     # SMB + remote-registry cost. Critical at corporate scale where 30-50% of
     # workstations may be powered off at any moment.
     if hosts:
-        reach = await filter_reachable_hosts(hosts, port=445)
+        reach = await filter_reachable_hosts(hosts, port=445, scope_surface=_DUMP_SCOPE_SURFACE)
         print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
         if not reach.reachable:
             render_no_reachable_panel(
@@ -3522,8 +3601,6 @@ async def _run_native_dump_batch_live(
                 )
             return host, result
 
-    tasks = [asyncio.create_task(_run_one(h)) for h in hosts]
-
     with Progress(
         SpinnerColumn(style=_ICE),
         BarColumn(bar_width=28, style=_MUTED, complete_style=_ICE),
@@ -3534,8 +3611,11 @@ async def _run_native_dump_batch_live(
         transient=False,
     ) as prog:
         task_id = prog.add_task("", total=len(hosts))
-        for coro in asyncio.as_completed(tasks):
-            host, result = await coro
+
+        async def _run_and_show(target: str) -> tuple[str, Any]:
+            # Streams each host as it completes (credentials are recorded by
+            # ``on_result`` right away, so a stop keeps every host already done).
+            host, result = await _run_one(target)
             all_results.append((host, result))
             prog.advance(task_id)
 
@@ -3557,7 +3637,21 @@ async def _run_native_dump_batch_live(
                     f"  [{_LAVA}]✗[/{_LAVA}] [{_MUTED}]{host}[/{_MUTED}]"
                     f"  [{_MUTED}]{err}[/{_MUTED}]{badge_cell}"
                 )
+            return host, result
 
+        outcome = await run_stoppable_fanout(
+            hosts,
+            _run_and_show,
+            concurrency=concurrency,
+            should_stop=should_stop,
+            # A long sweep: each chunk is prepared and each host judged again
+            # right before its dump (the partition above is from the start).
+            before_item=fanout_scope_gate(
+                shell, hosts, surface=_DUMP_SCOPE_SURFACE, domain=domain
+            ),
+        )
+    if coverage is not None:
+        coverage.absorb(outcome, hosts)
     return all_results
 
 
@@ -3628,12 +3722,26 @@ async def _run_lsass_campaign_async(
     workspace_dir: str,
     method_name: str,
     intel: "EdrIntelligence",
+    should_stop: Any = None,
+    coverage: SweepCoverage | None = None,
 ) -> list[_LsassCampaignResult]:
     """Async LSASS bulk campaign with live progress and per-host credential streaming.
 
-    Uses asyncio.as_completed so results display as hosts finish rather than
-    waiting for the slowest host. Credentials are saved to shell in-flight.
+    Results display as hosts finish rather than waiting for the slowest host.
+    Credentials are saved to shell in-flight, so a stop (``should_stop``,
+    default the running step's) keeps every host already dumped; ``coverage``
+    names the hosts it left undumped.
     """
+    prepare_targets_for_scope(shell, hosts, domain=domain)
+    scope = partition_targets_in_scope(
+        shell,
+        hosts,
+        surface=_DUMP_SCOPE_SURFACE,
+        what="LSASS bulk dump",
+        domain=domain,
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    hosts = scope.allowed
     concurrency = _native_dump_concurrency("lsass")
     semaphore = _paced_semaphore(concurrency)
     _creds = getattr(shell, "current_creds", None) or {}
@@ -3682,8 +3790,6 @@ async def _run_lsass_campaign_async(
             return out
         return out, ()
 
-    tasks = [asyncio.create_task(_run_one_with_creds(h)) for h in hosts]
-
     with Progress(
         SpinnerColumn(style=_ICE),
         BarColumn(bar_width=28, style=_MUTED, complete_style=_ICE),
@@ -3695,8 +3801,8 @@ async def _run_lsass_campaign_async(
     ) as prog:
         task_id = prog.add_task("", total=len(hosts))
 
-        for coro in asyncio.as_completed(tasks):
-            r, creds = await coro
+        async def _run_and_show(target: str) -> None:
+            r, creds = await _run_one_with_creds(target)
             campaign_results.append(r)
             prog.advance(task_id)
 
@@ -3750,6 +3856,19 @@ async def _run_lsass_campaign_async(
                     f"  [{_MUTED}]{r.error or ''}[/{_MUTED}]"
                 )
 
+        outcome = await run_stoppable_fanout(
+            hosts,
+            _run_and_show,
+            concurrency=concurrency,
+            should_stop=should_stop,
+            # A long sweep: each chunk is prepared and each host judged again
+            # right before its dump (the partition above is from the start).
+            before_item=fanout_scope_gate(
+                shell, hosts, surface=_DUMP_SCOPE_SURFACE, domain=domain
+            ),
+        )
+    if coverage is not None:
+        coverage.absorb(outcome, hosts)
     return campaign_results
 
 
@@ -3846,17 +3965,24 @@ def _native_execute_dump_sam_bulk(
         f"\n[bold {_ICE}]◉  SAM Campaign[/bold {_ICE}]"
         f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
     )
-    results = _run_native_async(
-        _run_native_dump_batch_live(
-            shell, domain=domain, hosts=hosts, dump_kind="sam", on_result=_on_result
+    coverage = SweepCoverage()
+    with sweep_step("sam_bulk_dump", label="SAM bulk dump") as step:
+        results = _run_native_async(
+            _run_native_dump_batch_live(
+                shell, domain=domain, hosts=hosts, dump_kind="sam",
+                on_result=_on_result,
+                should_stop=step.should_stop,
+                coverage=coverage,
+            )
         )
-    )
-    _CONSOLE.print()
-    _persist_bulk_sam_local_credentials(
-        shell, domain=domain, credentials=bulk_credentials
-    )
-    _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
-    _render_bulk_summary("SAM", results, finding_count, domain=domain)
+        _CONSOLE.print()
+        _persist_bulk_sam_local_credentials(
+            shell, domain=domain, credentials=bulk_credentials
+        )
+        _print_bulk_summary(dump_kind="SAM", summary=bulk_summary)
+        _render_bulk_summary("SAM", results, finding_count, domain=domain)
+        finish_sweep_step(step, coverage)
+        announce_not_checked(label="SAM bulk dump", coverage=coverage)
 
     # Post-dump reuse matrix: pure data match, no network. Highlights
     # credentials that grant local admin on multiple hosts.
@@ -3927,22 +4053,29 @@ def _native_execute_dump_lsa_bulk(
         f"\n[bold {_ICE}]◉  LSA Campaign[/bold {_ICE}]"
         f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
     )
-    results = _run_native_async(
-        _run_native_dump_batch_live(
-            shell, domain=domain, hosts=hosts, dump_kind="lsa", on_result=_on_result
+    coverage = SweepCoverage()
+    with sweep_step("lsa_bulk_dump", label="LSA bulk dump") as step:
+        results = _run_native_async(
+            _run_native_dump_batch_live(
+                shell, domain=domain, hosts=hosts, dump_kind="lsa",
+                on_result=_on_result,
+                should_stop=step.should_stop,
+                coverage=coverage,
+            )
         )
-    )
-    _CONSOLE.print()
-    _persist_bulk_credentials(
-        shell,
-        domain=domain,
-        dump_kind="LSA",
-        auth_username=auth_username,
-        credentials=bulk_credentials,
-        include_machine_accounts=include_machine_accounts,
-    )
-    _print_bulk_summary(dump_kind="LSA", summary=bulk_summary)
-    _render_bulk_summary("LSA", results, finding_count, domain=domain)
+        _CONSOLE.print()
+        _persist_bulk_credentials(
+            shell,
+            domain=domain,
+            dump_kind="LSA",
+            auth_username=auth_username,
+            credentials=bulk_credentials,
+            include_machine_accounts=include_machine_accounts,
+        )
+        _print_bulk_summary(dump_kind="LSA", summary=bulk_summary)
+        _render_bulk_summary("LSA", results, finding_count, domain=domain)
+        finish_sweep_step(step, coverage)
+        announce_not_checked(label="LSA bulk dump", coverage=coverage)
 
 
 def _native_execute_dump_dpapi_bulk(
@@ -3974,13 +4107,20 @@ def _native_execute_dump_dpapi_bulk(
         f"\n[bold {_ICE}]◉  DPAPI Campaign[/bold {_ICE}]"
         f"  [{_MUTED}]{len(hosts)} hosts[/{_MUTED}]\n"
     )
-    results = _run_native_async(
-        _run_native_dump_batch_live(
-            shell, domain=domain, hosts=hosts, dump_kind="dpapi", on_result=_on_result
+    coverage = SweepCoverage()
+    with sweep_step("dpapi_bulk_dump", label="DPAPI bulk dump") as step:
+        results = _run_native_async(
+            _run_native_dump_batch_live(
+                shell, domain=domain, hosts=hosts, dump_kind="dpapi",
+                on_result=_on_result,
+                should_stop=step.should_stop,
+                coverage=coverage,
+            )
         )
-    )
-    _CONSOLE.print()
-    _render_bulk_summary("DPAPI", results, finding_count, domain=domain)
+        _CONSOLE.print()
+        _render_bulk_summary("DPAPI", results, finding_count, domain=domain)
+        finish_sweep_step(step, coverage)
+        announce_not_checked(label="DPAPI bulk dump", coverage=coverage)
 
 
 def _native_execute_dump_lsass_bulk(
@@ -3997,11 +4137,31 @@ def _native_execute_dump_lsass_bulk(
     workspace_dir = _native_workspace_dir(shell, domain)
     intel = EdrIntelligence(workspace_dir)
 
+    # Engagement scope before anything is contacted (the sample fingerprint
+    # below connects to the first target): one partition over every candidate,
+    # the resolved list and the domain controllers the smart targeting adds.
+    smart_hosts, tier_label = _lsass_smart_targets(shell, domain)
+    candidates = list(dict.fromkeys([*smart_hosts, *hosts]))
+    prepare_targets_for_scope(shell, candidates, domain=domain)
+    in_scope = {
+        str(host).strip().lower()
+        for host in partition_targets_in_scope(
+            shell,
+            candidates,
+            surface=_DUMP_SCOPE_SURFACE,
+            what="LSASS bulk dump",
+            domain=domain,
+        ).allowed
+    }
+    hosts = [host for host in hosts if str(host).strip().lower() in in_scope]
     # Smart targeting: DCs first, fall back to the full resolved list
-    dc_hosts, tier_label = _lsass_smart_targets(shell, domain)
+    dc_hosts = [host for host in smart_hosts if str(host).strip().lower() in in_scope]
     if not dc_hosts:
         dc_hosts = hosts
         tier_label = f"{len(hosts)} hosts"
+    if not dc_hosts:
+        print_warning("No LSASS campaign target is inside the engagement scope.")
+        return
 
     # Sample fingerprint on the first DC to drive method selection
     fp_sample: HostFingerprint | None = None
@@ -4053,14 +4213,25 @@ def _native_execute_dump_lsass_bulk(
         f"  [{_MUTED}]{tier_label}  ·  {len(selected_hosts)} hosts  ·  {best_method.name}[/{_MUTED}]\n"
     )
 
-    results = _run_native_async(
-        _run_lsass_campaign_async(
-            shell, selected_hosts, domain, workspace_dir, best_method.name, intel
+    coverage = SweepCoverage()
+    with sweep_step("lsass_bulk_dump", label="LSASS bulk dump") as step:
+        results = _run_native_async(
+            _run_lsass_campaign_async(
+                shell,
+                selected_hosts,
+                domain,
+                workspace_dir,
+                best_method.name,
+                intel,
+                should_stop=step.should_stop,
+                coverage=coverage,
+            )
         )
-    )
 
-    _CONSOLE.print()
-    _render_lsass_campaign_summary(results)
+        _CONSOLE.print()
+        _render_lsass_campaign_summary(results)
+        finish_sweep_step(step, coverage)
+        announce_not_checked(label="LSASS bulk dump", coverage=coverage)
 
 
 # ---------------------------------------------------------------------------
@@ -4189,8 +4360,19 @@ async def _run_native_local_admin_reuse_check_async(
     username: str,
     nt_hash: str,
     targets_file: str,
+    should_stop: Any = None,
+    coverage: SweepCoverage | None = None,
+    hosts_in_scope: list[str] | None = None,
 ) -> None:
     """Native replacement for netexec --local-auth reuse check (single cred).
+
+    ``hosts_in_scope`` is the member-host list a caller already partitioned by
+    the engagement scope (one operator line for a whole multi-credential run);
+    without it the targets are read from ``targets_file`` and partitioned here,
+    before the 445 probe.
+
+    Honours the scan control plane through ``check_smb_privilege_batch``: after
+    a stop no new host is tried and ``coverage`` names the hosts left unchecked.
 
     Reads targets from ``targets_file``, runs local-account SMB checks in
     parallel, streams Pwn3d!/not-admin results live, and records attack steps.
@@ -4204,9 +4386,24 @@ async def _run_native_local_admin_reuse_check_async(
     )
 
     is_dc = domain_controller_matcher(shell, domain)
-    hosts, _skipped_dcs = split_out_domain_controllers(
-        _load_native_bulk_hosts(targets_file), is_dc
+    if hosts_in_scope is not None:
+        hosts = list(hosts_in_scope)
+    else:
+        hosts, _skipped_dcs = split_out_domain_controllers(
+            _load_native_bulk_hosts(targets_file), is_dc
+        )
+    # Engagement scope before the 445 probe: nothing is refused when the caller
+    # already partitioned (``hosts_in_scope``), so the operator reads one line.
+    prepare_targets_for_scope(shell, hosts, domain=domain)
+    scope = partition_targets_in_scope(
+        shell,
+        hosts,
+        surface="local_admin_reuse_check",
+        what="Local admin reuse check",
+        domain=domain,
     )
+    note_outside_scope(coverage, scope.refused_items)
+    hosts = scope.allowed
     if not hosts:
         print_warning("No member hosts found for the local admin reuse check.")
         return
@@ -4221,7 +4418,11 @@ async def _run_native_local_admin_reuse_check_async(
     # Pre-flight TCP probe: filter offline hosts before paying the auth cost.
     # Centralized via host_reachability_filter so every bulk-host caller (SAM
     # dumps, LSA dumps, RDP/WinRM sweeps) uses the same vocabulary and tuning.
-    reach = await filter_reachable_hosts(hosts, port=445)
+    # The liveness gate is a fan-out of its own: it asks the engagement scope
+    # about each host right before its probe. A host kept out since the
+    # partition above is outside the scope, not offline.
+    reach = await filter_reachable_hosts(hosts, port=445, scope_surface="local_admin_reuse_check")
+    note_outside_scope(coverage, scope_excluded_hosts(reach))
     print_reachability_summary(reach, service_label="SMB", console=_CONSOLE)
     if not reach.reachable:
         render_no_reachable_panel(
@@ -4260,7 +4461,13 @@ async def _run_native_local_admin_reuse_check_async(
         transient=False,
     ) as prog:
         task_id = prog.add_task("", total=len(configs))
-        results = await check_smb_privilege_batch(configs, max_concurrency=concurrency)
+        results = await check_smb_privilege_batch(
+            configs,
+            max_concurrency=concurrency,
+            should_stop=should_stop,
+            coverage=coverage,
+            shell=shell,
+        )
         for r in results:
             prog.advance(task_id)
             if r.status == SMBPrivilegeStatus.ADMIN:
@@ -4364,6 +4571,16 @@ def _offer_native_local_admin_reuse(
         _load_native_bulk_hosts(targets_file), domain_controller_matcher(shell, domain)
     )
     announce_skipped_domain_controllers(skipped_dcs, domain=domain)
+    # One engagement-scope partition for the whole run (every recovered
+    # credential is tried against the same hosts), before the prompt counts them.
+    prepare_targets_for_scope(shell, member_hosts, domain=domain)
+    member_hosts = partition_targets_in_scope(
+        shell,
+        member_hosts,
+        surface="local_admin_reuse_check",
+        what="Local admin reuse check",
+        domain=domain,
+    ).allowed
     n_hosts = len(member_hosts)
     if not n_hosts:
         return
@@ -4385,11 +4602,33 @@ def _offer_native_local_admin_reuse(
     if not local_credential_reuse_consented(shell, prompt=f"  [{_ICE}]Proceed?[/{_ICE}]"):
         return
 
-    for cred in admin_creds:
-        _run_native_async(
-            _run_native_local_admin_reuse_check_async(
-                shell, domain, cred.username, cred.nt_hash, targets_file
+    coverage = SweepCoverage()
+    with sweep_step(
+        "local_admin_reuse_check", label="Local admin reuse check", unit="host checks"
+    ) as step:
+        for index, cred in enumerate(admin_creds):
+            if step.should_stop():
+                untried = len(admin_creds) - index
+                print_warning(
+                    f"Local admin reuse check stopped: {untried} recovered "
+                    f"credential{'s were' if untried != 1 else ' was'} not tried."
+                )
+                break
+            _run_native_async(
+                _run_native_local_admin_reuse_check_async(
+                    shell,
+                    domain,
+                    cred.username,
+                    cred.nt_hash,
+                    targets_file,
+                    should_stop=step.should_stop,
+                    coverage=coverage,
+                    hosts_in_scope=member_hosts,
+                )
             )
+        finish_sweep_step(step, coverage)
+        announce_not_checked(
+            label="Local admin reuse check", coverage=coverage, unit="host checks"
         )
 
 
@@ -4486,6 +4725,8 @@ def _native_execute_dump_sam(
     After the dump, if admin credentials are found, offers a native reuse
     check (replaces netexec --local-auth) against all SMB targets.
     """
+    if not _dump_host_in_scope(shell, host, domain, "SAM"):
+        return
     display = DumpDisplay()
     workspace_dir = _native_workspace_dir(shell, domain)
     config = _build_smb_config_from_shell(shell, host, domain)
@@ -5001,6 +5242,8 @@ def _native_execute_dump_lsa(
     include_machine_accounts: bool,
 ) -> None:
     """Native LSA dump fast-path using NativeDumpService + DumpDisplay."""
+    if not _dump_host_in_scope(shell, host, domain, "LSA"):
+        return
     display = DumpDisplay()
     workspace_dir = _native_workspace_dir(shell, domain)
     config = _build_smb_config_from_shell(shell, host, domain)
@@ -5266,6 +5509,8 @@ def _native_execute_dump_lsass(
     host: str,
 ) -> None:
     """Native LSASS dump fast-path using NativeDumpService + DumpDisplay."""
+    if not _dump_host_in_scope(shell, host, domain, "LSASS"):
+        return
     display = DumpDisplay()
     workspace_dir = _native_workspace_dir(shell, domain)
     config = _build_smb_config_from_shell(shell, host, domain)
@@ -5354,6 +5599,8 @@ def _native_execute_dump_dpapi(
     import tempfile
     from adscan_internal.services.exploitation.dump_display import DumpDisplay
 
+    if not _dump_host_in_scope(shell, host, domain, "DPAPI"):
+        return
     display = DumpDisplay()
     domains_data = getattr(shell, "domains_data", None) or {}
     pdc_ip = str(domains_data.get(domain, {}).get("pdc") or "").strip()
@@ -6342,6 +6589,8 @@ async def run_intelligent_lsass_dump(
     host security posture and method rationale before any dump attempt starts.
     Returns True on success.
     """
+    if not _dump_host_in_scope(shell, host, domain, "LSASS"):
+        return False
     config = _build_smb_config_from_shell(shell, host, domain)
     intel = EdrIntelligence(workspace_dir)
 

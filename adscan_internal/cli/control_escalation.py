@@ -47,7 +47,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from adscan_internal.cli.ace_step_execution import AceStepContext, execute_ace_step
-from adscan_internal.rich_output import mark_sensitive, print_info_debug
+from adscan_internal.rich_output import mark_sensitive, markup_object_label, print_info_debug
 
 
 # Relations that already confer effective GenericAll — no escalation rung.
@@ -149,7 +149,7 @@ def ensure_control_to_wield_next_edge(
     relation = _norm(control_relation)
     kind = _norm(exec_context.target_kind)
     domain = exec_context.domain
-    marked_to = mark_sensitive(to_label, "node")
+    marked_to = markup_object_label(to_label)
 
     # Only act when there IS a dependent next edge sourced from this object.
     if not _next_edge_sourced_from(next_edge, to_label):
@@ -208,7 +208,7 @@ def ensure_control_to_wield_next_edge(
         result.wielded = bool(wielded)
         result.reason = (
             f"escalation rung applied; wielded GenericAll on {kind} target "
-            f"{mark_sensitive(to_label, 'node')}"
+            f"{markup_object_label(to_label)}"
             if wielded
             else f"escalation rung applied; GenericAll wield failed on {kind} target"
         )
@@ -246,7 +246,7 @@ def _escalate_owner_then_dacl(
     handler grants self GenericAll and registers ``dacl_ace_added``. Returns
     True only when both rungs succeed.
     """
-    marked_to = mark_sensitive(exec_context.to_label, "node")
+    marked_to = markup_object_label(exec_context.to_label)
     owner_ok = bool(execute_ace_step(shell, context=replace(exec_context, relation="writeowner")))
     if not owner_ok:
         result.reason = f"owner change failed on {exec_context.target_sam_or_label}"
@@ -268,7 +268,7 @@ def _grant_generic_all_self(
     The writedacl handler (non-domain target) grants self GenericAll and
     registers ``dacl_ace_added`` cleanup. Returns True on success.
     """
-    marked_to = mark_sensitive(exec_context.to_label, "node")
+    marked_to = markup_object_label(exec_context.to_label)
     ok = bool(execute_ace_step(shell, context=replace(exec_context, relation="writedacl")))
     if not ok:
         result.reason = f"GenericAll self-grant failed on {exec_context.target_sam_or_label}"

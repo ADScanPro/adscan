@@ -31,6 +31,17 @@ from adscan_internal.services.cve_scanner.result import (
     CVEResult,
     CVEStatus,
     Severity,
+    public_cve_reference,
+)
+
+#: Worst first. The top-findings list orders by ADscan severity, never by a
+#: CVSS number (CLAUDE.md § "No CVSS on a client surface").
+_SEVERITY_ORDER: tuple[Severity, ...] = (
+    Severity.CRITICAL,
+    Severity.HIGH,
+    Severity.MEDIUM,
+    Severity.LOW,
+    Severity.INFO,
 )
 
 
@@ -219,7 +230,7 @@ class CVEDashboard:
             if r.is_vulnerable
         ]
         rows.sort(
-            key=lambda r: (-(r.cvss_v3 or 0.0), r.aka, r.host),
+            key=lambda r: (_SEVERITY_ORDER.index(r.severity), r.aka, r.host),
         )
         body = Table.grid(padding=(0, 1))
         body.add_column()
@@ -230,8 +241,9 @@ class CVEDashboard:
             line.append("●", style=_SEVERITY_STYLE[result.severity])
             line.append(f"  {result.aka}  ", style="bold")
             line.append(mark_sensitive(result.host, "host"), style="cyan")
-            if result.cvss_v3 is not None:
-                line.append(f"  CVSS {result.cvss_v3:.1f}", style="dim")
+            cve_ref = public_cve_reference(result.cve_id)
+            if cve_ref:
+                line.append(f"  {cve_ref}", style="dim")
             body.add_row(line)
         return Panel(body, title="Top findings", border_style="bright_black")
 

@@ -136,6 +136,14 @@ class ScanRecapModel:
     verdict_kind: str = ""
     verdict_phrase: str = ""
     verdict_sentence: str = ""
+    # The engagement-scope disclosure, from the tier-shared SSOT. Empty when the
+    # run had no asset scope. ``asset_scope_lines`` holds one line per
+    # population, never merged: the objects the client excluded, and the ones
+    # ADscan could not confirm as within the scope and left alone.
+    # ``asset_scope_statement`` is the record-only fallback when the scan did
+    # not stamp the per-domain blocks.
+    asset_scope_lines: tuple[str, ...] = field(default_factory=tuple)
+    asset_scope_statement: str = ""
 
 
 #: Verdict kinds whose routes to domain compromise were mapped and not run.
@@ -227,6 +235,20 @@ def _scope_line(model: ScanRecapModel) -> Text | None:
     )
 
 
+def _asset_scope_lines(model: ScanRecapModel) -> list[Text]:
+    """Render the engagement-scope lines, one per population.
+
+    The objects the client excluded and the ones ADscan could not confirm as
+    within the scope are different facts, so each gets its own line. Empty when
+    the run had no asset scope. Wording from the tier-shared SSOT.
+    """
+    if model.asset_scope_lines:
+        return [Text(f"Scope   {line}", style="dim") for line in model.asset_scope_lines]
+    if model.asset_scope_statement:
+        return [Text(model.asset_scope_statement, style="dim")]
+    return []
+
+
 def _paths_line(model: ScanRecapModel) -> Text | None:
     """Render the attack-path count clause, in the report's own words.
 
@@ -279,7 +301,9 @@ def _timing_line(model: ScanRecapModel) -> Text | None:
         return Text(
             f"{missing} {verb} not completed for this domain, so this run "
             "cannot say whether it held. The findings below are what the "
-            "checks that did run observed.",
+            "checks that did run observed. Reopen this workspace and choose "
+            "Resume to finish them (give ADscan more memory first if a stage "
+            "stopped for memory).",
             style=COLOR_AMBER,
         )
     if model.outcome == "domain_compromised":
@@ -393,7 +417,9 @@ def _closest_reach_line(cr, klass, path: RecapPath, nodes: list[str], edges: lis
             line.append("…", style="dim")
             line.append_text(arrow)
             line.append(target, style="bold")
-    line.append("   ")
+    # The reach phrase on its own line: run on after the chain it wrapped
+    # mid-sentence at 80 columns and read as part of the route.
+    line.append("\n")
     line.append_text(cr.class_reach(klass))
     return line
 
@@ -573,6 +599,8 @@ def build_recap_body(model: ScanRecapModel) -> RenderableType:
     scope = _scope_line(model)
     if scope is not None:
         parts.append(scope)
+
+    parts.extend(_asset_scope_lines(model))
 
     path_block = _path_block(model)
     if path_block is not None:

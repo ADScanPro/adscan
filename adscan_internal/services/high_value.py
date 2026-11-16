@@ -622,7 +622,10 @@ def classify_users_tier0_high_value(
                     if normalized:
                         candidates.add(normalized)
 
-                candidates &= set(results)
+                # The dict's key view, not ``set(results)``: building a set of
+                # every requested account per User node made this pass
+                # quadratic (44k nodes x 42k accounts at the dense preset).
+                candidates &= results.keys()
                 unresolved_candidates = {
                     candidate
                     for candidate in candidates

@@ -38,7 +38,7 @@ pure-logic helpers above remain importable in environments without winacl.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 from adscan_core.reporting.well_known_principals import (
     credential_less_readset_sids,
@@ -197,10 +197,19 @@ def decide_verification_tier(
     return VERIFICATION_SHARE_ACL_ONLY
 
 
+class ClosureBuildStopped(Exception):
+    """:func:`build_sid_group_closure` gave up because ``should_stop`` said so."""
+
+
+#: SIDs expanded between two calls to ``should_stop``.
+_CLOSURE_STOP_CHECK_EVERY = 1024
+
+
 def build_sid_group_closure(
     member_of_edges: Iterable[tuple[str, str]],
     *,
     max_depth: int = 16,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, frozenset[str]]:
     """Build per-SID transitive group membership closures from MemberOf edges.
 
@@ -221,6 +230,14 @@ def build_sid_group_closure(
             SID pairs. Non-string / empty entries are skipped.
         max_depth: Maximum transitive expansion depth (defense against
             pathological membership graphs at enterprise scale).
+        should_stop: Asked every few thousand SIDs (a memory guard's
+            ``over_line``). The closure of a large, densely nested directory
+            holds every principal's whole group set, so it can outgrow the
+            memory the run has; a ``True`` abandons it.
+
+    Raises:
+        ClosureBuildStopped: ``should_stop`` returned ``True``. Nothing partial
+            is returned.
 
     Returns:
         Mapping of ``member_sid -> frozenset(group_sids)``. SIDs that appear
@@ -239,7 +256,13 @@ def build_sid_group_closure(
         direct.setdefault(m, set()).add(g)
 
     closure: dict[str, frozenset[str]] = {}
-    for sid in direct:
+    for index, sid in enumerate(direct):
+        if (
+            should_stop is not None
+            and index % _CLOSURE_STOP_CHECK_EVERY == 0
+            and should_stop()
+        ):
+            raise ClosureBuildStopped
         seen: set[str] = set()
         stack: list[tuple[str, int]] = [(sid, 0)]
         while stack:

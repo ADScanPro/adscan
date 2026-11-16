@@ -13,7 +13,7 @@ for user interaction (confirmation prompts, password spraying decisions, etc.).
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import logging
@@ -199,8 +199,16 @@ class SpideringService(BaseService):
         *,
         credsweeper_path: Optional[str],
         timeout: int = 300,
+        hosts: Optional[List[str]] = None,
+        shell: Any = None,
     ) -> Dict[str, List]:
         """Execute manspider password scan and analyze results with CredSweeper.
+
+        Engagement scope: the spider is a child process and ``command`` already
+        names its targets, so the scope is asked here on ``hosts`` (the hosts
+        the command was built from, for the session ``shell``). When one of
+        them is excluded, or an asset scope exists and the hosts are not
+        declared, the command is not run at all: it cannot be trimmed.
 
         This method mirrors the previous ``execute_manspider(..., scan_type='passw')``
         behavior in ``adscan.py`` but without any CLI interactivity.
@@ -223,6 +231,31 @@ class SpideringService(BaseService):
         Returns:
             Dictionary of credentials organized by CredSweeper rule name.
         """
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            asset_scope_recorded,
+        )
+
+        declared = [str(host).strip() for host in (hosts or []) if str(host or "").strip()]
+        if declared:
+            from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+                subprocess_targets_in_scope,
+            )
+
+            # Asked here, by the function that starts the child, right before it does.
+            refused = bool(
+                subprocess_targets_in_scope(
+                    shell, declared, surface="smb_share_hunt", what="SMB share spidering"
+                ).refused
+            )
+        else:
+            refused = asset_scope_recorded(shell)
+        if refused:
+            print_warning(
+                "SMB share spidering not run: its target list could not be "
+                "confirmed inside the engagement scope."
+            )
+            return {}
+
         # Ensure parent directory for the log exists
         log_dir = os.path.dirname(log_file) or "."
         os.makedirs(log_dir, exist_ok=True)

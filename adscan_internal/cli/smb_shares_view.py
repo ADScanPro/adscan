@@ -63,6 +63,11 @@ from adscan_internal.services.kerberos_hostname_inventory import (
 from adscan_internal.services.kerberos_spn_resolution import (
     resolve_spn_or_decide_ntlm,
 )
+from adscan_internal.services.smb_guest_auth_service import (
+    build_smb_guest_config,
+    is_guest_sign_in_request,
+    resolve_smb_guest_username,
+)
 from adscan_internal.services.smb_transport import SMBConfig
 from adscan_internal.services.views._graph_share_reader import (
     GraphShareSnapshot,
@@ -176,6 +181,8 @@ def run_native_shares_view(
         domain=domain,
         target_host=target_host,
         mode=resolved_mode,
+        username_override=username,
+        credential_override=credential,
     )
 
     # ── 2. Run the operation under a timer + status spinner ────────────────
@@ -242,27 +249,69 @@ def _resolve_target_host(shell: Any, domain: str, host: Optional[str]) -> str:
     return pdc_hostname or pdc_ip or domain
 
 
+def _is_guest_override(
+    shell: Any,
+    domain: str,
+    username_override: Optional[str],
+    credential_override: Optional[str],
+) -> bool:
+    """True when the caller asked for a guest session (a guest identity, no credential)."""
+    if username_override is None:
+        return False
+    return is_guest_sign_in_request(
+        username_override, credential_override, shell=shell, domain=domain
+    )
+
+
+def _session_identity_label(
+    shell: Any,
+    domain: str,
+    username_override: Optional[str],
+    credential_override: Optional[str],
+) -> str:
+    """The identity THIS session signs in as, mirroring ``_build_smb_config_for_host``.
+
+    Not the domain's authentication state: a guest probe on an authenticated
+    domain is still a guest session.
+    """
+    domain_data = (shell.domains_data.get(domain) or {}) if hasattr(shell, "domains_data") else {}
+    if _is_guest_override(shell, domain, username_override, credential_override):
+        transport = resolve_smb_guest_username(shell=shell, domain=domain)
+        return (
+            f"Guest session (transport name {mark_sensitive(transport, 'user')}, "
+            "not a domain account)"
+        )
+    if username_override is not None:
+        username = str(username_override or "").strip()
+        return mark_sensitive(username, "user") if username else "Null session (anonymous)"
+    auth_state = str(domain_data.get("auth") or "unauth").strip().lower()
+    stored_user = str(domain_data.get("username") or "").strip()
+    if auth_state in ("auth", "pwned") and stored_user:
+        return mark_sensitive(stored_user, "user")
+    return "Null session (anonymous)"
+
+
 def _render_header(
     *,
     shell: Any,
     domain: str,
     target_host: str,
     mode: SharesViewMode,
+    username_override: Optional[str] = None,
+    credential_override: Optional[str] = None,
 ) -> None:
     if suppress_rich():
         return
 
     domain_data = (shell.domains_data.get(domain) or {}) if hasattr(shell, "domains_data") else {}
-    auth_state = str(domain_data.get("auth") or "unauth").strip().lower()
-    auth_label = {"auth": "authenticated", "pwned": "pwned", "unauth": "unauth"}.get(
-        auth_state, auth_state
-    )
     posture_summary = _summarise_posture(domain_data)
 
     details = {
         "Target": target_host,
         "Domain": domain,
-        "Auth": auth_label,
+        "Signed in as": _session_identity_label(
+            shell, domain, username_override, credential_override
+        ),
         "Mode": mode.value,
     }
     if posture_summary:
@@ -317,8 +366,8 @@ def _run_live_probe(
                 error=f"Cannot run live probe: {exc}",
                 cause="No usable credentials in the shell for this domain.",
                 commands=[
-                    f"adscan domain creds set --domain {domain} --user <u> --password <p>",
-                    f"adscan smb shares --domain {domain} --output json --mode graph",
+                    f"creds save {domain} <username> <password>",
+                    f"smb_shares {domain} --mode graph",
                 ],
             )
         return None, str(exc)
@@ -335,7 +384,9 @@ def _run_live_probe(
             print_remediation_card(
                 error=f"Live SMB share probe failed: {exc}",
                 cause=_classify_error_cause(str(exc)),
-                commands=_remediation_commands(domain=domain, status="error"),
+                commands=_remediation_commands(
+                    domain=domain, status=_failure_kind(str(exc)) or "error"
+                ),
             )
         return None, str(exc)
 
@@ -347,7 +398,10 @@ def _run_live_probe(
             print_remediation_card(
                 error=f"Live SMB share probe failed: {result.error or 'unknown'}",
                 cause=cause,
-                commands=_remediation_commands(domain=domain, status=result.status),
+                commands=_remediation_commands(
+                    domain=domain,
+                    status=_failure_kind(result.error or "") or result.status,
+                ),
             )
         return result, result.error
 
@@ -583,18 +637,14 @@ def _render_footer(
 def _suggest_next_command(
     *, view_set: ShareViewSet, mode: SharesViewMode, domain: str
 ) -> Optional[str]:
-    # Prioritise the most operationally valuable next step:
-    # writable shares → hunt for credentials / drop payloads first.
-    writable = [v for v in view_set.views if getattr(v, "is_writable_live", False)]
-    readable = [v for v in view_set.views if getattr(v, "is_readable", False)]
-    if writable or readable:
-        share_names = ",".join(v.name for v in (writable or readable)[:2])
-        return f"adscan smb hunt --domain {domain} --shares {share_names}"
+    # Every suggestion is a command that exists (a REPL ``do_<verb>`` or a
+    # launcher subcommand); readable/writable shares are hunted by the scan
+    # flow itself, so there is no separate command to point at.
     if any(v.delta == ShareDelta.LIVE_EXCEEDS_GRAPH for v in view_set.views):
-        return f"adscan smb shares --domain {domain} --mode delta"
+        return f"smb_shares {domain} --mode delta"
     if view_set.sources.get("graph") == "missing":
         return f"adscan ci --domain {domain}"
-    return f"adscan smb sessions --domain {domain}"
+    return f"sessions {domain}"
 
 
 def _posture_for_envelope(*, shell: Any, domain: str) -> Dict[str, Any]:
@@ -635,6 +685,14 @@ def _persist_snapshot(
         }
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, sort_keys=False)
+        # The proven readers are also store evidence (``unauthenticated``
+        # stage): the graph build re-sources share-file credential edges from
+        # them (``graph_build/passes/shares.py``). Best-effort.
+        from adscan_internal.services.collector.store_writer import (  # noqa: PLC0415
+            commit_share_probe_read_sets,
+        )
+
+        commit_share_probe_read_sets(shell, domain, view_set.host, payload.get("views") or [])
         return out_path
     except Exception as exc:  # noqa: BLE001 — UX-best-effort, not fatal
         telemetry.capture_exception(exc)
@@ -717,6 +775,19 @@ def _build_smb_config_for_host(
 
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip() or None
     pdc_ip = str(domain_data.get("pdc") or "").strip()
+
+    # A guest identity (the "guest"/"anonymous" alias or the engagement's guest
+    # transport name) with no credential is a GUEST session: built by the one
+    # guest builder, which establishes the name and declares it to the guard.
+    if _is_guest_override(shell, domain, username_override, credential_override):
+        return build_smb_guest_config(
+            shell,
+            domain=domain,
+            target_ip=str(target_host or pdc_ip or "").strip(),
+            target_hostname=pdc_hostname if not target_host else None,
+            timeout=timeout,
+            dns_server=dns_server,
+        )
 
     # Caller-supplied override — username_override is not None means explicit.
     # credential_override may be empty string (guest / null session).
@@ -867,6 +938,19 @@ def _classify_error_cause(error_text: str) -> str:
     AP-REP parse failure that may actually be a non-default salt/etype or clock
     skew. The wrong-SPN message is reserved for the codes that genuinely mean it.
     """
+    kind = _failure_kind(error_text)
+    if kind == "withheld":
+        reason = error_text.split("withheld to protect the account from lockout:", 1)[-1].strip()
+        return (
+            "The sign-in was not sent: ADscan's account lockout protection withheld it"
+            + (f" ({reason.rstrip('.')})." if reason else ".")
+        )
+    if kind == "guest_unavailable":
+        return (
+            "This host does not grant guest access, so nothing can be read as guest "
+            "here. No account was signed in to. Enumerate the host with an account instead."
+        )
+
     upper = error_text.upper()
 
     # Concrete, decoded Kerberos AP-exchange error codes — diagnose precisely.
@@ -929,18 +1013,35 @@ def _classify_error_cause(error_text: str) -> str:
     return "Unknown SMB transport error — check the workspace log for details."
 
 
+def _failure_kind(error_text: str) -> str:
+    """``withheld`` (lockout guard), ``guest_unavailable``, or ``""`` for anything else."""
+    text = str(error_text or "")
+    if "withheld to protect the account from lockout" in text:
+        return "withheld"
+    if "Guest access is not available" in text or "Guest access is not confirmed" in text:
+        return "guest_unavailable"
+    return ""
+
+
 def _remediation_commands(*, domain: str, status: str) -> List[str]:
-    if status == "denied":
+    """Next commands for a failed live probe. Every one is a real REPL command
+    (``do_<verb>`` on the shell), locked by a test."""
+    if status == "guest_unavailable":
         return [
-            f"adscan domain creds rotate --domain {domain}",
-            f"adscan smb shares --domain {domain} --mode graph",
+            f"smb_auth_shares {domain} <username> <password>",
+            f"smb_shares {domain} --mode graph",
+        ]
+    if status in ("denied", "withheld"):
+        return [
+            "creds show",
+            f"smb_shares {domain} --mode graph",
         ]
     if status == "error":
         return [
-            f"adscan domain check --domain {domain}",
-            f"adscan smb shares --domain {domain} --mode graph",
+            f"posture show {domain}",
+            f"smb_shares {domain} --mode graph",
         ]
-    return [f"adscan smb shares --domain {domain} --output json"]
+    return [f"smb_shares {domain} --mode graph"]
 
 
 __all__ = [

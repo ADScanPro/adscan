@@ -153,7 +153,7 @@ NOT_RECHECKABLE: Mapping[str, str] = {
         "Tested with an anonymous SMB session; the re-check signs in as an account, so it cannot "
         "repeat the unauthenticated test."
     ),
-    # Derived in persistence._persist_derived_attack_steps (the SPN pass).
+    # Derived in persistence.derive_result_findings (the SPN pass).
     "probe.http_relay_surface": (
         "No read-only observer yet: derived in the scan's pass over every account's service "
         "principal names."

@@ -326,6 +326,9 @@ def compute_remediation_priorities(
                 # reads first (their people, in their language), above the
                 # attack-path count which stays as the secondary redundancy axis.
                 "reach_users": entry.reach_users,
+                # Where this technique's paths start, by object kind. The row's
+                # sentence reads it; it never assumes a foothold kind.
+                "source_kinds": list(entry.source_kinds),
                 "reach_total": reach_total,
                 "reach_pct": (
                     min(round(entry.reach_users / max(reach_total, 1) * 100, 1), 100.0)
@@ -804,6 +807,7 @@ def build_remediation_start_here(
             reach_total=row_reach_total,
             reach_pct=row_reach_pct,
             reach_is_uniform=reach_is_uniform,
+            source_kinds=entry.get("source_kinds"),
         )
         choke_id = _resolve_row_choke_identifier(entry.get("top_choke_point"))
         badge = bool(is_structural_choke(choke_id, card_map))
@@ -825,6 +829,9 @@ def build_remediation_start_here(
                 "reach_users": row_reach_users,
                 "reach_total": row_reach_total,
                 "reach_pct": row_reach_pct,
+                "source_kinds": sorted(
+                    str(kind) for kind in (entry.get("source_kinds") or ())
+                ),
                 # Per-technique remediation guidance, carried onto the row so the
                 # merged remediation section (IA v2: ONE ranked list) can attach
                 # the fix detail to each row instead of a second ranked table.

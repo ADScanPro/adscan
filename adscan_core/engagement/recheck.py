@@ -49,7 +49,8 @@ from adscan_core.engagement.model import (
     Transition,
     Vantage,
 )
-from adscan_core.engagement.reconcile import reconcile
+from adscan_core.engagement.reconcile import reason_code, reconcile
+from adscan_core.engagement.sources import BASIS_LABELS
 from adscan_core.engagement.specs import ObservationSpec, edge_spec_lookup, spec_for
 
 RUN_PLAN_SCHEMA = "adscan.run_plan/1"
@@ -104,15 +105,42 @@ REASON_NOT_READ = "not_read"
 REASON_READ_FAILED = "read_failed"
 REASON_PARTIAL_READ = "object_read_only"
 REASON_VANTAGE = "weaker_vantage"
+#: A read the check is decided from was not obtained in this run (no credential
+#: of the kind it needs, access denied, no answer). The item is not re-checked;
+#: the specific read follows the colon (``basis_not_read:ca_registry_not_read``).
+REASON_BASIS_NOT_READ = "basis_not_read"
+#: The reads an observer names when its family could not be decided because a
+#: value it is graded from was not obtained. Each has operator copy in
+#: :data:`REASON_LABELS`.
+#: Declared once, with their copy, in ``adscan_core.engagement.sources`` (the
+#: scan lifecycle names the same reads the same way).
+BASIS_NOT_READ_REASONS: frozenset[str] = frozenset(BASIS_LABELS)
 REASON_NOT_WALKED = "not_walked"
 REASON_PRECONDITION_REMOVED = "precondition_removed"
+#: The engagement scope kept the read from being made (the domain controller it
+#: needs, or the account it runs as, is excluded). The token every surface uses
+#: for a step outside the scope (``reporting.engagement_scope
+#: .NOT_EXECUTED_OUTSIDE_SCOPE``; spelled out because this package imports only
+#: the standard library and its own modules, and locked equal by a test); never
+#: a statement about the client's directory.
+REASON_OUTSIDE_SCOPE = "outside_engagement_scope"
+#: The step's object could not be confirmed as within the engagement scope, so
+#: the step was left alone. Said apart from an exclusion: it is not a statement
+#: about what the client asked for (the wording of
+#: ``reporting.engagement_scope.UNCONFIRMED_SCOPE_STEP_LABEL``, locked by a test).
+REASON_SCOPE_UNCONFIRMED = "engagement_scope_unconfirmed"
 
 #: Operator copy per reason.
 REASON_LABELS: Mapping[str, str] = {
+    REASON_OUTSIDE_SCOPE: "outside the engagement scope",
+    REASON_SCOPE_UNCONFIRMED: "could not be confirmed as within the engagement scope",
     REASON_NO_READ_ONLY_CHECK: "no read-only check",
     REASON_NOT_READ: "its check did not run",
     REASON_READ_FAILED: "the read failed",
     REASON_PARTIAL_READ: "only some affected objects were read",
+    REASON_BASIS_NOT_READ: "a value it is decided from was not read",
+    **BASIS_LABELS,
+    "directory_not_answering": "the directory did not answer the read",
     REASON_VANTAGE: "this credential sees less than the one that found it",
     REASON_NOT_WALKED: "not walked: the route stopped earlier",
     REASON_PRECONDITION_REMOVED: "precondition removed",
@@ -320,6 +348,21 @@ def _sentence_tail(sentence: str) -> str:
     return sentence
 
 
+def reason_text(reason: str) -> str:
+    """Operator copy for a reason code.
+
+    A compound code (``basis_not_read:ca_registry_not_read``) is worded by its
+    specific half when that half has copy of its own; any other code keeps its
+    label, or its own words with the underscores removed.
+    """
+    if reason in REASON_LABELS:
+        return REASON_LABELS[reason]
+    _base, sep, detail = reason.partition(":")
+    if sep and detail in REASON_LABELS:
+        return REASON_LABELS[detail]
+    return reason.replace("_", " ")
+
+
 @dataclass(frozen=True)
 class Verdict:
     """What the operator is told about one item.
@@ -341,7 +384,7 @@ class Verdict:
             return f"{label}: {_sentence_tail(self.detail)}"
         if not self.reason:
             return label
-        return f"{label}: {REASON_LABELS.get(self.reason, self.reason.replace('_', ' '))}"
+        return f"{label}: {reason_text(self.reason)}"
 
 
 @dataclass(frozen=True)
@@ -395,16 +438,41 @@ def _finding_keys_of(check_id: Optional[str]) -> frozenset[str]:
 
 
 def _reason_for(result: ItemResult, outcome: Optional[ReadOutcome]) -> str:
-    if result.reason in {"no_spec", "never_auto"}:
+    # ``reconcile`` may qualify its code with the unread source
+    # (``check_partial:ca_registry_not_read``); the recheck wording below is
+    # decided from the code and the observer's own reason.
+    code = reason_code(result.reason)
+    if code in {"no_spec", "never_auto"}:
         return REASON_NO_READ_ONLY_CHECK
-    if result.reason == "check_failed":
+    if outcome is not None and outcome.reason == REASON_OUTSIDE_SCOPE:
+        # Not a failed read: the engagement scope kept it from being made.
+        return REASON_OUTSIDE_SCOPE
+    if code == "check_failed":
         return f"{REASON_READ_FAILED}:{outcome.reason}" if outcome and outcome.reason else REASON_READ_FAILED
-    if result.reason == "check_partial":
+    if code == "check_partial":
+        if outcome is not None and outcome.reason in BASIS_NOT_READ_REASONS:
+            return f"{REASON_BASIS_NOT_READ}:{outcome.reason}"
         return REASON_PARTIAL_READ
-    if result.reason == "vantage":
+    if code == "vantage":
         return REASON_VANTAGE
     if outcome is not None and outcome.status is CheckStatus.SKIPPED and outcome.reason:
         return f"{REASON_NOT_READ}:{outcome.reason}"
+    return REASON_NOT_READ
+
+
+def _undecided_reason(outcome: Optional[ReadOutcome]) -> str:
+    """Why an item with nothing to transition was still not re-checked.
+
+    Only a read that names what it could not obtain adds to the generic
+    "its check did not run": a finding the ledger never held and one it holds
+    open are then told the same thing about the same read.
+    """
+    if outcome is None:
+        return REASON_NOT_READ
+    if outcome.reason == REASON_OUTSIDE_SCOPE:
+        return REASON_OUTSIDE_SCOPE
+    if outcome.status is CheckStatus.PARTIAL and outcome.reason in BASIS_NOT_READ_REASONS:
+        return f"{REASON_BASIS_NOT_READ}:{outcome.reason}"
     return REASON_NOT_READ
 
 
@@ -570,7 +638,9 @@ def build_recheck_decisions(
             verdicts[item.item_id] = Verdict(VERDICT_CLOSED_OBSERVED)
         else:
             verdicts[item.item_id] = Verdict(
-                VERDICT_NOT_RECHECKED, REASON_NOT_READ, _declared_detail(item, outcome)
+                VERDICT_NOT_RECHECKED,
+                _undecided_reason(outcome),
+                _declared_detail(item, outcome),
             )
     return RecheckDecisions(observed=observed, coverage=coverage, results=results, verdicts=verdicts)
 
@@ -593,8 +663,12 @@ __all__ = (
     "LEVEL_FINDING",
     "LEVEL_PATH",
     "LEVEL_STEP",
+    "BASIS_NOT_READ_REASONS",
+    "REASON_BASIS_NOT_READ",
     "REASON_LABELS",
     "REASON_NO_READ_ONLY_CHECK",
+    "REASON_OUTSIDE_SCOPE",
+    "REASON_SCOPE_UNCONFIRMED",
     "RESULT_SCHEMA",
     "ReadOutcome",
     "RecheckDecisions",

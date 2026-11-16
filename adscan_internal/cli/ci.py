@@ -20,6 +20,7 @@ from adscan_internal import (
     print_error,
     print_exception,
     print_info,
+    print_info_debug,
     print_info_verbose,
     print_success,
     print_warning,
@@ -81,6 +82,19 @@ _CI_PHASES: tuple[tuple[str, str], ...] = (
 )
 
 
+#: The banner phases this run completed (1-indexed). Reset when a run starts.
+#: The strip ticks a phase only when it is in here, so a run that stops in
+#: preflight never closes with "Reconnaissance, Scan, Reporting" ticked.
+_CI_PHASES_DONE: set[int] = set()
+
+#: What ``ci`` prints instead of the loot card when the scan itself never
+#: started: there are no results to summarise, and the reason is already above.
+CI_NOT_STARTED_NOTICE = (
+    "The scan stopped before its first phase, so there are no results to "
+    "summarise. The reason is stated above."
+)
+
+
 def _chapter(number: int) -> PhaseChapter:
     """Build a PhaseChapter for the given 1-indexed phase number."""
     title, subtitle = _CI_PHASES[number - 1]
@@ -89,7 +103,18 @@ def _chapter(number: int) -> PhaseChapter:
         title=title,
         subtitle=subtitle,
         all_phases=tuple(name for name, _ in _CI_PHASES),
+        done=frozenset(_CI_PHASES_DONE),
     )
+
+
+def _mark_ci_phases_done(*numbers: int) -> None:
+    """Record banner phases as completed by this run."""
+    _CI_PHASES_DONE.update(numbers)
+
+
+def ci_scan_started() -> bool:
+    """Whether this run got past preflight into the scan (phase 2 or 3 ran)."""
+    return bool(_CI_PHASES_DONE & {2, 3})
 
 
 @dataclass(frozen=True)
@@ -215,13 +240,10 @@ def _build_ci_loot_card(
 
     # --- attack graph: node count + roastable counts -----------------------
     try:
-        from adscan_internal.workspaces import domain_subpath
-        import json as _json
+        from adscan_internal.services.attack_graph_service import load_attack_graph
 
-        graph_path = domain_subpath(ws_dir, domains_dir, domain, "attack_graph.json")
-        if os.path.exists(graph_path):
-            with open(graph_path, "r", encoding="utf-8") as fh:
-                graph = _json.load(fh)
+        graph = load_attack_graph(shell, domain)
+        if graph.get("nodes"):
             nodes = graph.get("nodes")
             total_nodes = len(nodes) if isinstance(nodes, (list, dict)) else 0
             kerb_targets: set[str] = set()
@@ -504,6 +526,325 @@ def resolve_ci_scan_config(args: object):
     return load_scan_config(scan_config_path)
 
 
+def _apply_ci_asset_scope(shell: Any, args: object, deps: Any) -> bool:
+    """Record the run's asset scope (flags, else the scan-config section).
+
+    Unattended: never prompts; prints the summary as lines. Returns False (after
+    ``deps.exit(2)``) on a syntax error or a scope configuration error, so the
+    run stops before its first network contact.
+    """
+    from adscan_core.engagement_scope_cli import scope_error_line  # noqa: PLC0415
+    from adscan_core.engagement_scope_model import ScopeSyntaxError  # noqa: PLC0415
+    from adscan_internal.cli.asset_scope_cmd import (  # noqa: PLC0415
+        apply_scope_request,
+        resolve_scope_request,
+        scope_stops_unattended_run,
+    )
+
+    try:
+        # What the operator named for this run (the target domain, a domain
+        # controller of it, its name server), told to the scope BEFORE it is
+        # recorded: the scope's names are then looked up through the domain's
+        # own name server, and the controller is judged as a controller.
+        from adscan_internal.services.engagement_scope import declare_scan_target  # noqa: PLC0415
+
+        declare_scan_target(
+            shell,
+            domain=str(getattr(args, "domain", "") or ""),
+            dc_ip=str(getattr(args, "dc_ip", "") or "") or None,
+            dns_server=str(getattr(args, "dns_server", "") or "") or None,
+        )
+        request = resolve_scope_request(args, getattr(shell, "scan_config", None))
+        apply_scope_request(shell, request, confirm=False)
+    except ScopeSyntaxError as exc:
+        from rich.markup import escape  # noqa: PLC0415
+
+        print_error(escape(scope_error_line(exc)))
+        deps.exit(2)
+        return False
+    if scope_stops_unattended_run(
+        shell,
+        domain=str(getattr(args, "domain", "") or ""),
+        dc_ip=str(getattr(args, "dc_ip", "") or "") or None,
+        username=str(getattr(args, "username", "") or ""),
+    ):
+        deps.exit(2)
+        return False
+    return True
+
+
+#: ``ci_resume_decision`` reasons.
+CI_RESUME_INTERRUPTED = "interrupted"
+CI_FRESH_REQUESTED = "fresh_requested"
+CI_FRESH_OTHER_ACCOUNT = "other_account"
+CI_FRESH_OTHER_SCOPE = "other_scope"
+CI_FRESH_NO_INTERRUPTED_SCAN = "no_interrupted_scan"
+
+
+def ci_resume_decision(shell: Any, *, domain: str, username: str) -> tuple[bool, str]:
+    """Decide whether an authenticated ``ci`` run resumes the workspace or starts clean.
+
+    A ``ci`` run resumes when the workspace holds an INTERRUPTED scan of the same
+    domain by the same account: its ``scan_progress`` or ``collection_progress``
+    record is still ``running`` (an operator stop, the platform's stop, a killed
+    container). That is the headless resume the host-granular collection design
+    promises ("a later ``adscan ci`` resume picks it up") and the one the web
+    worker relies on when it seeds a resumed run's execution workspace from the
+    logical one. Everything else starts clean, as ``ci`` always did.
+
+    ``ADSCAN_COLLECTOR_FRESH`` (the collector's existing "fresh full sweep"
+    switch) asks for a clean start even over an interrupted scan.
+
+    A resumed run also runs under the SAME engagement scope as the scan it
+    resumes (equal digests of the allow and deny lists). Under other lists the
+    result would mix two engagements: hosts excluded since keep what was read
+    from them, and hosts added since are skipped by the phases already
+    complete. So a changed scope starts clean. The scope record itself is never
+    cleared: its lineage (``record_id`` and revisions) carries on either way.
+
+    Returns:
+        ``(resume, reason)``, ``reason`` one of the ``CI_*`` constants above.
+    """
+    from adscan_internal.services import collection_progress, scan_progress  # noqa: PLC0415
+
+    domain = str(domain or "").strip()
+    interrupted = bool(domain) and (
+        scan_progress.is_incomplete(shell, domain)
+        or collection_progress.is_incomplete(shell, domain)
+    )
+    if not interrupted:
+        return False, CI_FRESH_NO_INTERRUPTED_SCAN
+    if collection_progress.collector_fresh_requested():
+        return False, CI_FRESH_REQUESTED
+    domains_data = getattr(shell, "domains_data", None)
+    entry = domains_data.get(domain) if isinstance(domains_data, dict) else None
+    stored_user = str((entry or {}).get("username") or "").strip().casefold()
+    if stored_user and stored_user != str(username or "").strip().casefold():
+        return False, CI_FRESH_OTHER_ACCOUNT
+    from adscan_internal.services.scan_scope_lineage import (  # noqa: PLC0415
+        asset_scope_change_since_scan,
+    )
+
+    # The one comparison the interactive resume offers ask too. Unattended,
+    # nobody is there to weigh a changed scope, so any change starts clean.
+    if not asset_scope_change_since_scan(shell, domain).same:
+        return False, CI_FRESH_OTHER_SCOPE
+    return True, CI_RESUME_INTERRUPTED
+
+
+def _ci_stopped_phase_title(shell: Any, domain: str) -> str:
+    """Title of the phase the interrupted scan stopped in, ``""`` when unknown."""
+    try:
+        from adscan_internal.services import scan_progress  # noqa: PLC0415
+
+        phases = tuple(scan_progress.incomplete_phases(shell, domain))
+        if not phases:
+            return ""
+        return scan_progress.phase_titles(phases[:1])[0]
+    except Exception:  # noqa: BLE001 - a notice detail never blocks the run
+        return ""
+
+
+def prepare_ci_workspace_for_auth_scan(shell: Any, *, domain: str, username: str) -> bool:
+    """Resume the workspace's interrupted scan, or clear the workspace; say which.
+
+    Never leaves the operator guessing: a resumed run prints what it keeps, a
+    clean start over an earlier scan prints that the earlier results go. The
+    clear itself is ``do_clear_all``, which closes the session's graph stores
+    before it deletes them.
+
+    Returns:
+        Whether the run resumes.
+    """
+    resume, reason = ci_resume_decision(shell, domain=domain, username=username)
+    shown_domain = mark_sensitive(str(domain), "domain")
+    if resume:
+        stopped_in = _ci_stopped_phase_title(shell, domain)
+        where = f" It stopped during {stopped_in}." if stopped_in else ""
+        print_info(
+            f"Resuming the interrupted scan of {shown_domain} in this workspace.{where} "
+            "What it collected is kept, and the hosts and phases it finished are not "
+            "run again. To start over instead, run ci with a new --workspace."
+        )
+        print_info_debug(f"[ci] workspace kept for resume: reason={reason}")
+        return True
+    if reason == CI_FRESH_REQUESTED:
+        print_info(
+            "Starting a fresh scan, as ADSCAN_COLLECTOR_FRESH asks: the interrupted "
+            "scan's results in this workspace are cleared."
+        )
+    elif reason == CI_FRESH_OTHER_ACCOUNT:
+        print_info(
+            "Starting a fresh scan: the interrupted scan in this workspace ran as "
+            "another account, so its results are cleared."
+        )
+    elif reason == CI_FRESH_OTHER_SCOPE:
+        print_info(
+            "Starting a fresh scan: the engagement scope changed since the "
+            "interrupted scan in this workspace, so its results are cleared. The "
+            "scope record and its history are kept."
+        )
+    elif getattr(shell, "domains_data", None):
+        print_info("Starting a fresh scan: this workspace's earlier results are cleared.")
+    shell.do_clear_all(None)
+    return False
+
+
+def _enter_ci_phase(phase_id: str, domain: str) -> None:
+    """Declare a ``ci`` preflight phase to the scan control plane.
+
+    Raises :class:`ScanAbortRequested` when a stop is pending (the boundary
+    contract), and names the phase a stop that lands here is recorded against,
+    so ``coverage.json`` says where the run was stopped.
+    """
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
+    control = scan_control()
+    if control.in_scan():
+        control.enter_phase(phase_id, domain=str(domain or "") or None)
+
+
+def _ci_run_auth_scan(shell: Any, args: Any) -> bool:
+    """The authenticated ``ci`` scan: preflight, workspace preparation, ``start_auth``."""
+    required = [args.domain, args.dc_ip, args.username, args.password]
+    if not all(required):
+        print_error(
+            "Auth mode requires --domain, --dc-ip, --username, and --password"
+        )
+        return False
+    if getattr(shell, "scan_policy", None) is None:
+        print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
+        return False
+    # No interface requirement here: only broadcast poisoning needs a named
+    # NIC, and the poisoning seam skips it with a warning when none was given.
+    if shell.auto is None:
+        print_error(
+            "Auto mode not found. Please configure it using 'set auto <value>'."
+        )
+        return False
+    # Declare the full ordered plan up-front so the web renders the
+    # engine-declared chapters → phases → subphases dynamically.
+    from adscan_internal.services.scan_phases import (
+        COMMAND_AUDIT,
+        COMMAND_CI_AUTH,
+    )
+
+    emit_scan_plan(
+        COMMAND_AUDIT if policy_settings.runs_full_assessment(shell) else COMMAND_CI_AUTH,
+        getattr(shell, "scan_config", None),
+    )
+    # Chapter 1: Preflight (DNS validation, connectivity)
+    print_phase_chapter(_chapter(1))
+    emit_phase("dns_validation")
+    _enter_ci_phase("dns_validation", args.domain)
+    if not shell.do_check_dns(args.domain, args.dc_ip):
+        return False
+    emit_phase("dns_configuration")
+    _enter_ci_phase("dns_configuration", args.domain)
+    # Resume the workspace's interrupted scan of this domain, or start clean,
+    # and say which (F30: ci used to clear unconditionally, so a stopped run
+    # could never be resumed and the web's resume seeding was wiped).
+    prepare_ci_workspace_for_auth_scan(
+        shell, domain=str(args.domain), username=str(args.username)
+    )
+    shell.scan_mode = None
+    # Chapter 2: Reconnaissance + Chapter 3: Scan are merged here because
+    # the entire authenticated scan pipeline runs inside do_start_auth
+    # without external phase boundaries we can hook from this file.
+    _mark_ci_phases_done(1)
+    print_phase_chapter(_chapter(2))
+    shell.do_start_auth(
+        f"{args.domain} {args.dc_ip} {args.username} {args.password}"
+    )
+    if getattr(shell, "scan_mode", None) != "auth":
+        return False
+    _mark_ci_phases_done(2, 3)
+    domain_data = shell.domains_data.get(args.domain)
+    if not domain_data:
+        print_warning("Authentication scan did not populate domain data.")
+        return False
+    username_key = args.username.lower()
+    if username_key not in domain_data.get("credentials", {}):
+        print_warning("Authenticated credential not stored; treating as failure.")
+        return False
+    return True
+
+
+def _ci_run_unauth_scan(shell: Any, args: Any) -> bool:
+    """The unauthenticated ``ci`` scan: workspace clear, ``start_unauth``."""
+    if not args.hosts and not getattr(args, "dc_ip", None):
+        print_error("Unauth mode requires --hosts or --dc-ip")
+        return False
+    if getattr(shell, "scan_policy", None) is None:
+        print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
+        return False
+    # No interface requirement here: only broadcast poisoning needs a named
+    # NIC, and the poisoning seam skips it with a warning when none was given.
+    if shell.auto is None:
+        print_error(
+            "Auto mode not found. Please configure it using 'set auto <value>'."
+        )
+        return False
+
+    shell.hosts = args.hosts
+    shell.do_clear_all(None)
+    shell.scan_mode = None
+    # Declare the unauth plan up-front for the web renderer.
+    from adscan_internal.services.scan_phases import COMMAND_CI_UNAUTH
+
+    emit_scan_plan(COMMAND_CI_UNAUTH, getattr(shell, "scan_config", None))
+    # Chapter 2: Reconnaissance — the unauth path is pure recon.
+    _mark_ci_phases_done(1)
+    print_phase_chapter(_chapter(2))
+    if getattr(args, "dc_ip", None):
+        shell.do_start_unauth(str(args.dc_ip))
+    else:
+        shell.do_start_unauth(None)
+    if getattr(shell, "scan_mode", None) != "unauth":
+        return False
+    _mark_ci_phases_done(2, 3)
+    if not shell.domains_data:
+        print_warning(
+            "Unauthenticated scan completed but did not discover any domains."
+        )
+        return False
+    return True
+
+
+def run_ci_scan(shell: Any, args: Any) -> tuple[bool, bool]:
+    """Run the scan of one ``ci`` invocation inside ONE scan scope.
+
+    The scope spans the whole scan, from the run's coverage record to the end of
+    ``start_auth`` / ``start_unauth`` (which open theirs inside this one and share
+    it): a SIGINT anywhere in it is the clean stop, exit 3 with the stop in
+    ``coverage.json``, never the shell's immediate shutdown. Before, the ci
+    preflight, the workspace preparation and the scan-end steps ran outside any
+    scope, so a Ctrl+C there took the old shutdown path (F29).
+
+    Returns:
+        ``(success, operator_stopped)``. A scan stopped by SIGINT or the
+        platform's "stop the scan" ran its normal finalisation (artifacts,
+        coverage gap), but it is not a successful assessment.
+    """
+    from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
+        start_run_coverage,
+    )
+    from adscan_internal.services.scan_control_bridge import (  # noqa: PLC0415
+        operator_scan_scope,
+    )
+
+    # Coverage evidence for the reconciliation rule: which checks ran, from which
+    # vantage. Written as "interrupted" now so a crash closes nothing.
+    start_run_coverage(shell, authenticated=args.mode == "auth")
+    success = False
+    with operator_scan_scope(shell, "ci") as control:
+        if args.mode == "auth":
+            success = _ci_run_auth_scan(shell, args)
+        else:
+            success = _ci_run_unauth_scan(shell, args)
+    return bool(success), bool(control.last_scan_aborted)
+
+
 def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     """Run a non-interactive scan suitable for CI pipelines.
 
@@ -511,6 +852,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     """
     args = config.args
     _ci_started_at = time.monotonic()
+    _CI_PHASES_DONE.clear()
 
     deps.enable_auto_mode()
 
@@ -526,22 +868,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     if not ensure_license_allows_new_scan("ci", workspace_dir=_ci_workspace_dir(args)):
         return LICENSE_BLOCKED_EXIT_CODE
 
-    # PRO partner-tag gate — FAIL FAST, before the heavy preflight.
-    #
-    # `adscan check` (deps.handle_check, run below) verifies every tool + launches
-    # Chromium — tens of seconds. A PRO run with no partner tag is refused anyway,
-    # so refusing it AFTER that preflight made a paying customer wait through the
-    # whole check only to be told a one-line tag is missing. The gate needs only
-    # the resolved license mode (not the shell), and `adscan ci` is always
-    # non-interactive (ADSCAN_NONINTERACTIVE is set at entry), so we can resolve
-    # the license mode early and gate here. The full gate is a no-op for LITE and
-    # for PRO once the tag is resolved, so an already-configured PRO run is
-    # unaffected. (`start` keeps its own gate at its interactive seam.)
     license_mode = deps.resolve_license_mode(config.requested_pro)
-    from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
-
-    if not ensure_partner_tag_for_pro(license_mode):
-        return 1
 
     # Scan-policy gate — FAIL FAST, before the preflight and before any network
     # activity. An unattended scan runs only under a policy the run names.
@@ -572,6 +899,17 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     if not _announce_report_options(args):
         return 2
 
+    # Engagement-scope gate — FAIL FAST, before the preflight and before any
+    # network contact. The launcher already refused a syntax error before Docker
+    # started; this is the same parser again, and the only check on the native
+    # Windows runtime, which has no launcher.
+    from adscan_internal.cli.asset_scope_cmd import (  # noqa: PLC0415
+        validate_scope_flags_or_exit,
+    )
+
+    if not validate_scope_flags_or_exit(args, exit_fn=deps.exit):
+        return 2
+
     preflight_result = run_session_preflight(
         config=SessionPreflightConfig(
             command_name="ci",
@@ -588,7 +926,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         ),
     )
 
-    # ``license_mode`` was resolved above for the early partner-tag gate.
+    # ``license_mode`` was resolved above, before the fail-fast gates.
     shell = deps.create_shell(deps.console, license_mode)
     shell.session_command_type = "ci"
     _record_scan_compliance_frameworks(shell, args)
@@ -690,9 +1028,6 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     # one value; the flag wins over the file, like --read-only.
     _apply_auto_revert_flag(shell, getattr(args, "auto_revert", None))
 
-    # (The PRO partner-tag gate already ran as a fail-fast before the preflight,
-    # above — a missing tag never reaches this far, so no second check is needed.)
-
     shell.preflight_check_passed = bool(preflight_result.passed)
     shell.preflight_check_fix_attempted = bool(preflight_result.fix_attempted)
     shell.preflight_check_overridden = bool(preflight_result.overridden)
@@ -740,6 +1075,13 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     )
 
     load_cleanup_credential_for_run(shell)
+    # The asset-level engagement scope, recorded after the workspace load (the
+    # load rehydrates the scope an earlier run recorded) and before anything is
+    # sent. A run that names a scope replaces the recorded one; a run that names
+    # none keeps it. A domain controller the scope excludes, or an allow entry
+    # the directory shows to be ambiguous, stops the run here with exit 2.
+    if not _apply_ci_asset_scope(shell, args, deps):
+        return 2
     # With an account set, state what it can undo in scope (printed, never asked:
     # ``ci`` is unattended). A fresh workspace knows no domain yet; the checklist
     # is printed again before the first attack step, once the directory is read.
@@ -894,105 +1236,10 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         )
     shell.auto = True
 
-    def _run_auto_auth() -> bool:
-        required = [args.domain, args.dc_ip, args.username, args.password]
-        if not all(required):
-            print_error(
-                "Auth mode requires --domain, --dc-ip, --username, and --password"
-            )
-            return False
-        if getattr(shell, "scan_policy", None) is None:
-            print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
-            return False
-        # No interface requirement here: only broadcast poisoning needs a named
-        # NIC, and the poisoning seam skips it with a warning when none was given.
-        if shell.auto is None:
-            print_error(
-                "Auto mode not found. Please configure it using 'set auto <value>'."
-            )
-            return False
-        # Declare the full ordered plan up-front so the web renders the
-        # engine-declared chapters → phases → subphases dynamically.
-        from adscan_internal.services.scan_phases import (
-            COMMAND_AUDIT,
-            COMMAND_CI_AUTH,
-        )
-
-        emit_scan_plan(
-            COMMAND_AUDIT if policy_settings.runs_full_assessment(shell) else COMMAND_CI_AUTH,
-            getattr(shell, "scan_config", None),
-        )
-        # Chapter 1: Preflight (DNS validation, connectivity)
-        print_phase_chapter(_chapter(1))
-        emit_phase("dns_validation")
-        if not shell.do_check_dns(args.domain, args.dc_ip):
-            return False
-        emit_phase("dns_configuration")
-        shell.do_clear_all(None)
-        shell.scan_mode = None
-        # Chapter 2: Reconnaissance + Chapter 3: Scan are merged here because
-        # the entire authenticated scan pipeline runs inside do_start_auth
-        # without external phase boundaries we can hook from this file.
-        print_phase_chapter(_chapter(2))
-        shell.do_start_auth(
-            f"{args.domain} {args.dc_ip} {args.username} {args.password}"
-        )
-        if getattr(shell, "scan_mode", None) != "auth":
-            return False
-        domain_data = shell.domains_data.get(args.domain)
-        if not domain_data:
-            print_warning("Authentication scan did not populate domain data.")
-            return False
-        username_key = args.username.lower()
-        if username_key not in domain_data.get("credentials", {}):
-            print_warning("Authenticated credential not stored; treating as failure.")
-            return False
-        return True
-
-    def _run_auto_unauth() -> bool:
-        if not args.hosts and not getattr(args, "dc_ip", None):
-            print_error("Unauth mode requires --hosts or --dc-ip")
-            return False
-        if getattr(shell, "scan_policy", None) is None:
-            print_error("The run has no scan policy. Pass --policy NAME (see: adscan policy list).")
-            return False
-        # No interface requirement here: only broadcast poisoning needs a named
-        # NIC, and the poisoning seam skips it with a warning when none was given.
-        if shell.auto is None:
-            print_error(
-                "Auto mode not found. Please configure it using 'set auto <value>'."
-            )
-            return False
-
-        shell.hosts = args.hosts
-        shell.do_clear_all(None)
-        shell.scan_mode = None
-        # Declare the unauth plan up-front for the web renderer.
-        from adscan_internal.services.scan_phases import COMMAND_CI_UNAUTH
-
-        emit_scan_plan(COMMAND_CI_UNAUTH, getattr(shell, "scan_config", None))
-        # Chapter 2: Reconnaissance — the unauth path is pure recon.
-        print_phase_chapter(_chapter(2))
-        if getattr(args, "dc_ip", None):
-            shell.do_start_unauth(str(args.dc_ip))
-        else:
-            shell.do_start_unauth(None)
-        if getattr(shell, "scan_mode", None) != "unauth":
-            return False
-        if not shell.domains_data:
-            print_warning(
-                "Unauthenticated scan completed but did not discover any domains."
-            )
-            return False
-        return True
-
     from adscan_internal.services.engagement.coverage_recorder import (
         finalize_run_coverage,
-        start_run_coverage,
     )
 
-    # Coverage evidence for the reconciliation rule: which checks ran, from which
-    # vantage. Written as "interrupted" now so a crash closes nothing.
     # Engagement history (PRO): a workspace scanned before the ledger existed is
     # imported from its flat artifacts now, before this run overwrites them.
     from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
@@ -1002,14 +1249,7 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     )
 
     import_before_run(shell.current_workspace_dir, at=_dt.now(_tz.utc).isoformat())
-    start_run_coverage(shell, authenticated=args.mode == "auth")
-    success = _run_auto_auth() if args.mode == "auth" else _run_auto_unauth()
-    # A scan stopped by SIGINT or the platform's "stop the scan" ran its normal
-    # finalisation (artifacts, coverage gap), but it is not a successful
-    # assessment: exit with the incomplete status and render no deliverable.
-    from adscan_core.scan_control import scan_control as _scan_control  # noqa: PLC0415
-
-    operator_stopped = _scan_control().last_scan_aborted
+    success, operator_stopped = run_ci_scan(shell, args)
     if operator_stopped:
         success = False
     # The license refused every environment this run tried to assess (its
@@ -1022,9 +1262,6 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
     )
 
     environment_refused = environment_refused_for_run(shell)
-    # Scoped licences: enabled identities of the assessed domains, read from
-    # the workspace now, before an ephemeral workspace is removed below.
-    record_scan_identity_usage(shell)
     if environment_refused:
         success = False
     # A run that reached its end is still not a successful assessment when the
@@ -1038,6 +1275,19 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         if assessment_gap:
             success = False
     finalize_run_coverage(shell, success=bool(success))
+    if args.mode == "auth" and args.domain and shell.current_workspace_dir:
+        # technical_report.json carries the same completeness verdict as the
+        # exit status and coverage.json (scan_progress SSOT).
+        from adscan_internal.services.scan_progress import (  # noqa: PLC0415
+            sync_assessment_integrity_to_report,
+        )
+
+        sync_assessment_integrity_to_report(shell, str(args.domain), create=True)
+    # Licence usage: scoped Enterprise licences record enabled identities; a PRO
+    # licence records each domain's band, size counts and how the run ended
+    # (read from the coverage just finalised). From the workspace now, before
+    # an ephemeral workspace is removed below.
+    record_scan_identity_usage(shell)
 
     # Flag validation is a lab activity (genuinely environment), and only for a
     # lab that has flags: a GOAD run has none, so it must not exit 2 for them.
@@ -1166,7 +1416,28 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         deliverable_failed=deliverable_requested and not report_file_path,
         operator_stopped=operator_stopped,
     )
-    if exit_code == 0 and should_validate_flags:
+    # A run the engagement scope ended (the directory showed the scan credential
+    # to be an excluded account) is a configuration error, like one caught
+    # before the first contact: exit 2, never "incomplete" and never 0.
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        run_scope_error,
+    )
+
+    scope_ended_run = bool(run_scope_error(shell))
+    if scope_ended_run:
+        from rich.markup import escape  # noqa: PLC0415
+
+        print_error(escape(run_scope_error(shell)))
+        exit_code = 2
+    if scope_ended_run:
+        # Its own line: not a flags failure, and not a stop somebody asked for.
+        print_error(
+            "CI scan stopped: the account it signs in with is excluded from the "
+            "engagement scope, so nothing more was sent. Use an account inside the "
+            "scope, or correct the scope, and run it again."
+            + ("" if report_file_path else " No report was generated.")
+        )
+    elif exit_code == 0 and should_validate_flags:
         print_success("CI scan finished successfully with flags validated.")
     elif exit_code == 0:
         print_success("CI scan finished successfully.")
@@ -1187,14 +1458,15 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
         print_error(
             "CI scan stopped before it finished (interrupt or platform request). "
             "Results collected so far are in the workspace and the coverage record "
-            "declares what was not assessed. No report was generated."
+            f"declares what was not assessed. {_incomplete_run_report_sentence(shell)}"
         )
     elif exit_code == CI_EXIT_ASSESSMENT_INCOMPLETE:
         print_error(
             f"CI scan incomplete for {mark_sensitive(str(args.domain), 'domain')}: "
             f"{_describe_phases(assessment_gap)} did not complete, so this run "
-            "cannot say whether the domain held. No report was generated. See "
-            "the log above for the step that ended the scan early."
+            "cannot say whether the domain held. "
+            f"{_incomplete_run_report_sentence(shell)} See the log above for the "
+            "step that ended the scan early."
         )
         for detail in _describe_gap_details(shell, str(args.domain or ""), assessment_gap):
             print_error(f"  {detail}")
@@ -1279,18 +1551,25 @@ def run_ci(*, config: CiConfig, deps: CiDeps) -> int:
 
     # --- End-of-run loot card ---
     try:
-        # Chapter 5: Loot — final act, the loot card is its centrepiece.
-        print_phase_chapter(_chapter(5))
-        _loot_domain = str(
-            getattr(args, "domain", "") or getattr(shell, "current_domain", "") or ""
-        )
-        print_session_loot_card(
-            _build_ci_loot_card(
-                shell,
-                _loot_domain,
-                elapsed_seconds=time.monotonic() - _ci_started_at,
+        if ci_scan_started():
+            # Chapter 5: Loot — final act, the loot card is its centrepiece.
+            if deliverable_requested and report_file_path:
+                _mark_ci_phases_done(4)
+            print_phase_chapter(_chapter(5))
+            _loot_domain = str(
+                getattr(args, "domain", "") or getattr(shell, "current_domain", "") or ""
             )
-        )
+            print_session_loot_card(
+                _build_ci_loot_card(
+                    shell,
+                    _loot_domain,
+                    elapsed_seconds=time.monotonic() - _ci_started_at,
+                )
+            )
+        else:
+            # The run stopped in preflight (or was refused before it): no phase
+            # ran, so nothing is ticked and there is no summary of results.
+            print_warning(CI_NOT_STARTED_NOTICE)
     except Exception:  # noqa: BLE001
         pass  # loot card is cosmetic — never block exit
 
@@ -1365,6 +1644,23 @@ def _ci_assessment_gap(shell: Any, domain: str) -> tuple[str, ...]:
         telemetry.capture_exception(exc)
         print_exception(show_locals=False, exception=exc)
         return ()
+
+
+def _incomplete_run_report_sentence(shell: Any) -> str:
+    """What an incomplete run leaves behind, stated truthfully.
+
+    An incomplete run never renders the client report, but the scan data it
+    collected is written as it goes, ``technical_report.json`` included, and that
+    file records which phases did not finish. Saying "no report" while that
+    file sits in the workspace sent the release gate looking for a bug.
+    """
+    workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+    if workspace_dir and os.path.isfile(os.path.join(workspace_dir, "technical_report.json")):
+        return (
+            "No client report was rendered. The data collected so far is in the "
+            "workspace (technical_report.json), marked as incomplete."
+        )
+    return "No report was generated."
 
 
 def _describe_phases(phase_ids: tuple[str, ...]) -> str:

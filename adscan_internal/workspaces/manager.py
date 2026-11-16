@@ -77,6 +77,23 @@ def _report_execution_workspaces_in_use(kept: object) -> None:
     )
 
 
+def _close_graph_stores_under(root: str) -> None:
+    """Close every graph store this process holds under ``root`` before a delete.
+
+    An open store whose directory is deleted keeps writing into an unlinked
+    database (``graph_runtime.close_graph_stores_under``). Best-effort: a delete
+    never fails on it.
+    """
+    try:
+        from adscan_internal.services.graph_runtime import (  # noqa: PLC0415
+            close_graph_stores_under,
+        )
+
+        close_graph_stores_under(root)
+    except Exception:  # noqa: BLE001 - best-effort; never block the delete
+        pass
+
+
 def delete_workspace_dir(workspaces_dir: str, workspace_name: str) -> WorkspacePaths:
     """Delete a workspace and everything ADscan keeps about it elsewhere.
 
@@ -102,6 +119,7 @@ def delete_workspace_dir(workspaces_dir: str, workspace_name: str) -> WorkspaceP
     forget_workspace_name(workspace_name)
     paths = resolve_workspace_paths(workspaces_dir, workspace_name)
     domains = workspace_domains(paths.root)
+    _close_graph_stores_under(paths.root)
     shutil.rmtree(paths.root)
     purged = purge_workspace_residue(
         workspace_name,
@@ -139,6 +157,7 @@ def trim_workspace_to_logs(workspace_dir: str) -> WorkspacePaths:
     root = os.path.abspath(workspace_dir)
     workspaces_dir, name = os.path.dirname(root), os.path.basename(root)
     domains = workspace_domains(root)
+    _close_graph_stores_under(root)
     for entry in os.listdir(root):
         if entry == "logs":
             continue

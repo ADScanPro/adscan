@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from adscan_internal.rich_output import mark_sensitive, print_info_debug, print_success_debug
 from adscan_internal.services.coercion.aiosmb_adapter import AiosmbRpcAdapter
@@ -20,6 +21,8 @@ from adscan_internal.services.coercion.core import (
 )
 from adscan_internal.services.coercion.display import print_coercion_summary
 from adscan_internal.services.coercion.registry import default_coercion_methods
+from adscan_internal.services.engagement_scope import require_host_in_scope
+from adscan_internal.services.engagement_scope_targets import prepare_targets_for_scope
 
 
 
@@ -56,16 +59,43 @@ class NativeCoercionRunConfig:
     show_summary: bool = True
 
 
+#: Reused by every "not run" result this module returns for a refused host.
+COERCION_NOT_RUN_OUTSIDE_SCOPE_REASON = "outside the engagement scope"
+
+
 async def run_native_coercion(
     *,
     connection_factory,
     target_host: str,
     config: NativeCoercionRunConfig,
     target_name: str | None = None,
+    shell: Any = None,
+    domain: str | None = None,
 ) -> CoercionRunResult:
-    """Run native async coercion against one target using an aiosmb factory."""
+    """Run native async coercion against one target using an aiosmb factory.
+
+    ``shell`` is the active session, when one is in reach of the caller; it is
+    consulted for the engagement scope before any RPC is attempted against
+    ``target_host``. With no session (or no recorded scope) the host is
+    treated as in scope, unchanged from before this check existed.
+    """
 
     target = CoercionTarget(host=target_host, display_name=target_name)
+    prepare_targets_for_scope(shell, [target_host], domain=domain)
+    if not require_host_in_scope(
+        shell,
+        host=target_host,
+        surface="native_coercion",
+        what="Coercion",
+        domain=domain,
+    ):
+        print_info_debug(
+            "[coercion] skipped "
+            f"target={mark_sensitive(target.label, 'hostname')}: "
+            f"{COERCION_NOT_RUN_OUTSIDE_SCOPE_REASON}"
+        )
+        return CoercionRunResult(target=target, results=(), timed_out=False, attempts=0, captured=False)
+
     listener = CoercionListener(
         auth_type=config.listener_auth_type,
         host=config.listener_host,

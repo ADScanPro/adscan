@@ -59,7 +59,7 @@ class _FailureClassification:
     is what the operator needs to see.
     """
 
-    severity: str          # "lab" (env/network) | "auth" | "policy" | "unknown"
+    severity: str          # "lab" (env/network) | "protocol" | "auth" | "policy" | "unknown"
     title: str             # short headline shown in the panel border
     summary: str           # one-line plain-English explanation
     actions: tuple[str, ...]  # concrete CLI/operator steps to remediate
@@ -193,6 +193,33 @@ def _classify_cert_request_failure(
     surface = chain[0]
     surface_name = type(surface).__name__
     surface_msg = str(surface).strip()
+
+    # A Kerberos reply that could not be read is named as exactly that. It is
+    # neither an environment-connectivity failure nor an unexplained one, and
+    # nothing is retried here: a retry would hide a reply that is reproducibly
+    # unreadable.
+    from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+        MALFORMED_KDC_REPLY_SUMMARY,
+        is_malformed_kdc_reply,
+    )
+
+    if is_malformed_kdc_reply(exc):
+        return _FailureClassification(
+            severity="protocol",
+            title="ADCS enrollment failed: unreadable Kerberos reply",
+            summary=MALFORMED_KDC_REPLY_SUMMARY,
+            actions=(
+                "Re-run the step once: a reply cut short by the network does not repeat, "
+                "one that repeats for the same account and service is reproducible.",
+                "If it repeats, re-run with --debug and report it together with the debug log, "
+                "which records the size of the reply that could not be read.",
+            ),
+            technical_label=(
+                f"{surface_name}: {surface_msg}"
+                if surface_msg
+                else f"{surface_name} from {type(surface).__module__} (no message)"
+            ),
+        )
 
     # First pass: prefer the shallowest *informative* match (skip the
     # final ``CancelledError`` if a better candidate exists earlier).
@@ -384,6 +411,7 @@ def _render_cert_request_failure(
 
     severity_colour = {
         "lab": "yellow",
+        "protocol": "yellow",
         "auth": "red",
         "policy": "magenta",
         "unknown": "red",
@@ -1589,6 +1617,45 @@ async def _require_reversal_capability(config: CertRequestConfig) -> Optional[st
     )
 
 
+def _ca_outside_engagement_scope(config: CertRequestConfig) -> Optional[str]:
+    """The not-executed reason when the engagement scope excludes the CA host.
+
+    Asked before anything is sent to the certification authority, for a request
+    and for the retrieval of a pending one. The refusal is recorded and printed
+    once by the scope engine; ``None`` means the CA host may be contacted (also
+    when no asset scope is recorded).
+    """
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        NOT_EXECUTED_OUTSIDE_SCOPE,
+    )
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        require_host_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    ca_host = str(config.ca_host or "").strip()
+    named = str(config.ca_fqdn or "").strip() or ca_host
+    if not named:
+        return None
+    # A bare label carries no domain of its own: tell the engine which domain
+    # the CA was listed for. An FQDN or an address is resolved by the engine.
+    listed_for = None if "." in named or ":" in named else (config.target_domain or config.domain)
+    # One CA host: the session is told about it, then judges it.
+    prepare_targets_for_scope(None, [named], address=lambda _named: ca_host, domain=listed_for)
+    if require_host_in_scope(
+        None,
+        host=named,
+        connect_address=ca_host or None,
+        surface="adcs_cert_request",
+        what="Certificate request",
+        domain=listed_for,
+    ):
+        return None
+    return NOT_EXECUTED_OUTSIDE_SCOPE
+
+
 async def request_certificate_native(
     config: CertRequestConfig, output_dir: Path
 ) -> CertRequestResult:
@@ -1603,6 +1670,11 @@ async def request_certificate_native(
         success, or an error message on failure.
     """
     try:
+        scope_refusal = _ca_outside_engagement_scope(config)
+        if scope_refusal is not None:
+            return CertRequestResult(
+                success=False, error=scope_refusal, not_executed_reason=scope_refusal
+            )
         config = await _resolve_impersonation_sid(config)
         # Reversible by construction (§ 5.1): the right to REVOKE this certificate
         # on this CA is established BEFORE it is requested, never discovered after.
@@ -1810,6 +1882,11 @@ async def retrieve_certificate_native(
             so the retrieved cert is packaged into a signing-capable PFX.
     """
     try:
+        scope_refusal = _ca_outside_engagement_scope(config)
+        if scope_refusal is not None:
+            return CertRequestResult(
+                success=False, error=scope_refusal, not_executed_reason=scope_refusal
+            )
         return await _do_retrieve_certificate(
             config, output_dir, request_id, private_key_pem=private_key_pem
         )

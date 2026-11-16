@@ -23,6 +23,7 @@ from adscan_core.reporting.technical_report import _get_technical_report_path
 from adscan_core.rich_output import print_error
 from adscan_internal.cli.ci import run_generate_report
 from adscan_internal.services.lite_html_report import generate_lite_report_artifacts
+from adscan_internal.services.report_memory import render_bounded
 
 
 def _build_workspace_shell(workspace: str | None) -> Any | None:
@@ -112,18 +113,28 @@ def run_report_sync(args: argparse.Namespace) -> int:
         # workspace renders with no compliance mapping and says so.
 
         report_json = _resolve_report_json(shell)
-        result = run_generate_report(
-            shell,
-            report_json,
-            report_format="pdf",
-            frameworks=frameworks,
-            display_name=getattr(args, "client", "") or "",
+        stopped, result = render_bounded(
+            lambda: run_generate_report(
+                shell,
+                report_json,
+                report_format="pdf",
+                frameworks=frameworks,
+                display_name=getattr(args, "client", "") or "",
+            ),
+            workspace_dir=getattr(shell, "current_workspace_dir", None),
+            shell=shell,
+            total=1,
         )
-        return 0 if result else 1
+        return 0 if result and not stopped else 1
 
     # LITE: the self-contained exposure report, with its PRO CTA intact.
-    artifacts = generate_lite_report_artifacts(shell, asked_for_the_kit=True)
-    return 0 if artifacts is not None else 1
+    stopped, artifacts = render_bounded(
+        lambda: generate_lite_report_artifacts(shell, asked_for_the_kit=True),
+        workspace_dir=getattr(shell, "current_workspace_dir", None),
+        shell=shell,
+        total=1,
+    )
+    return 0 if artifacts is not None and not stopped else 1
 
 
 def add_report_subparser(

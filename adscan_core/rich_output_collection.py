@@ -1377,6 +1377,12 @@ class PhaseChapter:
     title: str
     subtitle: str = ""
     all_phases: tuple[str, ...] = ()
+    #: The 1-indexed phases that actually ran to their end. ``None`` (legacy
+    #: callers) reads every phase before ``number`` as done. A caller that
+    #: tracks its run passes the set, so a phase the run never reached is drawn
+    #: as not run instead of ticked: a run that failed in its first phase used
+    #: to close with every phase ticked.
+    done: frozenset[int] | None = None
 
     @property
     def total(self) -> int:
@@ -1403,10 +1409,15 @@ def print_phase_chapter(chapter: PhaseChapter) -> None:
     total = max(n, int(chapter.total))
 
     # --- progress glyph: ▰ for done/active, ▱ for pending ---
+    def _is_done(position: int) -> bool:
+        return position in chapter.done if chapter.done is not None else True
+
     glyph = Text()
     for i in range(1, total + 1):
-        if i < n:
+        if i < n and _is_done(i):
             glyph.append("▰", style=_STEEL)
+        elif i < n:
+            glyph.append("▱", style=_MUTED)
         elif i == n:
             glyph.append("▰", style=f"bold {_AMBER}")
         else:
@@ -1450,9 +1461,13 @@ def print_phase_chapter(chapter: PhaseChapter) -> None:
     sep = "   "
     for idx, label in enumerate(labels):
         position = idx + 1  # 1-indexed
-        if position < n:
+        if position < n and _is_done(position):
             strip.append("✓ ", style=_STEEL)
             strip.append(label, style=_STEEL)
+        elif position < n:
+            # Before the active phase and never completed: not run.
+            strip.append("– ", style=_MUTED)
+            strip.append(label, style=_MUTED)
         elif position == n:
             strip.append("▶ ", style=f"bold {_AMBER}")
             strip.append(label, style=f"bold {_AMBER}")

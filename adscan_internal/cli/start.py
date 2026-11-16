@@ -97,7 +97,7 @@ from adscan_internal.services.engagement_timeline_record import (
 )
 from adscan_internal.services.scan_outcome_telemetry import emit_scan_outcome, write_scan_summary
 from adscan_internal.services.scan_control_bridge import operator_scan_scope
-from adscan_core.scan_control import scan_control
+from adscan_core.scan_control import ScanAbortRequested, scan_control
 from adscan_core.rich_output_collection import (
     SessionHeader,
     print_session_header,
@@ -643,7 +643,9 @@ def _prompt_workspace_cleanup(shell: Any) -> None:
         "[dim]Alternatives:[/dim]\n"
         "    [yellow]clear_all[/yellow]            clean manually later\n"
         "    [yellow]workspace create[/yellow]     start with a new workspace\n\n"
-        "[dim]Cleanup preserves variables.json, technical_report.json, and command history.[/dim]",
+        "[dim]Cleanup removes this workspace's scan data. It keeps the session settings and the "
+        "engagement history: earlier runs, delivered reports, the scope record, the record of "
+        "removed secrets and the command history.[/dim]",
         title="[bold]» Workspace Preparation[/bold]",
         border_style="yellow",
         padding=(1, 2),
@@ -1135,10 +1137,29 @@ def _prompt_dc_discovery_recovery(
     over ten minutes until the operator hit Ctrl+C. So `adscan ci` is told what
     to change and stops.
     """
+    from adscan_core.engagement_scope_cli import (  # noqa: PLC0415
+        SCOPE_EMPTIED_DISCOVERY_HEADLINE,
+        scope_emptied_discovery_guidance,
+    )
     from adscan_internal.interaction import is_non_interactive
 
+    # The engagement scope left the discovery nothing to contact: no host was
+    # asked, so "no controller found, widen the range" would be false twice.
+    emptied_by_scope = reason == "no_candidates" and bool(
+        getattr(shell, "_last_dc_discovery_excluded_by_scope", False)
+    )
+
     if is_non_interactive(shell):
-        if reason == "invalid_scope":
+        if emptied_by_scope:
+            print_warning(
+                SCOPE_EMPTIED_DISCOVERY_HEADLINE,
+                panel=True,
+                items=[
+                    f"Range given: {mark_sensitive(current_target, 'host')}",
+                    *scope_emptied_discovery_guidance(unattended=True),
+                ],
+            )
+        elif reason == "invalid_scope":
             print_warning(
                 "The target expression could not be parsed, so nothing was scanned.",
                 panel=True,
@@ -1187,6 +1208,17 @@ def _prompt_dc_discovery_recovery(
             "Switch to known domain/DC input instead",
             "Cancel start_unauth for now",
         ]
+    elif emptied_by_scope:
+        body = (
+            f"[bold]{SCOPE_EMPTIED_DISCOVERY_HEADLINE}[/bold]\n\n"
+            + "\n".join(scope_emptied_discovery_guidance(unattended=False))
+        )
+        title = "[bold]» Discovery Held Back by the Engagement Scope[/bold]"
+        options = [
+            "Enter a host range/IP that is inside the scope (recommended)",
+            "Switch to known domain/DC input instead",
+            "Cancel start_unauth for now",
+        ]
     else:
         body = (
             "[bold]Discovery completed, but no likely DCs were found.[/bold]\n\n"
@@ -1200,8 +1232,9 @@ def _prompt_dc_discovery_recovery(
             "Cancel start_unauth for now",
         ]
 
+    range_label = "Range given" if emptied_by_scope else "Current scope"
     print_panel(
-        f"{body}\n\nCurrent scope: {mark_sensitive(current_target, 'host')}",
+        f"{body}\n\n{range_label}: {mark_sensitive(current_target, 'host')}",
         title=title,
         border_style="cyan",
         padding=(1, 2),
@@ -3554,6 +3587,9 @@ class StartSessionConfig:
     requested_pro: bool
     verbose_mode: bool
     debug_mode: bool
+    #: The parsed ``adscan start`` arguments (the ``--scope-*`` flags are read
+    #: from it once the startup workspace is open). ``None`` = no flags.
+    startup_args: Any = None
 
 
 @dataclass(frozen=True)
@@ -3660,16 +3696,13 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
         shell = deps.create_shell(deps.console, license_mode)
         setattr(shell, "session_command_type", "start")
 
-        # PRO partner-tag gate: under the shared-image model the partner tag is
-        # asked once at runtime and persisted to the volume. Refuse to start PRO
-        # without it (interactive prompt here; LITE is never gated).
-        from adscan_internal.cli.partner_tag_gate import ensure_partner_tag_for_pro
-
-        if not ensure_partner_tag_for_pro(getattr(shell, "license_mode", None)):
-            return
-
         if not _ensure_workspace_selected_for_start(shell):
             return
+
+        # The --scope flags apply to the workspace opened at startup, after its
+        # own recorded scope was loaded and after a confirmation summary, before
+        # any scan step. Declining keeps the recorded scope.
+        _apply_startup_asset_scope(shell, config.startup_args, deps.confirm_ask)
 
         shell.preflight_check_passed = bool(preflight_ok)
         shell.preflight_check_fix_attempted = bool(preflight_fix_attempted)
@@ -3738,6 +3771,41 @@ def run_start_session(*, config: StartSessionConfig, deps: StartSessionDeps) -> 
         raise
 
 
+def _apply_startup_asset_scope(
+    shell: Any, startup_args: Any, ask: Callable[[str, bool], bool]
+) -> None:
+    """Apply the ``--scope-*`` flags of ``adscan start`` to the opened workspace.
+
+    Shows the summary and asks (narrowing defaults to Yes, widening to No);
+    unattended it prints the same summary as lines and never prompts. A
+    configuration error (an excluded domain controller) is printed, not fatal:
+    the operator is in the shell and fixes it with the ``scope`` command.
+    """
+    from rich.markup import escape  # noqa: PLC0415
+
+    from adscan_core.engagement_scope_cli import scope_error_line  # noqa: PLC0415
+    from adscan_core.engagement_scope_model import ScopeSyntaxError  # noqa: PLC0415
+    from adscan_internal.cli.asset_scope_cmd import (  # noqa: PLC0415
+        apply_scope_request,
+        resolve_scope_request,
+        scope_configuration_errors,
+    )
+
+    try:
+        request = resolve_scope_request(startup_args) if startup_args is not None else None
+        apply_scope_request(shell, request, confirm=True, ask=ask)
+    except ScopeSyntaxError as exc:
+        print_error(escape(scope_error_line(exc)))
+        return
+    except Exception as exc:  # noqa: BLE001 - the shell still opens; the scope is shown by `scope`
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error("The engagement scope could not be applied; check it with the scope command.")
+        return
+    for error in scope_configuration_errors(shell, domain=str(getattr(shell, "domain", "") or "")):
+        print_error(escape(error))
+
+
 def _ensure_workspace_selected_for_start(shell: Any) -> bool:
     """Require an active workspace before entering the interactive shell.
 
@@ -3798,6 +3866,46 @@ def _ensure_workspace_selected_for_start(shell: Any) -> bool:
     return True
 
 
+def finalize_authenticated_scan_end(shell, verb: str) -> None:
+    """Run the scan-end steps that close an authenticated scan: re-materialize the
+    web-consumed attack-path snapshot, render the post-scan panels, reconcile the
+    background jobs.
+
+    The SINGLE owner of the closing so ``run_start_auth`` and the workspace-load
+    resume offer cannot drift on it. The resume offer used to call the
+    enumeration directly and skipped this entirely, so a resumed scan never
+    re-materialized the attack-path snapshot and never rendered the "Scan
+    complete" moment — the two paths now close through this one function.
+    """
+    # Re-materialize the web-consumed attack-path snapshot as a pure projection
+    # of the reconciled graph BEFORE the loot card / web handoff, so a
+    # compromised domain is never ingested as all-theoretical. Single
+    # scan-finalization seam for both `adscan start` and `adscan ci`.
+    from adscan_internal.cli.attack_path_execution import (
+        rematerialize_attack_path_snapshots_at_scan_end,
+    )
+
+    rematerialize_attack_path_snapshots_at_scan_end(shell)
+    _emit_post_scan_panels(shell, verb)
+    reconcile_jobs_at_scan_end(shell)
+
+
+def run_authenticated_enumeration_and_finalize(
+    shell, domain: str, *, verb: str = "start_auth"
+) -> None:
+    """Run the authenticated enumeration of ``domain`` and then the scan-end steps.
+
+    The single owner of "run the authenticated scan to its end" used by the
+    workspace-load resume offer, so it closes through the SAME
+    :func:`finalize_authenticated_scan_end` seam ``run_start_auth`` uses. The
+    resume offer previously called ``do_enum_domain_auth`` directly and the
+    scan-end steps (``run_start_auth`` runs them after the enumeration) never
+    fired on that path.
+    """
+    shell.do_enum_domain_auth(domain)
+    finalize_authenticated_scan_end(shell, verb)
+
+
 def _emit_post_scan_panels(shell, verb: str) -> None:
     """Render the post-scan moment (exposure report, premium recap, first-scan flag).
 
@@ -3854,6 +3962,33 @@ def _emit_post_scan_panels(shell, verb: str) -> None:
         pass
 
 
+def _operator_stop_resume_phase(shell: Any) -> str:
+    """The human phase title a stopped scan resumes from, or ``""`` when none.
+
+    Reads the persisted checkpoint for the scan's domain so the stop notice can
+    name the exact phase a later Resume re-enters at. Never raises.
+    """
+    try:
+        from adscan_internal.services import scan_progress as sp  # noqa: PLC0415
+
+        domain = str(getattr(shell, "domain", "") or "").strip()
+        if not domain:
+            return ""
+        record = sp.read_scan_progress(shell, domain)
+        from adscan_core.scan_policy.settings import scan_phase_family  # noqa: PLC0415
+
+        scan_type = str(record.get("scan_type") or scan_phase_family(shell))
+        phase_id = sp.resume_phase_id(shell, domain, scan_type)
+        if not phase_id:
+            return ""
+        from adscan_internal.services.scan_phases import get_phase  # noqa: PLC0415
+
+        phase = get_phase(phase_id)
+        return str(getattr(phase, "title", "") or phase_id)
+    except Exception:  # noqa: BLE001 - a notice line must never break the stop
+        return ""
+
+
 def _print_operator_stopped_panel(shell: Any, *, command_name: str) -> None:
     """Report a scan the operator stopped from the Ctrl+C menu (or ``ci`` SIGINT)."""
     body_lines = [
@@ -3867,6 +4002,15 @@ def _print_operator_stopped_panel(shell: Any, *, command_name: str) -> None:
         body_lines.append("")
         body_lines.append("[bold]Kept:[/bold]")
         body_lines.extend(f"    [cyan]›[/cyan]  {line}" for line in preserved)
+    resume_phase = _operator_stop_resume_phase(shell)
+    if resume_phase:
+        body_lines.extend(
+            [
+                "",
+                f"This scan can be resumed later from [bold]{resume_phase}[/bold]: reopen",
+                "this workspace and choose Resume. Everything collected is kept.",
+            ]
+        )
     body_lines.extend(
         [
             "",
@@ -3881,6 +4025,29 @@ def _print_operator_stopped_panel(shell: Any, *, command_name: str) -> None:
         border_style="yellow",
         padding=(1, 2),
     )
+
+
+#: Scan scopes opened by a scan entry point of this module. An entry nested in
+#: one of these (``start_auth`` handing over to ``start_unauth``) leaves the
+#: stopped-scan finalisation to the outer entry, which owns the scan.
+_SCAN_ENTRY_KINDS = frozenset({"start_auth", "start_unauth"})
+
+
+def _owns_nested_stop(outer_kind: str) -> bool:
+    """Whether a scan entry nested in a scope of ``outer_kind`` finalises a stop.
+
+    ``adscan ci`` opens one scope around its whole run (so a SIGINT in its
+    preflight is a clean stop too) and runs ``start_auth`` / ``start_unauth``
+    inside it. The outermost scope swallows the abort, so the nested entry never
+    sees ``last_scan_aborted``; it finalises the stopped scan itself (outcome,
+    summary, snapshot, the "Scan stopped" panel) and lets the abort reach ``ci``.
+    """
+    return bool(outer_kind) and outer_kind not in _SCAN_ENTRY_KINDS
+
+
+def _nested_scan_stopped(outer_kind: str) -> bool:
+    """A nested entry's scan ended with a stop pending that nothing raised."""
+    return _owns_nested_stop(outer_kind) and scan_control().abort_requested()
 
 
 def _finalize_operator_stopped_scan(shell: Any, verb: str) -> None:
@@ -3934,10 +4101,17 @@ def run_start_unauth(shell, args: str | None) -> None:
     """
     while True:
         _reset_scan_launch_marker(shell)
+        outer_kind = scan_control().scan_kind
         try:
-            with operator_scan_scope(shell, "start_unauth") as control:
-                scan_ran = _run_start_unauth_impl(shell, args)
-            if control.last_scan_aborted:
+            try:
+                with operator_scan_scope(shell, "start_unauth") as control:
+                    scan_ran = _run_start_unauth_impl(shell, args)
+            except ScanAbortRequested:
+                # Only reachable nested: the outermost scope swallows the abort.
+                if _owns_nested_stop(outer_kind):
+                    _finalize_operator_stopped_scan(shell, "start_unauth")
+                raise
+            if control.last_scan_aborted or _nested_scan_stopped(outer_kind):
                 _finalize_operator_stopped_scan(shell, "start_unauth")
                 return
             # Only render the post-scan "Scan complete" panel when a scan
@@ -4560,6 +4734,22 @@ def _start_auth_with_params(
         (network preflight failed, DNS resolution failed).
     """
     _maybe_apply_domain_inference(shell, domain)
+    # The operator supplied this credential for the scan: they vouch for it, so
+    # it may read the directory before the engagement scope can place it. An
+    # account the scope already excludes is a configuration error, stated here
+    # before anything is sent.
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        note_operator_credential,
+        scan_credential_scope_error,
+    )
+
+    credential_error = scan_credential_scope_error(shell, domain=domain, username=username)
+    if credential_error:
+        from rich.markup import escape  # noqa: PLC0415
+
+        print_error(escape(credential_error))
+        return False
+    note_operator_credential(shell, domain=domain, username=username)
     interactive_mode = bool(sys.stdin.isatty())
     if not _run_start_network_preflight(
         shell,
@@ -4722,10 +4912,17 @@ def run_start_auth(shell, args: str | None) -> None:
     """
     while True:
         _reset_scan_launch_marker(shell)
+        outer_kind = scan_control().scan_kind
         try:
-            with operator_scan_scope(shell, "start_auth") as control:
-                scan_ran = _run_start_auth_impl(shell, args)
-            if control.last_scan_aborted:
+            try:
+                with operator_scan_scope(shell, "start_auth") as control:
+                    scan_ran = _run_start_auth_impl(shell, args)
+            except ScanAbortRequested:
+                # Only reachable nested: the outermost scope swallows the abort.
+                if _owns_nested_stop(outer_kind):
+                    _finalize_operator_stopped_scan(shell, "start_auth")
+                raise
+            if control.last_scan_aborted or _nested_scan_stopped(outer_kind):
                 _finalize_operator_stopped_scan(shell, "start_auth")
                 return
             # Only render the post-scan "Scan complete" panel when a scan
@@ -4733,18 +4930,10 @@ def run_start_auth(shell, args: str | None) -> None:
             # target, preflight/DNS abort) and delegation to run_start_unauth
             # return False so we don't render a false completion.
             if scan_ran:
-                # Re-materialize the web-consumed attack-path snapshot as a pure
-                # projection of the reconciled graph BEFORE the loot card / web
-                # handoff, so a compromised domain is never ingested as
-                # all-theoretical. Single scan-finalization seam for both
-                # `adscan start` and `adscan ci` (ci routes through this).
-                from adscan_internal.cli.attack_path_execution import (
-                    rematerialize_attack_path_snapshots_at_scan_end,
-                )
-
-                rematerialize_attack_path_snapshots_at_scan_end(shell)
-                _emit_post_scan_panels(shell, "start_auth")
-                reconcile_jobs_at_scan_end(shell)
+                # The scan-end steps (snapshot re-materialisation + post-scan
+                # panels + job reconcile) are owned by the single seam the resume
+                # offer also closes through, so the two paths cannot drift.
+                finalize_authenticated_scan_end(shell, "start_auth")
             return
         except (EOFError, KeyboardInterrupt):
             action = _handle_start_wizard_interrupt(

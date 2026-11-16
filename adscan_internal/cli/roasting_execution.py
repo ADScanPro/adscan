@@ -378,6 +378,40 @@ def _normalize_hashes_file_for_hashcat(
     return normalized_path
 
 
+def _roast_target_outside_scope(
+    shell: Any, *, technique: str, domain: str, target_user: str
+) -> bool:
+    """True (after refusing it) when the engagement scope excludes the roast target.
+
+    These runners are reachable outside the attack-path loop, so they ask the
+    scope SSOT themselves: no ticket is requested for an account the client
+    excluded, no roast edge is written for it, and the refusal is recorded once
+    with the shared reason (``refuse_outside_scope``).
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        refuse_outside_scope,
+    )
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        account_scope_refusal,
+        prepare_accounts_for_scope,
+    )
+
+    # One account the runner was asked to roast: told to the session, then judged.
+    prepare_accounts_for_scope(shell, [target_user], domain=domain)
+    verdict = account_scope_refusal(shell, principal=target_user, domain=domain)
+    if verdict is None:
+        return False
+    refuse_outside_scope(
+        shell,
+        relation=technique,
+        out_domain="",
+        surface="roasting",
+        to_label=target_user,
+        asset_verdict=verdict,
+    )
+    return True
+
+
 def run_kerberoast_for_user(
     shell: Any,
     domain: str,
@@ -425,6 +459,10 @@ def run_kerberoast_for_user(
         )
         return False
     roast_domain = realm.roast_domain
+    if _roast_target_outside_scope(
+        shell, technique="Kerberoasting", domain=roast_domain, target_user=target_user
+    ):
+        return False
 
     auth = _resolve_roast_auth_credential(
         shell, domain, auth_username=auth_username, auth_secret=auth_secret
@@ -583,6 +621,10 @@ def run_asreproast_for_user(
         )
         return False
     roast_domain = realm.roast_domain
+    if _roast_target_outside_scope(
+        shell, technique="ASREPRoasting", domain=roast_domain, target_user=target_user
+    ):
+        return False
 
     print_warning(
         "AS-REP Roasting requests pre-auth disabled TGTs. "

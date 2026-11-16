@@ -1034,6 +1034,20 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
         # Don't fail workspace loading if logging update fails
         print_info_debug(f"Failed to update workspace logging: {e}")
 
+    # The engagement scope recorded for this workspace (trust decision and
+    # asset scope) governs every later command of the session: `execute`,
+    # `recheck` and a reopened `start` never run under a fresh default. It
+    # REPLACES whatever the previous workspace left on the shell.
+    try:
+        from adscan_internal.services.engagement_scope import (
+            rehydrate_engagement_scope,
+        )
+
+        rehydrate_engagement_scope(shell, workspace_path)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
     variables_file = os.path.join(workspace_path, "variables.json")
     loaded_successfully = True
 
@@ -1488,6 +1502,19 @@ def load_workspace_data(shell: WorkspaceLoaderShell, workspace_path: str) -> Non
 
     if loaded_successfully:
         print_success(f"Workspace data successfully processed for {workspace_path}")
+        # A previous run the memory sentinel stopped left a small stop record:
+        # fold it into the phase record and the technical report now.
+        try:
+            from adscan_internal.services.memory_sentinel_wiring import (
+                apply_pending_memory_stop,
+                point_sentinel_marker_at,
+            )
+
+            apply_pending_memory_stop(shell, workspace_path)
+            point_sentinel_marker_at(getattr(shell, "current_workspace_dir", None) or workspace_path)
+        except Exception as exc:  # noqa: BLE001 - never break a workspace load
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
         # Auto-surface the crash-resume offer: if this workspace holds a scan that
         # was interrupted mid-phase, offer to continue it from where it stopped
         # (interactive only; gated off + idempotent under ``adscan ci``). Best

@@ -2388,12 +2388,16 @@ def run_show_attack_paths(
                     target = target or (parts[-1] if parts else "")
             return source, target
 
-        def _mark_node(name: str) -> str:
-            # Strip domain suffix (e.g. @AIS.LOCAL) — domain is shown in panel header.
-            display = name.split("@")[0] if "@" in name else name
-            if "." in display or display.endswith("$"):
-                return mark_sensitive(display, "hostname")
-            return mark_sensitive(display, "user")
+        def _mark_node(name: str, path: dict[str, Any] | None = None) -> str:
+            # The CLI node SSOT: humanized, intra-domain realm dropped (the
+            # domain is in the panel header), marked for telemetry. ``path`` is
+            # the route the node belongs to: it says whether the node is a group,
+            # which keeps the directory's own casing.
+            from adscan_core.output._attack_paths import format_cli_node
+            from adscan_core.reporting.principal_display import node_identity_scope
+
+            with node_identity_scope(records=[path] if path else None):
+                return format_cli_node(name, target_domain)
 
         def _handle_path_detail(path: dict[str, Any], display_idx: int) -> None:
             print_attack_path_detail(
@@ -2595,7 +2599,7 @@ def run_show_attack_paths(
                         )
                         label = (
                             f"  {i + 1}.  [{tag}]  "
-                            f"{_mark_node(source)} → {_mark_node(target)}{status_suffix}"
+                            f"{_mark_node(source, path)} → {_mark_node(target, path)}{status_suffix}"
                         )
                         choices.append(_q.Choice(title=label, value=f"path:{i}"))
 
@@ -2638,9 +2642,9 @@ def run_show_attack_paths(
                 # ── Plain text fallback (no questionary) ──────────────────────
                 flat: list[str] = [
                     f"{i + 1}. [{_path_type_tag(p)}] "
-                    + _mark_node(_path_source_target(p)[0])
+                    + _mark_node(_path_source_target(p)[0], p)
                     + " → "
-                    + _mark_node(_path_source_target(p)[1])
+                    + _mark_node(_path_source_target(p)[1], p)
                     for i, p in enumerate(attack_paths)
                 ]
                 flat.append("0. Exit")

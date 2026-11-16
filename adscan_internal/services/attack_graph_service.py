@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     mark_sensitive,
+    markup_object_label,
     print_info,
     print_info_debug,
     print_info_verbose,
@@ -30,8 +32,12 @@ from adscan_internal.rich_output import (
     print_exception,
     print_attack_paths_summary_debug,
 )
+from adscan_core.graph_compact import load_graph_file, make_edge
 from adscan_core.rich_output import strip_sensitive_markers
-from adscan_core.engagement.output_formats import output_marker
+from adscan_core.engagement.output_formats import (
+    marker_major,
+    output_marker,
+)
 from adscan_core.reporting.attack_path_execution_events import (
     NOT_EXECUTED_REASON_KEY,
     not_needed_reason,
@@ -66,9 +72,7 @@ from adscan_core.reporting.attack_path_memory_gate import (
 )
 from adscan_internal.services.attack_graph_findings import sync_attack_graph_findings
 from adscan_internal.services.graph_secret_store import redact_graph_for_persist
-from adscan_internal.services.attack_graph_findings import (
-    stamp_adcs_edge_display_contract,
-)
+from adscan_internal.services.graph_runtime import runtime_writer as _runtime_writer
 from adscan_internal.services.privileged_group_classifier import (
     classify_privileged_membership,
     is_dependency_only_tier_zero_group,
@@ -83,15 +87,14 @@ from adscan_internal.services.privileged_group_classifier import (
 )
 from adscan_internal.services.attack_paths_materialized_cache import (
     MaterializedAttackPathArtifacts,
-    MaterializedPreparedRuntimeGraph,
+    PreparedRuntimeDelta,
     build_attack_path_artifact_fingerprint,
     invalidate_attack_path_artifacts,
     load_disk_cached_attack_path_results,
     load_materialized_attack_path_artifacts,
-    load_materialized_prepared_runtime_graph,
     persist_attack_path_results_to_disk,
     persist_materialized_attack_path_artifacts,
-    persist_materialized_prepared_runtime_graph,
+    remove_legacy_prepared_runtime_graph_files,
     unlink_attack_path_results_for_domain,
 )
 from adscan_internal.services.attack_step_support_registry import (
@@ -100,7 +103,6 @@ from adscan_internal.services.attack_step_support_registry import (
     classify_relation_support,
 )
 from adscan_internal.services.attack_step_catalog import (
-    build_step_knowledge,
     classify_edge_relation,
     derive_step_display_status,
     get_exploitation_relation_vuln_keys,
@@ -119,7 +121,6 @@ from adscan_internal.services.edge_kind import classify_edge_kind
 from adscan_internal.services.compromise_class import (
     PrivilegeTier,
     apply_path_based_classification,
-    is_structural_hierarchy_source,
     node_stamped_privilege_tier,
     privilege_tier_for_node,
     privilege_tier_for_principal,
@@ -446,6 +447,18 @@ _ATTACK_PATH_PRINCIPAL_SYNTHETIC_MIN_SNAPSHOT_COVERAGE = _env_float(
 _ATTACK_PATHS_COMPUTE_CACHE: "OrderedDict[tuple[Any, ...], list[dict[str, Any]]]" = (
     OrderedDict()
 )
+#: In-memory entries whose records a resource STOP produced (the memory gate
+#: stopped discovery and the bounded recovery answered), with the memory that
+#: was available when it stopped (``None`` when unreadable). Such a result is the
+#: answer for this graph state only under the conditions it stopped in: it is
+#: never written to disk, so a later run recomputes, and an in-process repeat
+#: recomputes once markedly more memory is available (:func:`_stopped_entry_is_stale`).
+#: A result the predictor CHOSE (the sampled mode on a dense directory) is not a
+#: stop: it is a function of the graph and is cached like a complete one.
+_STOPPED_RESULT_HEADROOM: dict[tuple[Any, ...], int | None] = {}
+#: How much more available memory than at the stop makes an in-process repeat
+#: recompute instead of serving the stopped result.
+_STOPPED_RESULT_RECOMPUTE_FACTOR = 1.25
 _ATTACK_PATHS_CACHE_STATS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
@@ -462,7 +475,7 @@ _ATTACK_PATHS_MATERIALIZED_CACHE: OrderedDict[
     tuple[str, str], MaterializedAttackPathArtifacts
 ] = OrderedDict()
 _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE: OrderedDict[
-    tuple[str, str], MaterializedPreparedRuntimeGraph
+    tuple[str, str], PreparedRuntimeDelta
 ] = OrderedDict()
 _ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES = _env_int(
     "ADSCAN_ATTACK_PATHS_MATERIALIZED_CACHE_MAX_ENTRIES",
@@ -2108,6 +2121,21 @@ def _read_memory_ceiling() -> tuple[int | None, int | None]:
         return None, None
 
 
+def _read_process_resident_bytes() -> int | None:
+    """Return this process's resident memory for the gate's projection, best-effort.
+
+    Both seams run with the graph already loaded, so the gate projects from this
+    measured figure instead of modelling the floor and the graph's in-memory
+    size. ``None`` (unreadable) falls back to the modelled projection.
+    """
+    try:
+        from adscan_core import memory_probe
+
+        return memory_probe.read_process_rss_bytes()
+    except Exception:  # noqa: BLE001 — a memory read must never break discovery.
+        return None
+
+
 def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
     """Stage A — project the graph-RESIDENT term only, before the DFS runs.
 
@@ -2119,19 +2147,14 @@ def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
     of what else is running — and it fires only when the graph is literally too big
     to hold, the one thing that is knowable before the DFS.
 
-    Interactive: WARN and proceed — the operator sees the resize advice and can
-    choose to stop.
-
-    Non-interactive (``adscan ci`` / the web worker): raise the declared abort so
-    the run stops cleanly with a coverage declaration instead of being
-    ``SIGKILL``ed. This is safe to keep unattended because Stage A projects ONLY
-    the graph-resident term against the deterministic total ceiling — a
-    near-certain "graph too large to hold" signal, not the uncertain projected
-    PEAK. The uncertain peak (graph + estimated path term) is Stage B's job
-    (post-DFS, ``raw_paths`` known); a domain whose graph fits but whose PEAK might
-    not is NOT aborted here — it proceeds, and the in-DFS ``DfsMemoryBudget``
-    (actual RSS) is the authoritative OOM guard. The abort is caught at the public
-    entry point.
+    Since 15.0.0 the projection only chooses the engine; it never decides
+    coverage. It raises the declared abort (interactive or not) only in the
+    ``over`` band, a projection at least ``FALLBACK_PROJECTION_RATIO`` times the
+    guard's stop line, and the entry point then runs the bounded mode, which
+    declares its coverage. Below that band the full compute runs and the live
+    guard (``DfsMemoryBudget`` in the DFS, the post-processing bound after it) is
+    the authority: a compute that does not fit is stopped there and recovered by
+    the bounded mode once its memory is released (``_recover_from_memory_abort``).
 
     Best-effort: any failure other than the declared abort leaves the compute
     unchanged.
@@ -2147,6 +2170,7 @@ def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
             limit_bytes=limit_bytes,
             available_bytes=available_bytes,
             stage="pre_dfs",
+            resident_bytes=_read_process_resident_bytes(),
         )
         if not projection.exceeds:
             return
@@ -2156,19 +2180,16 @@ def _gate_attack_path_memory_pre_dfs(nodes: int, edges: int) -> None:
     except Exception:  # noqa: BLE001 — the pre-DFS gate must never break discovery.
         return
 
-    non_interactive = False
-    try:
-        from adscan_internal.interaction import is_non_interactive
-
-        non_interactive = bool(is_non_interactive())
-    except Exception:  # noqa: BLE001 — default to the safe interactive behaviour.
-        non_interactive = False
-
-    if non_interactive:
-        # Doomed graph, unattended run — stop cleanly with a declaration rather
-        # than let the DFS reach a SIGKILL. examined_routes=0: the DFS never ran.
-        raise _AttackPathMemoryBudgetExceeded(message, examined_routes=0)
-    print_warning(message)
+    # The ``over`` band (projected at least FALLBACK_PROJECTION_RATIO times the
+    # stop line): the full compute cannot fit, so it goes straight to the bounded
+    # mode. examined_routes=0: the DFS never ran. Anything below that band runs
+    # the full compute under the live guard, which decides.
+    raise _AttackPathMemoryBudgetExceeded(
+        message,
+        examined_routes=0,
+        projected_peak_bytes=projection.projected_peak_bytes,
+        before_discovery=True,
+    )
 
 
 def _estimate_affected_count_for_gate(
@@ -2279,6 +2300,7 @@ def _gate_attack_path_memory_post_dfs(
             available_bytes=available_bytes,
             stage="post_dfs",
             affected_count=affected_count,
+            resident_bytes=_read_process_resident_bytes(),
         )
         if not projection.exceeds:
             return
@@ -2289,7 +2311,11 @@ def _gate_attack_path_memory_post_dfs(
         return
     # Raise OUTSIDE the try so the abort signal is not swallowed by the broad
     # except above. The operator message reaches the terminal at the catch site.
-    raise _AttackPathMemoryBudgetExceeded(message, examined_routes=raw_paths)
+    raise _AttackPathMemoryBudgetExceeded(
+        message,
+        examined_routes=raw_paths,
+        projected_peak_bytes=projection.projected_peak_bytes,
+    )
 
 
 def _choose_attack_path_engine(graph: dict[str, Any]) -> str:
@@ -2822,6 +2848,7 @@ def _record_attack_path_coverage_for_compute(
 
         block = _carry_known_complete_route_counts(shell, domain, coverage.to_block())
         record_attack_path_coverage(shell, domain, coverage=block)
+        _sync_attack_path_resource_coverage(shell, domain, block)
         if emit:
             _emit_attack_path_coverage_status_line(
                 shell, attack_path_coverage_view(block)
@@ -2831,6 +2858,70 @@ def _record_attack_path_coverage_for_compute(
         telemetry.capture_exception(record_exc)
         print_exception(exception=record_exc)
         return None
+
+
+#: Machine token of an attack-path discovery stopped at the memory ceiling, in
+#: the phase record (``scan_progress``) and ``coverage.json``.
+_ATTACK_PATHS_MEMORY_TOKEN = "memory:attack_paths"
+
+
+def _sync_attack_path_resource_coverage(
+    shell: object, domain: str, block: dict[str, Any]
+) -> None:
+    """Mirror the canonical attack-path coverage into ``resource_coverage``.
+
+    One gap, one sentence: when discovery STOPPED at the memory ceiling (the
+    bounded mode, no recovered result) the ``attack_paths`` stage entry carries
+    the ``attack_path_coverage`` statement verbatim, and the
+    ``attack_paths_discovery`` phase is marked incomplete (``adscan ci`` exits
+    3). Any later canonical computation (complete, or recovered into a sampled
+    result) clears both, since the block describes the latest computation.
+    Best-effort; never raises.
+    """
+    try:
+        from adscan_core.reporting.attack_path_memory_gate import (  # noqa: PLC0415
+            COVERAGE_MODE_BOUNDED,
+        )
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            STAGE_ATTACK_PATHS,
+            build_resource_coverage,
+        )
+        from adscan_internal.services import scan_progress  # noqa: PLC0415
+        from adscan_internal.services.resource_coverage_recorder import (  # noqa: PLC0415
+            record_stage_coverage,
+        )
+
+        phase_id = "attack_paths_discovery"
+        if block.get("mode") == COVERAGE_MODE_BOUNDED:
+            record_stage_coverage(
+                shell,
+                domain,
+                build_resource_coverage(
+                    stage=STAGE_ATTACK_PATHS,
+                    unit="candidate routes",
+                    examined=block.get("examined_routes"),
+                    statement=block.get("statement"),
+                ),
+                replace_stage=STAGE_ATTACK_PATHS,
+            )
+            scan_progress.mark_phase_incomplete(
+                shell,
+                domain,
+                phase_id,
+                reasons=(_ATTACK_PATHS_MEMORY_TOKEN,),
+                detail="Attack-path discovery stopped within the available memory.",
+            )
+            return
+        # The session's record AND a stop an earlier process persisted only in
+        # the technical report; the phase's own memory reason goes with it.
+        from adscan_internal.services.resource_coverage_recorder import (  # noqa: PLC0415
+            clear_stage_coverage,
+        )
+
+        clear_stage_coverage(shell, domain, STAGE_ATTACK_PATHS)
+    except Exception as exc:  # noqa: BLE001 - a coverage mirror never breaks discovery
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _handle_attack_path_memory_abort(
@@ -2852,10 +2943,7 @@ def _handle_attack_path_memory_abort(
     INFO iff the bounded recompute never overwrites it with a SAMPLED result.
     Best-effort; never raises.
     """
-    try:
-        print_warning(exc.operator_message)
-    except Exception:  # noqa: BLE001 — the operator line is best-effort.
-        pass
+    _print_attack_path_memory_operator_notice(exc)
     try:
         from adscan_core.reporting.attack_path_coverage import (
             REASON_DFS_ABORTED,
@@ -2879,6 +2967,85 @@ def _handle_attack_path_memory_abort(
         telemetry.capture_exception(record_exc)
         print_exception(exception=record_exc)
         return None
+
+
+def _print_attack_path_memory_operator_notice(
+    exc: "_AttackPathMemoryBudgetExceeded",
+) -> None:
+    """The operator's copy of an attack-path memory stop, through the memory SSOT.
+
+    Before any route was examined (the projection's ``over`` band) it is the
+    pre-stage notice: with the memory available, ADscan examines a representative
+    sample, and the full set needs about the projected figure. A stop during or
+    after the search is the stop panel: what stopped, what was kept, the projected
+    need when the gate measured one (none from the in-search bound, which only
+    knows it crossed the line), the ways to give ADscan more memory that apply
+    here, and "reopen this workspace and choose Resume". Falls back to the
+    one-line message; never raises.
+    """
+    try:
+        from adscan_core.memory_guard import (  # noqa: PLC0415
+            MemoryCeilingReached,
+            MemoryGuard,
+            build_memory_prestage_notice,
+            print_memory_stop_panel,
+        )
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            STAGE_ATTACK_PATHS,
+        )
+
+        reading = MemoryGuard(STAGE_ATTACK_PATHS).sample()
+        if exc.before_discovery:
+            print_warning(
+                build_memory_prestage_notice(
+                    projected_peak_bytes=exc.projected_peak_bytes,
+                    ceiling_bytes=reading.ceiling_bytes,
+                    unit="routes",
+                )
+            )
+            return
+        print_memory_stop_panel(
+            MemoryCeilingReached(
+                stage=STAGE_ATTACK_PATHS,
+                units_done=exc.examined_routes,
+                reading=reading,
+            ),
+            unit="candidate routes",
+            estimate_bytes=exc.projected_peak_bytes,
+        )
+    except Exception as notice_exc:  # noqa: BLE001 — the operator line is best-effort.
+        telemetry.capture_exception(notice_exc)
+        try:
+            print_warning(exc.operator_message)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _operator_declines_sampled_routes(
+    shell: object, exc: "_AttackPathMemoryBudgetExceeded"
+) -> bool:
+    """Whether the operator chose to stop instead of continuing with a sample.
+
+    Asked only before discovery (the projection decided) and only in an
+    interactive run, through the centralised prompt helper with the safe default
+    (continue). An unattended run continues; the sampled coverage it records is
+    the record. Never changes which routes are computed when it continues.
+    """
+    if not exc.before_discovery:
+        return False
+    try:
+        from adscan_internal.interaction import is_non_interactive  # noqa: PLC0415
+
+        if is_non_interactive(shell):
+            return False
+        from adscan_core.rich_output import confirm_ask  # noqa: PLC0415
+
+        return not confirm_ask(
+            "Continue with a representative sample of routes?", default=True
+        )
+    except Exception as prompt_exc:  # noqa: BLE001 — never block discovery on a prompt
+        telemetry.capture_exception(prompt_exc)
+        return False
 
 
 def _resolve_exposure_source_count(shell: object, domain: str) -> int | None:
@@ -3280,6 +3447,16 @@ def _attack_paths_cache_base_key(
 _STRUCTURAL_HASH_ERROR_PREFIX = "structural-error:"
 
 
+_U128 = (1 << 128) - 1
+
+
+def _structural_token_digest(token: str) -> int:
+    """One node or edge token of :func:`_graph_structural_hash`, as a 128-bit int."""
+    return int.from_bytes(
+        hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest(), "big"
+    )
+
+
 def _graph_structural_hash(graph: dict[str, Any]) -> str:
     """Return a stable structural fingerprint of an attack graph.
 
@@ -3298,22 +3475,36 @@ def _graph_structural_hash(graph: dict[str, Any]) -> str:
     which routes exist, so a status-only write leaves this hash unchanged (the
     whole point: caches stay warm across the post-ex status storm).
 
-    Deterministic across runs: node/edge tuples are sorted before hashing, so
-    there is no set/dict-iteration-order dependence.
+    Deterministic across runs and independent of node/edge order: each node and
+    edge token is hashed on its own and the digests are summed modulo 2**128 (a
+    multiset hash), so a duplicate still counts and no order leaks in. Memory is
+    constant: the earlier form built and sorted one string per edge, a ~115 B
+    per-edge transient (59 MB on a 515,746-edge directory) at the start of every
+    compute.
 
     Best-effort: on a malformed graph it returns a per-call error sentinel that
-    forces a recompute (never a blind stale serve) and never raises.
+    forces a recompute (never a blind stale serve) and never raises. The empty
+    graph a build stopped at the memory ceiling hands out gets the same per-call
+    sentinel: it is not the domain's graph, so nothing keyed on it may ever be
+    served again, here or in a later session (its content hash would equal that
+    of a genuinely empty domain).
     """
     try:
-        node_tokens: list[str] = []
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            graph_unavailable_stage,
+        )
+
+        if graph_unavailable_stage(graph=graph):
+            return f"{_STRUCTURAL_HASH_ERROR_PREFIX}unavailable:{uuid.uuid4().hex}"
         nodes = graph.get("nodes")
-        node_iter: list[Any]
+        node_iter: Iterable[Any]
         if isinstance(nodes, dict):
-            node_iter = list(nodes.values())
+            node_iter = nodes.values()
         elif isinstance(nodes, list):
             node_iter = nodes
         else:
-            node_iter = []
+            node_iter = ()
+        node_count, node_sum = 0, 0
         for node in node_iter:
             if not isinstance(node, dict):
                 continue
@@ -3321,11 +3512,12 @@ def _graph_structural_hash(graph: dict[str, Any]) -> str:
             if not node_id:
                 continue
             kind = str(node.get("kind") or "").strip().lower()
-            node_tokens.append(f"{node_id}\x1f{kind}")
+            node_sum += _structural_token_digest(f"{node_id}\x1f{kind}")
+            node_count += 1
 
-        edge_tokens: list[str] = []
         edges = graph.get("edges")
-        edge_iter = edges if isinstance(edges, list) else []
+        edge_iter = edges if isinstance(edges, list) else ()
+        edge_count, edge_sum = 0, 0
         for edge in edge_iter:
             if not isinstance(edge, dict):
                 continue
@@ -3334,19 +3526,16 @@ def _graph_structural_hash(graph: dict[str, Any]) -> str:
             relation = str(edge.get("relation") or "")
             if not from_id or not to_id or not relation:
                 continue
-            edge_tokens.append(f"{from_id}\x1f{relation}\x1f{to_id}")
+            edge_sum += _structural_token_digest(f"{from_id}\x1f{relation}\x1f{to_id}")
+            edge_count += 1
+        node_sum &= _U128
+        edge_sum &= _U128
 
         hasher = hashlib.blake2b(digest_size=16)
-        # Length-prefix each section so a node token can never be confused with
-        # an edge token (canonical, unambiguous join).
-        hasher.update(f"N{len(node_tokens)}\x1e".encode("utf-8"))
-        for token in sorted(node_tokens):
-            hasher.update(token.encode("utf-8"))
-            hasher.update(b"\x1e")
-        hasher.update(f"E{len(edge_tokens)}\x1e".encode("utf-8"))
-        for token in sorted(edge_tokens):
-            hasher.update(token.encode("utf-8"))
-            hasher.update(b"\x1e")
+        # Count-prefix each section so a node token can never be confused with
+        # an edge token.
+        hasher.update(f"N{node_count}\x1e{node_sum:032x}\x1e".encode("utf-8"))
+        hasher.update(f"E{edge_count}\x1e{edge_sum:032x}\x1e".encode("utf-8"))
         return hasher.hexdigest()
     except Exception:  # noqa: BLE001 — best-effort; never raise, force recompute
         return f"{_STRUCTURAL_HASH_ERROR_PREFIX}{uuid.uuid4().hex}"
@@ -3410,6 +3599,15 @@ def _structural_epoch_enabled() -> bool:
     DCSync-inserted ``derived`` edge still surface its route; does the deliverable
     match a flag-OFF run). Revert to ``"0"`` if validation is not clean; set
     ``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH=0`` to force the proven mtime path.
+
+    What that lab run must show, on a store-backed workspace (GOAD, one row that
+    executes a route end to end): (1) after a step succeeds, the next listing is a
+    cache hit and shows the step ``success`` and the route ``partial`` or
+    ``exploited``, the same statuses a ``--no-cache`` listing gives; (2) a
+    follow-up that inserts an edge (DCSync's derived edge, a runtime AdminTo)
+    recomputes and the new route is listed; (3) the PRO and LITE deliverables of
+    that workspace are identical to a run with ``=0``. The unit-level contract is
+    locked by ``tests/unit/services/test_attack_path_cache_contract_store.py``.
     """
     return os.getenv("ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH", "1").strip().lower() in {
         "1",
@@ -3419,24 +3617,45 @@ def _structural_epoch_enabled() -> bool:
     }
 
 
-def _mtime_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
-    """Return the legacy ``(graph_mtime, snapshot_mtime)`` file-mtime epoch.
+def _file_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
+    """``(graph_mtime, snapshot_mtime)``: the epoch of the store-less read path.
 
-    This is the ORIGINAL invalidation epoch — cheap disk stats, changes on EVERY
-    ``save_attack_graph`` (including status-only writes). It is the flag-OFF
-    behaviour of :func:`attack_paths_epoch_fingerprint` AND the key
-    :func:`load_attack_graph`'s own memo uses unconditionally (the load memo only
-    needs to invalidate on ANY file change, and mtime does that cheaply without
-    the recursion a structural key would create — the fingerprint loads the graph
-    via ``load_attack_graph``).
-
-    Returns:
-        ``(graph_mtime_token, snapshot_mtime_token)`` — each a float mtime or
-        ``None`` when the file is absent. Best-effort; never raises.
+    Cheap disk stats; keys the file-graph load memo (which must not key on the
+    structural epoch: that one loads the graph through this very memo).
     """
     graph_path = _graph_path(shell, domain)
     snapshot_path = _membership_snapshot_path(shell, domain)
     return (_file_mtime_token(graph_path), _file_mtime_token(snapshot_path))
+
+
+def _graph_epoch_token(shell: object, domain: str) -> Any:
+    """What changes whenever ``domain``'s graph changes.
+
+    With a store it is the store generation (a runtime write appends an op
+    and never touches the file, so the file's mtime would not move); without
+    one, the file's mtime.
+    """
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    token = graph_runtime.store_generation_token(shell, domain)
+    if token is not None:
+        return token
+    return _file_mtime_token(_graph_path(shell, domain))
+
+
+def _mtime_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
+    """Return the legacy ``(graph_epoch, snapshot_mtime)`` epoch.
+
+    The ORIGINAL invalidation epoch: it changes on EVERY graph write
+    (status-only writes included). It is the flag-OFF behaviour of
+    :func:`attack_paths_epoch_fingerprint`. The graph half is the store
+    generation when the domain has a store (:func:`_graph_epoch_token`).
+
+    Returns:
+        ``(graph_epoch_token, snapshot_mtime_token)``; best-effort, never raises.
+    """
+    snapshot_path = _membership_snapshot_path(shell, domain)
+    return (_graph_epoch_token(shell, domain), _file_mtime_token(snapshot_path))
 
 
 def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...]:
@@ -3450,11 +3669,13 @@ def attack_paths_epoch_fingerprint(shell: object, domain: str) -> tuple[Any, ...
 
     Two modes, selected by ``ADSCAN_ATTACK_PATHS_STRUCTURAL_EPOCH``:
 
-    - **OFF (default)** — the legacy ``(graph_mtime, snapshot_mtime)`` tuple. Every
-      ``save_attack_graph`` bumps the graph mtime, so a step-state (status) write
-      changes the epoch and colds the caches. Provably never-stale, but re-runs
-      the compute on every post-ex status write (the recompute storm).
-    - **ON (structural)** — ``(graph_structural_hash, snapshot_structural_hash)``
+    - **OFF** (``=0``) — the legacy ``(graph_epoch, snapshot_mtime)`` tuple, where
+      the graph half is the store generation for a store-backed domain
+      (:func:`_graph_epoch_token`; every runtime write appends an op and moves it)
+      and the file mtime otherwise. A step-state (status) write changes the epoch
+      and colds the caches. Provably never-stale, but re-runs the compute on every
+      post-ex status write (the recompute storm).
+    - **ON (structural, the default)** — ``(graph_structural_hash, snapshot_structural_hash)``
       computed from the already-warm loaded graph
       (:func:`_graph_structural_hash` / :func:`_snapshot_structural_hash`). A
       status/notes/timestamp-only write does NOT change the hash (caches stay warm,
@@ -3747,6 +3968,17 @@ def _attack_paths_cache_get(
     if no_cache or not _ATTACK_PATHS_CACHE_ENABLED:
         return None
     cached = _ATTACK_PATHS_COMPUTE_CACHE.get(key)
+    if cached is not None and _stopped_entry_is_stale(key):
+        # A stopped result, and markedly more memory is available now than when
+        # discovery stopped: recompute rather than serve the bounded answer.
+        _ATTACK_PATHS_COMPUTE_CACHE.pop(key, None)
+        _STOPPED_RESULT_HEADROOM.pop(key, None)
+        _cache_stats_inc(domain, "misses")
+        print_info_debug(
+            f"[attack_paths] stopped result not served: domain={mark_sensitive(domain, 'domain')} "
+            f"scope={scope} reason=more_memory_available"
+        )
+        return None
     if cached is None:
         # L1 MISS -> try the L2 disk sidecar (cold-start reuse). A disk hit is
         # promoted into L1 through the existing put path so the byte-budget
@@ -3779,6 +4011,24 @@ def _attack_paths_cache_get(
     if shell is not None and _structural_epoch_enabled():
         served = _rederive_cached_record_statuses(served, shell=shell, domain=domain)
     return served
+
+
+def _stopped_entry_is_stale(key: tuple[Any, ...]) -> bool:
+    """Whether a stopped in-memory result must be recomputed instead of served.
+
+    True when the entry is a stopped one and the memory available now is
+    unknown, or at least :data:`_STOPPED_RESULT_RECOMPUTE_FACTOR` times what was
+    available when discovery stopped (or that was unknown). A repeat call in the
+    same conditions (the report stamps at scan end) is served; one after the
+    operator freed memory recomputes.
+    """
+    if key not in _STOPPED_RESULT_HEADROOM:
+        return False
+    at_stop = _STOPPED_RESULT_HEADROOM.get(key)
+    _limit, available_now = _read_memory_ceiling()
+    if available_now is None or at_stop is None:
+        return True
+    return available_now >= at_stop * _STOPPED_RESULT_RECOMPUTE_FACTOR
 
 
 def _load_attack_paths_disk_cache(
@@ -3832,8 +4082,14 @@ def _attack_paths_cache_put(
     compute_seconds: float | None = None,
     shell: object | None = None,
     no_cache: bool = False,
+    stopped: bool = False,
 ) -> None:
     """Store attack-path records in a bounded LRU cache (+ optional disk L2).
+
+    ``stopped`` marks records a resource stop produced (the memory gate stopped
+    discovery and the bounded recovery answered): they stay in memory only,
+    stamped with the memory available now, and are never written to disk (see
+    :data:`_STOPPED_RESULT_HEADROOM`).
 
     The entry is bounded by an estimated per-entry BYTE ceiling and a
     "caching-is-a-win" gate, NOT by a path count (which bounds the wrong
@@ -3885,11 +4141,16 @@ def _attack_paths_cache_put(
             )
             return
     _ATTACK_PATHS_COMPUTE_CACHE[key] = copy.deepcopy(records)
+    if stopped:
+        _STOPPED_RESULT_HEADROOM[key] = _read_memory_ceiling()[1]
+    else:
+        _STOPPED_RESULT_HEADROOM.pop(key, None)
     _cache_stats_inc(domain, "stores")
     _ATTACK_PATHS_COMPUTE_CACHE.move_to_end(key)
     evicted = 0
     while len(_ATTACK_PATHS_COMPUTE_CACHE) > _ATTACK_PATHS_CACHE_MAX_ENTRIES:
-        _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
+        evicted_key, _records = _ATTACK_PATHS_COMPUTE_CACHE.popitem(last=False)
+        _STOPPED_RESULT_HEADROOM.pop(evicted_key, None)
         evicted += 1
     if evicted:
         _cache_stats_inc(domain, "evictions", by=evicted)
@@ -3899,8 +4160,9 @@ def _attack_paths_cache_put(
     )
     # L2 disk sidecar — only from real compute call sites (shell present), only
     # for an entry that passed BOTH gates above (composes with the byte-budget),
-    # and never on the disk-hit promotion (shell=None) or no_cache path.
-    if shell is not None:
+    # and never on the disk-hit promotion (shell=None) or no_cache path. Never a
+    # stopped result: a later run must recompute it, not inherit the stop.
+    if shell is not None and not stopped:
         _store_attack_paths_disk_cache(key, records, domain=domain, scope=scope, shell=shell)
 
 
@@ -3925,6 +4187,40 @@ def _store_attack_paths_disk_cache(
         return
     if wrote:
         _cache_stats_inc(domain, "disk_stores")
+
+
+def _cache_routed_result_under_outer_key(
+    cache_key: tuple[Any, ...],
+    records: list[dict[str, Any]],
+    *,
+    domain: str,
+    scope: str,
+    started_at: float,
+    shell: object,
+    no_cache: bool,
+) -> None:
+    """Cache a result the proactive routing produced under the CALLER's key.
+
+    On a directory dense enough that the predictor routes discovery to the
+    bounded per-terminal engine, the bounded run caches its records under its
+    own ``force_perterminal=True`` key. Without this, a repeat call for the same
+    graph state missed its own key every time and paid, before reaching that
+    entry, the graph load, the domain-scope start set and the predictor over
+    the whole graph. The routing is a function of the graph (part of the key),
+    so the result is the same for the same key: a sampled result is a legitimate
+    result to reuse for the same graph state, exactly as the memory-abort
+    recovery caches its bounded result under the caller's key. The coverage
+    declaration was recorded by the computation itself, in this process.
+    """
+    _attack_paths_cache_put(
+        cache_key,
+        records,
+        domain=domain,
+        scope=scope,
+        compute_seconds=max(0.0, time.monotonic() - started_at),
+        shell=shell,
+        no_cache=no_cache,
+    )
 
 
 def _invalidate_load_attack_graph_memo(domain: str) -> None:
@@ -3981,6 +4277,7 @@ def _invalidate_attack_paths_cache(
         if str(key[0] or "").strip().lower() != domain_key:
             continue
         _ATTACK_PATHS_COMPUTE_CACHE.pop(key, None)
+        _STOPPED_RESULT_HEADROOM.pop(key, None)
         removed += 1
     if removed:
         _cache_stats_inc(domain, "invalidations", by=1)
@@ -4101,6 +4398,7 @@ def _purge_attack_path_caches_for_domain(shell: object, domain: str) -> None:
                 and str(key[0] or "").strip().lower() == domain_key
             ):
                 _ATTACK_PATHS_COMPUTE_CACHE.pop(key, None)
+                _STOPPED_RESULT_HEADROOM.pop(key, None)
     except Exception:  # noqa: BLE001 - cache hygiene must never break a compute
         pass
     # Epoch-keyed load memo + in-memory materialized/prepared caches.
@@ -4243,6 +4541,24 @@ def _apply_recursive_target_priority_overrides(
     return False
 
 
+def _artifact_schema_key(shell: object, domain: str, base: str) -> str:
+    """The artifact fingerprints' schema key, carrying the store generation.
+
+    ``build_attack_path_artifact_fingerprint`` keys on the graph FILE, which a
+    runtime write to a store no longer touches; folding the generation in keeps
+    the disk-materialized artifacts as fresh as the graph they derive from.
+    """
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    token = graph_runtime.store_generation_token(shell, domain)
+    if token is None:
+        return base
+    # ``store:<inventory>:<overlay>``, plus the per-session stop marker when the
+    # build of this generation stopped (the artifacts of an empty graph must
+    # never key like the full build of the same generation).
+    return f"{base}:" + ":".join(str(part) for part in token)
+
+
 def _load_or_build_materialized_attack_path_artifacts(
     shell: object,
     *,
@@ -4276,7 +4592,7 @@ def _load_or_build_materialized_attack_path_artifacts(
     fingerprint = build_attack_path_artifact_fingerprint(
         graph_path=graph_path,
         snapshot_path=snapshot_path,
-        schema_version=ATTACK_GRAPH_SCHEMA_VERSION,
+        schema_version=_artifact_schema_key(shell, domain, ATTACK_GRAPH_SCHEMA_VERSION),
     )
 
     cached = _materialized_cache_get(domain, fingerprint=fingerprint)
@@ -4328,13 +4644,14 @@ def _prepared_runtime_graph_cache_get(
     domain: str,
     *,
     fingerprint: str,
-) -> MaterializedPreparedRuntimeGraph | None:
-    """Return a matching in-memory prepared runtime graph bundle."""
+    base_token: tuple[int, int, int],
+) -> PreparedRuntimeDelta | None:
+    """Return the cached prepared-graph delta for this exact loaded graph."""
     if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
         return None
     key = (str(domain or "").strip().lower(), fingerprint)
     cached = _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.get(key)
-    if cached is None:
+    if cached is None or cached.base_token != base_token:
         return None
     _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.move_to_end(key)
     return cached
@@ -4342,13 +4659,13 @@ def _prepared_runtime_graph_cache_get(
 
 def _prepared_runtime_graph_cache_put(
     domain: str,
-    prepared_graph: MaterializedPreparedRuntimeGraph,
+    delta: PreparedRuntimeDelta,
 ) -> None:
-    """Store a prepared runtime graph in the bounded in-memory cache."""
+    """Store a prepared-graph delta in the bounded in-memory cache."""
     if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED:
         return
-    key = (str(domain or "").strip().lower(), prepared_graph.fingerprint)
-    _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE[key] = prepared_graph
+    key = (str(domain or "").strip().lower(), delta.fingerprint)
+    _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE[key] = delta
     _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.move_to_end(key)
     while (
         len(_ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE)
@@ -4357,29 +4674,81 @@ def _prepared_runtime_graph_cache_put(
         _ATTACK_PATHS_PREPARED_RUNTIME_GRAPH_CACHE.popitem(last=False)
 
 
-def _build_prepared_runtime_graph(
+def _prepared_graph_base_token(base_graph: dict[str, Any]) -> tuple[int, int, int]:
+    """Identify the loaded graph a prepared-graph delta was computed against."""
+    nodes = base_graph.get("nodes")
+    edges = base_graph.get("edges")
+    return (
+        id(base_graph),
+        len(nodes) if isinstance(nodes, dict) else 0,
+        len(edges) if isinstance(edges, list) else 0,
+    )
+
+
+def _assemble_prepared_runtime_graph(
+    base_graph: dict[str, Any],
+    *,
+    injected_edges: Iterable[dict[str, Any]] = (),
+    minted_nodes: Iterable[tuple[str, dict[str, Any]]] = (),
+    nodes_by_id: bool,
+) -> dict[str, Any]:
+    """The prepared runtime graph over the loaded graph's OWN objects.
+
+    The node and edge dicts are the loaded graph's, never copies: holding the
+    prepared graph costs one node dict and one edge list, not a second graph.
+    (Until 15.0.0 the prepared graph was persisted to disk and read back, a
+    complete second copy of the graph resident for the whole compute: 483 MB of
+    a 1.2 GB peak on a 275,714-edge directory.) The compute treats these
+    objects as read-only; ``tests/unit/services/test_prepared_runtime_graph_shares_base.py``
+    locks that a compute leaves the loaded graph unchanged.
+
+    ``nodes_by_id`` orders the node map by node id. The DFS walks ``nodes`` in
+    order to pick its roots, and the order decides which of several equivalent
+    routes represents them, so each caller keeps the order its graph always had:
+    a single-domain graph was computed on the persisted copy, written with
+    sorted keys (``True``); a merged multi-domain graph, or any graph with the
+    materialized cache disabled, was built in memory in the loaded graph's own
+    order, minted groups last (``False``).
+    """
+    base_nodes = base_graph.get("nodes")
+    base_edges = base_graph.get("edges")
+    nodes: dict[str, Any] = dict(base_nodes) if isinstance(base_nodes, dict) else {}
+    for node_id, node in minted_nodes:
+        nodes.setdefault(node_id, node)
+    edges: list[Any] = list(base_edges) if isinstance(base_edges, list) else []
+    edges.extend(injected_edges)
+    prepared: dict[str, Any] = dict(base_graph)
+    prepared["nodes"] = dict(sorted(nodes.items())) if nodes_by_id else nodes
+    prepared["edges"] = edges
+    prepared["_attack_paths_terminal_memberships_materialized"] = True
+    return prepared
+
+
+def _compute_prepared_runtime_delta(
     *,
     base_graph: dict[str, Any],
     domain: str,
     snapshot: dict[str, Any] | None,
     expand_terminal_memberships: bool,
     materialized_artifacts: MaterializedAttackPathArtifacts | None,
-) -> dict[str, Any]:
-    """Build a reusable runtime graph with terminal memberships already expanded."""
-    runtime_graph: dict[str, Any] = dict(base_graph)
-    runtime_graph["nodes"] = dict(
-        base_graph.get("nodes") if isinstance(base_graph.get("nodes"), dict) else {}
-    )
-    runtime_graph["edges"] = list(
-        base_graph.get("edges") if isinstance(base_graph.get("edges"), list) else []
-    )
+    fingerprint: str,
+) -> PreparedRuntimeDelta:
+    """Expand the terminal memberships and return only what they added."""
+    base_nodes = base_graph.get("nodes")
+    base_edges = base_graph.get("edges")
+    working: dict[str, Any] = {
+        **base_graph,
+        "nodes": dict(base_nodes) if isinstance(base_nodes, dict) else {},
+        "edges": list(base_edges) if isinstance(base_edges, list) else [],
+    }
+    base_edge_count = len(working["edges"])
     if (
         expand_terminal_memberships
         and snapshot
-        and not attack_paths_core._graph_has_persisted_memberships(runtime_graph)  # noqa: SLF001
+        and not attack_paths_core._graph_has_persisted_memberships(working)  # noqa: SLF001
     ):
         candidate_to_ids: set[str] = set()
-        for edge in runtime_graph["edges"]:
+        for edge in working["edges"]:
             if not isinstance(edge, dict):
                 continue
             if (
@@ -4391,7 +4760,7 @@ def _build_prepared_runtime_graph(
             if to_id:
                 candidate_to_ids.add(to_id)
         attack_paths_core._inject_memberof_edges_from_snapshot(  # noqa: SLF001
-            runtime_graph,
+            working,
             domain,
             snapshot,
             principal_node_ids=candidate_to_ids,
@@ -4407,8 +4776,44 @@ def _build_prepared_runtime_graph(
                 else None
             ),
         )
-    runtime_graph["_attack_paths_terminal_memberships_materialized"] = True
-    return runtime_graph
+    injected_edges = working["edges"][base_edge_count:]
+    attack_paths_core.restore_synthetic_group_nodes(working, domain, injected_edges)
+    base_node_ids = base_nodes if isinstance(base_nodes, dict) else {}
+    return PreparedRuntimeDelta(
+        fingerprint=fingerprint,
+        base_token=_prepared_graph_base_token(base_graph),
+        injected_edges=tuple(injected_edges),
+        minted_nodes=tuple(
+            (node_id, node)
+            for node_id, node in working["nodes"].items()
+            if node_id not in base_node_ids
+        ),
+    )
+
+
+def _build_prepared_runtime_graph(
+    *,
+    base_graph: dict[str, Any],
+    domain: str,
+    snapshot: dict[str, Any] | None,
+    expand_terminal_memberships: bool,
+    materialized_artifacts: MaterializedAttackPathArtifacts | None,
+) -> dict[str, Any]:
+    """Build a runtime graph with terminal memberships already expanded."""
+    delta = _compute_prepared_runtime_delta(
+        base_graph=base_graph,
+        domain=domain,
+        snapshot=snapshot,
+        expand_terminal_memberships=expand_terminal_memberships,
+        materialized_artifacts=materialized_artifacts,
+        fingerprint="",
+    )
+    return _assemble_prepared_runtime_graph(
+        base_graph,
+        injected_edges=delta.injected_edges,
+        minted_nodes=delta.minted_nodes,
+        nodes_by_id=False,
+    )
 
 
 def _load_or_build_prepared_runtime_graph(
@@ -4422,12 +4827,10 @@ def _load_or_build_prepared_runtime_graph(
 ) -> dict[str, Any]:
     """Load or build a reusable prepared runtime graph for local DFS scopes.
 
-    The prepared runtime graph is DISK-materialized and fingerprinted on the
-    graph FILE's mtime, so the in-memory foreign-DC enrichment (which depends on
-    live ``domains_data`` and never touches the file) would be bypassed by a
-    stale disk/memory cache. It is therefore re-applied to whatever graph this
-    returns — the graph the DFS actually consumes — on every call. Idempotent
-    and a no-op when no foreign DC matches the inventory.
+    The foreign-DC enrichment depends on live ``domains_data`` and never touches
+    the graph file, so it is re-applied to whatever graph this returns (the
+    graph the DFS actually consumes) on every call. Idempotent and a no-op when
+    no foreign DC matches the inventory.
     """
     prepared = _load_or_build_prepared_runtime_graph_raw(
         shell,
@@ -4450,9 +4853,16 @@ def _load_or_build_prepared_runtime_graph_raw(
     expand_terminal_memberships: bool,
     materialized_artifacts: MaterializedAttackPathArtifacts | None,
 ) -> dict[str, Any]:
-    """Load or build a reusable prepared runtime graph for local DFS scopes."""
-    # A MERGED multi-domain graph must build fresh in-memory and NEVER touch the
-    # per-domain disk cache (fingerprinted on the single-domain graph file), or it
+    """Assemble the prepared runtime graph, reusing a cached membership delta.
+
+    Only the expanded terminal memberships are cached (in memory, keyed on the
+    graph and snapshot fingerprint AND the loaded graph object), never the
+    graph: the prepared graph is reassembled over the loaded graph's own
+    objects on every call, which costs two containers. A whole-graph copy an
+    earlier release left on disk is deleted the first time a domain is prepared.
+    """
+    # A MERGED multi-domain graph must build fresh in-memory and NEVER key a
+    # per-domain cache (fingerprinted on the single-domain graph file), or it
     # would poison the single-domain prepared graph with cross-domain content.
     if not _ATTACK_PATHS_MATERIALIZED_CACHE_ENABLED or bool(
         base_graph.get("_merged_domains")
@@ -4470,51 +4880,37 @@ def _load_or_build_prepared_runtime_graph_raw(
     fingerprint = build_attack_path_artifact_fingerprint(
         graph_path=graph_path,
         snapshot_path=snapshot_path,
-        schema_version=f"{ATTACK_GRAPH_SCHEMA_VERSION}:prepared:{int(expand_terminal_memberships)}",
+        schema_version=_artifact_schema_key(
+            shell,
+            domain,
+            f"{ATTACK_GRAPH_SCHEMA_VERSION}:prepared:{int(expand_terminal_memberships)}",
+        ),
     )
-
-    cached = _prepared_runtime_graph_cache_get(domain, fingerprint=fingerprint)
-    if cached is not None:
-        return dict(cached.graph)
-
-    loaded = load_materialized_prepared_runtime_graph(
-        shell=shell,
-        domain=domain,
-        fingerprint=fingerprint,
+    base_token = _prepared_graph_base_token(base_graph)
+    delta = _prepared_runtime_graph_cache_get(
+        domain, fingerprint=fingerprint, base_token=base_token
     )
-    if loaded is not None:
-        _prepared_runtime_graph_cache_put(domain, loaded)
-        print_info_debug(
-            f"[attack_paths] prepared runtime graph cache hit: "
-            f"domain={mark_sensitive(domain, 'domain')} format={loaded.storage_format}"
+    if delta is None:
+        if remove_legacy_prepared_runtime_graph_files(shell, domain):
+            print_info_debug(
+                "[attack_paths] removed the whole-graph prepared copy an earlier "
+                f"release persisted: domain={mark_sensitive(domain, 'domain')}"
+            )
+        delta = _compute_prepared_runtime_delta(
+            base_graph=base_graph,
+            domain=domain,
+            snapshot=snapshot,
+            expand_terminal_memberships=expand_terminal_memberships,
+            materialized_artifacts=materialized_artifacts,
+            fingerprint=fingerprint,
         )
-        return dict(loaded.graph)
-
-    prepared_graph = _build_prepared_runtime_graph(
-        base_graph=base_graph,
-        domain=domain,
-        snapshot=snapshot,
-        expand_terminal_memberships=expand_terminal_memberships,
-        materialized_artifacts=materialized_artifacts,
+        _prepared_runtime_graph_cache_put(domain, delta)
+    return _assemble_prepared_runtime_graph(
+        base_graph,
+        injected_edges=delta.injected_edges,
+        minted_nodes=delta.minted_nodes,
+        nodes_by_id=True,
     )
-    built = MaterializedPreparedRuntimeGraph(
-        fingerprint=fingerprint,
-        graph=prepared_graph,
-        storage_format="memory",
-    )
-    persist_materialized_prepared_runtime_graph(
-        shell=shell,
-        domain=domain,
-        prepared_graph=built,
-    )
-    persisted = load_materialized_prepared_runtime_graph(
-        shell=shell,
-        domain=domain,
-        fingerprint=fingerprint,
-    )
-    final = persisted or built
-    _prepared_runtime_graph_cache_put(domain, final)
-    return dict(final.graph)
 
 
 def get_attack_paths_cache_stats(
@@ -7384,8 +7780,14 @@ def _edge_has_tier0_source(
     from_id: str,
     relation: str,
     to_id: str | None = None,
+    source_verdicts: dict[str, bool] | None = None,
 ) -> bool:
     """Return True when an actionable edge starts from a Tier-0 principal.
+
+    ``source_verdicts`` memoises the per-source-node verdict
+    (:func:`_node_is_direct_compromise_source`) across the calls of ONE pass
+    over a graph: the verdict depends on the node alone, and a pass asks it
+    once per edge (hundreds of thousands of times on a large directory).
 
     The filter narrowed to ``direct_compromise`` sources only — the canonical
     "domain-takeover sinks" (Domain Admins, Enterprise Admins, BUILTIN
@@ -7472,7 +7874,14 @@ def _edge_has_tier0_source(
             tgt_domain = _node_domain(target_node)
             if src_domain and tgt_domain and src_domain != tgt_domain:
                 return False
-    return _node_is_direct_compromise_source(source_node)
+    if source_verdicts is None:
+        return _node_is_direct_compromise_source(source_node)
+    source_key = str(from_id or "").strip()
+    verdict = source_verdicts.get(source_key)
+    if verdict is None:
+        verdict = _node_is_direct_compromise_source(source_node)
+        source_verdicts[source_key] = verdict
+    return verdict
 
 
 def _node_domain(node: dict[str, Any]) -> str:
@@ -7526,14 +7935,45 @@ def _node_is_direct_compromise_source(node: dict[str, Any]) -> bool:
     )
 
 
-def _prune_tier0_source_attack_edges(graph: dict[str, Any]) -> int:
-    """Remove persisted attack edges that originate from Tier-0 principals."""
+def _prune_tier0_source_attack_edges(
+    graph: dict[str, Any], *, only: Iterable[Any] | None = None
+) -> int:
+    """Remove persisted attack edges that originate from Tier-0 principals.
+
+    ``only`` limits the check to those edge dicts (the runtime facade checks
+    only the edges its pending writes touched; an edge's verdict depends on the
+    edge and its endpoints alone).
+    """
     edges = graph.get("edges")
     if not isinstance(edges, list):
         return 0
+    if only is not None:
+        source_verdicts_only: dict[str, bool] = {}
+        doomed = {
+            id(edge)
+            for edge in only
+            if isinstance(edge, dict)
+            and _edge_has_tier0_source(
+                graph,
+                from_id=str(edge.get("from") or "").strip(),
+                relation=str(edge.get("relation") or "").strip(),
+                to_id=str(edge.get("to") or "").strip(),
+                source_verdicts=source_verdicts_only,
+            )
+        }
+        if not doomed:
+            return 0
+        graph["edges"] = [edge for edge in edges if id(edge) not in doomed]
+        maintenance = graph.setdefault("maintenance", {})
+        if isinstance(maintenance, dict):
+            maintenance["tier0_source_attack_edges_pruned"] = (
+                int(maintenance.get("tier0_source_attack_edges_pruned") or 0) + len(doomed)
+            )
+        return len(doomed)
 
     kept: list[dict[str, Any]] = []
     removed = 0
+    source_verdicts: dict[str, bool] = {}
     for edge in edges:
         if not isinstance(edge, dict):
             kept.append(edge)
@@ -7542,7 +7982,11 @@ def _prune_tier0_source_attack_edges(graph: dict[str, Any]) -> int:
         to_id = str(edge.get("to") or "").strip()
         relation = str(edge.get("relation") or "").strip()
         if _edge_has_tier0_source(
-            graph, from_id=from_id, relation=relation, to_id=to_id
+            graph,
+            from_id=from_id,
+            relation=relation,
+            to_id=to_id,
+            source_verdicts=source_verdicts,
         ):
             removed += 1
             continue
@@ -7696,6 +8140,9 @@ def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
 def _node_is_enabled_user(node: dict[str, Any]) -> bool:
     """Return True when the node represents an enabled user principal."""
     if _node_kind(node) != "User":
+        return False
+    if is_tombstoned(node):
+        # Deleted: reads as enabled, but nobody can sign in as it.
         return False
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     enabled = props.get("enabled")
@@ -8117,6 +8564,7 @@ def persist_memberof_chain_edges(
     transitive closure (principal -> all ancestor groups). This avoids creating
     synthetic shortcut edges that inflate the number of displayed paths.
     """
+    edge_index = EdgeUpsertIndex()
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
@@ -8171,6 +8619,7 @@ def persist_memberof_chain_edges(
                 continue
             upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=node_id,
                 to_id=gid,
                 relation="MemberOf",
@@ -8214,6 +8663,7 @@ def persist_memberof_chain_edges(
                 continue
             upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=from_id,
                 to_id=to_id,
                 relation="MemberOf",
@@ -8278,6 +8728,7 @@ def persist_rodc_followup_chain_edges(
     graph: dict[str, Any],
 ) -> int:
     """Persist the canonical multi-step RODC follow-up chain into the attack graph."""
+    edge_index = EdgeUpsertIndex()
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
         return 0
@@ -8371,6 +8822,7 @@ def persist_rodc_followup_chain_edges(
             )
             upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=from_id,
                 to_id=to_id,
                 relation=relation,
@@ -8743,7 +9195,7 @@ def _merged_node_global_id(node: dict[str, Any], *, domain: str, local_id: str) 
 
 
 def list_domains_with_attack_graph(shell: object) -> list[str]:
-    """List every workspace domain that has a persisted ``attack_graph.json``.
+    """List every workspace domain that has a graph (a store or an ``attack_graph.json``).
 
     Scans ``<workspace>/<domains_dir>/*/attack_graph.json`` so path computation
     can decide whether to merge (more than one domain graph) or run single-domain.
@@ -8758,11 +9210,15 @@ def list_domains_with_attack_graph(shell: object) -> list[str]:
     root = os.path.join(workspace_cwd, domains_dir)
     if not os.path.isdir(root):
         return []
+    from adscan_core.graph_store import graph_store_exists  # noqa: PLC0415
+
     found: list[str] = []
     try:
         for entry in os.listdir(root):
-            graph_file = os.path.join(root, entry, "attack_graph.json")
-            if os.path.isfile(graph_file):
+            domain_dir = os.path.join(root, entry)
+            graph_file = os.path.join(domain_dir, "attack_graph.json")
+            # A domain whose graph lives in a store counts before its first export.
+            if os.path.isfile(graph_file) or graph_store_exists(domain_dir):
                 found.append(entry)
     except OSError:
         return []
@@ -8793,65 +9249,6 @@ def _load_attack_graph_for_paths(shell: object, domain: str) -> dict[str, Any]:
             shell, _order_domains(domains_with_graph, primary=domain)
         )
     return load_attack_graph(shell, domain)
-
-
-def persist_cross_domain_trust_edges(
-    shell: object,
-    *,
-    domain: str,
-    domains_data: "Mapping[str, Any] | None",
-    foreign_domain_nodes: "Mapping[str, dict[str, Any]] | None" = None,
-) -> bool:
-    """Persist CrossOrgTgtDelegation + RaiseChild trust escalation edges to disk.
-
-    These edges were previously minted in-memory only (``virtual``) at query time,
-    so a status write (``update_edge_status_by_labels``) had no persisted edge to
-    land on and a reload re-derived them as ``theoretical``. This runs the same
-    couplings against the ORIGIN domain's on-disk graph and saves it, so the edge
-    (and its execution status) survives reloads. The query-time merge re-runs the
-    couplings as a no-op once the persisted edge exists.
-
-    A coupling needs BOTH domain nodes present. When the trust partner's Domain
-    node is not in this domain's own graph, ``foreign_domain_nodes`` (partner FQDN
-    upper -> a light Domain node payload, built from the cross-domain registry)
-    supplies it, keyed by the partner node's graph id so it merges cleanly.
-
-    Best-effort and idempotent. Returns True when it changed (and re-saved) the
-    graph.
-    """
-    graph = load_attack_graph(shell, domain)
-    nodes = graph.setdefault("nodes", {})
-    if not isinstance(nodes, dict):
-        nodes = {}
-        graph["nodes"] = nodes
-    if foreign_domain_nodes:
-        for node_id, node_payload in foreign_domain_nodes.items():
-            if node_id and node_id not in nodes and isinstance(node_payload, dict):
-                nodes[node_id] = node_payload
-
-    # NOTE: ``load_attack_graph`` already runs these couplings IN MEMORY on every
-    # load (via ``_enrich_foreign_dc_nodes``), so the edge is usually present in
-    # ``graph`` before we call the couplings again — their idempotent return would
-    # then be False even though nothing is on DISK yet. So we do not gate the save
-    # on the coupling return: we save whenever a synthesized trust edge is present
-    # in the graph, materializing the previously in-memory-only edge to disk so its
-    # execution status survives reloads. Idempotent — a second call re-saves the
-    # same content (no duplicate, upsert identity).
-    attack_graph_core.couple_cross_org_tgt_delegation_edges(graph, domains_data)
-    attack_graph_core.couple_raise_child_edges(graph, domains_data)
-    synthesized = [
-        edge
-        for edge in graph.get("edges", [])
-        if isinstance(edge, dict)
-        and str(edge.get("relation") or "") in {"CrossOrgTgtDelegation", "RaiseChild"}
-        and str((edge.get("notes") or {}).get("synthesized_from") or "").startswith(
-            ("cross_org_tgt_delegation", "within_forest_child_parent")
-        )
-    ]
-    if not synthesized:
-        return False
-    save_attack_graph(shell, domain, graph)
-    return True
 
 
 def _enrich_foreign_dc_nodes(shell: object, domain: str, graph: dict[str, Any]) -> None:
@@ -8904,16 +9301,39 @@ def _enrich_foreign_dc_nodes(shell: object, domain: str, graph: dict[str, Any]) 
 
 
 def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
-    """Load or initialize the attack graph for a domain (epoch-memoized).
+    """The attack graph of ``domain`` for this session.
 
-    Thin memoizing entry over :func:`_load_and_prepare_attack_graph`. During the
-    per-path readiness / offer-evaluation pass this is called thousands of times
-    for the same unchanged graph; the memo returns the already-parsed, already-
-    enriched object for a ``(domain, epoch)`` without touching disk. The epoch is
-    :func:`attack_paths_epoch_fingerprint` — ``(graph_mtime, snapshot_mtime)`` —
-    so any :func:`save_attack_graph` (which bumps the graph mtime) forces the next
-    load to miss the memo and re-read, making the memo provably never-stale. See
-    ``_LOAD_ATTACK_GRAPH_MEMO`` for the read-only-callers audit.
+    With a store (``graph_runtime``): the graph built from it, memoised on
+    ``(store.generation(), context.fingerprint())``; runtime writes patch it in
+    place, so a load after a status change costs nothing. Without one (a
+    14.0.x workspace, a frozen recheck, a domain not collected yet): the
+    ``attack_graph.json`` file, format 1 or 2, read and prepared in memory and
+    memoised on its mtime. The read path NEVER writes: no file, no store.
+    """
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    try:
+        # Inside a runtime writer (``graph_runtime.runtime_writer``) the graph
+        # handed out is the recorded one: what the writer changes is an op.
+        built = graph_runtime.scoped_graph(shell, domain)
+        if built is None:
+            built = graph_runtime.live_graph(shell, domain)
+    except Exception as exc:  # noqa: BLE001 - an unreadable store falls back to the file
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        built = None
+    if built is not None:
+        return built
+    return _load_attack_graph_file_memoised(shell, domain)
+
+
+def _load_attack_graph_file_memoised(shell: object, domain: str) -> dict[str, Any]:
+    """The store-less read path, epoch-memoised on the file's mtime.
+
+    During the per-path readiness pass this is called thousands of times for
+    the same unchanged graph; the memo returns the already-parsed, already-
+    enriched object for a ``(domain, path, mtime epoch)`` without touching
+    disk.
     """
     if not _LOAD_ATTACK_GRAPH_MEMO_ENABLED:
         return _load_and_prepare_attack_graph(shell, domain)
@@ -8922,24 +9342,14 @@ def load_attack_graph(shell: object, domain: str) -> dict[str, Any]:
     try:
         path = _graph_path(shell, domain)
         # Only memoize when the graph file EXISTS: the file-absent branch returns a
-        # fresh empty dict (an ambiguous ``(None, None)`` epoch shared by every
-        # not-yet-created graph), which a caller then mutates before the first save,
-        # so caching it would leak that scaffold across unrelated domains/workspaces.
+        # fresh empty dict, which a caller may mutate before its first write, so
+        # caching it would leak that scaffold across unrelated domains/workspaces.
         if not os.path.exists(path):
             return _load_and_prepare_attack_graph(shell, domain)
-        # The load memo keys on the MTIME epoch unconditionally — NOT the public
-        # structural epoch. Two reasons: (1) the load memo only needs to
-        # invalidate on ANY file change (a re-read of the parsed graph is cheap;
-        # it is the downstream COMPUTE that is expensive and wants the structural
-        # epoch), and (2) the structural epoch computes its hash BY loading the
-        # graph via this very function — keying the load memo on it would recurse.
-        epoch = _mtime_epoch_fingerprint(shell, domain)
+        epoch = _file_epoch_fingerprint(shell, domain)
     except Exception:  # noqa: BLE001 — never fail a load over the memo key
         return _load_and_prepare_attack_graph(shell, domain)
 
-    # Key on the resolved FILE PATH (not just the domain name): the same domain
-    # name legitimately maps to different files across workspaces, and the mtime
-    # epoch alone cannot tell them apart.
     memo_key = (domain_key, path, epoch)
     cached = _LOAD_ATTACK_GRAPH_MEMO.get(memo_key)
     if cached is not None:
@@ -8969,149 +9379,7 @@ def _domain_data_for(shell: object, domain: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) else None
 
 
-def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]:
-    """Load or initialize the attack graph for a domain."""
-    path = _graph_path(shell, domain)
-    if os.path.exists(path):
-        data = read_json_file(path)
-        # Migration on read: a graph written before secret references existed
-        # carries recovered values inline. Retain them in the secret sidecar and
-        # drop them from the in-memory graph, so no consumer sees them and the
-        # next save cannot write them back. The file itself is rewritten only by
-        # ``save_attack_graph``, which runs the same redaction.
-        if isinstance(data, dict):
-            redact_graph_for_persist(shell, domain, data)
-        schema_version = str(data.get("schema_version") or "")
-        # Phase 2 (schema 1.2) added a top-level `kind` field to every
-        # edge. Schema 1.1 graphs upgrade transparently: backfill the
-        # kinds in memory; the schema_version is bumped on the next save.
-        if schema_version in {ATTACK_GRAPH_SCHEMA_VERSION, "1.1"}:
-            if schema_version != ATTACK_GRAPH_SCHEMA_VERSION:
-                edges_list = data.get("edges")
-                if isinstance(edges_list, list):
-                    for _edge in edges_list:
-                        if isinstance(_edge, dict) and not _edge.get("kind"):
-                            _edge["kind"] = classify_edge_kind(
-                                str(_edge.get("relation") or "")
-                            ).value
-            maintenance = _get_attack_graph_maintenance_state(data)
-            maintenance_target = _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION)
-            maintenance_version = str(maintenance.get("normalization") or "").strip()
-            snapshot = _load_membership_snapshot(shell, domain)
-
-            repaired = False
-            normalized = False
-            domain_normalized = False
-            kind_normalized = False
-            metadata_updated = 0
-            reuse_notes_compacted = 0
-            target_priority_overrides_updated = False
-
-            # These maintenance passes are expensive on large graphs and should
-            # run only once per maintenance version.
-            if maintenance_version != maintenance_target:
-                # Historical graphs may contain duplicate nodes (same label, different IDs).
-                # Repair them early so path computations stay consistent and self-loop
-                # avoidance works as intended.
-                repaired = _repair_duplicate_nodes_by_label(data)
-                normalized = _normalize_user_computer_labels(data)
-                domain_normalized = _normalize_domain_labels(data)
-                kind_normalized = _normalize_principal_kinds_from_snapshot(
-                    data, snapshot
-                )
-                metadata_updated = _refresh_attack_graph_edge_metadata(data)
-                reuse_notes_compacted = _compact_local_reuse_edge_notes(data)
-                maintenance["normalization"] = maintenance_target
-
-            target_priority_overrides_updated = (
-                _apply_recursive_target_priority_overrides(
-                    data,
-                    snapshot,
-                    domain=domain,
-                )
-            )
-
-            if (
-                maintenance_version != maintenance_target
-                or repaired
-                or normalized
-                or domain_normalized
-                or kind_normalized
-                or metadata_updated
-                or reuse_notes_compacted
-                or target_priority_overrides_updated
-            ):
-                try:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    parts: list[str] = []
-                    if maintenance_version != maintenance_target:
-                        parts.append("applied graph maintenance")
-                    if repaired:
-                        parts.append("repaired duplicate nodes")
-                    if normalized:
-                        parts.append("normalized principal labels")
-                    if domain_normalized:
-                        parts.append("normalized domain labels")
-                    if kind_normalized:
-                        parts.append("normalized principal kinds")
-                    if metadata_updated:
-                        parts.append("classified edge metadata")
-                    if reuse_notes_compacted:
-                        parts.append("compacted local reuse notes")
-                    if target_priority_overrides_updated:
-                        parts.append("updated recursive target priority overrides")
-                    action = ", ".join(parts) if parts else "updated"
-                    print_info_debug(
-                        f"[attack_graph] {action} in {marked_domain} attack graph."
-                    )
-                except Exception:
-                    pass
-                save_attack_graph(shell, domain, data)
-            # In-memory only, applied on EVERY load AFTER the persist decision so
-            # it never reaches disk: back-fill the writable-DC role marker on a
-            # foreign (pivot-discovered) DC node from the trust-enum inventory in
-            # domains_data, and synthesize the trusted domain's Domain node when
-            # absent. This lets the F6 DCSync overlay couple a cross-forest
-            # compromised DC to its own domain. Depends on live domains_data, so
-            # it cannot be a version-gated maintenance pass.
-            _enrich_foreign_dc_nodes(shell, domain, data)
-            attack_graph_core._backfill_privilege_tier(data)
-            # Same in-memory-only contract: derive the privileged-group
-            # escalation edges (Backup Operators / DnsAdmins / Print Operators)
-            # so a workspace collected before that derivation existed still
-            # materialises the member's path to domain compromise. Runs AFTER
-            # the label/domain normalization passes, because the edge target is
-            # resolved from the domain NODE.
-            attack_graph_core._backfill_privileged_group_escalations(
-                data, _domain_data_for(shell, domain)
-            )
-            return data
-        if schema_version in {"1.0"}:
-            migrated = _migrate_attack_graph(data)
-            if migrated:
-                _repair_duplicate_nodes_by_label(migrated)
-                _normalize_user_computer_labels(migrated)
-                _normalize_domain_labels(migrated)
-                snapshot = _load_membership_snapshot(shell, domain)
-                _normalize_principal_kinds_from_snapshot(migrated, snapshot)
-                _refresh_attack_graph_edge_metadata(migrated)
-                _compact_local_reuse_edge_notes(migrated)
-                _apply_recursive_target_priority_overrides(
-                    migrated,
-                    snapshot,
-                    domain=domain,
-                )
-                maintenance = _get_attack_graph_maintenance_state(migrated)
-                maintenance["normalization"] = _maintenance_key(
-                    _ATTACK_GRAPH_MAINTENANCE_VERSION
-                )
-                save_attack_graph(shell, domain, migrated)
-                _enrich_foreign_dc_nodes(shell, domain, migrated)
-                attack_graph_core._backfill_privilege_tier(migrated)
-                attack_graph_core._backfill_privileged_group_escalations(
-                    migrated, _domain_data_for(shell, domain)
-                )
-                return migrated
+def _empty_attack_graph(domain: str) -> dict[str, Any]:
     return {
         "schema_version": ATTACK_GRAPH_SCHEMA_VERSION,
         "domain": domain,
@@ -9125,8 +9393,116 @@ def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]
     }
 
 
+def _load_and_prepare_attack_graph(shell: object, domain: str) -> dict[str, Any]:
+    """Read ``domain``'s ``attack_graph.json`` (no store), or an empty graph."""
+    path = _graph_path(shell, domain)
+    if os.path.exists(path):
+        data = read_attack_graph_file(shell, domain, path)
+        if data is not None:
+            return data
+    return _empty_attack_graph(domain)
+
+
+def read_attack_graph_file(
+    shell: object, domain: str, path: str, *, retain_secrets: bool = False
+) -> dict[str, Any] | None:
+    """Read and prepare an ``attack_graph.json`` in memory. Never writes it.
+
+    Formats 1.0 (migrated), 1.1 to 1.x and 2.x. Recovered secrets an old file
+    carries inline are replaced by references in memory and their values are
+    kept in the workspace's secret sidecar (so a step can still resolve one);
+    on a frozen workspace nothing is written and the references carry no
+    fingerprint (``retain_secrets`` forces the retention: the store import). A format-1 edge's baked
+    ``knowledge`` is dropped (readers render it from the catalog). The
+    maintenance passes, the foreign-DC enrichment and the backfills run in
+    memory on every read, as the build does for a store.
+
+    Returns:
+        The prepared graph, or ``None`` when the file is not a readable graph.
+    """
+    # A 14.0.x file is read whole (one C call the guard cannot interrupt), so
+    # the read is refused up front when it does not fit; the boundary declares
+    # it as a graph-build stop and the reader gets no graph.
+    from adscan_internal.services.graph_runtime_memory import (  # noqa: PLC0415
+        load_graph_file_bounded,
+    )
+
+    loaded, data = load_graph_file_bounded(shell, domain, path, loader=load_graph_file)
+    if not loaded:
+        return None
+    if not isinstance(data, dict):
+        return None
+    from adscan_core.workspace_freeze import write_blocked  # noqa: PLC0415
+
+    if retain_secrets or not write_blocked(path):
+        # The values an old file carries inline are retained in the secret
+        # sidecar (not in the graph): an attack step that reuses one resolves it
+        # from there. The graph file itself is never rewritten here.
+        redact_graph_for_persist(shell, domain, data)
+    else:
+        from adscan_core import graph_secret_refs as _refs  # noqa: PLC0415
+        from adscan_internal.services.graph_secret_store import (  # noqa: PLC0415
+            fingerprint_key_for,
+        )
+
+        try:
+            key = fingerprint_key_for(shell, create=False)
+        except Exception:  # noqa: BLE001 - no key: references carry no fingerprint
+            key = None
+        _refs.redact_graph_secrets(data, key=key, domain=domain)
+    schema_version = str(data.get("schema_version") or "")
+    if schema_version == "1.0":
+        migrated = _migrate_attack_graph(data)
+        if not migrated:
+            return None
+        data = migrated
+        maintenance = _get_attack_graph_maintenance_state(data)
+        maintenance["normalization"] = ""
+        schema_version = ATTACK_GRAPH_SCHEMA_VERSION
+    readable_major = marker_major("attack_graph", schema_version)
+    if readable_major is None:
+        return None
+    # Formats 1.1 to 1.x and 2.x load as they are. Schema 1.1 predates the
+    # top-level edge ``kind``: it is backfilled in memory.
+    if readable_major == 1:
+        attack_graph_core.drop_format1_edge_knowledge(data)
+        edges_list = data.get("edges")
+        if isinstance(edges_list, list):
+            for _edge in edges_list:
+                if isinstance(_edge, dict) and not _edge.get("kind"):
+                    _edge["kind"] = classify_edge_kind(str(_edge.get("relation") or "")).value
+    maintenance = _get_attack_graph_maintenance_state(data)
+    maintenance_target = _maintenance_key(_ATTACK_GRAPH_MAINTENANCE_VERSION)
+    maintenance_version = str(maintenance.get("normalization") or "").strip()
+    snapshot = _load_membership_snapshot(shell, domain)
+    if maintenance_version != maintenance_target:
+        # Historical graphs may contain duplicate nodes (same label, different
+        # IDs) and older label/kind conventions; normalised in memory (the read
+        # path never rewrites the file).
+        _repair_duplicate_nodes_by_label(data)
+        _normalize_user_computer_labels(data)
+        _normalize_domain_labels(data)
+        _normalize_principal_kinds_from_snapshot(data, snapshot)
+        _refresh_attack_graph_edge_metadata(data)
+        _compact_local_reuse_edge_notes(data)
+        maintenance["normalization"] = maintenance_target
+    _apply_recursive_target_priority_overrides(data, snapshot, domain=domain)
+    # Depends on live domains_data, so it cannot be a version-gated pass:
+    # back-fill the writable-DC role marker on a foreign DC node and synthesize
+    # the trusted domain's Domain node, then the privilege-tier stamp and the
+    # privileged-group escalation edges (after the label normalisation, since
+    # the escalation target is resolved from the domain NODE).
+    _enrich_foreign_dc_nodes(shell, domain, data)
+    attack_graph_core._backfill_privilege_tier(data)
+    attack_graph_core._backfill_privileged_group_escalations(
+        data, _domain_data_for(shell, domain)
+    )
+    return data
+
+
 def _migrate_attack_graph(graph: dict[str, Any]) -> dict[str, Any] | None:
     """Migrate older attack graph schema versions to the current version."""
+    edge_index = EdgeUpsertIndex()
     nodes_map = graph.get("nodes")
     edges = graph.get("edges")
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
@@ -9183,6 +9559,7 @@ def _migrate_attack_graph(graph: dict[str, Any]) -> dict[str, Any] | None:
 
         migrated_entry = upsert_edge(
             {"nodes": new_nodes, "edges": new_edges},
+            index=edge_index,
             from_id=from_new,
             to_id=to_new,
             relation=relation,
@@ -9248,13 +9625,13 @@ def _compact_local_reuse_edge_notes(graph: dict[str, Any]) -> int:
         notes = edge.get("notes")
         if not isinstance(notes, dict):
             continue
-        removed = False
-        for key in ("confirmed_hosts", "confirmed_node_ids"):
-            if key in notes:
-                notes.pop(key, None)
-                removed = True
-        if removed:
-            edge["notes"] = notes
+        if any(key in notes for key in ("confirmed_hosts", "confirmed_node_ids")):
+            # Replaced, never mutated: a notes object may be shared between edges.
+            edge["notes"] = {
+                key: value
+                for key, value in notes.items()
+                if key not in ("confirmed_hosts", "confirmed_node_ids")
+            }
             changed += 1
     return changed
 
@@ -9433,7 +9810,7 @@ def _desired_exec_support_state(
 _UNDECIDED_EDGE_STATUSES: frozenset[str] = frozenset({"", "discovered", "theoretical"})
 
 
-def classify_graph_edges(graph: dict[str, Any]) -> int:
+def classify_graph_edges(graph: dict[str, Any], *, edges: Iterable[Any] | None = None) -> int:
     """Give every edge the classification the canonical writer would have given it.
 
     Classification is a property of *persisting* the document, not of whichever
@@ -9477,10 +9854,15 @@ def classify_graph_edges(graph: dict[str, Any]) -> int:
 
     Returns:
         How many edges were stamped.
+
+    ``edges`` limits the pass to those edges (the runtime facade re-classifies
+    only the edges its pending writes touched); each edge's stamp depends on the
+    edge and the node map only, so a subset pass equals the full one on it.
     """
-    edges = graph.get("edges")
-    if not isinstance(edges, list):
-        return 0
+    if edges is None:
+        edges = graph.get("edges")
+        if not isinstance(edges, list):
+            return 0
     changed = 0
     for edge in edges:
         if not isinstance(edge, dict):
@@ -9509,332 +9891,78 @@ def classify_graph_edges(graph: dict[str, Any]) -> int:
             graph, relation=relation, to_id=str(edge.get("to") or "")
         )
         edge["status"] = desired_status
-        notes.update(desired_notes)
-        edge["notes"] = notes
+        edge["notes"] = {**notes, **desired_notes}
         changed += 1
     return changed
 
 
-def _verification_env_from_graph(graph: dict[str, Any]) -> dict[str, str]:
-    """The graph-level coordinates a verify/exploit command is filled with.
-
-    Stamped once by :func:`save_attack_graph` (``dc_ip`` via ``resolve_dc_ip``,
-    ``dc_fqdn`` via ``resolve_dc_fqdn``, the NetBIOS name and the account the
-    scan authenticated as). None of them is a secret.
-    """
-    env: dict[str, str] = {}
-    for graph_key, details_key in (
-        ("dc_ip", "dc_ip"),
-        ("domain", "domain"),
-        ("dc_fqdn", "dc_fqdn"),
-        ("netbios", "netbios_domain"),
-        ("scan_principal", "scan_principal"),
-        ("ca_name", "ca_name"),
-        ("ca_host", "ca_host"),
-    ):
-        value = str(graph.get(graph_key) or "").strip()
-        if value:
-            env[details_key] = value
-    return env
-
-
-def _edge_verification_step(
-    graph: dict[str, Any],
-    edge: dict[str, Any],
-    env: dict[str, str],
-    nodes_by_id: dict[str, Any] | None = None,
-    member_resolver: Any = None,
-) -> dict[str, Any]:
-    """Build the synthetic step a technique edge's verify block renders against.
-
-    Carries the edge's own notes (template, CA, SPNs, impersonation hint), the
-    graph coordinates, and the REAL identifiers of both endpoint nodes
-    (sAMAccountName / DN / DNS hostname / object class) so a command names the
-    object the client can resolve, never the display label.
-    """
-    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-    details: dict[str, Any] = {
-        **notes,
-        "from": str(notes.get("source_label") or edge.get("from") or ""),
-        "to": str(notes.get("target_label") or edge.get("to") or ""),
-        **env,
-    }
-    if nodes_by_id is not None:
-        attack_graph_core._stamp_step_identity(
-            details,
-            nodes_by_id.get(str(edge.get("from") or "")),
-            nodes_by_id.get(str(edge.get("to") or "")),
-        )
-    if member_resolver is not None:
-        # A GROUP source acts through a known member (membership SSOT, a
-        # controlled one first), the same rule the report's step render uses.
-        from adscan_internal.services.affected_assets_struct import (  # noqa: PLC0415
-            stamp_step_source_member,
-        )
-
-        stamp_step_source_member(details, member_resolver)
-    return {"relation": str(edge.get("relation") or "").strip(), "details": details}
-
-
-def _bake_engine_followup_knowledge(graph: dict[str, Any]) -> int:
-    """Bake technique knowledge onto stored engine follow-ups that lack it.
-
-    An edge created through :func:`upsert_edge` gets its ``knowledge`` block
-    there; an engine follow-up is appended by the writer instead, so the web edge
-    detail would otherwise open it with no technique prose. Same baking, same
-    inputs, once per edge. Best-effort.
-    """
-    edges = graph.get("edges")
-    if not isinstance(edges, list):
-        return 0
-    baked = 0
-    for edge in edges:
-        if not isinstance(edge, dict) or "knowledge" in edge:
-            continue
-        if not attack_graph_core.edge_is_engine_followup(edge):
-            continue
-        try:
-            knowledge = _personalize_edge_knowledge(
-                _normalize_relation(str(edge.get("relation") or "")),
-                edge.get("notes") if isinstance(edge.get("notes"), dict) else {},
-                dc_ip=str(graph.get("dc_ip") or "").strip(),
-                domain=str(graph.get("domain") or "").strip(),
-            )
-        except Exception:  # noqa: BLE001 - never break the write over an enrichment
-            continue
-        if knowledge:
-            edge["knowledge"] = knowledge
-            baked += 1
-    return baked
-
-
-def _refresh_edge_verify_commands(
-    graph: dict[str, Any], member_resolver: Any = None
-) -> int:
-    """Re-render the ``knowledge`` verification block on technique edges.
-
-    An edge's ``knowledge`` block is baked in :func:`upsert_edge`, which runs
-    during collection, before ``save_attack_graph`` stamps the graph's
-    coordinates (``dc_ip``, ``dc_fqdn``, ``netbios``, the scan's principal), so
-    its commands still carry ``<dc_ip>`` / ``<domain>`` fill-ins. Once the writer
-    knows them it re-renders the structured ``verification`` block (and the two
-    legacy strings derived from it) against each edge's own endpoints, with the
-    endpoint nodes' real identifiers, so the web CTEM shows the same filled
-    command the report re-renders at PDF-build time.
-
-    Only technique edges (those carrying a ``knowledge`` block with a verify or
-    exploit command) are touched. A secret is never filled: no coordinate is a
-    credential and ``<password>`` tokens stay as authored. Idempotent and
-    best-effort: a no-op when the graph has no coordinates or no such edges.
-    """
-    env = _verification_env_from_graph(graph)
-    if not (env.get("dc_ip") or env.get("domain")):
-        return 0
-    edges = graph.get("edges")
-    if not isinstance(edges, list):
-        return 0
-    try:
-        from adscan_core.reporting.verification_model import (  # noqa: PLC0415
-            legacy_text_from_items,
-        )
-        from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
-            render_step_verification,
-        )
-    except Exception:  # noqa: BLE001 — never break the write over an enrichment
-        return 0
-    nodes = graph.get("nodes")
-    nodes_by_id: dict[str, Any] = nodes if isinstance(nodes, dict) else {}
-    refreshed = 0
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        knowledge = edge.get("knowledge")
-        if not isinstance(knowledge, dict):
-            continue
-        if not (
-            knowledge.get("verify_windows")
-            or knowledge.get("verify_linux")
-            or knowledge.get("verification")
-        ):
-            continue
-        if not str(edge.get("relation") or "").strip():
-            continue
-        try:
-            rendered = render_step_verification(
-                _edge_verification_step(graph, edge, env, nodes_by_id, member_resolver)
-            )
-        except Exception:  # noqa: BLE001
-            continue
-        updates: dict[str, Any] = {}
-        if rendered["verify"] or rendered["exploit"]:
-            updates["verification"] = rendered
-        windows = legacy_text_from_items(rendered["verify"], "windows")
-        linux = legacy_text_from_items(rendered["verify"], "linux")
-        if windows:
-            updates["verify_windows"] = windows
-        if linux:
-            updates["verify_linux"] = linux
-        changed = any(knowledge.get(key) != value for key, value in updates.items())
-        if changed:
-            knowledge.update(updates)
-            refreshed += 1
-    return refreshed
-
-
 def save_attack_graph(shell: object, domain: str, graph: dict[str, Any]) -> None:
-    """Persist the attack graph to disk with stable formatting.
+    """Persist a caller-changed graph: the legacy save bridge.
 
-    The ONE writer of ``domains/<domain>/attack_graph.json``. Everything a
-    persisted graph must be true of lives here — edge classification, the Tier-0
-    source prune, stable edge ordering, an atomic write, cache invalidation and
-    the technical-findings sync — so a caller that appends edges by hand inherits
-    all of it by persisting through this function instead of serializing the file
-    itself. Locked by ``tests/unit/services/test_attack_graph_write_seam.py``.
+    The graph lives in the domain's store (``graph_runtime``); the file is its
+    export. A caller that still loads the graph, changes the dict and saves it
+    gets the difference recorded as overlay ops (``origin="legacy_save_bridge"``)
+    and the export rewritten: correct for any caller, at the cost of one build,
+    which is why runtime writers record through ``graph_runtime`` instead. Only
+    callers inside this module remain, their number locked so it can only
+    shrink; the bridge leaves with the last of them. Everything a
+    persisted graph must be true of (edge classification, the Tier-0-source
+    prune, follow-ups, the AD CS display contract, stable ordering, secret
+    redaction, the technique-knowledge root block) is done by the build and the
+    write seam, never by the caller. A frozen workspace (a recheck) is never
+    written. Locked by ``tests/unit/services/test_graph_runtime_is_the_only_writer.py``.
     """
     from adscan_core.workspace_freeze import write_blocked  # noqa: PLC0415
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
 
     if write_blocked(_graph_path(shell, domain)):
-        # A frozen workspace (a recheck) keeps the scan's graph byte-identical.
         return
-    graph["schema_version"] = ATTACK_GRAPH_SCHEMA_VERSION
-    graph["domain"] = domain
-    graph["generated_at"] = _utc_now_iso()
-    # Bind the graph to the recorded run writing it (or clear a stale binding),
-    # so the run's coverage.json is only trusted for a graph that run wrote.
-    from adscan_core.engagement.coverage_io import stamp_artifact_run_id  # noqa: PLC0415
-    from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
-        active_run_id,
-    )
-
-    stamp_artifact_run_id(graph, active_run_id(shell))
-    # Stamp the DC/KDC IP onto the graph so downstream renderers (report,
-    # attack-path snapshot, edge-knowledge bake) can substitute a real IP into
-    # the independent-verification commands instead of a literal <dc_ip> token.
-    # Resolved once here through the ``resolve_dc_ip`` SSOT (never a hand-rolled
-    # .get("dc_ip") walk). Best-effort: absent domains_data / no resolvable DC
-    # leaves the field unset and the catalog degrades to the literal token.
+    if graph_runtime.active_recorder(graph) is not None:
+        # The graph a runtime writer was handed: every change is already an op.
+        return
+    caller = ""
     try:
-        from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+        import sys  # noqa: PLC0415
 
-        domains_data = getattr(shell, "domains_data", None)
-        domain_entry = (
-            domains_data.get(domain) if isinstance(domains_data, dict) else None
-        )
-        if isinstance(domain_entry, dict):
-            resolved_dc_ip = resolve_dc_ip(domain_entry)
-            if resolved_dc_ip:
-                graph["dc_ip"] = resolved_dc_ip
-            # NetBIOS (flat) domain for the NT-account form of a client-facing
-            # remediation command (dsacls / NTAccount principals must be
-            # NetBIOS-qualified, e.g. HTB\Account Operators). Prefer the real
-            # persisted flat name; the catalog derives it from the DNS domain
-            # when the graph carries none.
-            netbios = str(domain_entry.get("netbios") or "").strip()
-            if netbios:
-                graph["netbios"] = netbios
-            # The DC's DNS name (the Kerberos SPN host a ``-k`` verify or exploit
-            # command needs) through the ``resolve_dc_fqdn`` SSOT, and the
-            # account the scan authenticated as (the principal a read-only verify
-            # query runs as). Neither is a secret; the password never is stamped.
-            from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+        frame = sys._getframe(1)  # noqa: SLF001
+        caller = f"{frame.f_globals.get('__name__', '')}.{frame.f_code.co_name}"
+    except Exception:  # noqa: BLE001 - diagnostics only
+        caller = ""
+    graph_runtime.record_saved_graph(shell, domain, graph, caller=caller)
+    _unlink_attack_paths_disk_cache(shell, domain, reason="graph_saved")
 
-            dc_fqdn = resolve_dc_fqdn(domain_entry, target_domain=domain)
-            if dc_fqdn:
-                graph["dc_fqdn"] = dc_fqdn
-            scan_principal = str(domain_entry.get("username") or "").strip()
-            if scan_principal:
-                graph["scan_principal"] = scan_principal
-            # The domain's certificate authority the scan enumerated (name and
-            # host), so an AD CS command names it instead of a ``<ca_host>``
-            # fill-in. Recorded by the ADCS discovery; not a secret.
-            ca_name = str(domain_entry.get("ca") or "").strip()
-            ca_host = str(
-                domain_entry.get("adcs_fqdn") or domain_entry.get("adcs") or ""
-            ).strip()
-            if ca_name and isinstance(domain_entry.get("ca"), str):
-                graph["ca_name"] = ca_name
-            if ca_host and "." in ca_host:
-                graph["ca_host"] = ca_host.lower()
-    except Exception:  # noqa: BLE001 — never break the graph write over an enrichment
-        pass
-    # Edges are baked during collection, BEFORE the dc_ip/domain stamps above
-    # exist on the graph, so their knowledge verify blocks still carry the
-    # literal <dc_ip>/<domain> tokens. Refresh them here — at the ONE writer,
-    # after the coordinates are known — so the web CTEM edge panel gets the real
-    # DC IP + domain in its copy-paste verify commands (parity with the report).
-    _member_resolver = None
-    _ws_dir = str(getattr(shell, "current_workspace_dir", "") or "")
-    if _ws_dir:
-        from adscan_internal.services.affected_assets_struct import (  # noqa: PLC0415
-            safe_member_example_resolver,
-        )
 
-        _member_resolver = safe_member_example_resolver(_ws_dir, domain)
-    # The follow-up steps the engine adds after an access are stored as ordinary
-    # edges, with their provenance, so their outcome always has an edge to land
-    # on and every reader sees one representation. Idempotent. Runs before the
-    # verify-command refresh so a new follow-up's technique knowledge is filled
-    # with the graph's coordinates like any other edge's.
-    _followups_added, _followups_removed = (
-        attack_graph_core.materialize_engine_followup_edges(graph)
-    )
-    if _followups_added or _followups_removed:
-        print_info_debug(
-            "[attack_graph] engine follow-ups reconciled: "
-            f"added={_followups_added} removed={_followups_removed}"
-        )
-    _bake_engine_followup_knowledge(graph)
-    _refresh_edge_verify_commands(graph, _member_resolver)
-    classify_graph_edges(graph)
-    _prune_tier0_source_attack_edges(graph)
-    _flush_tier0_source_attack_edge_skip_summary(graph)
-    # After the prune and before the write: every surviving AD CS edge carries
-    # endpoint labels and the report's own finding verdict, so the web AD CS
-    # view reads the engine's decision instead of re-deriving it.
-    stamp_adcs_edge_display_contract(graph, getattr(shell, "domains_data", None))
-    # A recovered secret never reaches the ``finding``-class graph file: each
-    # secret-bearing note field becomes a credential-store reference plus a keyed
-    # fingerprint, and the value is retained in the secret-class sidecar first.
-    # Runs on the in-memory graph too, so the load memo cannot serve the value.
-    redact_graph_for_persist(shell, domain, graph)
-    path = _graph_path(shell, domain)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def after_graph_export(
+    shell: object, domain: str, path: str, graph: Mapping[str, Any]
+) -> None:
+    """What follows every export of ``domain``'s graph (``graph_runtime``).
 
-    edges = graph.get("edges")
-    if isinstance(edges, list):
-        graph["edges"] = sorted(
-            edges,
-            key=lambda e: (
-                (
-                    str(e.get("from", "")),
-                    str(e.get("relation", "")),
-                    str(e.get("to", "")),
-                )
-                if isinstance(e, dict)
-                else ("", "", "")
-            ),
-        )
-
-    write_json_file(path, graph)
-    _invalidate_attack_paths_cache(domain, reason="graph_saved", shell=shell)
-    _invalidate_materialized_attack_path_cache(domain)
-    invalidate_attack_path_artifacts(shell, domain)
+    Records the file and the anonymous scale counters on the session's
+    ``domains_data`` (telemetry reads them back without re-reading the file),
+    drops the attack-path artifacts derived from the previous file, and
+    materialises the graph's exploitation edges as technical findings, so
+    ``technical_report.json`` always describes the exported graph. Best-effort:
+    never raises into the export.
+    """
     try:
         domains_data = getattr(shell, "domains_data", None)
         if isinstance(domains_data, dict):
             domains_data.setdefault(domain, {})["attack_graph_file"] = path
-            # Persist a compact, ANONYMOUS AD-scale fingerprint (counts only, no
-            # principal names) so session telemetry can report per-domain scale
-            # (computers/users/groups + enabled) cheaply at session time without
-            # re-reading the (potentially large) attack_graph.json. Read back by
-            # build_session_ad_scale_metadata(). Plain JSON ints -> safe for
-            # save_workspace_data. Best-effort: never break the graph save.
-            stats = _compute_ad_scale_stats(graph)
+            stats = _compute_ad_scale_stats(dict(graph))
             if stats:
                 domains_data[domain]["collection_stats"] = stats
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
-    _sync_attack_graph_findings_best_effort(shell, domain, graph)
+    try:
+        # The result caches key on the store generation (or the graph's
+        # structure), so nothing stale is reachable; only the artifacts derived
+        # from the previous FILE are dropped here, cheaply.
+        _invalidate_materialized_attack_path_cache(domain)
+        invalidate_attack_path_artifacts(shell, domain)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    _sync_attack_graph_findings_best_effort(shell, domain, dict(graph))
 
 
 def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
@@ -9853,6 +9981,23 @@ def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
     ``enabled`` is fail-open: a node with unknown (``None``) enabled state counts
     as enabled (mirrors ``is_collectable_computer_host``), so ``*_enabled`` is
     "live total minus the explicitly-disabled".
+
+    ``domain_controllers`` counts the live Computer objects the DC-role SSOT
+    (:func:`computer_node_role.classify_computer_node_role`) grades writable
+    DC or RODC. ``certificate_authorities`` counts the enterprise CA objects
+    (``EnterpriseCA`` nodes): they live in the forest's Configuration
+    partition, so every domain of one forest reports the same figure.
+
+    ``servers`` / ``workstations`` / ``os_unknown`` (and their ``enabled_``
+    twins) split the live computers by ``operatingSystem`` through the tier
+    stamp's own rule (:func:`compromise_class.computer_os_kind`); the three add
+    up to ``computers``. ``enabled_computers_tier*`` count the enabled computers
+    by the STAMPED ``privilege_tier`` (:func:`compromise_class.node_stamped_privilege_tier`,
+    never the legacy ``isTierZero``) when membership, role or the computer's own
+    attributes placed it there. A computer placed by a right
+    (:data:`compromise_class.RIGHT_BASED_TIER_BASES`) counts only in
+    ``enabled_computers_tier_by_right``, and one with no stamp only in
+    ``enabled_computers_tier_unknown``; the six add up to ``enabled_computers``.
     """
     nodes = graph.get("nodes")
     if isinstance(nodes, dict):
@@ -9871,7 +10016,26 @@ def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
         "groups": 0,
         "ous": 0,
         "gpos": 0,
+        "domain_controllers": 0,
+        "certificate_authorities": 0,
     }
+    from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+        computer_os_kind,
+        node_stamped_privilege_tier,
+        node_stamped_tier_basis,
+        tier_basis_is_right_based,
+    )
+    from adscan_internal.services.computer_node_role import (  # noqa: PLC0415
+        classify_computer_node_role,
+    )
+
+    os_keys = {"server": "servers", "workstation": "workstations", "unknown": "os_unknown"}
+    for key in os_keys.values():
+        counts[key] = 0
+        counts[f"enabled_{key}"] = 0
+    for key in ("tier0_direct", "tier0_escalation_capable", "tier1", "tier2", "tier_by_right", "tier_unknown"):
+        counts[f"enabled_computers_{key}"] = 0
+
     for node in node_iter:
         if not isinstance(node, dict):
             continue
@@ -9885,8 +10049,28 @@ def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
                 counts["tombstoned_computers"] += 1
             else:
                 counts["computers"] += 1
+                props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+                os_key = os_keys[
+                    computer_os_kind(
+                        props.get("os")
+                        or props.get("operatingsystem")
+                        or props.get("operatingSystem")
+                        or node.get("operatingsystem")
+                    )
+                ]
+                counts[os_key] += 1
                 if enabled is not False:
                     counts["enabled_computers"] += 1
+                    counts[f"enabled_{os_key}"] += 1
+                    tier = node_stamped_privilege_tier(node)
+                    if tier is None:
+                        counts["enabled_computers_tier_unknown"] += 1
+                    elif tier_basis_is_right_based(node_stamped_tier_basis(node)):
+                        counts["enabled_computers_tier_by_right"] += 1
+                    else:
+                        counts[f"enabled_computers_{tier.value}"] += 1
+                if classify_computer_node_role(node) is not None:
+                    counts["domain_controllers"] += 1
         elif kind == "User":
             if tombstoned:
                 counts["tombstoned_users"] += 1
@@ -9895,11 +10079,14 @@ def _compute_ad_scale_stats(graph: dict[str, Any]) -> dict[str, int]:
                 if enabled is not False:
                     counts["enabled_users"] += 1
         elif kind == "Group":
-            counts["groups"] += 1
+            if not tombstoned:
+                counts["groups"] += 1
         elif kind == "OU":
             counts["ous"] += 1
         elif kind == "GPO":
             counts["gpos"] += 1
+        elif kind.lower() == "enterpriseca" and not tombstoned:
+            counts["certificate_authorities"] += 1
     return counts
 
 
@@ -9927,224 +10114,156 @@ def _sync_attack_graph_findings_best_effort(
         )
 
 
-def refresh_attack_graph_execution_support(
-    shell: object, domain: str
-) -> dict[str, int]:
-    """Refresh execution support classification for edges in an existing graph.
+def _execution_support_drift(graph: dict[str, Any], *, keep_outcomes: bool) -> dict[str, int]:
+    """How many edges a status reset would move, by destination status.
 
-    This is used when loading a workspace to keep older `attack_graph.json` files
-    aligned with the current ADscan version's supported/policy-blocked relations.
-
-    Returns:
-        Counts of changes performed.
+    ``keep_outcomes`` leaves execution outcomes, configuration closes and
+    safety abstentions alone (the version reconcile), exactly as the overlay's
+    ``reset_statuses`` op does. Read-only.
     """
-    graph = load_attack_graph(shell, domain)
-    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
-    if not edges:
-        return {"changed": 0}
-
     from adscan_internal.services.destructive_action_policy import (  # noqa: PLC0415
         DANGEROUS_DESTRUCTIVE_MARKER,
     )
 
-    changed = 0
-    to_blocked = 0
-    to_unsupported = 0
-    to_discovered = 0
-    metadata_updated = 0
-
-    for edge in edges:
+    counts = {"changed": 0, "to_blocked": 0, "to_unsupported": 0, "to_discovered": 0}
+    for edge in graph.get("edges") or ():
         if not isinstance(edge, dict):
             continue
         relation = str(edge.get("relation") or "").strip()
         if not relation:
             continue
-        category, vuln_key = _classify_edge_relation(relation)
-        if "discovered_at" not in edge:
-            first_seen = edge.get("first_seen")
-            edge["discovered_at"] = first_seen or _utc_now_iso()
-            changed += 1
-            metadata_updated += 1
-        if edge.get("category") != category or edge.get("vuln_key") != vuln_key:
-            edge["category"] = category
-            edge["vuln_key"] = vuln_key
-            changed += 1
-            metadata_updated += 1
-        current_status = str(edge.get("status") or "discovered").strip().lower()
-        if current_status in {
-            "success",
-            "attempted",
-            "failed",
-            "error",
-            "unavailable",
-            # An environment/topology closure (e.g. single-DC NTLMv1 self-relay
-            # reflection). This is decided by the environment, NOT by the ADscan
-            # version — the exec-support reconcile (a VERSION concern) must never
-            # re-open it as an executable "discovered" step. Without this, a
-            # config-closed edge on a SUPPORTED relation was silently re-stamped
-            # "discovered" and offered for execution.
-            "closed_by_configuration",
-        }:
-            continue
-        # A SAFETY abstention — a destructive step hard-refused by the
-        # destructive-action policy (stamped ``blocked_kind="dangerous_destructive"``)
-        # — is likewise an environment/safety closure, not a version concern.
-        # Re-opening it to "discovered" would offer a destructive action ADscan
-        # deliberately refuses to run. Gated on the safety marker so the
-        # policy_blocked reconcile below (which SETS ``blocked`` on other edges,
-        # and re-derives an opt-in ``blocked_kind="dangerous"`` FCP edge) is
-        # unaffected.
-        if current_status == "blocked":
-            existing = edge.get("notes")
+        current = str(edge.get("status") or "discovered").strip().lower()
+        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+        if keep_outcomes:
+            if current in {
+                "success",
+                "attempted",
+                "failed",
+                "error",
+                "unavailable",
+                # An environment/topology closure is decided by the environment,
+                # not by the ADscan version: never re-opened by a version reconcile.
+                "closed_by_configuration",
+            }:
+                continue
+            # A safety abstention is never re-opened to "discovered".
             if (
-                isinstance(existing, dict)
-                and str(existing.get("blocked_kind") or "").strip()
-                == DANGEROUS_DESTRUCTIVE_MARKER
+                current == "blocked"
+                and str(notes.get("blocked_kind") or "").strip() == DANGEROUS_DESTRUCTIVE_MARKER
             ):
                 continue
-
-        desired_status, desired_notes = _desired_exec_support_state(
-            graph,
-            relation=relation,
-            to_id=str(edge.get("to") or ""),
+        desired, _notes = _desired_exec_support_state(
+            graph, relation=relation, to_id=str(edge.get("to") or "")
         )
+        if desired != current or (not keep_outcomes and "attempts" in notes):
+            counts["changed"] += 1
+            key = f"to_{desired}" if f"to_{desired}" in counts else "to_discovered"
+            if desired != current:
+                counts[key] += 1
+    return counts
 
-        if desired_status != current_status:
-            edge["status"] = desired_status
-            changed += 1
-            if desired_status == "blocked":
-                to_blocked += 1
-            elif desired_status == "unsupported":
-                to_unsupported += 1
-            elif desired_status == "discovered":
-                to_discovered += 1
 
-        existing_notes = edge.get("notes")
-        if not isinstance(existing_notes, dict):
-            existing_notes = {}
-        existing_notes.update(desired_notes)
-        edge["notes"] = existing_notes
+def refresh_attack_graph_execution_support(
+    shell: object, domain: str
+) -> dict[str, int]:
+    """Reconcile edge execution support with this ADscan version.
 
-    if changed:
-        save_attack_graph(shell, domain, graph)
-    return {
-        "changed": changed,
-        "to_blocked": to_blocked,
-        "to_unsupported": to_unsupported,
-        "to_discovered": to_discovered,
-        "metadata_updated": metadata_updated,
-    }
+    Run when a workspace is loaded: an edge whose relation this version
+    supports, blocks by policy or does not support is put back to the status
+    that says so, while execution outcomes, configuration closes and safety
+    abstentions are left alone. One ``reset_statuses`` overlay op (with
+    ``keep_outcomes``), recorded only when something would move, so opening a
+    workspace that is already current writes nothing (and a 14.0.x workspace
+    gets no store just for being opened).
+
+    Returns:
+        Counts of the edges moved.
+    """
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+    from adscan_internal.services.graph_build.overlay import (  # noqa: PLC0415
+        reset_statuses_selector,
+    )
+
+    graph = load_attack_graph(shell, domain)
+    counts = _execution_support_drift(graph, keep_outcomes=True)
+    counts["metadata_updated"] = 0
+    if counts["changed"]:
+        graph_runtime.reset_edge_statuses(
+            shell,
+            domain,
+            selector=reset_statuses_selector(keep_outcomes=True),
+            origin="refresh_attack_graph_execution_support",
+        )
+        # A bulk change: the file follows at once (a report or a reset tool
+        # reads it next).
+        graph_runtime.ensure_export_fresh(shell, domain)
+    return counts
 
 
 def reset_attack_graph_execution_statuses(shell: object, domain: str) -> dict[str, int]:
-    """Reset persisted edge execution states to their support-derived defaults.
+    """Reset every edge execution state to its support-derived default.
 
-    This helper is intended for local testing workflows where operators want to
-    clear all runtime execution outcomes and return the graph to the same status
-    baseline produced by a fresh enumeration.
+    For local testing workflows that clear all runtime execution outcomes and
+    return the graph to the status baseline of a fresh enumeration: one
+    ``reset_statuses`` overlay op. The earlier outcomes stay in the store's op
+    log; the graph no longer shows them.
 
     Returns:
         Counts describing how many edges were updated.
     """
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+    from adscan_internal.services.graph_build.overlay import (  # noqa: PLC0415
+        reset_statuses_selector,
+    )
+
     graph = load_attack_graph(shell, domain)
-    edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
-    if not edges:
-        return {"changed": 0}
-
-    changed = 0
-    to_blocked = 0
-    to_unsupported = 0
-    to_discovered = 0
-    attempts_cleared = 0
-    metadata_updated = 0
-    version = getattr(telemetry, "VERSION", "unknown")
-
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        relation = str(edge.get("relation") or "").strip()
-        if not relation:
-            continue
-
-        category, vuln_key = _classify_edge_relation(relation)
-        if "discovered_at" not in edge:
-            first_seen = edge.get("first_seen")
-            edge["discovered_at"] = first_seen or _utc_now_iso()
-            changed += 1
-            metadata_updated += 1
-        if edge.get("category") != category or edge.get("vuln_key") != vuln_key:
-            edge["category"] = category
-            edge["vuln_key"] = vuln_key
-            changed += 1
-            metadata_updated += 1
-
-        support = _classify_edge_execution_support(
-            graph,
-            relation=relation,
-            to_id=str(edge.get("to") or ""),
+    counts = _execution_support_drift(graph, keep_outcomes=False)
+    counts["attempts_cleared"] = sum(
+        1
+        for edge in graph.get("edges") or ()
+        if isinstance(edge, dict)
+        and isinstance(edge.get("notes"), dict)
+        and "attempts" in edge["notes"]
+    )
+    counts["metadata_updated"] = 0
+    if counts["changed"]:
+        graph_runtime.reset_edge_statuses(
+            shell,
+            domain,
+            selector=reset_statuses_selector(keep_outcomes=False),
+            origin="reset_attack_graph_execution_statuses",
         )
-        desired_status = "discovered"
-        desired_notes: dict[str, Any] = {
-            "exec_support": support.kind,
-            "exec_support_version": version,
-        }
-        if support.kind == "policy_blocked":
-            desired_status = "blocked"
-            desired_notes.update(
-                _policy_blocked_edge_notes(
-                    graph,
-                    relation=relation,
-                    to_id=str(edge.get("to") or ""),
-                    support=support,
-                )
-            )
-        elif support.kind == "unsupported":
-            desired_status = "unsupported"
-            desired_notes.update(
-                {
-                    "blocked_kind": "unsupported",
-                    "reason": support.reason,
-                    "exec_support": "unsupported",
-                }
-            )
+        # A bulk change: the file follows at once (a report or a reset tool
+        # reads it next).
+        graph_runtime.ensure_export_fresh(shell, domain)
+    return counts
 
-        current_status = str(edge.get("status") or "discovered").strip().lower()
-        if desired_status != current_status:
-            edge["status"] = desired_status
-            changed += 1
-            if desired_status == "blocked":
-                to_blocked += 1
-            elif desired_status == "unsupported":
-                to_unsupported += 1
-            else:
-                to_discovered += 1
 
-        existing_notes = edge.get("notes")
-        if not isinstance(existing_notes, dict):
-            existing_notes = {}
-        if "attempts" in existing_notes:
-            existing_notes.pop("attempts", None)
-            attempts_cleared += 1
-            changed += 1
-        existing_notes.update(desired_notes)
-        edge["notes"] = existing_notes
+def _graph_recorder(graph: Any) -> Any:
+    """The ``graph_runtime`` recorder writing ``graph``, or ``None``.
 
-    if changed:
-        save_attack_graph(shell, domain, graph)
-    return {
-        "changed": changed,
-        "to_blocked": to_blocked,
-        "to_unsupported": to_unsupported,
-        "to_discovered": to_discovered,
-        "attempts_cleared": attempts_cleared,
-        "metadata_updated": metadata_updated,
-    }
+    Nothing records until ``graph_runtime`` is imported (it opens the
+    recorders), so a graph built in a test, the collector or a derivation pass
+    is never intercepted.
+    """
+    runtime = sys.modules.get("adscan_internal.services.graph_runtime")
+    if runtime is None:
+        return None
+    return runtime.active_recorder(graph)
 
 
 def upsert_nodes(
     graph: dict[str, Any], nodes: Iterable[dict[str, Any]]
 ) -> dict[str, str]:
-    """Upsert nodes and return a mapping of their computed ids."""
+    """Upsert nodes and return a mapping of their computed ids.
+
+    On a store-backed graph inside ``graph_runtime.mutate`` the upsert is
+    recorded as overlay ops (and applied through this same function), so the
+    change survives every rebuild.
+    """
+    recorder = _graph_recorder(graph)
+    if recorder is not None:
+        return recorder.upsert_nodes(nodes)
     node_map: dict[str, Any] = graph.setdefault("nodes", {})
     if not isinstance(node_map, dict):
         node_map = {}
@@ -10153,6 +10272,12 @@ def upsert_nodes(
     computed: dict[str, str] = {}
     graph_domain = str(graph.get("domain") or "").strip()
     domain_upper = graph_domain.upper() if graph_domain else ""
+    # The duplicate-label probe below asks "which node already carries this
+    # label?" once per upserted node. Answered by a linear walk over every node
+    # that is O(N^2) per call (minutes on a 59k-node directory, on every
+    # collector checkpoint), so it is answered from a label index kept in step
+    # with the merges this loop makes.
+    label_index = _NodeLabelIndex(node_map)
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -10163,7 +10288,7 @@ def upsert_nodes(
         kind = _node_kind(node)
         nid = _node_id(node)
         computed[_node_display_name(node)] = nid
-        existing_best_id = _find_node_id_by_label(graph, _node_display_name(node))
+        existing_best_id = label_index.best_id(graph, _node_display_name(node))
         if existing_best_id and existing_best_id != nid:
             maintenance = graph.setdefault("maintenance", {})
             if isinstance(maintenance, dict):
@@ -10329,8 +10454,70 @@ def upsert_nodes(
         merged["kind"] = _node_kind(merged)
         merged["label"] = _canonical_node_label(merged)
         node_map[nid] = merged
+        label_index.refresh(nid, merged)
 
     return computed
+
+
+class _NodeLabelIndex:
+    """Label lookups over one node map, with ``_find_node_id_by_label`` semantics.
+
+    Two buckets per node, the two passes of the linear lookup: the exact label
+    (stripped, upper-cased) and the normalized account name. A query ranks the
+    bucket's candidates with the same quality score and tie-break as the linear
+    walk, against their CURRENT content, so the answer is identical. Built once
+    per ``upsert_nodes`` call and refreshed per merged node; never cached across
+    calls.
+    """
+
+    __slots__ = ("_nodes", "_exact", "_normalized", "_keys")
+
+    def __init__(self, nodes_map: dict[str, Any]) -> None:
+        self._nodes = nodes_map
+        self._exact: dict[str, set[str]] = {}
+        self._normalized: dict[str, set[str]] = {}
+        self._keys: dict[str, tuple[str, str]] = {}
+        for node_id, node in nodes_map.items():
+            self.refresh(node_id, node)
+
+    def refresh(self, node_id: Any, node: Any) -> None:
+        """(Re)index ``node_id`` after it was inserted or merged."""
+        nid = str(node_id)
+        previous = self._keys.pop(nid, None)
+        if previous is not None:
+            self._exact.get(previous[0], set()).discard(nid)
+            self._normalized.get(previous[1], set()).discard(nid)
+        if not isinstance(node, dict):
+            return
+        raw_label = str(node.get("label") or "")
+        exact_key = raw_label.strip().upper()
+        normalized_key = _normalize_account(raw_label)
+        self._keys[nid] = (exact_key, normalized_key)
+        self._exact.setdefault(exact_key, set()).add(nid)
+        self._normalized.setdefault(normalized_key, set()).add(nid)
+
+    def best_id(self, graph: dict[str, Any], label: str) -> str | None:
+        """Same answer as ``_find_node_id_by_label(graph, label)``."""
+        del graph  # the index is bound to the node map it was built from
+        exact = str(label or "").strip().upper()
+        if exact:
+            best = self._best_of(self._exact.get(exact))
+            if best is not None:
+                return best
+        return self._best_of(self._normalized.get(_normalize_account(label)))
+
+    def _best_of(self, node_ids: set[str] | None) -> str | None:
+        if not node_ids:
+            return None
+        ranked: list[tuple[int, str]] = []
+        for nid in node_ids:
+            node = self._nodes.get(nid)
+            if isinstance(node, dict):
+                ranked.append((_node_label_quality_score(node), nid))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        return ranked[0][1]
 
 
 # Edge identity beyond (from, relation, to) is the shared SSOT the web
@@ -10372,335 +10559,163 @@ def _edge_matches_upsert_identity(
     return True
 
 
-# Cache of the baked technique-knowledge object, keyed by
-# ``(relation, source_is_tier0_direct)``. The prose is pure (a function of the
-# relation, that one flag, and the static VULN_CATALOG), so resolving it once
-# per key per process avoids re-running the catalog join on every
-# ``upsert_edge`` call at 1-2k-host scale.
-_EDGE_KNOWLEDGE_CACHE: dict[tuple[str, bool], dict[str, Any]] = {}
-
-
-def _bake_edge_technique_knowledge(
-    relation_norm: str,
+def _incoming_edge_upsert_key(
     *,
-    source_is_tier0_direct: bool = False,
-) -> dict[str, Any] | None:
-    """Resolve the rich technique-knowledge object for one edge relation.
+    from_id: str,
+    to_id: str,
+    relation: str,
+    incoming_notes: dict[str, Any] | None,
+) -> tuple[Any, Any, str, str]:
+    """Identity key of an edge about to be upserted.
 
-    The persisted attack-graph artifact (``attack_graph.json``) is ingested by
-    the paid web, which must NOT import the PRO ``VULN_CATALOG``. So the CLI
-    engine (which HAS the catalog) bakes the per-edge technique prose here and
-    the web reads it straight from the ingested edge — mirroring how findings
-    carry their ``knowledge`` block (commit ``fdf34348``).
-
-    Reuses ``build_step_knowledge`` (the single source of truth for per-step
-    technique prose that already feeds ``attack_paths_snapshot.json``) so the
-    edge card and the path-step card read identical prose. The join is lazy +
-    best-effort: an edge whose relation has no catalog entry, or a LITE/runtime
-    context without the PRO catalog, yields ``None`` and no ``knowledge`` is
-    stamped (the panel then falls back to its generic blurb).
-
-    Args:
-        relation_norm: The already-normalized edge relation.
-        source_is_tier0_direct: True when the edge's SOURCE is already a Tier 0
-            direct principal, so the catalog renders the structural-hierarchy
-            line instead of removal advice (the web edge panel would otherwise
-            tell a client to strip replication rights off its own domain
-            controllers). Part of the cache key — at most two entries per
-            relation.
-
-    Returns:
-        The technique-knowledge dict (``description``, ``impact``,
-        ``remediation``, ``references``, ``mitre_technique_id/name``,
-        ``vuln_key``), or ``None`` when the relation maps to no technique.
+    Equal keys are exactly the pairs ``_edge_matches_upsert_identity`` accepts:
+    same ``from``, ``to`` and relation string, and the same share identity (empty
+    for a relation outside the share-access family, or for a share edge naming
+    no share).
     """
-    if not relation_norm:
-        return None
-    cache_key = (relation_norm, bool(source_is_tier0_direct))
-    cached = _EDGE_KNOWLEDGE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached or None
-    try:
-        knowledge = build_step_knowledge(
-            {
-                "relation": relation_norm,
-                "details": {
-                    "source_privilege_tier": (
-                        PrivilegeTier.TIER0_DIRECT.value
-                        if source_is_tier0_direct
-                        else PrivilegeTier.TIER2.value
-                    )
-                },
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        knowledge = None
-
-    baked: dict[str, Any] | None = None
-    # Only TECHNIQUE edges carry baked knowledge — those that resolve to a
-    # ``vuln_key`` (ESC1, DCSync, Kerberoast, ...). Structural edges (MemberOf,
-    # Contains, GpLink) resolve generic prose with no ``vuln_key``; they stay
-    # clean so the web panel shows them as plain relations, not techniques.
-    catalog_key = (
-        str(knowledge.get("vuln_key") or "").strip()
-        if isinstance(knowledge, dict)
-        else ""
-    )
-    if isinstance(knowledge, dict) and knowledge and catalog_key:
-        baked = knowledge
-        # Enrich with the catalog's title + severity so the web edge panel can
-        # render a contextual severity band without the PRO catalog. Lazy +
-        # best-effort: a LITE/runtime context without the catalog keeps the
-        # base prose ``build_step_knowledge`` already resolved. Only the edge
-        # artifact carries these — the shared path-step knowledge shape (which
-        # also feeds the report) is intentionally left unchanged.
-        try:
-            from adscan_internal.pro.reporting.vuln_catalog import VULN_CATALOG
-
-            catalog_entry = VULN_CATALOG.get(catalog_key)
-        except Exception:  # noqa: BLE001
-            catalog_entry = None
-        if isinstance(catalog_entry, dict):
-            title = str(catalog_entry.get("title") or "").strip()
-            severity = str(catalog_entry.get("severity") or "").strip()
-            if title:
-                baked["title"] = title
-            if severity:
-                baked["severity"] = severity
-    # Cache the resolved value (even a no-technique resolution, stored as ``{}``)
-    # so a relation without a technique mapping is not re-resolved on every
-    # upsert at scale.
-    _EDGE_KNOWLEDGE_CACHE[cache_key] = baked if isinstance(baked, dict) else {}
-    return baked
+    return (from_id, to_id, relation, _edge_share_identity(relation, incoming_notes))
 
 
-#: Relations whose execution seams stamp a defensive-posture observation onto
-#: the active attack step: the credential-dump family (LSASS, and the registry
-#: secrets reads behind DumpLSA / DumpSAM). The posture renderers are keyed on
-#: the STAMPED FIELD, not on the relation, which is right for the report (the
-#: PDF reads the step it was stamped on). The edge bake needs the relation too,
-#: because the stamp lands on "the active step" and a knowledge block invented
-#: for a structural edge that happened to carry dump notes would be a claim
-#: about a technique that edge does not represent.
-#: The relations whose edges can carry a defensive-posture stamp, as
-#: ``_normalize_relation_key`` spells them (lower-case, punctuation-free).
-#:
-#: Keyed through that normalizer deliberately. ``_normalize_relation`` only
-#: strips whitespace and PRESERVES CASE, so an edge arrives as ``DumpSAM`` and
-#: a lower-case membership test never matched: the posture sentence was dropped
-#: for every relation, which made the fix that introduced this set a no-op in
-#: production. Its own contract test could not catch it, because that module
-#: imports the web backend and skips wherever sqlalchemy is absent, which is
-#: CI and most working copies.
-#:
-#: ``backupoperatorescalation`` belongs here on the same evidence as the other
-#: three: ``cli/dumps.py`` derives registry posture notes at four call sites
-#: and stamps the fourth onto that edge, "mirroring DumpLSA/DumpSAM exactly".
-#: ``DumpDPAPI`` is correctly absent, because no call site derives posture
-#: notes for it.
-_POSTURE_BEARING_RELATIONS: frozenset[str] = frozenset(
-    {
-        "dumplsass",
-        "dumplsa",
-        "dumpsam",
-        "backupoperatorescalation",
-        "backupoperatorsescalation",
-        "dumpdpapi",
-    }
-)
+def _existing_edge_upsert_key(edge: dict[str, Any]) -> tuple[Any, Any, str, str]:
+    """Identity key of an edge already in ``graph["edges"]`` (see above)."""
+    relation = str(edge.get("relation") or "")
+    notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
+    return (edge.get("from"), edge.get("to"), relation, _edge_share_identity(relation, notes))
 
 
-def _render_edge_posture_context(
-    relation_norm: str, edge_notes: dict[str, Any] | None
-) -> str:
-    """Render THIS edge's defensive-posture sentence, or ``""``.
+#: Lookups an :class:`EdgeUpsertIndex` answers with a plain scan before it
+#: builds its map. Building costs about five scans (a key per edge against a
+#: cheap early-exit compare), so a caller that upserts once or twice pays no
+#: more than the scan it always paid, and a bulk caller pays at most a few
+#: extra scans before every lookup turns O(1).
+_EDGE_INDEX_LINEAR_LOOKUPS = 4
 
-    Bakes the posture context onto the edge so the web CTEM renders the SAME
-    authored sentence the PDF reads from the step details. Built from this edge's
-    posture notes (stamped at the dump seam), through the SAME catalog SSOT
-    (``render_lsass_posture_context`` / ``render_registry_posture_context``) —
-    one authored string per technique, one shared edge field
-    (``defensive_posture_context``), zero drift.
 
-    The two renders key on DIFFERENT, non-overlapping stamp fields
-    (``lsass_dump_outcome`` vs ``registry_dump_outcome``), so at most one ever
-    produces a non-empty sentence for a given edge; trying both is safe. Empty
-    for any edge without posture notes (a non-dump edge, or a dump edge scanned
-    before the dump ran), so it never fabricates a claim. Best-effort: any
-    failure yields ``""`` and leaves the knowledge block clean.
+class EdgeUpsertIndex:
+    """Edge identity -> edge, so a BULK ``upsert_edge`` is O(1) per edge.
+
+    Without it ``upsert_edge`` scans ``graph["edges"]`` linearly, which is fine
+    for a single runtime update and ruinous in a loop: the collector's persist
+    upserts every collected edge, so one persist cost O(E^2) (about an hour on a
+    717k-edge directory, repeated on every mid-sweep checkpoint).
+
+    Semantics are the linear scan's, exactly: the key is the identity
+    ``_edge_matches_upsert_identity`` compares, and a key maps to the FIRST edge
+    in list order carrying it (a legacy graph can hold duplicates).
+
+    Any loop that upserts may pass one: the first few lookups are plain scans
+    (see ``_EDGE_INDEX_LINEAR_LOOKUPS``), after which the map is built. It
+    follows the list it indexes: if ``graph["edges"]`` is replaced by another
+    list or its length changed outside ``upsert_edge(index=...)`` (a prune), the
+    next lookup rebuilds. The one mutation it cannot see is an in-place swap
+    that keeps the length, so a caller only edits the edge list through
+    ``upsert_edge`` while it holds one.
     """
-    if (
-        not edge_notes
-        or _normalize_relation_key(relation_norm) not in _POSTURE_BEARING_RELATIONS
-    ):
-        return ""
-    try:
-        from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
-            render_dpapi_posture_context,
-            render_lsass_posture_context,
-            render_registry_posture_context,
-        )
 
-        # The three renderers key on DIFFERENT, non-overlapping stamp fields
-        # (``lsass_dump_outcome`` / ``registry_dump_outcome`` /
-        # ``dpapi_dump_outcome``), so at most one ever produces a sentence for
-        # a given edge and trying each in turn is safe.
-        posture_step = {"relation": relation_norm, "details": dict(edge_notes)}
-        return (
-            render_lsass_posture_context(posture_step)
-            or render_registry_posture_context(posture_step)
-            or render_dpapi_posture_context(posture_step)
-        )
-    except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
-        telemetry.capture_exception(exc)
-        return ""
+    __slots__ = ("_edges", "_count", "_by_key", "_dirty", "_linear_left")
 
+    def __init__(self) -> None:
+        self._edges: list[Any] | None = None
+        self._count = -1
+        self._by_key: dict[tuple[Any, Any, str, str], dict[str, Any]] | None = None
+        self._dirty = True
+        self._linear_left = _EDGE_INDEX_LINEAR_LOOKUPS
 
-def _personalize_edge_knowledge(
-    relation_norm: str,
-    edge_notes: dict[str, Any] | None,
-    *,
-    source_is_tier0_direct: bool = False,
-    dc_ip: str = "",
-    domain: str = "",
-) -> dict[str, Any] | None:
-    """Weave THIS edge's concrete assets into its baked technique knowledge.
+    def _sync(self, edges: list[Any]) -> dict[tuple[Any, Any, str, str], dict[str, Any]]:
+        if (
+            self._by_key is not None
+            and not self._dirty
+            and edges is self._edges
+            and len(edges) == self._count
+        ):
+            return self._by_key
+        by_key: dict[tuple[Any, Any, str, str], dict[str, Any]] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            key = _existing_edge_upsert_key(edge)
+            try:
+                if key not in by_key:
+                    by_key[key] = edge
+            except TypeError:
+                # An unhashable from/to never equals a string id: the linear
+                # scan could not match it either.
+                continue
+        self._by_key = by_key
+        self._edges = edges
+        self._count = len(edges)
+        self._dirty = False
+        return by_key
 
-    The base knowledge from :func:`_bake_edge_technique_knowledge` is shared
-    (cached) per relation, so it carries the generic catalog prose. This builds
-    a per-edge COPY whose impact/remediation name the exact assets on this edge
-    (the abused certificate template, the enrolling principal), so the paid web
-    edge-detail panel reads "ESC1 (DOMAIN USERS can enrol)" instead of "the
-    affected template". Never mutates the cached base. Returns ``None`` when the
-    relation maps to no technique (so the caller stamps nothing).
+    def prime(self, edges: list[Any]) -> "EdgeUpsertIndex":
+        """Build the map now, skipping the plain-scan phase.
 
-    The cached base bakes the independent-verification commands from a synthetic,
-    context-free step, so its ``verify_windows``/``verify_linux`` carry the
-    literal ``<dc_ip>``/``<domain>`` tokens. When the caller passes this edge's
-    environment coordinates (``dc_ip`` from the graph's ``resolve_dc_ip`` stamp,
-    ``domain`` from the graph), the verify block is re-rendered against a step
-    carrying them plus this edge's source/target, so the web CTEM shows a
-    copy-paste command with the real DC IP and domain — parity with the report,
-    which re-renders the same block at PDF-build time. ``<user>``/``<pass>`` are
-    NEVER substituted (the credential must never land in the CTEM). Absent
-    coordinates leave the literal tokens in place.
-
-    Mirrors the finding-side weave in
-    ``report_service.sync_attack_graph_findings`` via the SAME affected-assets
-    SSOT, so the edge card and the finding card name identical assets.
-    """
-    base = _bake_edge_technique_knowledge(
-        relation_norm, source_is_tier0_direct=source_is_tier0_direct
-    )
-    if not isinstance(edge_notes, dict) or not edge_notes:
-        edge_notes = {}
-    posture_context = _render_edge_posture_context(relation_norm, edge_notes)
-    if not isinstance(base, dict) or not base:
-        # No catalog TECHNIQUE prose for this relation. That is the normal case
-        # for a structural edge (MemberOf, Contains, GpLink), which must stay
-        # clean -- but it is ALSO the case for the credential-dump family
-        # (DumpLSASS / DumpLSA / DumpSAM), whose catalog entries carry no
-        # ``vuln_key`` and therefore no baked base. Those edges are exactly the
-        # ones that carry a defensive-posture observation, so returning the bare
-        # base here dropped the authored sentence on the way to the web CTEM
-        # while the PDF read it straight from the step details -- the one surface
-        # divergence the posture narrative exists to avoid. The sentence is an
-        # EDGE-OBSERVED fact, not catalog prose, so it travels on its own.
-        # Non-empty only for an edge the dump seam actually stamped, so a
-        # structural edge still grows nothing.
-        return {"defensive_posture_context": posture_context} if posture_context else base
-    # Re-render the verification commands against this edge's real coordinates so
-    # the web CTEM's copy-paste verify block carries the DC IP + domain, matching
-    # the report. Only when the graph supplied at least one coordinate and the
-    # base actually carries a verify block. Best-effort: any failure keeps the
-    # generic (literal-token) verify already on the base.
-    verify_override: dict[str, Any] = {}
-    if (dc_ip or domain) and (
-        base.get("verify_windows") or base.get("verify_linux") or base.get("verification")
-    ):
-        try:
-            from adscan_core.reporting.verification_model import (  # noqa: PLC0415
-                legacy_text_from_items,
-            )
-            from adscan_internal.services.attack_step_catalog import (  # noqa: PLC0415
-                render_step_verification,
-            )
-
-            verify_step = {
-                "relation": relation_norm,
-                "details": {
-                    **edge_notes,
-                    "from": str(edge_notes.get("source_label") or ""),
-                    "to": str(edge_notes.get("target_label") or ""),
-                    **({"dc_ip": dc_ip} if dc_ip else {}),
-                    **({"domain": domain} if domain else {}),
-                },
-            }
-            rendered = render_step_verification(verify_step)
-            if rendered["verify"] or rendered["exploit"]:
-                verify_override["verification"] = rendered
-            windows = legacy_text_from_items(rendered["verify"], "windows")
-            linux = legacy_text_from_items(rendered["verify"], "linux")
-            if windows and base.get("verify_windows"):
-                verify_override["verify_windows"] = windows
-            if linux and base.get("verify_linux"):
-                verify_override["verify_linux"] = linux
-        except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
-            telemetry.capture_exception(exc)
-
-    def _with_verify(result: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Overlay the re-rendered verify commands + posture context onto a
-        knowledge dict.
-
-        Copies before mutating so the cached base is never touched. A no-op when
-        there is nothing to overlay (no verify override AND no posture context).
+        For a graph that will take many single writes over its life (the
+        runtime's live graph): every lookup is then O(1) from the first, and the
+        one O(E) pass is paid where the graph was built, not by a write.
         """
-        if not isinstance(result, dict):
-            return result
-        if not verify_override and not posture_context:
-            return result
-        merged = dict(result)
-        merged.update(verify_override)
-        if posture_context:
-            merged["defensive_posture_context"] = posture_context
-        return merged
+        self._linear_left = 0
+        self._sync(edges)
+        return self
 
-    if not edge_notes and not verify_override and not posture_context:
-        return base
-    try:
-        from adscan_internal.pro.reporting.finding_specifics import (
-            weave_specifics_into_knowledge,
+    def find(
+        self,
+        edges: list[Any],
+        *,
+        from_id: str,
+        to_id: str,
+        relation: str,
+        incoming_notes: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, tuple[Any, Any, str, str]]:
+        """Return ``(first matching edge or None, the incoming identity key)``."""
+        key = _incoming_edge_upsert_key(
+            from_id=from_id, to_id=to_id, relation=relation, incoming_notes=incoming_notes
         )
-    except Exception:  # noqa: BLE001 — LITE/runtime without the PRO catalog
-        return _with_verify(base)
-    vuln_key = str(base.get("vuln_key") or "").strip()
-    if not vuln_key:
-        return _with_verify(base)
-    if not edge_notes:
-        # Coordinates but no per-edge assets to weave — just overlay verify.
-        return _with_verify(base)
-    # Synthesise the minimal ``details`` shape the specifics SSOT expects: one
-    # attack-graph edge whose source/target/notes carry the concrete assets.
-    synthetic_details = {
-        "attack_graph_edges": [
-            {
-                "relation": relation_norm,
-                "source": edge_notes.get("source_label") or "",
-                "target": edge_notes.get("target_label") or "",
-                "notes": edge_notes,
-            }
-        ]
-    }
-    try:
-        return _with_verify(
-            weave_specifics_into_knowledge(vuln_key, base, synthetic_details)
-        )
-    except Exception as exc:  # noqa: BLE001 — edge baking must never break the graph
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return _with_verify(base)
+        if self._by_key is None and self._linear_left > 0:
+            self._linear_left -= 1
+            for edge in edges:
+                if isinstance(edge, dict) and _edge_matches_upsert_identity(
+                    edge,
+                    from_id=from_id,
+                    to_id=to_id,
+                    relation=relation,
+                    incoming_notes=incoming_notes,
+                ):
+                    return edge, key
+            return None, key
+        by_key = self._sync(edges)
+        try:
+            return by_key.get(key), key
+        except TypeError:
+            return None, key
+
+    def appended(self, edges: list[Any], edge: dict[str, Any]) -> None:
+        """Record that ``upsert_edge`` appended ``edge`` to ``edges``."""
+        if self._by_key is None:
+            return  # still in the plain-scan phase: nothing to keep in step
+        if not self._dirty and edges is self._edges and len(edges) == self._count + 1:
+            self._count += 1
+            try:
+                self._by_key.setdefault(_existing_edge_upsert_key(edge), edge)
+            except TypeError:
+                pass
+            return
+        self._dirty = True
+
+    def invalidate(self) -> None:
+        """Forget the map: the edge list changed in a way the index cannot see
+        (an edge removed). The next lookup rebuilds it."""
+        self._dirty = True
+
+    def updated(self, edge: dict[str, Any], old_key: tuple[Any, Any, str, str]) -> None:
+        """Record that a matched edge was updated in place (its notes merged).
+
+        A merge that changed the edge's identity (in practice it never does: the
+        incoming share name is the edge's own) invalidates the index rather than
+        guessing which earlier edge now owns either key.
+        """
+        if self._by_key is not None and _existing_edge_upsert_key(edge) != old_key:
+            self._dirty = True
 
 
 #: Statuses a "not needed" write may put back to ``discovered``: the ones a
@@ -10718,17 +10733,41 @@ def upsert_edge(
     status: str = "discovered",
     notes: dict[str, Any] | None = None,
     log_creation: bool = True,
+    index: EdgeUpsertIndex | None = None,
+    tier0_source_checked: bool = False,
 ) -> dict[str, Any]:
     """Upsert an edge.
 
     Most relations are keyed by ``(from, relation, to)``. SMB share-access
     relations are additionally keyed by share name because the same principal
     can legitimately have different access to multiple shares on one host.
+
+    ``index`` makes the identity lookup O(1). A caller that upserts in a loop
+    (the collector persist, any derivation over the whole graph) MUST pass one
+    :class:`EdgeUpsertIndex` for the whole loop; without it every call scans the
+    edge list. The result is identical either way.
+
+    ``tier0_source_checked`` says the caller already ran
+    :func:`_edge_has_tier0_source` for this edge and it was not a Tier-0-source
+    edge (and recorded the skip itself when it was), so the check is not
+    repeated. Only a caller that applies that exact check may pass it.
     """
+    recorder = _graph_recorder(graph)
+    if recorder is not None:
+        # A store-backed graph inside ``graph_runtime.mutate``: the write is an
+        # overlay op, applied through this same function by the overlay.
+        return recorder.upsert_edge(
+            from_id=from_id,
+            to_id=to_id,
+            relation=relation,
+            edge_type=edge_type,
+            status=status,
+            notes=notes,
+        )
     relation_norm = _normalize_relation(relation)
     if not from_id or not to_id or not relation_norm:
         return {}
-    if _edge_has_tier0_source(
+    if not tier0_source_checked and _edge_has_tier0_source(
         graph, from_id=from_id, relation=relation_norm, to_id=to_id
     ):
         _record_tier0_source_attack_edge_skip(graph, relation=relation_norm)
@@ -10770,13 +10809,6 @@ def upsert_edge(
                 "exec_support": support.kind,
                 "exec_support_version": version,
             }
-    # Is this edge built-in AD hierarchy (its SOURCE is already Tier 0 direct)?
-    # Resolved once and threaded into the baked technique knowledge, so the paid
-    # web edge panel never advises removing a right the domain needs to run.
-    _graph_nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    source_is_tier0_direct = is_structural_hierarchy_source(
-        _graph_nodes.get(from_id) if isinstance(_graph_nodes, dict) else None
-    )
     choke_point_notes = classify_attack_graph_edge_choke_point(
         graph,
         from_id=from_id,
@@ -10796,10 +10828,22 @@ def upsert_edge(
         graph["edges"] = edges
 
     now = _utc_now_iso()
-    for edge in edges:
+    if index is not None:
+        indexed_match, upsert_key = index.find(
+            edges,
+            from_id=from_id,
+            to_id=to_id,
+            relation=relation_norm,
+            incoming_notes=notes,
+        )
+        candidates: Iterable[Any] = (indexed_match,) if indexed_match is not None else ()
+    else:
+        upsert_key = None
+        candidates = edges
+    for edge in candidates:
         if not isinstance(edge, dict):
             continue
-        if _edge_matches_upsert_identity(
+        if index is not None or _edge_matches_upsert_identity(
             edge,
             from_id=from_id,
             to_id=to_id,
@@ -10853,68 +10897,40 @@ def upsert_edge(
             # with. Notes MERGE, so without this an edge stamped a choke point by
             # an older build keeps that stamp — and its severity — for the life
             # of the workspace, even after the classifier learned the transition
-            # was built-in AD hierarchy. Same heal-on-re-sync contract the baked
-            # ``knowledge`` block below follows.
+            # was built-in AD hierarchy.
             if choke_point_notes is None:
                 for stale_key in CHOKE_POINT_VERDICT_NOTE_KEYS:
                     merged_notes.pop(stale_key, None)
             if merged_notes:
                 edge["notes"] = merged_notes
-            # Bake the technique-knowledge prose so the paid web edge panel can
-            # render it without importing the PRO catalog. Personalised with THIS
-            # edge's concrete assets (template name, enrolling principal) from the
-            # merged notes, so the web edge-detail names the exact assets. Healed
-            # on re-sync: stamp when present, drop a stale block if the relation
-            # no longer maps to a technique.
-            baked_knowledge = _personalize_edge_knowledge(
-                relation_norm,
-                merged_notes,
-                source_is_tier0_direct=source_is_tier0_direct,
-                dc_ip=str(graph.get("dc_ip") or "").strip(),
-                domain=str(graph.get("domain") or "").strip(),
-            )
-            if baked_knowledge:
-                edge["knowledge"] = baked_knowledge
-            elif "knowledge" in edge:
-                edge.pop("knowledge", None)
+            if index is not None and upsert_key is not None:
+                index.updated(edge, upsert_key)
             return edge
 
     share_identity = _edge_share_identity(relation_norm, notes)
     edge_id_input = f"{from_id}|{relation_norm}|{to_id}|{edge_type}|{share_identity}"
     edge_id = hashlib.md5(edge_id_input.encode("utf-8")).hexdigest()
-    entry: dict[str, Any] = {
-        "id": edge_id,
-        "from": from_id,
-        "to": to_id,
-        "relation": relation_norm,
-        # Phase 2: canonical EdgeKind persisted as a top-level field. See
-        # adscan_internal/services/edge_kind.py for the catalog.
-        "kind": classify_edge_kind(relation_norm).value,
-        "edge_type": edge_type,
-        "category": edge_category,
-        "vuln_key": edge_vuln_key,
-        "status": desired_status,
-        "notes": {**(notes or {}), **desired_notes},
-        "discovered_at": now,
-        "first_seen": now,
-        "last_seen": now,
-    }
-    # Bake the rich technique-knowledge prose onto the edge so the paid web edge
-    # panel renders a high-level + technical brief without importing the PRO
-    # catalog. Personalised with THIS edge's concrete assets (template name,
-    # enrolling principal) so the web edge-detail names the exact assets. Only
-    # technique edges (those with a resolvable catalog entry) carry it;
-    # structural edges (MemberOf, Contains, ...) stay clean.
-    baked_knowledge = _personalize_edge_knowledge(
-        relation_norm,
-        entry.get("notes") if isinstance(entry.get("notes"), dict) else None,
-        source_is_tier0_direct=source_is_tier0_direct,
-        dc_ip=str(graph.get("dc_ip") or "").strip(),
-        domain=str(graph.get("domain") or "").strip(),
+    # A key-sharing dict with interned vocabulary (``adscan_core.graph_compact``):
+    # the same fields and key order as the literal it replaces. ``kind`` is the
+    # canonical EdgeKind (``services/edge_kind.py``).
+    entry: dict[str, Any] = make_edge(
+        id=edge_id,
+        from_=from_id,
+        to=to_id,
+        relation=relation_norm,
+        kind=classify_edge_kind(relation_norm).value,
+        edge_type=edge_type,
+        category=edge_category,
+        vuln_key=edge_vuln_key,
+        status=desired_status,
+        notes={**(notes or {}), **desired_notes},
+        discovered_at=now,
+        first_seen=now,
+        last_seen=now,
     )
-    if baked_knowledge:
-        entry["knowledge"] = baked_knowledge
     edges.append(entry)
+    if index is not None:
+        index.appended(edges, entry)
     if log_creation:
         try:
 
@@ -11276,6 +11292,7 @@ def _iter_runtime_graph_edges(graph: dict[str, Any]) -> Iterator[dict[str, Any]]
         yield from _expand_collectable_computers_scope_edge(graph, edge)
 
 
+@_runtime_writer("record_credential_source_steps")
 def record_credential_source_steps(
     shell: object,
     domain: str,
@@ -11690,35 +11707,60 @@ def _write_edge_status_in_graph(
     to_label: str,
     notes: dict[str, Any] | None,
 ) -> bool:
-    """Upsert the edge status into ``graph`` and persist ``domain``'s graph.
+    """Record the edge status in ``domain``'s graph through the runtime overlay.
+
+    ``graph`` is the graph the endpoints were resolved in (the session's live
+    graph of the domain). The write is one overlay op (``graph_runtime``): the
+    file is not rewritten. On a frozen workspace the status is applied in
+    memory only, as before.
 
     Returns False when the upsert refused the edge (a Tier-0-source edge the
     graph does not keep), so a caller never reports a status it did not record.
     """
-    written = upsert_edge(
-        graph,
-        from_id=from_id,
-        to_id=to_id,
-        relation=relation,
-        edge_type="runtime",
-        status=status,
-        notes=notes,
-    )
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    with graph_runtime.mutate(shell, domain, origin="update_edge_status_by_labels") as live:
+        written = upsert_edge(
+            live if live is not None else graph,
+            from_id=from_id,
+            to_id=to_id,
+            relation=relation,
+            edge_type="runtime",
+            status=status,
+            notes=notes,
+        )
     if not written:
         print_info_debug(
             "attack-graph: Edge status update skipped: "
             f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
-            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            f"from={markup_object_label(from_label)} to={markup_object_label(to_label)} "
             "reason=upsert_refused_tier0_source"
         )
         return False
-    save_attack_graph(shell, domain, graph)
     print_info_debug(
         "[attack-graph] Edge status updated: "
         f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
-        f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')}"
+        f"from={markup_object_label(from_label)} to={markup_object_label(to_label)}"
     )
     return True
+
+
+def _graph_for_runtime_write(shell: object, domain: str) -> dict[str, Any]:
+    """The graph a runtime writer resolves endpoints in: the session's live
+    graph of ``domain`` without the deferred post-overlay passes (a status
+    write must not pay for them), or the file graph when there is no store."""
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    try:
+        live = graph_runtime.live_graph(shell, domain, finalize=False)
+    except Exception as exc:  # noqa: BLE001 - an unopenable store: the file graph
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        live = None
+    # No store yet (a 14.0.x workspace, a fresh domain): resolve in the file
+    # graph; the write itself creates the store and imports that graph, which
+    # keeps every node id.
+    return live if live is not None else load_attack_graph(shell, domain)
 
 
 def _is_cross_domain_relation(relation: str) -> bool:
@@ -11850,12 +11892,22 @@ def _materialize_trust_partner_domain_endpoint(
     known, sid = _trust_partner_domain_sid(shell, domain, partner)
     if not known:
         return False
-    nodes_map = graph.get("nodes")
-    if not isinstance(nodes_map, dict):
-        return False
-    return attack_graph_core._ensure_trusted_domain_node(  # noqa: SLF001
-        nodes_map, partner, sid
-    )
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+    with graph_runtime.mutate(shell, domain, origin="trust_partner_domain_node") as live:
+        target = live if live is not None else graph
+        nodes_map = target.get("nodes")
+        if not isinstance(nodes_map, dict):
+            return False
+        before = set(nodes_map)
+        added = attack_graph_core._ensure_trusted_domain_node(  # noqa: SLF001
+            nodes_map, partner, sid
+        )
+        if added:
+            graph_runtime.record_direct_writes(
+                target, node_ids=[node_id for node_id in nodes_map if node_id not in before]
+            )
+        return added
 
 
 def update_edge_status_by_labels(
@@ -11899,7 +11951,7 @@ def update_edge_status_by_labels(
         status=status,
         notes=notes,
     )
-    graph = load_attack_graph(shell, domain)
+    graph = _graph_for_runtime_write(shell, domain)
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
         print_info_debug(
@@ -11915,7 +11967,7 @@ def update_edge_status_by_labels(
         print_info_debug(
             "[attack-graph] Edge status update skipped: "
             f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
-            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            f"from={markup_object_label(from_label)} to={markup_object_label(to_label)} "
             "reason=invalid_endpoint_labels"
         )
         return False
@@ -11956,7 +12008,7 @@ def update_edge_status_by_labels(
                     print_info_debug(
                         "[attack-graph] Trust partner Domain node materialized for a "
                         f"step outcome: domain={mark_sensitive(domain, 'domain')} "
-                        f"relation={relation} to={mark_sensitive(to_label, 'node')}"
+                        f"relation={relation} to={markup_object_label(to_label)}"
                     )
                     return _write_edge_status_in_graph(
                         shell,
@@ -11991,12 +12043,12 @@ def update_edge_status_by_labels(
             to_label=to_label,
             from_id=from_id,
             to_id=to_id,
-            mask_label=lambda value: mark_sensitive(value, "node"),
+            mask_label=lambda value: markup_object_label(value),
         )
         print_info_debug(
             "attack-graph: Edge status update skipped: "
             f"domain={mark_sensitive(domain, 'domain')} relation={relation} status={status} "
-            f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+            f"from={markup_object_label(from_label)} to={markup_object_label(to_label)} "
             f"reason=edge_nodes_not_found from_id={mark_sensitive(from_id or 'N/A', 'detail')} "
             f"to_id={mark_sensitive(to_id or 'N/A', 'detail')} "
             f"{diagnosis}"
@@ -12008,7 +12060,7 @@ def update_edge_status_by_labels(
             print_warning_debug(
                 "attack-graph: a PROVEN attack step could not be recorded: "
                 f"relation={relation} status={status} "
-                f"from={mark_sensitive(from_label, 'node')} to={mark_sensitive(to_label, 'node')} "
+                f"from={markup_object_label(from_label)} to={markup_object_label(to_label)} "
                 f"{diagnosis}"
             )
         return False
@@ -12144,7 +12196,7 @@ def _dcsync_grant_exercised_by(
         print_info_debug(
             "attack-graph: the replicating principal holds several DCSync grants; "
             "one replication proves one grant, so recording only "
-            f"{mark_sensitive(best_from_label, 'node')} "
+            f"{markup_object_label(best_from_label)} "
             f"(candidates={len(matches)})."
         )
     return best_from_label, best_to_label
@@ -12365,24 +12417,14 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
         command in the client report actually resolves the finding instead of
         silently matching nothing. Empty strings when a field is not carried
         on this node (e.g. a Domain object has no ``sAMAccountName``).
+        Read through the shared step-identity SSOT, the same reader the report
+        pipeline uses.
         """
-        node = nodes_map.get(node_id)
-        props = (
-            node.get("properties")
-            if isinstance(node, dict) and isinstance(node.get("properties"), dict)
-            else {}
+        from adscan_internal.services.step_identity import (  # noqa: PLC0415
+            node_identity_from_node,
         )
-        return {
-            "dn": str(
-                props.get("distinguishedname") or props.get("distinguishedName") or ""
-            ).strip(),
-            "samaccountname": str(
-                props.get("samaccountname") or props.get("sAMAccountName") or ""
-            ).strip(),
-            "dnshostname": str(
-                props.get("dnshostname") or props.get("dNSHostName") or ""
-            ).strip(),
-        }
+
+        return node_identity_from_node(nodes_map.get(node_id))
 
     nodes = [label(path.source_id)]
     relations: list[str] = []
@@ -12477,6 +12519,11 @@ def path_to_display_record(graph: dict[str, Any], path: AttackPath) -> dict[str,
             "target_dnshostname": _target_identity["dnshostname"],
             **(step.notes or {}),
         }
+        from adscan_internal.services.step_identity import (  # noqa: PLC0415
+            stamp_gpo_guid,
+        )
+
+        stamp_gpo_guid(step_details, _source_identity, _target_identity)
         if relation_key.startswith("adcs") or relation_key in {
             "coerceandrelayntlmtoadcs",
         }:
@@ -13504,6 +13551,7 @@ def _resolve_netexec_target_computer_node(
     return node_props, fqdn
 
 
+@_runtime_writer("upsert_netexec_privilege_edge")
 def upsert_netexec_privilege_edge(
     shell: object,
     domain: str,
@@ -13625,6 +13673,7 @@ def upsert_netexec_privilege_edge(
         return False
 
 
+@_runtime_writer("upsert_local_admin_password_reuse_edges")
 def upsert_local_admin_password_reuse_edges(
     shell: object,
     domain: str,
@@ -13640,6 +13689,7 @@ def upsert_local_admin_password_reuse_edges(
     switches to a compressed bidirectional star topology to avoid edge
     explosion and attack-path combinatorial blow-ups.
     """
+    edge_index = EdgeUpsertIndex()
     domain_clean = str(domain or "").strip()
     user_clean = str(local_admin_username or "").strip()
     credential_clean = str(credential or "").strip()
@@ -13784,7 +13834,15 @@ def upsert_local_admin_password_reuse_edges(
                     continue
                 if (from_key, to_key) in desired_pairs:
                     compacted_edges.append(edge)
+            kept = {id(edge) for edge in compacted_edges}
+            removed = [
+                edge for edge in edges_list if isinstance(edge, dict) and id(edge) not in kept
+            ]
             graph["edges"] = compacted_edges
+            if removed:
+                from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+                graph_runtime.record_direct_writes(graph, removed_edges=removed)
 
         # Count only newly-created edges (not updates) for UX summaries.
         existing_keys: set[tuple[str, str, str]] = set()
@@ -13812,6 +13870,7 @@ def upsert_local_admin_password_reuse_edges(
             key = (src_id, "localadminpassreuse", dst_id)
             edge = upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=src_id,
                 to_id=dst_id,
                 relation="LocalAdminPassReuse",
@@ -13862,6 +13921,7 @@ def upsert_local_admin_password_reuse_edges(
         return 0
 
 
+@_runtime_writer("upsert_local_cred_to_domain_reuse_edges")
 def upsert_local_cred_to_domain_reuse_edges(
     shell: object,
     domain: str,
@@ -13880,6 +13940,7 @@ def upsert_local_cred_to_domain_reuse_edges(
 
     This preserves path coverage while avoiding an O(N_hosts * M_users) mesh.
     """
+    edge_index = EdgeUpsertIndex()
     domain_clean = str(domain or "").strip()
     credential_clean = str(credential or "").strip()
     if (
@@ -13988,6 +14049,7 @@ def upsert_local_cred_to_domain_reuse_edges(
             key = (source_id, "localcredreusesource", cluster_node_id)
             edge = upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=source_id,
                 to_id=cluster_node_id,
                 relation="LocalCredReuseSource",
@@ -14004,6 +14066,7 @@ def upsert_local_cred_to_domain_reuse_edges(
             key = (cluster_node_id, "localcredtodomainreuse", user_id)
             edge = upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=cluster_node_id,
                 to_id=user_id,
                 relation="LocalCredToDomainReuse",
@@ -14035,6 +14098,7 @@ def upsert_local_cred_to_domain_reuse_edges(
         return 0
 
 
+@_runtime_writer("upsert_domain_password_reuse_edges")
 def upsert_domain_password_reuse_edges(
     shell: object,
     domain: str,
@@ -14053,6 +14117,7 @@ def upsert_domain_password_reuse_edges(
 
     The cluster node keeps edge count linear and avoids O(N*M) pairwise meshes.
     """
+    edge_index = EdgeUpsertIndex()
     from adscan_internal.principal_utils import is_machine_account
 
     domain_clean = str(domain or "").strip()
@@ -14200,6 +14265,7 @@ def upsert_domain_password_reuse_edges(
             key = (src_id, "domainpassreusesource", cluster_node_id)
             edge = upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=src_id,
                 to_id=cluster_node_id,
                 relation="DomainPassReuseSource",
@@ -14216,6 +14282,7 @@ def upsert_domain_password_reuse_edges(
             key = (cluster_node_id, "domainpassreuse", dst_id)
             edge = upsert_edge(
                 graph,
+                index=edge_index,
                 from_id=cluster_node_id,
                 to_id=dst_id,
                 relation="DomainPassReuse",
@@ -14247,6 +14314,7 @@ def upsert_domain_password_reuse_edges(
         return 0
 
 
+@_runtime_writer("upsert_cve_host_edge")
 def upsert_cve_host_edge(
     shell: object,
     domain: str,
@@ -14341,6 +14409,7 @@ def upsert_cve_host_edge(
         return False
 
 
+@_runtime_writer("upsert_cve_takeover_edge")
 def upsert_cve_takeover_edge(
     shell: object,
     domain: str,
@@ -14733,6 +14802,7 @@ def ensure_principal_node_for_domain(
     )
 
 
+@_runtime_writer("upsert_roast_entry_edge")
 def upsert_roast_entry_edge(
     shell: object,
     domain: str,
@@ -14785,6 +14855,7 @@ def upsert_roast_entry_edge(
     return True
 
 
+@_runtime_writer("upsert_ldap_anonymous_bind_entry_edge")
 def upsert_ldap_anonymous_bind_entry_edge(
     shell: object,
     domain: str,
@@ -14812,6 +14883,7 @@ def upsert_ldap_anonymous_bind_entry_edge(
     return True
 
 
+@_runtime_writer("upsert_poison_capture_ntlmv2_crack_edge")
 def upsert_poison_capture_ntlmv2_crack_edge(
     shell: object,
     domain: str,
@@ -14869,6 +14941,7 @@ def upsert_poison_capture_ntlmv2_crack_edge(
     return True
 
 
+@_runtime_writer("upsert_ntlmv1_crack_user_edge")
 def upsert_ntlmv1_crack_user_edge(
     shell: object,
     domain: str,
@@ -14928,6 +15001,7 @@ def upsert_ntlmv1_crack_user_edge(
     return True
 
 
+@_runtime_writer("upsert_password_spray_entry_edge")
 def upsert_password_spray_entry_edge(
     shell: object,
     domain: str,
@@ -15017,6 +15091,7 @@ def upsert_password_spray_entry_edge(
     return True
 
 
+@_runtime_writer("upsert_share_password_entry_edge")
 def upsert_share_password_entry_edge(
     shell: object,
     domain: str,
@@ -15048,6 +15123,7 @@ def upsert_share_password_entry_edge(
     return True
 
 
+@_runtime_writer("update_roast_entry_edge_status")
 def update_roast_entry_edge_status(
     shell: object,
     domain: str,
@@ -15129,12 +15205,9 @@ def update_roast_entry_edge_status(
             edge["status"] = status
         edge["last_seen"] = now
 
-        notes = edge.get("notes")
-        if not isinstance(notes, dict):
-            notes = {}
-        attempts = notes.get("attempts")
-        if not isinstance(attempts, list):
-            attempts = []
+        # Replaced, never mutated: a notes object (and its lists) may be shared.
+        notes = dict(edge.get("notes")) if isinstance(edge.get("notes"), dict) else {}
+        attempts = list(notes.get("attempts")) if isinstance(notes.get("attempts"), list) else []
         if wordlist:
             attempts.append({"wordlist": wordlist, "status": status, "at": now})
         else:
@@ -15147,6 +15220,9 @@ def update_roast_entry_edge_status(
         if reason_code_norm:
             notes[REASON_CODE_KEY] = reason_code_norm
         edge["notes"] = notes
+        from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+        graph_runtime.record_direct_writes(graph, edges=[edge])
         save_attack_graph(shell, domain, graph)
         return True
 
@@ -15195,47 +15271,49 @@ def _graph_node_by_label(graph: dict[str, Any], label: str) -> dict[str, Any] | 
     return node if isinstance(node, dict) else None
 
 
+def _node_label_quality_score(node: dict[str, Any]) -> int:
+    """Prefer well-formed BloodHound-backed nodes over synthetic/unknown ones.
+
+    Security principals (Group/User/Computer/Domain) outrank structural AD
+    objects (OU/Container/CertTemplate) when label collides — e.g. an OU
+    named "Domain Controllers" must NOT be returned in place of the
+    Domain Controllers security group, otherwise edge-status updates land
+    on the wrong node and runtime success/failure transitions are lost.
+    """
+    score = 0
+    kind = _node_kind(node)
+    props = (
+        node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    )
+
+    if kind in {"Group", "User", "Computer", "Domain"}:
+        score += 100  # security principals always outrank structural objects
+    elif kind != "Unknown":
+        score += 50
+    else:
+        score -= 50
+
+    if kind in {"User", "Computer"}:
+        if str(props.get("samaccountname") or "").strip():
+            score += 30
+        if str(props.get("domain") or "").strip():
+            score += 10
+    if kind == "Group":
+        if str(node.get("objectId") or props.get("objectid") or "").strip():
+            score += 20
+
+    if props:
+        score += 10
+    if str(node.get("objectId") or "").strip():
+        score += 5
+    return score
+
+
 def _find_node_id_by_label(graph: dict[str, Any], label: str) -> str | None:
     nodes_map = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
     if not isinstance(nodes_map, dict):
         return None
-
-    def _quality_score(node: dict[str, Any]) -> int:
-        """Prefer well-formed BloodHound-backed nodes over synthetic/unknown ones.
-
-        Security principals (Group/User/Computer/Domain) outrank structural AD
-        objects (OU/Container/CertTemplate) when label collides — e.g. an OU
-        named "Domain Controllers" must NOT be returned in place of the
-        Domain Controllers security group, otherwise edge-status updates land
-        on the wrong node and runtime success/failure transitions are lost.
-        """
-        score = 0
-        kind = _node_kind(node)
-        props = (
-            node.get("properties") if isinstance(node.get("properties"), dict) else {}
-        )
-
-        if kind in {"Group", "User", "Computer", "Domain"}:
-            score += 100  # security principals always outrank structural objects
-        elif kind != "Unknown":
-            score += 50
-        else:
-            score -= 50
-
-        if kind in {"User", "Computer"}:
-            if str(props.get("samaccountname") or "").strip():
-                score += 30
-            if str(props.get("domain") or "").strip():
-                score += 10
-        if kind == "Group":
-            if str(node.get("objectId") or props.get("objectid") or "").strip():
-                score += 20
-
-        if props:
-            score += 10
-        if str(node.get("objectId") or "").strip():
-            score += 5
-        return score
+    _quality_score = _node_label_quality_score
 
     exact = str(label or "").strip().upper()
     if exact:
@@ -15411,8 +15489,8 @@ def _repair_duplicate_nodes_by_label(graph: dict[str, Any]) -> bool:
         if not isinstance(existing_notes, dict):
             existing_notes = {}
         edge_notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-        existing_notes.update(edge_notes)
-        existing["notes"] = existing_notes
+        # Replaced, never mutated: a notes object may be shared between edges.
+        existing["notes"] = {**existing_notes, **edge_notes}
         for ts_key in ("first_seen", "last_seen"):
             if ts_key in edge and ts_key not in existing:
                 existing[ts_key] = edge[ts_key]
@@ -17312,6 +17390,8 @@ def compute_display_paths_for_user(
     ``enumeration_cap`` is the separate, declared resource bound on discovery.
     See :func:`_compute_display_paths_for_user_impl` for the computation.
     """
+    if _graph_unavailable_gate(shell, domain, scope="user"):
+        return []
     records = _compute_display_paths_for_user_impl(
         shell,
         domain,
@@ -17412,7 +17492,7 @@ def _compute_display_paths_for_user_impl(
         _user_start_node_id = _find_node_id_by_label(base_graph, username)
         _user_start_ids = {_user_start_node_id} if _user_start_node_id else set()
         if _service_scope_predicts_explosion(shell, base_graph, _user_start_ids):
-            return compute_display_paths_for_user(
+            _routed_records = compute_display_paths_for_user(
                 shell,
                 domain,
                 username=username,
@@ -17425,6 +17505,16 @@ def _compute_display_paths_for_user_impl(
                 display_friendly=display_friendly,
                 force_perterminal=True,
             )
+            _cache_routed_result_under_outer_key(
+                cache_key,
+                _routed_records,
+                domain=domain,
+                scope="user",
+                started_at=started_at,
+                shell=shell,
+                no_cache=no_cache,
+            )
+            return _routed_records
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
@@ -17492,7 +17582,9 @@ def _compute_display_paths_for_user_impl(
             principal_node_ids=candidate_to_ids,
             skip_tier0_principals=True,
         )
-    try:
+    # The full attempt is a function CALL: what it builds dies with its frame
+    # before a stop is recovered (``_attempt_or_abort``).
+    def _full_attempt() -> tuple[Any, ...]:
         _dfs_t0 = time.monotonic()
         with attack_paths_core.track_enumeration_truncation() as _enumeration:
             records = _sort_display_paths(
@@ -17551,7 +17643,10 @@ def _compute_display_paths_for_user_impl(
             display_friendly=display_friendly,
             runtime_graph=runtime_graph,
         )
-    except _AttackPathMemoryBudgetExceeded as exc:
+        return records, _dfs_elapsed
+
+    _attempt_result, _abort = _attempt_or_abort(_full_attempt)
+    if _abort is not None:
         # The memory gate stopped discovery cleanly (mid-DFS or in the O(N²)
         # post-DFS projection). Mirror the domain-scope self-recovery so the
         # bounded result is CACHED under this function's outer (force_perterminal
@@ -17559,7 +17654,7 @@ def _compute_display_paths_for_user_impl(
         # ``force_perterminal`` already set means THIS run was the bounded fallback;
         # re-raise so the shared helper's nested-abort branch degrades to empty.
         if force_perterminal:
-            raise
+            raise _abort
 
         def _recompute_bounded_user() -> list[dict[str, Any]]:
             return compute_display_paths_for_user(
@@ -17581,12 +17676,13 @@ def _compute_display_paths_for_user_impl(
         return _recover_from_memory_abort(
             shell,
             domain,
-            exc,
+            _abort,
             recompute_bounded=_recompute_bounded_user,
             cache_key=cache_key,
             scope="user",
             no_cache=no_cache,
         )
+    records, _dfs_elapsed = _attempt_result
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
         f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"
@@ -17611,6 +17707,35 @@ def _compute_display_paths_for_user_impl(
         no_cache=no_cache,
     )
     return records
+
+
+def _graph_unavailable_gate(shell: object, domain: str, *, scope: str | None) -> bool:
+    """Whether ``domain``'s graph is not available, declaring discovery not run.
+
+    The availability predicate (``graph_availability.domain_graph_unavailable_stage``)
+    asked with the graph this compute would read: loading it is what a build or
+    a file read does anyway (the cache key already loads it under the
+    structural epoch), and it is what reveals a stop that happens on THIS load.
+    When the graph is not available, discovery is declared NOT EVALUATED for
+    the canonical scope (the coverage writer's scope rules apply) and the caller
+    returns an empty listing without computing or caching anything.
+    """
+    from adscan_internal.services.graph_availability import (  # noqa: PLC0415
+        declare_attack_paths_not_evaluated,
+        domain_graph_unavailable_stage,
+    )
+
+    graph: Any = None
+    try:
+        graph = load_attack_graph(shell, domain)
+    except Exception as exc:  # noqa: BLE001 - the compute's own load reports it
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+    stage = domain_graph_unavailable_stage(shell, domain, graph=graph)
+    if not stage:
+        return False
+    declare_attack_paths_not_evaluated(shell, domain, stage, scope=scope)
+    return True
 
 
 def compute_display_paths_for_domain(
@@ -17652,6 +17777,8 @@ def compute_display_paths_for_domain(
         allow_owned_terminal_target=allow_owned_terminal_target,
     )
     with _suppress_domain_coverage_write(not canonical):
+        if _graph_unavailable_gate(shell, domain, scope="domain"):
+            return []
         records = _compute_display_paths_for_domain_impl(
             shell,
             domain,
@@ -17788,6 +17915,15 @@ def _compute_display_paths_for_domain_impl(
                 scope="domain",
                 reason=_REASON_PREDICTED_EXPLOSION,
             )
+            _cache_routed_result_under_outer_key(
+                cache_key,
+                _predicted_records,
+                domain=domain,
+                scope="domain",
+                started_at=started_at,
+                shell=shell,
+                no_cache=no_cache,
+            )
             return _predicted_records
     snapshot = _load_membership_snapshot(shell, domain)
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
@@ -17847,7 +17983,9 @@ def _compute_display_paths_for_domain_impl(
                 principal_node_ids=candidate_to_ids,
                 skip_tier0_principals=True,
             )
-    try:
+    # The full attempt is a function CALL: what it builds dies with its frame
+    # before a stop is recovered (``_attempt_or_abort``).
+    def _full_attempt() -> tuple[Any, ...]:
         _dfs_t0 = time.monotonic()
         with attack_paths_core.track_enumeration_truncation() as _enumeration:
             records = _sort_display_paths(
@@ -17901,7 +18039,10 @@ def _compute_display_paths_for_domain_impl(
             keep_longest=keep_longest,
             runtime_graph=runtime_graph,
         )
-    except _AttackPathMemoryBudgetExceeded as exc:
+        return records, _dfs_elapsed, _examined_route_count
+
+    _attempt_result, _abort = _attempt_or_abort(_full_attempt)
+    if _abort is not None:
         # The memory gate stopped discovery cleanly before it could be SIGKILLed
         # (either mid-DFS or in the O(N²) post-DFS projection). Stop the
         # coverage-bounded stop leaking out of the SERVICE layer at the SOURCE:
@@ -17915,7 +18056,7 @@ def _compute_display_paths_for_domain_impl(
         # whose ``recompute_bounded`` re-runs THIS function with the per-terminal
         # fallback engaged (CLAUDE.md § "A bounded computation is a data gap").
         if force_perterminal:
-            raise
+            raise _abort
 
         def _recompute_bounded_domain() -> list[dict[str, Any]]:
             return compute_display_paths_for_domain(
@@ -17936,12 +18077,13 @@ def _compute_display_paths_for_domain_impl(
         return _recover_from_memory_abort(
             shell,
             domain,
-            exc,
+            _abort,
             recompute_bounded=_recompute_bounded_domain,
             cache_key=cache_key,
             scope="domain",
             no_cache=no_cache,
         )
+    records, _dfs_elapsed, _examined_route_count = _attempt_result
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     # The full DFS walked every candidate route: declare COMPLETE coverage IN BAND
     # with this path set, overwriting any stale sampled/bounded declaration a
@@ -18657,6 +18799,13 @@ def _compute_rustworkx_display_paths(
         _ag_core.compute_maximal_attack_paths_from_start = _orig_start_dfs  # type: ignore[attr-defined]
 
 
+# The safe "try, then fall back" primitives are shared with the web's live
+# compute (``attack_paths_core.compute_display_paths_with_fallback``).
+_release_aborted_attempt = attack_paths_core.release_stopped_attempt
+_bounded_mode_may_start = attack_paths_core.bounded_mode_may_start
+_attempt_or_abort = attack_paths_core.attempt_or_stop
+
+
 def _recover_from_memory_abort(
     shell: object,
     domain: str,
@@ -18698,7 +18847,12 @@ def _recover_from_memory_abort(
        The bounded recompute closure itself runs with ``no_cache=True`` (it must not
        serve/store under the DISTINCT ``force_perterminal=True`` key), so caching the
        RESULT here under the outer key is what closes the "re-run + re-abort every
-       call" waste (the ~15s x N-at-exit regression); and
+       call" waste (the ~15s x N-at-exit regression). It is stored as a STOPPED
+       result: in memory only (never on disk, so a later run recomputes; 14.0.x
+       wrote it to disk under a key whose memory limit is ``None`` in a container
+       started without one, and served the bounded set again after the operator
+       added memory), and an in-process repeat recomputes once markedly more
+       memory is available than at the stop; and
     5. overwrites the hard-abort record with the SAMPLED coverage declaration
        (:func:`_handle_attack_path_sampled_coverage`), since discovery ultimately
        DID return a floored set covering every reachable target.
@@ -18723,8 +18877,43 @@ def _recover_from_memory_abort(
     ``None`` (the report/deliver derivation and the summaries backstop default)
     IS the domain-listing path and does write.
     """
+    # The stopped attempt ran in a function call that has returned, so its
+    # locals live only in the frames of ``exc``'s traceback: clear them, collect
+    # and trim the heap, THEN measure. Nothing the attempt built (raw routes,
+    # DFS state, affected-user maps) may sit beside the bounded mode.
+    _release_aborted_attempt(exc)
     _bounded_block = _handle_attack_path_memory_abort(shell, domain, exc, scope=scope)
+    if _operator_declines_sampled_routes(shell, exc):
+        # Stopped here at the operator's choice: nothing was examined, the hard
+        # stop record stands (discovery not evaluated) and nothing is cached.
+        if _bounded_block is not None:
+            from adscan_core.reporting.attack_path_memory_gate import (
+                attack_path_coverage_view,
+            )
+
+            _emit_attack_path_coverage_status_line(
+                shell, attack_path_coverage_view(_bounded_block)
+            )
+        return []
     _record_attack_path_engine_used(shell, engine="fallback", reason="dfs_aborted")
+    if not _bounded_mode_may_start():
+        # Memory did not come back under the resume line (the loaded graph alone
+        # may hold most of it): the bounded mode would stop too. The hard-abort
+        # record stands with what was examined; no partial route set returns.
+        print_warning(
+            "Memory did not come back down after attack-path discovery stopped, "
+            "so the bounded discovery was not started either. Raise the "
+            "available memory and re-run to compute the routes."
+        )
+        if _bounded_block is not None:
+            from adscan_core.reporting.attack_path_memory_gate import (
+                attack_path_coverage_view,
+            )
+
+            _emit_attack_path_coverage_status_line(
+                shell, attack_path_coverage_view(_bounded_block)
+            )
+        return []
     _recompute_started_at = time.monotonic()
     try:
         result = recompute_bounded()
@@ -18758,6 +18947,9 @@ def _recover_from_memory_abort(
             compute_seconds=max(0.0, time.monotonic() - _recompute_started_at),
             shell=shell,
             no_cache=no_cache,
+            # A STOP produced this result, not the graph: memory only, and an
+            # in-process repeat with markedly more memory recomputes.
+            stopped=True,
         )
     return result
 
@@ -18858,9 +19050,9 @@ def get_attack_path_summaries(
         )
         else None
     )
-    try:
+    def _summaries_attempt() -> list[dict[str, Any]]:
         with _attack_path_debug_summary_tables(render_debug_tables):
-            result = _compute_attack_path_summaries_inner(
+            return _compute_attack_path_summaries_inner(
                 shell,
                 domain,
                 scope_norm=scope_norm,
@@ -18877,27 +19069,38 @@ def get_attack_path_summaries(
                 display_friendly=display_friendly,
                 keep_longest=keep_longest,
             )
-        # Declare the coverage of THIS computation, both ways. The pre-DFS
-        # predictor may have routed the run to the bounded fallback engine (a very
-        # large directory): then the route set is a coverage-floored SAMPLE and the
-        # deliverable + web CTEM must never render it as complete. A full-DFS run
-        # now records COMPLETE rather than "nothing new", which is what clears a
-        # sampled declaration a PREVIOUS run latched onto the workspace.
-        #
-        # Scope-gated: the per-domain block describes the canonical DOMAIN listing
-        # (the set the deliverable renders), so an interactive owned / user /
-        # principals query cannot relabel it (see _COVERAGE_NON_OWNING_SCOPES).
-        if getattr(shell, "_attack_path_engine_used", None) == "fallback":
-            _handle_attack_path_sampled_coverage(
-                shell,
-                domain,
-                scope=scope_norm,
-                reason=getattr(shell, "_attack_path_fallback_reason", None),
-            )
-        else:
-            _handle_attack_path_complete_coverage(shell, domain, scope=scope_norm)
-        return _apply_listing_cap(result, max_paths)
-    except _AttackPathMemoryBudgetExceeded as exc:
+
+    try:
+        # The domain's graph is not available (its build or its directory read
+        # stopped at the memory ceiling): discovery did not run, it is declared
+        # so, and nothing records it as complete over an empty graph.
+        if _graph_unavailable_gate(shell, domain, scope=scope_norm):
+            return []
+        # The full attempt is a CALL (``_attempt_or_abort``): a stop leaves the
+        # ``except`` at once and is recovered below, after the attempt's frames
+        # are released.
+        result, _abort = _attempt_or_abort(_summaries_attempt)
+        if _abort is None:
+            # Declare the coverage of THIS computation, both ways. The pre-DFS
+            # predictor may have routed the run to the bounded fallback engine (a very
+            # large directory): then the route set is a coverage-floored SAMPLE and the
+            # deliverable + web CTEM must never render it as complete. A full-DFS run
+            # now records COMPLETE rather than "nothing new", which is what clears a
+            # sampled declaration a PREVIOUS run latched onto the workspace.
+            #
+            # Scope-gated: the per-domain block describes the canonical DOMAIN listing
+            # (the set the deliverable renders), so an interactive owned / user /
+            # principals query cannot relabel it (see _COVERAGE_NON_OWNING_SCOPES).
+            if getattr(shell, "_attack_path_engine_used", None) == "fallback":
+                _handle_attack_path_sampled_coverage(
+                    shell,
+                    domain,
+                    scope=scope_norm,
+                    reason=getattr(shell, "_attack_path_fallback_reason", None),
+                )
+            else:
+                _handle_attack_path_complete_coverage(shell, domain, scope=scope_norm)
+            return _apply_listing_cap(result, max_paths)
         # The memory gate stopped discovery cleanly before it could be SIGKILLed.
         # Abort backstop (hybrid switch): the DFS blew the budget even though the
         # pre-DFS predictor did not fire. Route the whole recovery through the ONE
@@ -18932,7 +19135,7 @@ def get_attack_path_summaries(
             _recover_from_memory_abort(
                 shell,
                 domain,
-                exc,
+                _abort,
                 recompute_bounded=_recompute_bounded_summaries,
                 scope=scope_norm,
             ),
@@ -19462,6 +19665,12 @@ def _compute_attack_path_summaries_inner(
         # apply to it).
         _gate_attack_path_memory_pre_dfs(_stage_a_nodes_count, _stage_a_edges_count)
 
+    # Release this frame's references to the loaded graph before the compute
+    # runs: the compute loads it again through the same memo, and a reload (a
+    # ``no_cache`` purge, a new store generation) must replace the graph, not
+    # sit beside a second copy this frame kept alive for the whole compute.
+    _stage_a_graph = _stage_a_nodes = _stage_a_edges = None
+
     allow_owned_terminal_target = bool(
         isinstance(summary_filters, AttackPathSummaryFilters)
         and summary_filters.target_labels
@@ -19671,6 +19880,8 @@ def compute_display_paths_for_principals(
     ``enumeration_cap`` is the separate, declared resource bound on discovery.
     See :func:`_compute_display_paths_for_principals_impl` for the computation.
     """
+    if _graph_unavailable_gate(shell, domain, scope="principals"):
+        return []
     records = _compute_display_paths_for_principals_impl(
         shell,
         domain,
@@ -19808,7 +20019,7 @@ def _compute_display_paths_for_principals_impl(
             if _principal_node_id:
                 _principal_start_ids.add(_principal_node_id)
         if _service_scope_predicts_explosion(shell, base_graph, _principal_start_ids):
-            return compute_display_paths_for_principals(
+            _routed_records = compute_display_paths_for_principals(
                 shell,
                 domain,
                 principals=principals,
@@ -19822,6 +20033,16 @@ def _compute_display_paths_for_principals_impl(
                 display_friendly=display_friendly,
                 force_perterminal=True,
             )
+            _cache_routed_result_under_outer_key(
+                cache_key,
+                _routed_records,
+                domain=domain,
+                scope="principals",
+                started_at=started_at,
+                shell=shell,
+                no_cache=no_cache,
+            )
+            return _routed_records
     materialized_artifacts = _load_or_build_materialized_attack_path_artifacts(
         shell,
         domain=domain,
@@ -19909,7 +20130,9 @@ def _compute_display_paths_for_principals_impl(
         scope="principals",
         materialized_artifacts=materialized_artifacts,
     )
-    try:
+    # The full attempt is a function CALL: what it builds dies with its frame
+    # before a stop is recovered (``_attempt_or_abort``).
+    def _full_attempt() -> tuple[Any, ...]:
         _dfs_t0 = time.monotonic()
         with attack_paths_core.track_enumeration_truncation() as _enumeration:
             records = _sort_display_paths(
@@ -19951,7 +20174,10 @@ def _compute_display_paths_for_principals_impl(
             display_friendly=display_friendly,
             runtime_graph=runtime_graph,
         )
-    except _AttackPathMemoryBudgetExceeded as exc:
+        return records, _dfs_elapsed
+
+    _attempt_result, _abort = _attempt_or_abort(_full_attempt)
+    if _abort is not None:
         # The memory gate stopped discovery cleanly (mid-DFS or in the O(N²)
         # post-DFS projection). Mirror the domain-scope self-recovery so the
         # bounded result is CACHED under this function's outer (force_perterminal
@@ -19959,7 +20185,7 @@ def _compute_display_paths_for_principals_impl(
         # the aborting full DFS. ``force_perterminal`` already set means THIS run was
         # the bounded fallback; re-raise so the shared helper degrades to empty.
         if force_perterminal:
-            raise
+            raise _abort
 
         def _recompute_bounded_principals() -> list[dict[str, Any]]:
             return compute_display_paths_for_principals(
@@ -19982,12 +20208,13 @@ def _compute_display_paths_for_principals_impl(
         return _recover_from_memory_abort(
             shell,
             domain,
-            exc,
+            _abort,
             recompute_bounded=_recompute_bounded_principals,
             cache_key=cache_key,
             scope="principals",
             no_cache=no_cache,
         )
+    records, _dfs_elapsed = _attempt_result
     _total_elapsed = max(0.0, time.monotonic() - started_at)
     print_info_debug(
         f"[engine={_engine_label(force_perterminal)}] dfs={_dfs_elapsed:.3f}s | post={max(0.0, _total_elapsed - _dfs_elapsed):.3f}s"

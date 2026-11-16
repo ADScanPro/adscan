@@ -627,6 +627,96 @@ def interface_mac_ipv4_linklocal(interface_name: str) -> tuple[str, str, str] | 
         return None
 
 
+#: ``addr_assign_type`` values that mark an address the OS made up or a user
+#: set (``NET_ADDR_RANDOM`` = 1, ``NET_ADDR_SET`` = 3): a randomised Wi-Fi MAC or
+#: a ``macchanger`` spoof. Neither identifies the hardware.
+_SYSFS_NON_PERMANENT_ADDR_TYPES = frozenset({"1", "3"})
+
+
+def _normalize_mac(raw: str) -> str | None:
+    """Return a lower-case colon MAC for a real unicast hardware address."""
+
+    text = str(raw or "").strip().lower().replace("-", ":")
+    parts = text.split(":")
+    if len(parts) != 6 or not all(len(p) == 2 for p in parts):
+        return None
+    try:
+        octets = [int(p, 16) for p in parts]
+    except ValueError:
+        return None
+    if not any(octets) or all(o == 0xFF for o in octets):
+        return None
+    if octets[0] & 0x01:  # multicast / group address
+        return None
+    return ":".join(parts)
+
+
+def _sysfs_hardware_macs(root: str) -> list[str]:
+    macs: list[str] = []
+    for name in sorted(os.listdir(root)):
+        if interface_kind(name, sysfs_net_root=root) != InterfaceKind.PHYSICAL:
+            continue
+        interface_dir = os.path.join(root, name)
+        if _sysfs_text(os.path.join(interface_dir, "addr_assign_type")) in (
+            _SYSFS_NON_PERMANENT_ADDR_TYPES
+        ):
+            continue
+        mac = _normalize_mac(_sysfs_text(os.path.join(interface_dir, "address")))
+        if mac and mac not in macs:
+            macs.append(mac)
+    return macs
+
+
+def _psutil_hardware_macs() -> list[str]:
+    import psutil  # noqa: PLC0415
+
+    macs: list[str] = []
+    for name in sorted(psutil.net_if_addrs()):
+        if "loopback" in name.lower():
+            continue
+        for entry in psutil.net_if_addrs().get(name) or []:
+            if entry.family != psutil.AF_LINK:
+                continue
+            # No locally-administered filter here: a KVM guest's own NIC is
+            # 52:54:00:..., which IS locally administered. Virtual adapters
+            # that come and go are absorbed by the caller's set-overlap rule.
+            mac = _normalize_mac(str(entry.address or ""))
+            if mac and mac not in macs:
+                macs.append(mac)
+    return macs
+
+
+def hardware_mac_addresses(*, sysfs_net_root: str | None = None) -> list[str]:
+    """Return the permanent MAC addresses of this host's physical NICs.
+
+    Used to tell a cloned machine from the original (a hypervisor gives a clone
+    new MACs). Only hardware addresses count: Linux reads ``/sys/class/net`` and
+    keeps interfaces the kernel types as :attr:`InterfaceKind.PHYSICAL` whose
+    address is permanent (randomised and user-set addresses are skipped, so
+    Wi-Fi MAC randomisation or a spoof never looks like a new machine). Windows
+    reads ``psutil`` (every adapter but loopback). Elsewhere the
+    stdlib ``uuid.getnode()`` is used when it returns a real hardware address.
+
+    The values are RAW and must never be sent anywhere; callers hash them.
+    Sorted by interface name, deduplicated. Never raises; ``[]`` when nothing
+    qualifies.
+    """
+
+    try:
+        if is_windows():
+            return _psutil_hardware_macs()
+        root = sysfs_net_root or _SYSFS_NET_ROOT
+        if os.path.isdir(root):
+            return _sysfs_hardware_macs(root)
+        import uuid  # noqa: PLC0415
+
+        node = uuid.getnode()
+        mac = _normalize_mac(":".join(f"{(node >> s) & 0xFF:02x}" for s in range(40, -1, -8)))
+        return [mac] if mac else []
+    except Exception:  # noqa: BLE001 - a fingerprint input, never a failure
+        return []
+
+
 __all__ = [
     "NET_ADMIN",
     "NET_BIND_PRIVILEGED",
@@ -635,6 +725,7 @@ __all__ = [
     "InterfaceKind",
     "can_bind_privileged_port",
     "capability_available",
+    "hardware_mac_addresses",
     "interface_ipv4_addresses",
     "interface_ipv4_addresses_for",
     "interface_ipv4_for",

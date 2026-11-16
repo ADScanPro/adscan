@@ -142,6 +142,17 @@ MAX_GRACE_DAYS = 90
 WARN_DAYS = 30
 #: A PoV runs about a month, so a 30-day warning would show from its first day.
 POV_WARN_DAYS = 7
+#: Days left at which the console raises its tone. Capped by the license's own
+#: ``warn_days`` so a short PoC is not "ending soon" from its first day.
+WARNING_DAYS = 7
+URGENT_DAYS = 3
+#: Urgency vocabulary the web console renders (see :attr:`LicenseStatus.urgency`).
+URGENCY_NONE = "none"
+URGENCY_NOTICE = "notice"
+URGENCY_WARNING = "warning"
+URGENCY_URGENT = "urgent"
+URGENCY_GRACE = "grace"
+URGENCY_BLOCKED = "blocked"
 DEFAULT_CLOCK_TOLERANCE_HOURS = 72
 MAX_LICENSE_BYTES = 64 * 1024
 #: ``"pov"`` is the free trial, which customers and every visible label call a
@@ -274,6 +285,43 @@ class LicenseStatus:
         )
 
     @property
+    def last_day(self) -> bool:
+        """True during the final 24 hours of the license term."""
+        return (
+            self.state in (STATE_VALID, STATE_EXPIRING)
+            and self.days_remaining is not None
+            and self.days_remaining <= 1
+        )
+
+    @property
+    def urgency(self) -> str:
+        """How loudly the console should speak about the remaining time.
+
+        One derivation for every surface: ``none`` outside Enterprise or far from
+        the end, then ``notice`` (inside the warning window, 30 days), ``warning``
+        (7 days), ``urgent`` (3 days and the last day), ``grace`` (past the end,
+        scans still allowed) and ``blocked`` (new scans refused). The windows
+        never exceed the license's own ``warn_days``.
+        """
+        if self.state == STATE_NOT_REQUIRED:
+            return URGENCY_NONE
+        if not self.scans_allowed:
+            return URGENCY_BLOCKED
+        if self.state == STATE_GRACE:
+            return URGENCY_GRACE
+        lic = self.license
+        if lic is None or self.days_remaining is None:
+            return URGENCY_NONE
+        days = self.days_remaining
+        if days <= min(URGENT_DAYS, lic.warn_days):
+            return URGENCY_URGENT
+        if days <= min(WARNING_DAYS, lic.warn_days):
+            return URGENCY_WARNING
+        if days <= lic.warn_days:
+            return URGENCY_NOTICE
+        return URGENCY_NONE
+
+    @property
     def display_message(self) -> str:
         """The message plus the image-expiry and environment notices."""
         parts = [self.message, self.binary_warning, self.environment_warning]
@@ -290,6 +338,8 @@ class LicenseStatus:
             "message": self.display_message,
             "error_code": self.error_code or None,
             "days_remaining": self.days_remaining,
+            "urgency": self.urgency,
+            "last_day": self.last_day,
             "binary_expires": self.binary_expires.isoformat()
             if self.binary_expires
             else None,

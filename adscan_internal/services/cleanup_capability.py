@@ -104,6 +104,7 @@ def in_scope_cas(shell: Any, domain: str) -> list[dict[str, str]]:
     """
     from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
         collection_host_verdict,
+        prepare_scope_targets,
     )
 
     found: dict[str, dict[str, str]] = {}
@@ -113,6 +114,8 @@ def in_scope_cas(shell: Any, domain: str) -> list[dict[str, str]]:
         ca_host = str(host or "").strip()
         if not ca_name or not ca_host:
             return
+        # The verdict only reads what the session was told about the host.
+        prepare_scope_targets(shell, [ca_host], domain=domain)
         verdict = collection_host_verdict(shell, host=ca_host, collecting_domain=domain)
         if not verdict.allowed:
             return

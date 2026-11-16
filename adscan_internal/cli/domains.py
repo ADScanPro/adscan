@@ -20,7 +20,7 @@ import sys
 import time
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
@@ -104,10 +104,15 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
     # see ``default_scope_for_selection``), NOT whether trusts are enumerated.
     # ``selected`` still constrains the recursive BFS to the listed partner
     # domains (that is a mapping-scope choice, not a suppression). ``origin_only``
-    # (and its back-compat alias ``skip``) no longer short-circuit here — they
-    # only mean "collect the origin domain only" at scope-selection time.
+    # (and its back-compat alias ``skip``) do not short-circuit the mapping: the
+    # origin's OWN trust list is still read from the origin's domain controller.
+    # What they forbid is contacting any other domain: the walk never expands
+    # into a partner, so no partner domain controller is probed or bound to
+    # (clients are told ``origin_only`` touches no other domain).
     from adscan_internal.services.scan_config import (
+        TRUST_POLICY_ORIGIN_ONLY,
         TRUST_POLICY_SELECTED,
+        TRUST_POLICY_SKIP,
     )
 
     scan_config = getattr(shell, "scan_config", None)
@@ -116,6 +121,31 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
     trust_allowlist: set[str] | None = None
     if trust_policy == TRUST_POLICY_SELECTED:
         trust_allowlist = {d.strip().lower() for d in getattr(trust_cfg, "domains", ())}
+    elif trust_policy in (TRUST_POLICY_ORIGIN_ONLY, TRUST_POLICY_SKIP):
+        # An empty allow-list: the walk stops at the origin's own trust list.
+        trust_allowlist = set()
+
+    def _partner_may_be_contacted(partner: str) -> bool:
+        """Whether the trust walk may contact ``partner``'s domain controllers.
+
+        Two answers, both must allow it: the configured partner list (when the
+        trust policy gives one) and, once a trust-scope decision is recorded for
+        that domain, the engagement-scope SSOT. A domain the recorded decision
+        keeps out is never contacted again, whatever the policy says now.
+        """
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            domain_in_engagement_scope,
+            scope_entry,
+        )
+
+        name = str(partner or "").strip().rstrip(".").lower()
+        if not name or name == str(domain or "").strip().rstrip(".").lower():
+            return True
+        if trust_allowlist is not None and name not in trust_allowlist:
+            return False
+        if scope_entry(shell, name) is not None:
+            return bool(domain_in_engagement_scope(shell, name))
+        return True
 
     if (
         domain not in shell.domains_data
@@ -308,12 +338,16 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             trusted_pdc_ip: str,
             source_domain: str,
         ) -> dict[str, Any]:
+            # The probe asks the engagement scope first (directory ports of a
+            # domain controller): an excluded partner DC is not probed and the
+            # result reads "excluded", so the walk does not expand into it.
             probe_result = probe_host_reachability_with_nmap(
                 shell,
                 host=trusted_pdc_ip,
                 ports=[88, 389, 53],
                 timeout_seconds=20,
                 report_label=f"trusted_dc_{trusted_domain.replace('.', '_')}",
+                scope_domain=trusted_domain,
             )
             probe_result["domain"] = trusted_domain
             probe_result["source_domain"] = source_domain
@@ -354,6 +388,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
                 allowed_partner_domains=trust_allowlist,
+                partner_in_scope=_partner_may_be_contacted,
             )
 
         # Premium summary card.
@@ -401,6 +436,7 @@ def run_enum_trusts(shell: DomainShell, domain: str) -> None:
             domain_dc_sets=result.domain_dc_sets,
             dc_set_degraded_reasons=result.dc_set_degraded_reasons,
             domain_dc_fqdns=result.domain_dc_fqdns,
+            may_contact_domain=_partner_may_be_contacted,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -1360,10 +1396,17 @@ def _handle_trust_enumeration_result(
     domain_dc_sets: dict[str, list[str]] | None = None,
     dc_set_degraded_reasons: dict[str, str] | None = None,
     domain_dc_fqdns: dict[str, str] | None = None,
+    may_contact_domain: Callable[[str], bool] | None = None,
 ) -> None:
     """Process recursive trust enumeration results and update domain state.
 
     Args:
+        may_contact_domain: Whether a discovered domain's controllers may be
+            contacted (the trust policy's partner list and the engagement-scope
+            SSOT, bound by the caller). A domain it refuses stays mapped from the
+            source domain's own trust list: its domain controller is not
+            resolved-and-validated, no sub-workspace is created, nothing is sent
+            to it. ``None`` contacts every discovered domain, as before.
         cross_domain_unreachable: Lower-cased trusted-realm names that were
             discovered but whose own DCs are all unreachable from this vantage.
             These are forced to the discovered-but-unreachable path: no
@@ -1432,6 +1475,17 @@ def _handle_trust_enumeration_result(
         except Exception:
             dns_service = None
 
+        def _may_contact(candidate_domain: str) -> bool:
+            """Fail closed: a scope answer that cannot be computed contacts nobody."""
+            if may_contact_domain is None:
+                return True
+            try:
+                return bool(may_contact_domain(candidate_domain))
+            except Exception as sexc:  # noqa: BLE001
+                telemetry.capture_exception(sexc)
+                print_exception(exception=sexc)
+                return False
+
         ordered_domains: list[str] = []
         seen_domains: set[str] = set()
 
@@ -1442,6 +1496,17 @@ def _handle_trust_enumeration_result(
             ordered_domains.append(main_domain)
             if main_domain not in shell.domains_data:
                 shell.domains_data[main_domain] = {}
+            if main_domain != domain and not _may_contact(main_domain):
+                # Outside the trust policy's partner list or the engagement
+                # scope: the trust is mapped, the domain is not contacted. The
+                # validation below queries and probes the domain's controller,
+                # so none of it runs for this domain.
+                print_info(
+                    "Trusted domain mapped from the trust list, not contacted: "
+                    f"{mark_sensitive(main_domain, 'domain')} is outside the "
+                    "engagement scope."
+                )
+                continue
             is_reachable = _domain_reachable_from_current_vantage(main_domain)
             if is_reachable:
                 shell.domains_data[main_domain]["auth"] = "auth"

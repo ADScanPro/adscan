@@ -25,39 +25,35 @@ _GROUP_MEMBER_INDEX_CACHE: dict[
 
 _CachedT = TypeVar("_CachedT")
 
-# The membership file on disk can be the RAW collector shape (``nodes`` +
+# The membership file on disk is normally the RAW collector shape (``nodes`` +
 # ``edges``) rather than the prepared one (``user_to_groups`` and friends), and
 # the index below reads only the prepared shape. Preparing it is
-# ``attack_paths_core.prepare_membership_snapshot``, which this module cannot
-# import: the appliance backend bundles this module and must never carry the
-# scan engine. So the engine registers its preparer here when it loads
-# (dependency inversion, same pattern as ``set_finding_catalog_provider``), and
-# a reader that loaded the file itself calls :func:`prepared_membership_snapshot`.
-# Unregistered (the appliance backend), the snapshot is returned as read.
-_MEMBERSHIP_SNAPSHOT_PREPARER: Any = None
-
-
-def set_membership_snapshot_preparer(preparer: Any) -> None:
-    """Register the engine's snapshot preparer (``prepare_membership_snapshot``)."""
-    global _MEMBERSHIP_SNAPSHOT_PREPARER  # noqa: PLW0603
-    _MEMBERSHIP_SNAPSHOT_PREPARER = preparer
+# ``membership_snapshot_shape.prepare_membership_snapshot``, a leaf module the
+# appliance backend bundles, so the engine and the web run the SAME function and
+# no reader depends on the engine having been imported first. (It used to be
+# registered here by the engine at import time, which left the appliance
+# backend, which bundles no engine, reading the raw file and finding no members.)
 
 
 def prepared_membership_snapshot(
     snapshot: dict[str, Any] | None, domain: str
 ) -> dict[str, Any] | None:
-    """``snapshot`` in the prepared shape the index reads, when a preparer is known.
+    """``snapshot`` in the prepared shape the index reads.
 
     A raw file (``nodes`` + ``edges`` with empty ``user_to_groups``) is the case
     that matters: read unprepared it yields no members at all, so a group
     source's command fell back to ``<member_of_the_source_group>`` even though
     the directory named its members. Never raises; returns ``snapshot``
-    unchanged when no preparer is registered or preparing fails.
+    unchanged when preparing fails.
     """
-    if not isinstance(snapshot, dict) or _MEMBERSHIP_SNAPSHOT_PREPARER is None:
+    if not isinstance(snapshot, dict):
         return snapshot
+    from adscan_internal.services.membership_snapshot_shape import (  # noqa: PLC0415
+        prepare_membership_snapshot,
+    )
+
     try:
-        prepared = _MEMBERSHIP_SNAPSHOT_PREPARER(snapshot, domain)
+        prepared = prepare_membership_snapshot(snapshot, domain)
     except Exception:  # noqa: BLE001 - a reader falls back to the file as read
         return snapshot
     return prepared if isinstance(prepared, dict) else snapshot

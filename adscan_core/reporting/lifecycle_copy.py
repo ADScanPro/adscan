@@ -20,21 +20,37 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from adscan_core.engagement.sources import BASIS_LABELS
+
 NOT_RECHECKED_PREFIX = "Not re-checked in the latest scan"
 
 #: Noun for the item, per kind, used in the notice sentence.
 _NOUNS = {"finding": "finding", "step": "step", "path": "route"}
 
-_NOTICE = {
-    "finding": f"{NOT_RECHECKED_PREFIX}. The check that observes this finding did not run on this scope.",
-    "step": f"{NOT_RECHECKED_PREFIX}. The check that observes this step did not run on this scope.",
-    "path": f"{NOT_RECHECKED_PREFIX}. None of the steps of this route could be re-checked.",
+#: Second sentence of the notice, by kind, WITHOUT its trailing period: the
+#: default clause (the check did not run) and the ``check_partial`` clause (the
+#: check ran on only part of the scope). A partial reason never reads "did not
+#: run" (it ran, just not everywhere) — the two together were a contradiction a
+#: web badge showed next to "covered only part of the scope" (gate finding R53).
+_CLAUSE_DEFAULT = {
+    "finding": "The check that observes this finding did not run on this scope",
+    "step": "The check that observes this step did not run on this scope",
+    "path": "None of the steps of this route could be re-checked",
 }
+_CLAUSE_PARTIAL = {
+    "finding": "The check that observes this finding ran on only part of this scope",
+    "step": "The check that observes this step ran on only part of this scope",
+    "path": "None of the steps of this route could be re-checked",
+}
+
+_NOTICE = {kind: f"{NOT_RECHECKED_PREFIX}. {clause}." for kind, clause in _CLAUSE_DEFAULT.items()}
 
 _REASON_DETAIL = {
     "run_incomplete": "The latest scan did not finish.",
     "coverage_unknown": "ADscan has no record of what the latest scan checked, so nothing was closed from it.",
     "artifact_unreadable": "The latest scan's results could not be read, so nothing was closed from them.",
+    "ingestion_incomplete": "The platform could not load all of the latest scan's results, so nothing was closed from them.",
+    "graph_not_current": "The latest scan did not finish building its relationship graph, so the previous one is kept and nothing was closed from it.",
     "no_spec": "No re-check is defined for it yet.",
     "never_auto": "Only a deliberate re-check closes it, since its absence from a scan proves nothing.",
     "check_skipped": "That check did not produce a result in the latest scan.",
@@ -69,15 +85,50 @@ VERIFIED_PREFIX = "Last verified"
 
 ALL_COPY_STRINGS: tuple[str, ...] = (
     *_NOTICE.values(),
+    *(f"{clause}." for clause in _CLAUSE_PARTIAL.values()),
     *_REASON_DETAIL.values(),
+    *BASIS_LABELS.values(),
     NOT_VERIFIED_LABEL,
     VERIFIED_PREFIX,
 )
 
 
 def reason_detail(reason_code: Optional[str]) -> str:
-    """Return the client-safe sentence for a reconciliation reason code."""
-    return _REASON_DETAIL.get(str(reason_code or ""), "")
+    """Return the client-safe sentence for a reconciliation reason code.
+
+    A code qualified with the read that was not obtained
+    (``check_skipped:host_registry_not_read``) reads as its sentence followed by
+    that read, worded once in ``adscan_core.engagement.sources``.
+    """
+    code, _sep, basis = str(reason_code or "").partition(":")
+    detail = _REASON_DETAIL.get(code, "")
+    label = BASIS_LABELS.get(basis, "") if basis else ""
+    if detail and label:
+        return f"{detail} {label[0].upper()}{label[1:]}."
+    return detail
+
+
+def _compose_notice(kind: str, reason: Optional[str]) -> str:
+    """The full "not re-checked" notice: a lead, one clause, and the read that failed.
+
+    A reason qualified with an unread source (``check_partial:share_permissions_not_read``,
+    ``check_skipped:host_registry_not_read``) reads as a single clause naming what
+    could not be read, so CLI, PDF and web show one coherent sentence. A partial
+    reason uses the "ran on only part of this scope" clause, never "did not run".
+    A reason with no basis keeps the existing lead + detail wording.
+    """
+    code, _sep, basis_token = str(reason or "").partition(":")
+    basis = BASIS_LABELS.get(basis_token, "") if basis_token else ""
+    if basis:
+        clauses = _CLAUSE_PARTIAL if code == "check_partial" else _CLAUSE_DEFAULT
+        clause = clauses.get(kind, clauses["finding"])
+        return f"{NOT_RECHECKED_PREFIX}. {clause}: {basis}."
+    if code == "check_partial":
+        clause = _CLAUSE_PARTIAL.get(kind, _CLAUSE_PARTIAL["finding"])
+        return f"{NOT_RECHECKED_PREFIX}. {clause}."
+    notice = _NOTICE.get(kind, _NOTICE["finding"])
+    detail = reason_detail(reason)
+    return f"{notice} {detail}" if detail else notice
 
 
 def _date_label(when: Optional[datetime]) -> str:
@@ -116,10 +167,7 @@ def build_lifecycle_view(
     not_reevaluated = evaluation_state == "not_reevaluated"
     notice = ""
     if not_reevaluated:
-        notice = _NOTICE.get(kind, _NOTICE["finding"])
-        detail = reason_detail(evaluation_reason)
-        if detail:
-            notice = f"{notice} {detail}"
+        notice = _compose_notice(kind, evaluation_reason)
     return {
         "not_reevaluated": not_reevaluated,
         "reason_code": evaluation_reason if not_reevaluated else None,

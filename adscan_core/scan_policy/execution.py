@@ -113,6 +113,39 @@ DEPENDS_ON_DECLINED_STEP_LABEL = (
 )
 
 
+# ── A not-run step always says why ───────────────────────────────────────────
+# Every step whose status is "not executed" carries exactly one reason. The
+# engine notes the step it stopped at; the steps behind it, and a step nobody
+# was asked about, are completed by ``annotate.annotate_policy_exclusions``
+# from the reasons below. A step after a not-executed step inherits the
+# "depends on" form of that step's reason.
+
+#: Reason token of a step left unrun behind a step the scan policy excludes.
+REASON_DEPENDS_ON_POLICY_EXCLUDED = "depends_on_step_excluded_by_scan_policy"
+DEPENDS_ON_POLICY_EXCLUDED_LABEL = "Not executed: depends on a step your scan policy excludes."
+#: Reason token of a step left unrun behind a step that ran and did not complete
+#: (or that ADscan withheld or could not run).
+REASON_DEPENDS_ON_INCOMPLETE_STEP = "depends_on_incomplete_step"
+DEPENDS_ON_INCOMPLETE_STEP_LABEL = "Not executed: depends on an earlier step that did not complete."
+#: Reason 2 on a step of an attended run that no operator was asked about.
+AWAITING_APPROVAL_NOT_ASKED_LABEL = (
+    "Mapped, awaiting approval: it was not put to an operator in this run."
+)
+#: Reason token of a mapped step an unattended run did not get to, and of the
+#: steps behind it. Nothing stopped it: it was mapped and not run.
+REASON_NOT_RUN_IN_ASSESSMENT = "not_run_in_this_assessment"
+NOT_RUN_IN_ASSESSMENT_LABEL = "Mapped, not executed in this assessment."
+#: The tokens the annotation completes a route with. None of them is a decision
+#: or an exclusion of its own, so a route's cause is never read from them.
+INHERITED_STEP_REASONS: frozenset[str] = frozenset(
+    {
+        REASON_DEPENDS_ON_POLICY_EXCLUDED,
+        REASON_DEPENDS_ON_INCOMPLETE_STEP,
+        REASON_NOT_RUN_IN_ASSESSMENT,
+    }
+)
+
+
 def dependent_step_label(reason: str) -> str:
     """The label of a step left unrun behind an operator decision, or ``""``.
 

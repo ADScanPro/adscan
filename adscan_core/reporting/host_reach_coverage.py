@@ -153,12 +153,68 @@ def _compose_statement(
     not_measured: int,
     silent_segments: list[str],
     scattered: int,
+    excluded: int = 0,
+    unconfirmed: int = 0,
 ) -> str:
     """Render the client-facing sentence for one domain or the report-wide fold.
 
     States what was and was not reached and what the client can do. Never the
-    internal reason, never a verdict about the client's network.
+    internal reason, never a verdict about the client's network. ``excluded``
+    computers (the client's engagement scope) are outside every figure here and
+    stated in one closing sentence, never as computers that did not answer.
     """
+    body = _compose_reach_statement(
+        in_scope=in_scope,
+        reached=reached,
+        not_reached=not_reached,
+        not_attempted=not_attempted,
+        not_measured=not_measured,
+        silent_segments=silent_segments,
+        scattered=scattered,
+    )
+    if not body:
+        return body
+    if excluded > 0 or unconfirmed > 0:
+        # The figures above cover only the computers left in scope, so they must
+        # not read as the whole directory.
+        import re  # noqa: PLC0415
+
+        body = re.sub(r" in the directory(?=[ .,])", " in the directory and in scope", body)
+    tails: list[str] = []
+    if excluded == 1:
+        tails.append(
+            "One further enabled computer was excluded from the engagement scope at "
+            "your request. It was not contacted and is not counted above."
+        )
+    elif excluded > 1:
+        tails.append(
+            f"A further {excluded:,} enabled computers were excluded from the engagement "
+            "scope at your request. They were not contacted and are not counted above."
+        )
+    if unconfirmed == 1:
+        tails.append(
+            "One further enabled computer could not be confirmed as within the "
+            "engagement scope, so it was left alone and is not counted above."
+        )
+    elif unconfirmed > 1:
+        tails.append(
+            f"A further {unconfirmed:,} enabled computers could not be confirmed as "
+            "within the engagement scope, so they were left alone and are not counted above."
+        )
+    return " ".join([body, *tails])
+
+
+def _compose_reach_statement(
+    *,
+    in_scope: int,
+    reached: int,
+    not_reached: int,
+    not_attempted: int,
+    not_measured: int,
+    silent_segments: list[str],
+    scattered: int,
+) -> str:
+    """The reach sentence over the in-scope computers (see :func:`_compose_statement`)."""
     if in_scope <= 0:
         return ""
     computers = _plural(in_scope, "computer", "computers")
@@ -367,14 +423,53 @@ def _sort_segment_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=_segment_sort_key)
 
 
+def host_reach_states(reachability_report: Any) -> dict[str, str]:
+    """``computer name -> "reached" | "not_reached"`` for the computers the
+    reachability pass resolved and tried.
+
+    The same rule the coverage block counts with (:func:`ip_entry_is_reached`
+    over every address the report lists for the host), exposed per host so
+    another block can say which computers answered without deriving it again.
+    A computer the report does not list, or lists with no address, is absent:
+    it was not measured.
+    """
+    report = reachability_report if isinstance(reachability_report, Mapping) else None
+    if report is None:
+        return {}
+    states: dict[str, str] = {}
+    for host in report.get("hosts") or ():
+        if not isinstance(host, Mapping):
+            continue
+        name = _normalize_host(host.get("hostname"))
+        ips = [ip for ip in host.get("ips") or () if isinstance(ip, Mapping) and ip.get("ip")]
+        if not name or not ips:
+            continue
+        if any(ip_entry_is_reached(ip) for ip in ips) or states.get(name) == "reached":
+            states[name] = "reached"
+        else:
+            states[name] = "not_reached"
+    return states
+
+
 def build_host_reach_coverage(
     *,
     enabled_computers: Iterable[Any],
     reachability_report: Any,
     vantage: Any = None,
     idle_interfaces: Any = None,
+    excluded_hosts: Iterable[Any] = (),
+    unconfirmed_hosts: Iterable[Any] = (),
 ) -> dict[str, Any]:
     """Build the ``host_reach_coverage`` block for one domain.
+
+    ``excluded_hosts`` are names (DNS name, short name, account name) of the
+    computers the client excluded from the engagement scope
+    (``engagement_scope.excluded_host_aliases``). They leave every figure here,
+    because ADscan never contacted them on purpose, and are counted in
+    ``computers_excluded_by_scope`` instead of reading as computers that did not
+    answer. ``unconfirmed_hosts`` are the computers the engine could not confirm
+    as within the scope and left alone; they leave the figures the same way and
+    are counted in ``computers_unconfirmed_scope``.
 
     Args:
         enabled_computers: The enabled computer objects in scope (the engine's
@@ -421,6 +516,23 @@ def build_host_reach_coverage(
             scope.append(name)
     if not scope:
         scope = sorted(host_ips)
+    excluded_names = {_normalize_host(h) for h in excluded_hosts or () if _normalize_host(h)}
+    unconfirmed_names = {
+        _normalize_host(h) for h in unconfirmed_hosts or () if _normalize_host(h)
+    }
+    excluded_count = 0
+    unconfirmed_count = 0
+    if excluded_names or unconfirmed_names:
+        kept: list[str] = []
+        for name in scope:
+            forms = {name, name.split(".", 1)[0]}
+            if forms & excluded_names:
+                excluded_count += 1
+            elif forms & unconfirmed_names:
+                unconfirmed_count += 1
+            else:
+                kept.append(name)
+        scope = kept
 
     reached_hosts: set[str] = set()
     unreached_hosts: set[str] = set()
@@ -461,7 +573,7 @@ def build_host_reach_coverage(
     )
     in_scope = len(scope)
     gap = len(unreached_hosts) + not_attempted + not_measured
-    return {
+    block: dict[str, Any] = {
         "measured": report is not None,
         "complete": gap == 0,
         "computers_in_scope": in_scope,
@@ -482,8 +594,17 @@ def build_host_reach_coverage(
             not_measured=not_measured,
             silent_segments=silent,
             scattered=scattered,
+            excluded=excluded_count,
+            unconfirmed=unconfirmed_count,
         ),
     }
+    # Absent without an asset scope, so the block of a scan with none is
+    # byte-identical to before.
+    if excluded_count:
+        block["computers_excluded_by_scope"] = excluded_count
+    if unconfirmed_count:
+        block["computers_unconfirmed_scope"] = unconfirmed_count
+    return block
 
 
 def _vantage_label(vantage: Any) -> str:
@@ -626,6 +747,8 @@ def host_reach_coverage_view(coverage: Any) -> dict[str, Any]:
         "computers_not_reached": _int(coverage, "computers_not_reached"),
         "computers_not_attempted": _int(coverage, "computers_not_attempted"),
         "computers_not_measured": _int(coverage, "computers_not_measured"),
+        "computers_excluded_by_scope": _int(coverage, "computers_excluded_by_scope"),
+        "computers_unconfirmed_scope": _int(coverage, "computers_unconfirmed_scope"),
         "unreached_segments": _int(coverage, "unreached_segments"),
         "segments": rows[:MAX_SEGMENT_ROWS],
         "segments_omitted": max(0, len(rows) - MAX_SEGMENT_ROWS),
@@ -667,6 +790,8 @@ def merge_host_reach_coverage(domain_entries: Any) -> dict[str, Any]:
             "computers_not_attempted",
             "computers_not_measured",
             "scattered_not_reached",
+            "computers_excluded_by_scope",
+            "computers_unconfirmed_scope",
         )
     }
     merged_segments: dict[str, dict[str, Any]] = {}
@@ -736,6 +861,8 @@ def merge_host_reach_coverage(domain_entries: Any) -> dict[str, Any]:
             not_measured=totals["computers_not_measured"],
             silent_segments=silent,
             scattered=totals["scattered_not_reached"],
+            excluded=totals["computers_excluded_by_scope"],
+            unconfirmed=totals["computers_unconfirmed_scope"],
         ),
     }
     view = host_reach_coverage_view(merged)

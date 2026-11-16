@@ -224,6 +224,16 @@ try {
     New-Item -ItemType Directory -Force -Path $PyDir | Out-Null
     Expand-Archive -Path $EmbedZip -DestinationPath $PyDir -Force
 
+    # The attack graph's working store (adscan_core\graph_store) is stdlib
+    # sqlite3, which the embeddable distribution carries as two files in its
+    # root. Without them every scan fails at its first collection stage, so a
+    # bundle missing either is broken, not degraded.
+    foreach ($sqliteFile in @("_sqlite3.pyd", "sqlite3.dll")) {
+        if (-not (Test-Path (Join-Path $PyDir $sqliteFile))) {
+            Fail "Embeddable CPython is missing $sqliteFile (needed by the graph store)."
+        }
+    }
+
     # -- (b) Create site\ and pip install the project + deps ------------------
     New-Item -ItemType Directory -Force -Path $SiteDir | Out-Null
     Write-Step "pip install project + deps into site\ (from pyproject.toml/uv.lock)"

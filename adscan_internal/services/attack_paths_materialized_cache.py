@@ -63,13 +63,25 @@ class MaterializedAttackPathArtifacts:
     storage_format: str
 
 
-@dataclass(slots=True)
-class MaterializedPreparedRuntimeGraph:
-    """Prepared runtime graph reused across attack-path computations."""
+@dataclass(frozen=True, slots=True)
+class PreparedRuntimeDelta:
+    """What preparing a runtime graph ADDS to the loaded attack graph.
+
+    The prepared graph is the loaded graph plus the terminal ``MemberOf`` edges
+    expanded from the membership snapshot (and any group node that expansion
+    mints). Only that addition is cached: the prepared graph itself is
+    assembled over the loaded graph's own node and edge objects, so holding it
+    costs two containers, never a second copy of the graph.
+
+    ``base_token`` identifies the loaded graph the delta was computed against
+    (object identity plus its sizes), so a delta is never applied to a different
+    graph object that happens to share the file fingerprint.
+    """
 
     fingerprint: str
-    graph: dict[str, object]
-    storage_format: str
+    base_token: tuple[int, int, int]
+    injected_edges: tuple[dict[str, object], ...]
+    minted_nodes: tuple[tuple[str, dict[str, object]], ...]
 
 
 def _file_token(path: str) -> tuple[int | None, int | None]:
@@ -114,11 +126,6 @@ def attack_path_cache_dir(shell: object, domain: str) -> Path:
 def artifact_metadata_path(shell: object, domain: str) -> Path:
     """Return the JSON metadata path for a domain cache directory."""
     return attack_path_cache_dir(shell, domain) / "artifacts_meta.json"
-
-
-def prepared_runtime_graph_metadata_path(shell: object, domain: str) -> Path:
-    """Return the metadata path for the prepared runtime graph cache."""
-    return attack_path_cache_dir(shell, domain) / "runtime_graph_meta.json"
 
 
 def invalidate_attack_path_artifacts(shell: object, domain: str) -> None:
@@ -210,68 +217,6 @@ def load_materialized_attack_path_artifacts(
     )
 
 
-def load_materialized_prepared_runtime_graph(
-    *,
-    shell: object,
-    domain: str,
-    fingerprint: str,
-) -> MaterializedPreparedRuntimeGraph | None:
-    """Load a prepared runtime graph when the fingerprint matches."""
-    cache_dir = attack_path_cache_dir(shell, domain)
-    meta_path = prepared_runtime_graph_metadata_path(shell, domain)
-    if not cache_dir.exists() or not meta_path.exists():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(meta, dict) or str(meta.get("fingerprint") or "") != fingerprint:
-        return None
-
-    storage_format = str(meta.get("storage_format") or "json").strip().lower()
-    if storage_format == "parquet" and pa is not None and pq is not None:
-        nodes_path = cache_dir / "runtime_graph_nodes.parquet"
-        edges_path = cache_dir / "runtime_graph_edges.parquet"
-        if not nodes_path.exists() or not edges_path.exists():
-            return None
-        try:
-            node_rows = pq.read_table(nodes_path).to_pylist()
-            edge_rows = pq.read_table(edges_path).to_pylist()
-        except Exception:
-            return None
-        # Restore the top-level graph metadata (domain/netbios/dc_ip/…) that the
-        # Parquet tables do not carry — see the persist side. Without this the
-        # report's ``_stamp_env`` sees an empty ``graph["domain"]`` and renders a
-        # literal ``<domain>`` in every container (pyarrow present); the host
-        # (JSON branch) is unaffected. ``nodes``/``edges`` from Parquet always win.
-        _top_level = meta.get("top_level")
-        graph = {
-            **(_top_level if isinstance(_top_level, dict) else {}),
-            "nodes": {
-                str(row.get("node_id") or ""): json.loads(str(row.get("node_json") or "{}"))
-                for row in node_rows
-                if str(row.get("node_id") or "").strip()
-            },
-            "edges": [json.loads(str(row.get("edge_json") or "{}")) for row in edge_rows],
-            "_attack_paths_terminal_memberships_materialized": True,
-        }
-    else:
-        graph_path = cache_dir / "runtime_graph.json"
-        if not graph_path.exists():
-            return None
-        try:
-            graph = json.loads(graph_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return None
-        if not isinstance(graph, dict):
-            return None
-    return MaterializedPreparedRuntimeGraph(
-        fingerprint=fingerprint,
-        graph=graph,
-        storage_format=storage_format,
-    )
-
-
 def persist_materialized_attack_path_artifacts(
     *,
     shell: object,
@@ -346,92 +291,39 @@ def persist_materialized_attack_path_artifacts(
     )
 
 
-def persist_materialized_prepared_runtime_graph(
-    *,
-    shell: object,
-    domain: str,
-    prepared_graph: MaterializedPreparedRuntimeGraph,
-) -> None:
-    """Persist a prepared runtime graph using Parquet when available."""
+#: Files a pre-15.0.0 engine wrote for the prepared runtime graph: a complete
+#: second copy of the domain's attack graph (hundreds of megabytes on a large
+#: directory, and it carried the graph's secret references). The prepared graph
+#: now shares the loaded graph's node and edge objects and is never written to
+#: disk; :func:`remove_legacy_prepared_runtime_graph_files` deletes these.
+LEGACY_PREPARED_RUNTIME_GRAPH_FILES: tuple[str, ...] = (
+    "runtime_graph.json",
+    "runtime_graph_nodes.parquet",
+    "runtime_graph_edges.parquet",
+    "runtime_graph_meta.json",
+)
+
+
+def remove_legacy_prepared_runtime_graph_files(shell: object, domain: str) -> int:
+    """Delete the whole-graph copy an earlier engine persisted, best-effort.
+
+    Returns how many files were removed. Never raises, and leaves a frozen
+    workspace untouched.
+    """
     cache_dir = attack_path_cache_dir(shell, domain)
-    if write_blocked(cache_dir):
-        return
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    graph = dict(prepared_graph.graph)
-    graph["_attack_paths_terminal_memberships_materialized"] = True
-    storage_format = "json"
-    if pa is not None and pq is not None:
-        nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-        edges = graph.get("edges") if isinstance(graph.get("edges"), list) else []
-        node_rows = [
-            {"node_id": str(node_id), "node_json": json.dumps(node, sort_keys=True)}
-            for node_id, node in sorted(nodes.items())
-            if isinstance(node, dict)
-        ]
-        edge_rows = [
-            {"edge_json": json.dumps(edge, sort_keys=True)}
-            for edge in edges
-            if isinstance(edge, dict)
-        ]
-        pq.write_table(
-            pa.Table.from_pylist(
-                node_rows,
-                schema=pa.schema([("node_id", pa.string()), ("node_json", pa.string())]),
-            ),
-            cache_dir / "runtime_graph_nodes.parquet",
-        )
-        pq.write_table(
-            pa.Table.from_pylist(
-                edge_rows,
-                schema=pa.schema([("edge_json", pa.string())]),
-            ),
-            cache_dir / "runtime_graph_edges.parquet",
-        )
-        storage_format = "parquet"
-    else:
-        (cache_dir / "runtime_graph.json").write_text(
-            json.dumps(graph, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-
-    # Preserve the graph's top-level scalar metadata (domain, netbios, dc_ip,
-    # schema_version, generated_at, …) across the Parquet round-trip. Parquet
-    # stores only the ``nodes``/``edges`` tables, so without this the reloaded
-    # graph would lose ``domain``/``netbios`` and the report's per-step
-    # ``_stamp_env`` would render a literal ``<domain>`` instead of ``HTB\`` —
-    # a defect visible ONLY where pyarrow is present (every container: LITE,
-    # PRO, appliance), never on a host without pyarrow (which takes the JSON
-    # branch that already round-trips the full graph). Store the whole
-    # top-level block, not just ``domain``, so no future top-level field is
-    # silently dropped. JSON-safe by construction (it came from the on-disk
-    # attack graph); guarded so a non-serializable value never breaks persist.
+    removed = 0
     try:
-        top_level = {
-            key: value
-            for key, value in graph.items()
-            if key not in ("nodes", "edges")
-        }
-        json.dumps(top_level)  # fail fast if anything is not serializable
-    except (TypeError, ValueError):
-        top_level = {"domain": domain}
-    prepared_runtime_graph_metadata_path(shell, domain).write_text(
-        json.dumps(
-            {
-                "fingerprint": prepared_graph.fingerprint,
-                "storage_format": storage_format,
-                "domain": domain,
-                "top_level": top_level,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    print_info_debug(
-        f"[attack_paths] prepared runtime graph stored: domain={mark_sensitive(domain, 'domain')} "
-        f"format={storage_format}"
-    )
+        if not cache_dir.is_dir() or write_blocked(cache_dir):
+            return 0
+    except OSError:
+        return 0
+    for name in LEGACY_PREPARED_RUNTIME_GRAPH_FILES:
+        try:
+            (cache_dir / name).unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 # --- L2 disk RESULT cache (final path set) ---------------------------------
@@ -444,6 +336,13 @@ def persist_materialized_prepared_runtime_graph(
 # disk layer inherits L1's never-stale contract for free: any topology change
 # moves the epoch -> new key -> new hash -> the old file is unreachable. There is
 # NO new correctness reasoning here; the key IS the correctness.
+
+
+#: Format of a disk result entry. An entry without it was written before results
+#: produced under a resource stop were kept off disk (14.0.x stored them, and its
+#: key carried a memory limit that is ``None`` in a container started without
+#: one), so it may hold a stopped result: it is never served, only recomputed.
+DISK_RESULT_FORMAT = 2
 
 
 def attack_path_results_key_hash(cache_key: tuple[Any, ...]) -> str:
@@ -495,6 +394,8 @@ def load_disk_cached_attack_path_results(
     except (OSError, ValueError, TypeError):
         return None
     if not isinstance(payload, dict):
+        return None
+    if payload.get("format") != DISK_RESULT_FORMAT:
         return None
     records = payload.get("records")
     if not isinstance(records, list):
@@ -552,6 +453,7 @@ def persist_attack_path_results_to_disk(
     try:
         results_dir.mkdir(parents=True, exist_ok=True)
         payload = {
+            "format": DISK_RESULT_FORMAT,
             "key_hash": key_hash,
             "domain": domain,
             "epoch": _epoch_token(epoch),

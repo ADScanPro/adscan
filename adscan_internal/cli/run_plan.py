@@ -168,7 +168,16 @@ _DELIVER_FIELDS: tuple[_Field, ...] = (
 #: and, for ``deliver``, an output directory OUTSIDE the workspace, which the
 #: contract forbids (a node writes only inside its workspace).
 _CONSOLE_DESTS = ("verbose", "debug", "dev")
-_UNREPRESENTABLE_DESTS = {"deliver": ("output",), "scan": ("output",)}
+#: The ``--scope-*`` flags of ``ci``: a plan carries the asset scope as data in
+#: ``scan.scan_config.asset_scope`` (no host file paths in a plan).
+_SCOPE_FLAG_DESTS = (
+    "scope_allow",
+    "scope_deny",
+    "scope_allow_file",
+    "scope_deny_file",
+    "scope_dc_access",
+)
+_UNREPRESENTABLE_DESTS = {"deliver": ("output",), "scan": ("output", *_SCOPE_FLAG_DESTS)}
 
 _KIND_FIELDS: dict[str, tuple[_Field, ...]] = {
     "scan": _CI_FIELDS,
@@ -301,6 +310,18 @@ def scan_config_to_plan(config: Any) -> dict[str, Any]:
     pacing = sc.pacing_section(config.pacing)
     if pacing:
         out["pacing"] = pacing
+    # The asset scope: a present section (even with both lists empty) replaces
+    # the workspace's recorded scope, so it is emitted whenever it was given.
+    asset_scope = getattr(config, "asset_scope", None)
+    if asset_scope is not None:
+        section: dict[str, Any] = {"allow": list(asset_scope.allow), "deny": list(asset_scope.deny)}
+        if asset_scope.dc_access:
+            section["dc_access"] = asset_scope.dc_access
+        if asset_scope.decided_by != "scan_configuration":
+            section["decided_by"] = asset_scope.decided_by
+        if asset_scope.decided_by_label:
+            section["decided_by_label"] = asset_scope.decided_by_label
+        out["asset_scope"] = section
     return out
 
 
@@ -416,7 +437,11 @@ class RunPlan:
                 raise ContractError(
                     "not_representable",
                     f"/{dest}",
-                    "a plan writes only inside the workspace; drop the flag or move the output",
+                    (
+                        "a plan carries the engagement scope in scan.scan_config.asset_scope"
+                        if dest in _SCOPE_FLAG_DESTS
+                        else "a plan writes only inside the workspace; drop the flag or move the output"
+                    ),
                 )
         has_user = bool(getattr(ns, "username", None))
         has_secret = bool(getattr(ns, "password", None))

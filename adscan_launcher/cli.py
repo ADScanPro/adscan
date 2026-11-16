@@ -126,6 +126,7 @@ _LINUX_REQUIRED_COMMANDS = {
 _KNOWN_LAUNCHER_COMMANDS = {
     "install",
     "license",
+    "config",
     "check",
     "start",
     "tui",
@@ -222,6 +223,9 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
 
     def format_help(self) -> str:  # type: ignore[override]
         base = super().format_help()
+        # Subparsers inherit this class; only the root parser carries the catalogue.
+        if self.prog != "adscan":
+            return base
         try:
             from adscan_core.cli_catalog import (
                 DELIVERABLE_COMMAND_ORDER as _DELIV_ORDER,
@@ -284,17 +288,10 @@ class _DeliverablesAwareParser(argparse.ArgumentParser):
         return base + "\n".join(lines) + "\n"
 
 
-# Help text for the launcher-own ``--partner-tag`` flag, shared by `start` and
-# `ci` so both read identically. This is a LAUNCHER flag (consumed at the seam,
-# never forwarded as a container argument), so it is deliberately NOT part of
-# `adscan_core.cli_passthrough_spec` — that SSOT only mirrors arguments the
-# container parser owns.
-_PARTNER_TAG_FLAG_HELP = (
-    "ADscan PRO: activate this install with the partner tag from your "
-    "onboarding email (for example: --partner-tag acme-mssp). The tag is saved "
-    "under ~/.adscan/state and reused on every later run, so you pass it once "
-    "per machine. Ignored by the free tier."
-)
+# ``--partner-tag`` is RETIRED (2026-11-12): a PRO install takes its identity,
+# and the partner tag, from its licence. The flag stays accepted and hidden so
+# an existing script that still passes it keeps working; its value is dropped.
+_RETIRED_PARTNER_TAG_FLAG_HELP = argparse.SUPPRESS
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -306,8 +303,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--image",
-        help="Override the ADscan Docker image (defaults to env ADSCAN_DOCKER_IMAGE or channel).",
+        help=(
+            "Advanced: run this exact Docker image instead of the edition your licence selects "
+            "(same as ADSCAN_DOCKER_IMAGE). Wins over --lite and the licence."
+        ),
         default=None,
+    )
+    parser.add_argument(
+        "--lite",
+        action="store_true",
+        help=(
+            "Run ADscan LITE for this command even when a PRO licence is active. "
+            "`adscan config edition lite` makes it the default."
+        ),
     )
     parser.add_argument(
         "--channel",
@@ -375,7 +383,47 @@ def _build_parser() -> argparse.ArgumentParser:
     # the curly-brace choices list at the top of ``--help``.
     sub = parser.add_subparsers(dest="command", required=False, metavar="command")
 
-    install = sub.add_parser("install", help="Install ADscan (Docker mode)")
+    install = sub.add_parser(
+        "install",
+        help="Install ADscan (Docker mode). With a PRO activation key, installs ADscan PRO.",
+        description=(
+            "Install ADscan. With --license-file, --license-stdin, --license or the "
+            "ADSCAN_ACTIVATION_KEY environment variable, this machine is activated first and "
+            "ADscan PRO is downloaded from the ADscan registry with this machine's own key. "
+            "No GitHub account and no docker login are needed."
+        ),
+    )
+    licence_src = install.add_mutually_exclusive_group()
+    licence_src.add_argument(
+        "--license-file",
+        metavar="FILE",
+        help="Activate ADscan PRO with the activation key in FILE, then install PRO.",
+    )
+    licence_src.add_argument(
+        "--license-stdin",
+        action="store_true",
+        help="Read the PRO activation key from standard input.",
+    )
+    licence_src.add_argument(
+        "--license",
+        metavar="KEY",
+        help="The PRO activation key itself (stays in your shell history; prefer --license-file).",
+    )
+    install.add_argument(
+        "--seat-label",
+        help="A name for this PRO seat, shown to your account (no hostname is sent).",
+    )
+    install.add_argument(
+        "--image-archive",
+        metavar="FILE",
+        help="Offline install: load ADscan PRO from adscan-pro-<version>.tar.zst after checking "
+        "its ADscan-signed sidecar (the .json beside it).",
+    )
+    install.add_argument(
+        "--image-sidecar",
+        metavar="FILE",
+        help="The signed sidecar, when it is not beside the archive.",
+    )
     install.add_argument(
         "--pull-timeout",
         type=int,
@@ -503,9 +551,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="no_telemetry",
         help=(
-            "Disable anonymous usage telemetry for this session (sensitive "
+            "Disable sanitized usage telemetry for this session (sensitive "
             "engagements). Sets ADSCAN_TELEMETRY=0 inside the session container. "
-            "To opt out permanently, run 'set telemetry off' in the shell."
+            "To opt out for every workspace, run 'set telemetry off global' in the shell."
         ),
     )
     start.add_argument(
@@ -513,8 +561,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="partner_tag",
         default=None,
         metavar="TAG",
-        help=_PARTNER_TAG_FLAG_HELP,
+        help=_RETIRED_PARTNER_TAG_FLAG_HELP,
     )
+    # The asset-level engagement scope, the same five flags the container `start`
+    # and `ci` parsers declare. Validated here before Docker starts; applied to
+    # the workspace opened at startup after a confirmation summary.
+    from adscan_core.engagement_scope_cli import add_scope_arguments as _add_scope_arguments
+
+    _add_scope_arguments(start)
     # `--tui` and the top-level `tui` subcommand are intentionally hidden
     # from --help while the Textual workbench is under active development.
     # Routing is preserved so anyone who knows the verb can still invoke
@@ -624,7 +678,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="no_telemetry",
         help=(
-            "Disable anonymous usage telemetry for this run (sensitive "
+            "Disable sanitized usage telemetry for this run (sensitive "
             "engagements). Sets ADSCAN_TELEMETRY=0 inside the scan container."
         ),
     )
@@ -633,7 +687,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="partner_tag",
         default=None,
         metavar="TAG",
-        help=_PARTNER_TAG_FLAG_HELP,
+        help=_RETIRED_PARTNER_TAG_FLAG_HELP,
     )
     ci.add_argument(
         "--scan-config",
@@ -813,14 +867,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-telemetry",
         action="store_true",
         dest="no_telemetry",
-        help="Disable anonymous usage telemetry for this run (sets ADSCAN_TELEMETRY=0).",
+        help="Disable sanitized usage telemetry for this run (sets ADSCAN_TELEMETRY=0).",
     )
     run_p.add_argument(
         "--partner-tag",
         dest="partner_tag",
         default=None,
         metavar="TAG",
-        help=_PARTNER_TAG_FLAG_HELP,
+        help=_RETIRED_PARTNER_TAG_FLAG_HELP,
     )
     run_p.add_argument(
         "run_args",
@@ -1007,6 +1061,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Show the editorial welcome screen (default with no command).",
     )
 
+    # ── adscan config (host-side launcher preferences) ─────────────────
+    from adscan_launcher.edition_command import add_config_subparser
+
+    add_config_subparser(sub)
+
     # ── adscan license (host-side; every launcher, LITE included) ─────
     # The PRO licence: activation, status, release, relay. Host-side because
     # activation must work before a PRO image exists on the host
@@ -1056,6 +1115,10 @@ def _drop_suppressed_choices(subparsers_action, dests: set[str]) -> None:
 def _apply_image_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "image", None):
         os.environ["ADSCAN_DOCKER_IMAGE"] = str(args.image)
+    if getattr(args, "lite", False):
+        from adscan_launcher.edition import EDITION_ENV, EDITION_LITE
+
+        os.environ[EDITION_ENV] = EDITION_LITE
     if getattr(args, "channel", None):
         os.environ["ADSCAN_DOCKER_CHANNEL"] = "dev" if args.channel == "dev" else ""
     if getattr(args, "dev", False):
@@ -1095,6 +1158,10 @@ def _consume_trailing_global_flags(
             continue
         if token == "--dev":
             setattr(ns, "dev", True)
+            idx += 1
+            continue
+        if token == "--lite":
+            setattr(ns, "lite", True)
             idx += 1
             continue
         if token == "--allow-low-memory" and cmd in low_memory_supported_cmds:
@@ -1233,64 +1300,18 @@ def _posture_env_from_flags(
     return extra_env, cleaned
 
 
-def _extract_partner_tag_flag(
-    ns: argparse.Namespace, passthrough: list[str]
-) -> tuple[str | None, list[str]]:
-    """Pull ``--partner-tag <value>`` out of the namespace and the passthrough.
-
-    Mirrors ``--scan-config``: the parsed attribute is used when the flag
-    preceded the auth/unauth positional, and the raw passthrough is scanned for
-    tokens that landed after it (past ``argparse.REMAINDER``'s flag cut-off).
-    Recognised tokens are removed so they never reach the container's parser.
-
-    Returns:
-        ``(tag_or_None, cleaned_passthrough)``.
-
-    Raises:
-        SystemExit: with code 2 when ``--partner-tag`` is given without a value.
-    """
-    tag = getattr(ns, "partner_tag", None)
-
-    cleaned: list[str] = []
-    tokens = list(passthrough)
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--partner-tag":
-            if index + 1 < len(tokens):
-                tag = tokens[index + 1]
-                index += 2
-                continue
-            print_error("--partner-tag requires a tag argument.")
-            raise SystemExit(2)
-        if token.startswith("--partner-tag="):
-            tag = token.split("=", 1)[1]
-            index += 1
-            continue
-        cleaned.append(token)
-        index += 1
-
-    normalized = str(tag).strip() if tag is not None else None
-    return (normalized or None), cleaned
-
-
-def _apply_partner_tag_flag(
+def _drop_retired_partner_tag_flag(
     ns: argparse.Namespace, passthrough: list[str]
 ) -> list[str]:
-    """Activate this install with ``--partner-tag`` and strip it from the args.
+    """Strip the retired ``--partner-tag`` flag and ignore its value.
 
-    ADscan PRO refuses to start without a partner tag, and until this flag
-    existed the only documented recovery was an environment variable — which is
-    a route the operator cannot take on their own if the launcher does not
-    forward it. This is the route that always works: the tag is validated
-    against the shared format contract, persisted to the bind-mounted state dir
-    (``~/.adscan/state/partner.json`` -> ``/opt/adscan/state``, so it survives
-    ``docker run --rm`` and every later run), and exported on the launcher
-    process so the standard env forwarding carries it into THIS run.
-
-    Setting the launcher's own environment (rather than returning an extra
-    ``-e``) keeps one forwarding mechanism: an explicit flag simply overrides an
-    ambient ``ADSCAN_PARTNER_TAG`` for this run instead of racing it.
+    A PRO install's identity, partner tag included, now comes from its signed
+    licence, so the user never supplies one. The flag is still parsed (hidden)
+    so an old script keeps working: a value given before the auth/unauth
+    positional is dropped from the namespace, and ``--partner-tag X`` /
+    ``--partner-tag=X`` tokens that landed after it (past
+    ``argparse.REMAINDER``) are removed so they never reach the container
+    parser. Quiet on purpose; one debug line says it was ignored.
 
     Args:
         ns: Parsed launcher namespace.
@@ -1298,129 +1319,30 @@ def _apply_partner_tag_flag(
 
     Returns:
         The passthrough with any ``--partner-tag`` tokens removed.
-
-    Raises:
-        SystemExit: with code 2 when the tag is missing its value or malformed.
     """
-    tag, cleaned = _extract_partner_tag_flag(ns, passthrough)
-    if not tag:
-        return cleaned
-
-    from adscan_core import telemetry as _telemetry
-
-    if not _telemetry.validate_partner_tag(tag):
-        print_error(
-            "Invalid partner tag. Use the tag from your onboarding email: "
-            f"{_telemetry.PARTNER_TAG_FORMAT_HINT}."
+    seen = bool(getattr(ns, "partner_tag", None))
+    cleaned: list[str] = []
+    tokens = list(passthrough)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--partner-tag":
+            seen = True
+            # Drop the value too, when there is one that is not another flag.
+            index += 2 if index + 1 < len(tokens) and not tokens[index + 1].startswith("-") else 1
+            continue
+        if token.startswith("--partner-tag="):
+            seen = True
+            index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+    if seen:
+        print_info_debug(
+            "--partner-tag is retired and was ignored: a PRO install takes its "
+            "identity from its licence (adscan license status)."
         )
-        raise SystemExit(2)
-
-    tag = tag.lower()
-    try:
-        _telemetry.persist_partner_tag(tag)
-    except OSError as exc:
-        capture_exception(exc)
-        print_exception(exception=exc)
-        # Non-fatal: the tag still reaches this run through the environment
-        # below; only the "ask once per machine" convenience is lost.
-        print_warning(
-            "Could not save the partner tag for future runs. Check that "
-            "~/.adscan is writable; this run continues with the tag you passed."
-        )
-
-    os.environ["ADSCAN_PARTNER_TAG"] = tag
-    try:
-        _telemetry.refresh_partner_tag()
-    except Exception:  # noqa: BLE001 — attribution is never worth failing a run
-        pass
     return cleaned
-
-
-def _image_ref_is_dev_edge(image_ref: str) -> bool:
-    """True when the resolved image is the internal dev/CI ``:edge`` build.
-
-    Mirrors :func:`adscan_internal.cli.partner_tag_gate._is_dev_edge_runtime`:
-    partners always receive ``:latest`` / a pinned ``:vX.Y.Z`` tag, so an
-    ``:edge`` tag is the founder's own ``--dev`` run or the CI regression
-    workflow. The partner-tag gate is attribution, not access control, so those
-    internal runs are never gated. Tolerant of a ``host:port`` registry prefix by
-    reading only the final path segment's tag.
-    """
-    last_segment = str(image_ref or "").strip().lower().rsplit("/", 1)[-1]
-    if ":" not in last_segment:
-        return False
-    return last_segment.rsplit(":", 1)[-1] == "edge"
-
-
-def _should_block_pro_without_tag(
-    license_mode: str | None, resolved_tag: str, image_ref: str = ""
-) -> bool:
-    """Return True when a PRO run has no resolvable partner tag.
-
-    Pure decision function so the gate can be unit-tested in isolation.
-
-    Args:
-        license_mode: The runtime license mode the launcher resolved before any
-            Docker pull (``"PRO"`` / ``"LITE"`` / ``None`` when undeterminable).
-        resolved_tag: The partner tag resolved via
-            :func:`adscan_core.telemetry.resolve_partner_tag` (env → persisted
-            volume file), ``""`` when none is resolvable by any route.
-        image_ref: The resolved runtime image reference. When it is the internal
-            dev/CI ``:edge`` build, the run is NEVER gated — mirroring the
-            in-container ``_is_dev_edge_runtime`` skip, so `--dev`/CI PRO runs are
-            not blocked (the regression this argument fixes).
-
-    Returns:
-        True only when the run is PRO, is not the dev/CI ``:edge`` image, and no
-        partner tag is resolvable — the one case the in-container gate would
-        refuse. Anything else (LITE, an undeterminable mode, the dev/CI image, or
-        a resolvable tag) returns False so the run proceeds and the in-container
-        gate stays the backstop.
-    """
-    if str(license_mode or "").strip().upper() != "PRO":
-        return False
-    if _image_ref_is_dev_edge(image_ref):
-        return False
-    return not resolved_tag
-
-
-def _enforce_partner_tag_before_container() -> None:
-    """Abort a doomed PRO-without-tag run BEFORE the launcher spends a docker run.
-
-    The in-container start gate (:mod:`adscan_internal.cli.partner_tag_gate`)
-    already refuses PRO without a partner tag, but only after the image starts
-    and the entrypoint runs. This is the fastest layer: it resolves the license
-    mode locally (no network) and the partner tag through the SAME SSOT resolver
-    the container uses (:func:`adscan_core.telemetry.resolve_partner_tag`, which
-    reads ``ADSCAN_PARTNER_TAG`` and the bind-mounted ``partner.json``), so host
-    and container agree by construction. Call it AFTER
-    :func:`_apply_partner_tag_flag` — a run WITH ``--partner-tag`` has already
-    exported the tag, so the resolver sees it and this no-ops.
-
-    LITE runs, and PRO runs with a resolvable tag, are never gated. The
-    in-container gate remains the backstop for a direct ``docker run`` that
-    bypasses the launcher.
-
-    Raises:
-        SystemExit: with code 1 when a PRO run has no resolvable partner tag.
-    """
-    from adscan_core import telemetry as _telemetry
-    from adscan_core.pro_license.identity import installed_licence_identity
-    from adscan_launcher.docker_commands import _select_existing_or_preferred_image
-
-    if installed_licence_identity() is not None:
-        # A verified PRO licence (`adscan license activate`) is the identity.
-        return
-    # Resolve the image ONCE so the license inference and the dev/CI :edge skip
-    # both key off the exact same reference the run will use.
-    image_ref = _select_existing_or_preferred_image()
-    if not _should_block_pro_without_tag(
-        resolve_runtime_license_mode(), _telemetry.resolve_partner_tag(), image_ref
-    ):
-        return
-
-    print_error(_telemetry.PARTNER_TAG_REQUIRED_MESSAGE)
-    raise SystemExit(1)
 
 
 # Container path the scan-config file is bind-mounted at. Fixed (not under the
@@ -1485,6 +1407,77 @@ def _ci_scan_config_from_flags(
     extra_env = [("ADSCAN_SCAN_CONFIG", _CI_SCAN_CONFIG_CONTAINER_PATH)]
     extra_mounts = [(resolved, _CI_SCAN_CONFIG_CONTAINER_PATH)]
     return extra_env, extra_mounts, cleaned
+
+
+def _scope_flags_for_container(values: Any) -> tuple[list[str], list[tuple[str, str]]]:
+    """Validate the ``--scope-*`` flags on the host and prepare them for Docker.
+
+    The launcher parses every inline value and every scope file with the same
+    stdlib parser the engine uses, BEFORE Docker starts: a syntax error exits 2
+    naming the file, the line and the reason, and nothing is sent. Each file is
+    then mounted read-only (one file, under ``SCOPE_IO_CONTAINER_DIR``, never its
+    folder and never under the ADscan home, so nothing is left behind) and the
+    flag is rewritten to the container path; the engine re-reads it.
+
+    Returns:
+        ``(container_flag_tokens, read_only_mounts)``; both empty without flags.
+    """
+    from rich.markup import escape  # noqa: PLC0415
+
+    from adscan_core.container_io import SCOPE_IO_CONTAINER_DIR  # noqa: PLC0415
+    from adscan_core.engagement_scope_cli import (  # noqa: PLC0415
+        mount_scope_files,
+        parse_scope_flags,
+        scope_error_line,
+    )
+    from adscan_core.engagement_scope_model import ScopeSyntaxError  # noqa: PLC0415
+
+    if not values.any_given:
+        return [], []
+    for path in (*values.allow_files, *values.deny_files):
+        resolved = os.path.abspath(os.path.expanduser(str(path)))
+        if not os.path.isfile(resolved):
+            print_error(
+                "Engagement scope not accepted, nothing was sent: scope file not found: "
+                f"{escape(resolved)}"
+            )
+            raise SystemExit(2)
+    try:
+        parsed = parse_scope_flags(values)
+    except ScopeSyntaxError as exc:
+        print_error(escape(scope_error_line(exc)))
+        raise SystemExit(2) from exc
+    for warning in parsed.warnings:
+        print_warning(f"Engagement scope: {escape(warning)}")
+    print_info(
+        f"Engagement scope checked: {len(parsed.allow)} allow and "
+        f"{len(parsed.deny)} deny entries."
+    )
+    mounted = mount_scope_files(values, container_root=SCOPE_IO_CONTAINER_DIR)
+    return mounted.tokens, mounted.mounts
+
+
+def _ci_scope_from_passthrough(passthrough: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Pull the scope flags out of the ``ci`` pass-through and validate them.
+
+    Returns the pass-through with the container-ready scope flags appended, and
+    the read-only mounts for the scope files.
+    """
+    from rich.markup import escape  # noqa: PLC0415
+
+    from adscan_core.engagement_scope_cli import (  # noqa: PLC0415
+        scope_error_line,
+        split_scope_tokens,
+    )
+    from adscan_core.engagement_scope_model import ScopeSyntaxError  # noqa: PLC0415
+
+    try:
+        values, rest = split_scope_tokens(passthrough)
+    except ScopeSyntaxError as exc:
+        print_error(escape(scope_error_line(exc)))
+        raise SystemExit(2) from exc
+    tokens, mounts = _scope_flags_for_container(values)
+    return rest + tokens, mounts
 
 
 #: Container directory the files of `adscan policy import` / `export --output`
@@ -1622,7 +1615,7 @@ class RunPlanIo:
 
     Reading the plan writes nothing secret: ``env_names`` lists the env:
     references, and :meth:`with_env_secrets` materialises them, which the
-    dispatch calls only AFTER the tier and partner-tag gates (either may exit)
+    dispatch calls only AFTER the tier gate (it may exit)
     and inside the ``try`` whose ``finally`` calls :meth:`cleanup`.
     """
 
@@ -2884,11 +2877,18 @@ def _render_host_welcome() -> None:
         print_welcome_host,
     )
     posture, ws_name, age_days = load_latest_posture_host()
+    try:
+        # Local only (no pull): the PRO badge and its licence line follow the
+        # image this host would run.
+        license_mode = resolve_runtime_license_mode() or "LITE"
+    except Exception:  # noqa: BLE001 - the welcome never fails on the badge
+        license_mode = "LITE"
     print_welcome_host(
         latest_posture=posture,
         workspace_name=ws_name,
         last_scan_age_days=age_days,
         version_tag=f"v{__version__}",
+        license_mode=license_mode,
     )
 
 
@@ -2972,6 +2972,9 @@ def main(argv: list[str] | None = None) -> None:
     if show_version:
         print_info(f"ADscan launcher: v{__version__}")
         img = get_docker_image_name()
+        from adscan_launcher.edition_command import describe_edition
+
+        print_info(describe_edition())
         print_info(f"Docker image: {img}")
         if not is_dev_update_context(image_name=img):
             recency = get_local_update_recency_summary(str(get_state_dir()))
@@ -3016,6 +3019,11 @@ def main(argv: list[str] | None = None) -> None:
         from adscan_launcher.license_command import run_license_command
 
         raise SystemExit(run_license_command(ns))
+
+    if cmd == "config":
+        from adscan_launcher.edition_command import run_config_command
+
+        raise SystemExit(run_config_command(ns))
 
     _emit_launcher_privilege_context(cmd)
     _guard_root_shell_without_user_context(cmd)
@@ -3090,13 +3098,12 @@ def main(argv: list[str] | None = None) -> None:
         # Same seam as `ci`: the posture toggles are consumed here and handed to
         # the container as environment, never as `adscan start` arguments.
         start_posture_env, _ = _posture_env_from_flags(ns, [])
-        # PRO activation: persist + export the partner tag before the container
-        # starts, so the in-container start gate finds it.
-        _apply_partner_tag_flag(ns, [])
-        # Fast pre-container gate: abort a PRO run with no resolvable partner tag
-        # here, before spending a docker run. Runs AFTER activation so a run WITH
-        # --partner-tag passes cleanly. No-op for LITE / when a tag is resolvable.
-        _enforce_partner_tag_before_container()
+        _drop_retired_partner_tag_flag(ns, [])
+        from adscan_core.engagement_scope_cli import scope_flag_values  # noqa: PLC0415
+
+        start_scope_args, start_scope_mounts = _scope_flags_for_container(
+            scope_flag_values(ns)
+        )
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="start",
@@ -3108,6 +3115,8 @@ def main(argv: list[str] | None = None) -> None:
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
                     tui=bool(getattr(ns, "tui", False)),
                     extra_env=start_posture_env,
+                    extra_args=start_scope_args,
+                    extra_mounts=start_scope_mounts,
                 ),
                 extra={"mode": "docker", "session_scope": "launcher_preflight"},
                 allowed_commands=set(SESSION_CAPTURE_ALLOWED_COMMANDS),
@@ -3143,6 +3152,17 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     if cmd == "install":
+        # PRO in one line: activate first, so the edition resolves to PRO and the
+        # install below pulls it from the licence-authorised registry.
+        from adscan_launcher.edition_command import activate_for_install
+
+        if activate_for_install(ns) != 0:
+            raise SystemExit(1)
+        from adscan_launcher.edition_command import load_image_archive
+
+        preloaded = load_image_archive(ns)
+        if preloaded is False:
+            raise SystemExit(1)
         raise SystemExit(
             _run_host_command_with_session_capture(
                 command_type="install",
@@ -3150,6 +3170,7 @@ def main(argv: list[str] | None = None) -> None:
                 runner=lambda: handle_install_docker(
                     pull_timeout_seconds=int(ns.pull_timeout),
                     allow_low_memory=bool(getattr(ns, "allow_low_memory", False)),
+                    image_preloaded=bool(preloaded),
                 ),
                 extra={"mode": "docker"},
             )
@@ -3203,22 +3224,19 @@ def main(argv: list[str] | None = None) -> None:
         # auth/unauth positional (past argparse.REMAINDER's flag cut-off) still
         # takes effect and never reaches the container parser.
         posture_env, passthrough = _posture_env_from_flags(ns, passthrough)
-        # PRO activation: validate + persist the partner tag and export it on
-        # this process so the standard env forwarding carries it into the scan
-        # container (the in-container gate otherwise refuses to start PRO).
-        # Consumed at the seam and stripped from the passthrough, like the
-        # toggles above.
-        passthrough = _apply_partner_tag_flag(ns, passthrough)
-        # Fast pre-container gate: abort a PRO run with no resolvable partner tag
-        # here, before spending a docker run. Runs AFTER activation so a run WITH
-        # --partner-tag passes cleanly. No-op for LITE / when a tag is resolvable.
-        _enforce_partner_tag_before_container()
+        # The retired --partner-tag is stripped at the seam so an old script's
+        # tokens never reach the container parser.
+        passthrough = _drop_retired_partner_tag_flag(ns, passthrough)
         # Translate --scan-config <host-path> into a read-only container mount +
         # ADSCAN_SCAN_CONFIG env var. Consumed at the seam and stripped from the
         # passthrough (mirrors the posture-toggle pattern). Absent = no-op.
         scan_config_env, scan_config_mounts, passthrough = _ci_scan_config_from_flags(
             ns, passthrough
         )
+        # Validate the --scope-* flags on the host (exit 2 before Docker starts on
+        # a syntax error) and mount each scope file read-only.
+        passthrough, scope_mounts = _ci_scope_from_passthrough(passthrough)
+        scan_config_mounts = list(scan_config_mounts) + scope_mounts
         # Copy a --client-logo host file into the mounted volume and rewrite the
         # flag to the container-visible path, so the post-scan report co-brands
         # its cover. Consumed at the seam, like --scan-config.
@@ -3320,12 +3338,10 @@ def main(argv: list[str] | None = None) -> None:
         # the plan is read and validated host-side first.
         passthrough = list(getattr(ns, "run_args", []) or [])
         posture_env, passthrough = _posture_env_from_flags(ns, passthrough)
-        passthrough = _apply_partner_tag_flag(ns, passthrough)
+        passthrough = _drop_retired_partner_tag_flag(ns, passthrough)
         run_io = _run_plan_io_from_flags(passthrough)
         # Both gates may exit; they run before any env: secret touches the disk.
         _maybe_pregate_pro_command(run_io.command, telemetry_console=telemetry_console)
-        if run_io.command == "ci":
-            _enforce_partner_tag_before_container()
         try:
             run_io = run_io.with_env_secrets()
             _run_rc = _run_host_command_with_session_capture(

@@ -167,7 +167,14 @@ class SMBConnection:
 		self.keepalive_timeout = 15
 		self.connection_closed_evt = None
 		self.login_ok = False
-		# TODO: turn it back on 
+		# ADscan: the server's SESSION_SETUP verdict, kept so a caller can tell a
+		# guest or null session from one that authenticated as a real account.
+		# Set only after a successful SESSION_SETUP; a refused sign-in leaves
+		# ``session_flags`` as None and both booleans False.
+		self.session_flags = None
+		self.session_is_guest = False
+		self.session_is_null = False
+		# TODO: turn it back on
 		self.supress_keepalive = False
 		self.activity_at = None
 		
@@ -813,6 +820,10 @@ class SMBConnection:
 					except TypeError:
 						server_granted_guest = bool(int(server_session_flags) & SessionFlags.SMB2_SESSION_FLAG_IS_GUEST.value)
 						server_granted_null = bool(int(server_session_flags) & SessionFlags.SMB2_SESSION_FLAG_IS_NULL.value)
+				# Expose the server's verdict (see __init__).
+				self.session_flags = server_session_flags
+				self.session_is_guest = server_granted_guest
+				self.session_is_null = server_granted_null
 
 				# A guest / null / anonymous session — whether we asked for it
 				# (``gssapi.is_guest()``) or the server downgraded us to it

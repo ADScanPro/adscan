@@ -197,7 +197,7 @@ class HttpSpnFinding:
     """A principal that publishes a Kerberos web service (``HTTP/*`` SPN).
 
     Derived in the same SPN pass that flags kerberoastable accounts
-    (``persistence._persist_derived_attack_steps``) from the already-collected
+    (``persistence.derive_result_findings``) from the already-collected
     ``serviceprincipalnames`` — no second SPN walk. An ``HTTP/`` SPN is a
     relay / forced-authentication surface: it marks a Kerberos-authenticating
     web endpoint published under the account. Plain JSON-serialisable scalars
@@ -344,7 +344,7 @@ class CollectionResult:
     trust_posture_findings: list[Any] = field(default_factory=list)
     # Principals publishing a Kerberos web service (``HTTP/*`` SPN) — a
     # relay / forced-authentication surface derived in the SAME SPN pass that
-    # flags kerberoastable accounts (``persistence._persist_derived_attack_steps``)
+    # flags kerberoastable accounts (``persistence.derive_result_findings``)
     # from the already-collected ``serviceprincipalnames``. Elements are
     # :class:`HttpSpnFinding` (defined above); typed ``Any`` here for parity
     # with the other finding lists.
@@ -364,6 +364,11 @@ class CollectionResult:
     # persistence (the pass that holds both the stamped privilege tiers and the
     # derived rights) and consumed by the positive-evidence emitter.
     enumerated_surfaces: dict[str, Any] = field(default_factory=dict)
+    # How ``persistence.derive_findings_bounded`` last ended over this result:
+    # ``""`` never run, ``"complete"`` (``http_spn_findings`` and
+    # ``enumerated_surfaces`` hold its output) or ``"stopped"`` (memory). After a
+    # memory stop of the run it is not run again over a result it already ran on.
+    findings_derivation: str = ""
     adcs_elapsed: float = 0.0
     # AD CS CAs whose registry probe (ESC6 / ESC11 / Certighost) found no
     # CA-host administrator during the LDAP pass

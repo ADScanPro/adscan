@@ -8,21 +8,35 @@ the compute will need, compares it against the *real* ceiling (the cgroup limit
 inside a container, never host RAM — see :mod:`adscan_core.memory_probe`), and
 decides whether to proceed, warn, or abort before the memory-heavy final stages.
 
-The projection model was measured under ``/usr/bin/time -v`` across a curve of
-real and synthetic workspaces (last re-derived 2026-08 against a high-corner
-sweep validated by a real cgroup OOM kill). Peak RSS over a fixed floor is TWO
-independent regimes, and the gate takes the larger:
+The projection starts from what is measurable. When the process's resident
+memory can be read (it can on Linux, and through psutil on Windows), the graph
+is already loaded at both seams, so the projection is that measured figure plus
+only what the compute will ADD (re-fitted 2026-11-13, see the coefficients):
 
-    projected_peak = FLOOR + max(affected_aware_term, graph_density_term)
+    stage A (pre-DFS)   = resident + ENGINE_FIXED_BYTES
+                                   + ENGINE_BYTES_PER_ELEMENT * (nodes + edges)
+    stage B (post-DFS)  = resident + max(affected_aware_term, graph_density_term)
 
-    affected_aware_term = GRAPH_BYTES_PER_ELEMENT * (nodes + edges)
-                        + raw_paths * (PATH_BASE_BYTES_PER_RAWPATH
+No coefficient then depends on how the graph is held in memory (loaded from a
+file, built from the store, or compact), and the process floor is never a
+guess. When it cannot be read, a modelled whole-process figure stands in:
+
+    graph_term          = FLOOR + ENGINE_FIXED_BYTES
+                        + GRAPH_BYTES_PER_ELEMENT * (nodes + edges)
+    stage B             = graph_term + max(affected_aware_term, graph_density_term)
+
+with, in both forms,
+
+    affected_aware_term = raw_paths * (PATH_BASE_BYTES_PER_RAWPATH
                                        + PATH_BYTES_PER_RAWPATH_AFFECTED
                                        * affected_count)
 
-    graph_density_term  = GRAPH_BYTES_PER_ELEMENT * (nodes + edges)
-                        + DENSITY_BYTES_PER_RAWPATH_BRANCH
+    graph_density_term  = DENSITY_BYTES_PER_RAWPATH_BRANCH
                           * raw_paths * (edges / nodes)
+
+The history below explains the two path regimes; it was measured (2026-08)
+against the whole-process model, before the engine stopped holding a second
+copy of the graph.
 
 **Regime 1 — the affected-aware path term.** The path term is two-dimensional:
 each surviving path stores its blast-radius (``meta.affected_users``) list, so
@@ -96,23 +110,66 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from adscan_core.memory_guard import STOP_FRACTION, MemoryGuard
+
 # --- The measured coefficients ------------------------------------------------
 #
-# Every coefficient below was pinned under ``/usr/bin/time -v`` across a workspace
-# curve and re-derived 2026-08 against a high-corner sweep that isolates each term
-# and was cross-checked against a real cgroup OOM kill. The floor and the graph
-# term are tight (±2%); the path term is two-dimensional (a base plus an
-# affected-count slope); the density term is a second, independent regime anchored
-# on the Forest measurement.
+# Re-fitted 2026-11-13 (15.0.0, package R2) after the engine stopped holding a
+# second copy of the graph. Every figure below is a measured peak RSS
+# (``/proc/self/statm`` sampled every 50 ms, one process per run, the gate's own
+# seams instrumented), not an estimate. The projection now starts from what is
+# already resident when that can be read, so the graph's in-memory
+# representation (file-loaded, store-built, or the compact form) and the process
+# floor are measured, never modelled; only what the compute will ADD is.
 
 #: Fixed baseline resident memory of the process before attack-path discovery
-#: allocates anything — interpreter, loaded modules, the workspace already read.
-#: Measured ~70 MB, tight (±2%). Final.
+#: allocates anything (interpreter, loaded modules, the workspace already read).
+#: Used ONLY when the process's resident memory cannot be read (see
+#: :func:`project_graph_term_bytes`); measured 75 MB for a bare process with the
+#: engine imported.
 FLOOR_BYTES = 70 * 1024 * 1024
 
-#: Marginal peak memory per graph element (one node OR one edge) held resident
-#: during discovery. Measured ~10 KB, tight (±2%). Final.
-GRAPH_BYTES_PER_ELEMENT = 10 * 1024
+#: Fixed working set the compute adds on top of the resident graph, independent of
+#: its size: the membership snapshot and its closure, the label index, the
+#: identity-risk snapshot. Measured 2026-11-13 from the pre-DFS seam to the
+#: path-free peak: 54 MB on a 29,442-element synthetic directory, 46 MB on a
+#: 36,112-element one; 60 MB covers both.
+ENGINE_FIXED_BYTES = 60 * 1024 * 1024
+
+#: Working set the compute adds per graph element (one node OR one edge) on top
+#: of the resident graph: adjacency, reachability sets, the expanded terminal
+#: memberships of a graph that does not persist them, the DFS frontier. Measured
+#: 2026-11-13 from the pre-DFS seam to the path-free peak:
+#:
+#:     | graph                        | nodes+edges | resident at seam | peak     | added   |
+#:     |------------------------------|------------:|-----------------:|---------:|--------:|
+#:     | real-shaped, file-loaded     |     309,993 |           613 MB |   697 MB |   84 MB |
+#:     | partner shape, store-built   |     573,741 |         1,359 MB | 1,393 MB |   34 MB |
+#:     | Scale-Heavy (synthetic)      |      29,442 |           144 MB |   198 MB |   54 MB |
+#:     | L15k (synthetic)             |      36,112 |           163 MB |   203 MB |   40 MB |
+#:
+#: The real-shaped run sets the slope: (84 - 54) MB over the 280,551 elements
+#: between the first and third rows is 112 B per element. 128 B leaves ~15 %:
+#: that row projects 711 MB against its 697 MB peak, and the partner shape
+#: 1,489 MB against 1,393 MB. (Resident memory there was read after the store
+#: build's freed memory was returned to the system; without that the build's
+#: high-water mark hides the compute's growth entirely.)
+ENGINE_BYTES_PER_ELEMENT = 128
+
+#: Peak memory per graph element (one node OR one edge) INCLUDING the graph
+#: itself, for the fallback projection used when the process's resident memory
+#: cannot be read. Measured 2026-11-13 over the path-free peak minus
+#: :data:`FLOOR_BYTES` and :data:`ENGINE_FIXED_BYTES`: 1.87 KB on the 275,714-edge
+#: real-shaped graph loaded from its file (2,051 B per edge resident), 2.25 KB
+#: on the store-built partner shape, 2.44 KB on Scale-Heavy. 2.5 KB covers all
+#: of them; the large graphs are over-projected by 10 % (partner) to 27 % (the
+#: file-loaded one). The previous 10 KB, measured while the engine held a
+#: second copy of the graph, projected 5.7 GB for the partner shape against a
+#: 1.4 GB peak and stopped it on a 4 GB machine (measured: the run aborted and
+#: its bounded re-run returned no route, where the full run finds one). This figure
+#: depends on how the graph is held in memory; the resident-aware projection
+#: does not, which is why it is the one used whenever RSS can be read.
+GRAPH_BYTES_PER_ELEMENT = int(2.5 * 1024)
 
 #: Base marginal peak memory per RAW DFS path, independent of blast radius — the
 #: fixed cost of holding one path's node/edge list resident. Measured ~4 KB
@@ -127,16 +184,28 @@ PATH_BASE_BYTES_PER_RAWPATH = 4 * 1024
 #: Marginal peak memory per (RAW DFS path × affected principal) — the cost of each
 #: surviving path storing its blast-radius ``meta.affected_users`` list, which is a
 #: list of REFERENCES into the shared group-member index (an 8-byte pointer per
-#: element, not a full copy). Re-derived 2026-08 against the REAL peak RSS of three
-#: graphs run to completion with the gate disabled (AffC 667 MB, AffHeavy 1,599 MB,
-#: L15k 1,156 MB — see the module docstring table): the true slope needed to cover
-#: those peaks is 19–34 B/(raw·affected). This uses 64 B (``0.0625 KB``), ~2x the
-#: worst observed slope, conservative without the ~11x over-projection the earlier
-#: 358 B (``0.35 KB``) slope caused. That earlier slope assumed the FULL
-#: ``raw × affected`` blast radius was resident at peak simultaneously (12.9 GB for
-#: L15k), which aborted L15k domain/all to zero paths in any container under
-#: ~15.6 GB — a silent false negative on a directory whose real peak is 1.16 GB.
-PATH_BYTES_PER_RAWPATH_AFFECTED = int(0.0625 * 1024)
+#: element, not a full copy). Re-measured 2026-11-13 as the growth from the
+#: post-DFS seam (Stage B) to the peak, less the 4 KB base per raw path:
+#:
+#:     | graph    | raw    | affected (gate estimate) | RSS at seam | peak     | slope   |
+#:     |----------|-------:|-------------------------:|------------:|---------:|--------:|
+#:     | AffC     |  8,000 |                    2,001 |      171 MB |   591 MB | 25.5 B  |
+#:     | AffHeavy | 12,000 |                    3,001 |      232 MB | 1,463 MB | 34.5 B  |
+#:     | L15k     | 15,000 |                    2,501 |      267 MB | 1,027 MB | 19.6 B  |
+#:
+#: 40 B covers the steepest (AffHeavy projects 1,652 MB, +13 %). The spread
+#: between the three is the affected estimate, an upper bound the gate must use
+#: because the real blast radius is resolved after it: L15k's paths affect fewer
+#: principals than its enabled-user count, so it projects 1,757 MB (+71 %), and
+#: no slope can tighten that without under-projecting AffHeavy.
+#:
+#: A projection that comes out low no longer risks a kill or a lost route: the
+#: projection only chooses between the full compute and the bounded mode (see
+#: :data:`FALLBACK_PROJECTION_RATIO`), the live guard stops a full compute that
+#: does not fit, and the bounded mode then runs once the stopped attempt's
+#: memory is released (:func:`fallback_may_start`). An undershoot costs a late
+#: stop, which is why the fit is used as measured. (64 B before 15.0.0.)
+PATH_BYTES_PER_RAWPATH_AFFECTED = 40
 
 #: Second-regime density coefficient: marginal peak per (raw_path × branching),
 #: where branching = ``edges / nodes``. The DFS transiently holds every
@@ -155,11 +224,41 @@ DENSITY_BYTES_PER_RAWPATH_BRANCH = 33 * 1024
 #: uses the two-dimensional path term plus the density regime above.
 PATH_BYTES_PER_RAWPATH = PATH_BASE_BYTES_PER_RAWPATH
 
+#: The projection's three bands, as a ratio of the projected peak to the guard's
+#: STOP LINE (``SAFETY_FRACTION`` of the ceiling), so the prediction and the live
+#: guard share one reference. Under :data:`TIGHT_PROJECTION_RATIO` the compute
+#: runs under the guard; from there up to :data:`FALLBACK_PROJECTION_RATIO` the
+#: FULL compute still runs under the guard, and the bounded mode is taken only if
+#: the guard actually trips; at or above it the compute goes straight to the
+#: bounded mode, which runs under the guard too and declares its coverage.
+#:
+#: The projection never decides coverage on its own below 2x because it is
+#: never accurate enough to: the worst over-projection measured on the battery
+#: (2026-11-13) is +71 % (L15k domain/all, 1,757 MB projected for a 1,027 MB
+#: peak, because the affected-user estimate is an upper bound). A compute that
+#: really fits projects under 1.71x its line, under 2x. Re-derive both ratios
+#: when the battery or the path terms change.
+TIGHT_PROJECTION_RATIO = 0.7
+FALLBACK_PROJECTION_RATIO = 2.0
+
+#: Band names (:attr:`MemoryProjection.band`).
+BAND_FITS = "fits"
+BAND_TIGHT = "tight"
+BAND_OVER = "over"
+
+#: After a full attempt is stopped and its memory released, the bounded mode
+#: starts only if the measured memory is back under this fraction of the stop
+#: line. The loaded graph stays resident and shared, so the check accounts for
+#: it: when the graph alone holds most of the line, the bounded mode would stop
+#: too, and the run declares the stop with what was examined instead.
+FALLBACK_RESUME_FRACTION = 0.6
+
 #: Fraction of the ceiling the projected peak may reach before the gate acts.
 #: The projection is a model with error bars and the SIGKILL is unrecoverable, so
 #: the gate leaves headroom rather than aiming for the exact limit — crossing the
-#: SIGKILL boundary is far worse than a slightly early stop.
-SAFETY_FRACTION = 0.85
+#: SIGKILL boundary is far worse than a slightly early stop. The ONE stop fraction
+#: of the product lives in :mod:`adscan_core.memory_guard`; this is that value.
+SAFETY_FRACTION = STOP_FRACTION
 
 #: Per-domain key the coverage block is stamped under, in ``technical_report.json``
 #: and in the renderer's ``report_data``. One name so the writer, the PDF and the
@@ -181,12 +280,16 @@ ATTACK_PATH_COVERAGE_KEY = "attack_path_coverage"
 # authoritative bound whenever it can read, and the absolute count cap is a strict
 # FALLBACK that only governs when RSS sampling is unavailable.
 #
-#   1. PRIMARY — RSS vs the real available ceiling. Every ``_RSS_SAMPLE_STRIDE``
-#      DFS invocations (cheap: the sample is amortised ~1/4096), sample the process
-#      RSS and the available memory from the SAME cgroup-aware reader the outer gate
-#      uses (:func:`adscan_core.memory_probe.read_memory_situation`). When RSS
+#   1. PRIMARY — RSS vs the real ceiling. Every ``_RSS_SAMPLE_STRIDE`` DFS
+#      invocations (cheap: the sample is amortised ~1/4096), take one reading from
+#      the product's single memory sampler, :class:`adscan_core.memory_guard.MemoryGuard`
+#      (the cgroup limit inside a container, read once; RSS plus the host's
+#      available memory without one; never host RAM inside a cgroup). When RSS
 #      crosses ``_RSS_STOP_FRACTION`` of that ceiling — the point where the kernel is
-#      about to kill — stop cleanly. A domain that FITS in RAM never crosses the
+#      about to kill — stop cleanly. (Until 15.0.0 the DFS compared RSS against
+#      the memory still AVAILABLE, which already excludes the process's own RSS,
+#      so it stopped at roughly half the real ceiling: a false bound on exactly
+#      the small machines the founder wants to serve.) A domain that FITS in RAM never crosses the
 #      fraction, so the bound never fires and coverage is byte-identical: only the
 #      pathological case that OOMs today is touched. This is the zero-coverage-loss
 #      guarantee. Once this reader has produced ONE usable reading (both a process
@@ -292,10 +395,28 @@ class _AttackPathMemoryBudgetExceeded(Exception):
     ``attack_graph_service`` re-exports it for its existing callers.
     """
 
-    def __init__(self, message: str, *, examined_routes: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        examined_routes: int,
+        projected_peak_bytes: int | None = None,
+        before_discovery: bool = False,
+    ) -> None:
         super().__init__(message)
         self.operator_message = message
         self.examined_routes = int(examined_routes)
+        #: The projection the gate measured (``None`` for the in-search bound,
+        #: which has a reading but no estimate of the full need).
+        self.projected_peak_bytes = (
+            int(projected_peak_bytes)
+            if isinstance(projected_peak_bytes, int) and projected_peak_bytes > 0
+            else None
+        )
+        #: True when the projection decided before any route was examined (the
+        #: pre-search gate in its ``over`` band): the operator gets the pre-stage
+        #: notice and, interactively, the choice to continue with a sample.
+        self.before_discovery = bool(before_discovery)
 
 
 class DfsMemoryBudget:
@@ -342,6 +463,16 @@ class DfsMemoryBudget:
         self.examined_states = 0
         self._rss_stop_fraction = float(rss_stop_fraction)
         self._sample_stride = max(1, int(sample_stride))
+        #: The ONE memory sampler of the product (:mod:`adscan_core.memory_guard`).
+        #: The DFS keeps its own stride counter and its own exception type, so it
+        #: only asks the guard for a reading; the ceiling, the RSS reader and the
+        #: stop fraction are the guard's.
+        self._guard = MemoryGuard(
+            "attack_paths",
+            stop_fraction=self._rss_stop_fraction,
+            sample_every=self._sample_stride,
+            min_interval_s=0.0,
+        )
         self._max_states = (
             int(max_states) if max_states is not None else _read_max_dfs_states()
         )
@@ -405,36 +536,42 @@ class DfsMemoryBudget:
             )
 
     def _rss_crossed_ceiling(self) -> tuple[bool, int | None, int | None]:
-        """Return ``(crossed, rss_bytes, available_bytes)``, best-effort.
+        """Return ``(crossed, rss_bytes, headroom_bytes)``, best-effort.
 
-        ``crossed`` is True only when BOTH live RSS and available memory are
-        readable AND ``rss >= available * fraction``. Any failure (no reader, a
-        ``None`` value) returns ``(False, ...)`` so the DFS proceeds under the
-        absolute state cap alone — never abort on a blind read.
+        Delegates the reading to :class:`adscan_core.memory_guard.MemoryGuard`,
+        so the DFS and every other stage judge memory the same way: inside a
+        cgroup, ``max(own RSS, the cgroup's non-reclaimable usage)`` against
+        :data:`SAFETY_FRACTION` of the limit (capped by host free memory);
+        without one, RSS against RSS plus host available, plus the guard's
+        free-memory floor. The second element is that measured figure. ``crossed`` is True only on a USABLE reading that is
+        at or over the stop line; a blind or partial read returns
+        ``(False, ...)`` so the DFS proceeds under the absolute state cap alone,
+        never aborting on a blind read.
 
-        A USABLE reading (both a process RSS and a positive available ceiling)
-        latches :attr:`_rss_active` ``True`` — from then on RSS is the sole abort
-        authority and the absolute state cap is disabled. A partial/absent reading
-        leaves the latch untouched, so the count-cap fallback still governs.
+        A usable reading latches :attr:`_rss_active` ``True``: from then on RSS
+        is the sole abort authority and the absolute state cap is disabled. A
+        partial or absent reading leaves the latch untouched.
+
+        The third element is the memory still free before the ceiling (what the
+        operator line calls "free"), or ``None`` when unknown.
         """
-        try:
-            from adscan_core import memory_probe
-
-            situation = memory_probe.read_memory_situation()
-            rss = situation.rss_bytes
-            available = situation.available_bytes
-        except Exception:  # noqa: BLE001 — a memory read must never break discovery.
-            return False, None, None
-        if not isinstance(rss, int) or not isinstance(available, int):
-            return False, None, None
-        if available <= 0:
-            return False, rss, available
+        reading = self._guard.sample()
+        measured = (
+            reading.measured_bytes
+            if reading.measured_bytes is not None
+            else reading.rss_bytes
+        )
+        if not reading.usable:
+            return False, measured, reading.available_bytes
         # A usable reading: RSS is now authoritative, so the count cap is switched
         # off for the rest of the compute (the false-positive fix — RSS, when it can
         # read, is the ground truth the state count only ever approximated).
         self._rss_active = True
-        threshold = int(available * self._rss_stop_fraction)
-        return rss >= threshold, rss, available
+        if reading.free_bytes is not None:
+            free = max(int(reading.free_bytes), 0)
+        else:
+            free = max(int(reading.ceiling_bytes) - int(measured), 0)  # type: ignore[arg-type]
+        return reading.crossed, measured, free
 
 
 def _dfs_bound_operator_message(
@@ -450,20 +587,23 @@ def _dfs_bound_operator_message(
     separate, reason-free statement built by :func:`build_attack_path_coverage` at
     the catch site. Never names an internal module or a verdict about the directory.
     """
-    if reason == "rss" and projected_bytes and available_bytes:
+    if reason == "rss" and projected_bytes and available_bytes is not None:
         rss = _mb(projected_bytes)
         avail = _mb(available_bytes)
         return (
             f"Attack-path discovery reached about {rss} of memory with only {avail} "
-            "free, and was stopped before this environment would run out. Raise the "
-            "available memory (or close other running workloads) and re-run to "
-            "compute the full set of routes."
+            "free, and was stopped before this environment would run out. The routes "
+            "found so far are kept and the rest is declared not evaluated. Give "
+            "ADscan more memory (a larger container limit, more RAM on the machine, "
+            "or fewer other programs running), then reopen this workspace and choose "
+            "Resume to compute the full set of routes."
         )
     return (
         f"Attack-path discovery examined {examined_states:,} intermediate states and "
-        "was stopped at the configured limit before it could exhaust memory. Raise "
-        "the analysis host's memory (or the state limit) and re-run to compute the "
-        "full set of routes."
+        "was stopped at the configured limit before it could exhaust memory. The "
+        "routes found so far are kept and the rest is declared not evaluated. Give "
+        "ADscan more memory (or raise the state limit), then reopen this workspace "
+        "and choose Resume to compute the full set of routes."
     )
 
 
@@ -488,8 +628,10 @@ class MemoryProjection:
             ``None`` when unknown.
         threshold_bytes: ``ceiling * SAFETY_FRACTION`` — the line the projection
             must stay under, or ``None`` when no ceiling is known.
-        exceeds: True when the projected peak crosses the threshold. Always False
-            when no ceiling could be read (best-effort: never abort blind).
+        exceeds: True when the projection is in the ``over`` band (at least
+            :data:`FALLBACK_PROJECTION_RATIO` times the stop line): the compute
+            goes straight to the bounded mode. Always False when no ceiling could
+            be read (best-effort: never abort blind).
         scenario: One of ``SCENARIO_*`` — which operator remedy applies.
         stage: ``"pre_dfs"`` (graph term only) or ``"post_dfs"`` (full peak).
     """
@@ -501,12 +643,58 @@ class MemoryProjection:
     exceeds: bool
     scenario: str
     stage: str
+    band: str = BAND_FITS
+    ratio: Optional[float] = None
 
 
-def project_graph_term_bytes(nodes: int, edges: int) -> int:
-    """Return the graph-resident memory term: FLOOR + per-element * (nodes+edges)."""
+def projection_band(ratio: Optional[float]) -> str:
+    """The band of a projected-peak / stop-line ratio (``None``: fits, unknown)."""
+    if ratio is None:
+        return BAND_FITS
+    if ratio >= FALLBACK_PROJECTION_RATIO:
+        return BAND_OVER
+    if ratio >= TIGHT_PROJECTION_RATIO:
+        return BAND_TIGHT
+    return BAND_FITS
+
+
+def fallback_may_start(
+    measured_bytes: Optional[int], ceiling_bytes: Optional[int]
+) -> bool:
+    """Whether the bounded mode may start after a stopped full attempt.
+
+    ``measured_bytes`` is the guard's reading once the attempt's memory was
+    released; it must be under :data:`FALLBACK_RESUME_FRACTION` of the stop line
+    (:data:`SAFETY_FRACTION` of ``ceiling_bytes``). An unreadable figure lets the
+    bounded mode start: it runs under its own guard, so a blind read never costs
+    the routes it could still find.
+    """
+    if not isinstance(measured_bytes, int) or not isinstance(ceiling_bytes, int):
+        return True
+    if ceiling_bytes <= 0 or measured_bytes < 0:
+        return True
+    stop_line = ceiling_bytes * SAFETY_FRACTION
+    return measured_bytes <= stop_line * FALLBACK_RESUME_FRACTION
+
+
+def project_graph_term_bytes(
+    nodes: int, edges: int, resident_bytes: Optional[int] = None
+) -> int:
+    """Return the projected peak before any path exists (Stage A's figure).
+
+    With the process's resident memory known (the graph is already loaded when
+    the gate runs), the projection is that measured figure plus what the
+    compute will add: :data:`ENGINE_FIXED_BYTES` and
+    :data:`ENGINE_BYTES_PER_ELEMENT` per node or edge. Nothing about how the
+    graph is held in memory is modelled, so a more compact graph representation
+    needs no re-fit. Without it, the fallback models the whole process:
+    :data:`FLOOR_BYTES` + :data:`ENGINE_FIXED_BYTES` +
+    :data:`GRAPH_BYTES_PER_ELEMENT` per element.
+    """
     elements = max(0, int(nodes)) + max(0, int(edges))
-    return FLOOR_BYTES + GRAPH_BYTES_PER_ELEMENT * elements
+    if isinstance(resident_bytes, int) and resident_bytes > 0:
+        return resident_bytes + ENGINE_FIXED_BYTES + ENGINE_BYTES_PER_ELEMENT * elements
+    return FLOOR_BYTES + ENGINE_FIXED_BYTES + GRAPH_BYTES_PER_ELEMENT * elements
 
 
 def _affected_aware_path_term_bytes(raw_paths: int, affected_count: int) -> int:
@@ -541,7 +729,11 @@ def _graph_density_path_term_bytes(nodes: int, edges: int, raw_paths: int) -> in
 
 
 def project_peak_bytes(
-    nodes: int, edges: int, raw_paths: int, affected_count: int = 0
+    nodes: int,
+    edges: int,
+    raw_paths: int,
+    affected_count: int = 0,
+    resident_bytes: Optional[int] = None,
 ) -> int:
     """Return the full projected peak: graph term + max(regime-1, regime-2).
 
@@ -555,6 +747,11 @@ def project_peak_bytes(
       DFS pre-minimisation transient that a small, high-branching graph holds, which
       the post-minimisation ``raw_paths`` under-predicts (the Forest regime).
 
+    ``resident_bytes`` is the process's resident memory at the seam. When it is
+    known the projection is that measured figure plus the path terms (the graph
+    and the engine's working set are already in it); without it the modelled
+    graph term of :func:`project_graph_term_bytes` stands in.
+
     ``affected_count`` is CONSERVATIVE — the true per-path blast radius is resolved
     only later, inside the very post-processing stage this gate protects, so at the
     projection point it is unknown. The caller passes an upper bound (the domain's
@@ -562,10 +759,14 @@ def project_peak_bytes(
     errs toward a clean early stop rather than toward reaching the SIGKILL. Passing
     ``0`` degrades to the base per-raw term only — safe, never optimistic beyond it.
     """
-    graph_term = project_graph_term_bytes(nodes, edges)
     affected_term = _affected_aware_path_term_bytes(raw_paths, affected_count)
     density_term = _graph_density_path_term_bytes(nodes, edges, raw_paths)
-    return graph_term + max(affected_term, density_term)
+    if isinstance(resident_bytes, int) and resident_bytes > 0:
+        # Stage B runs after the DFS: the graph, the engine's working set and the
+        # raw paths are already resident and measured, so only the path terms
+        # are added on top.
+        return resident_bytes + max(affected_term, density_term)
+    return project_graph_term_bytes(nodes, edges) + max(affected_term, density_term)
 
 
 def _resolve_pre_dfs_ceiling(limit_bytes: Optional[int]) -> Optional[int]:
@@ -587,7 +788,9 @@ def _resolve_pre_dfs_ceiling(limit_bytes: Optional[int]) -> Optional[int]:
 
 
 def _resolve_ceiling(
-    limit_bytes: Optional[int], available_bytes: Optional[int]
+    limit_bytes: Optional[int],
+    available_bytes: Optional[int],
+    resident_bytes: Optional[int] = None,
 ) -> Optional[int]:
     """Pick the ceiling the projection is compared against — the REAL headroom.
 
@@ -599,8 +802,18 @@ def _resolve_ceiling(
     Returns ``None`` when neither is known, so the caller proceeds rather than
     aborting on no information. The total-vs-available distinction that decides the
     operator remedy lives in :func:`_classify_scenario`, not here.
+
+    When the process's resident memory is known the ceiling is the memory this
+    process can REACH: what is free plus what it already holds, capped at the
+    hard limit. The projection it is compared with is a total that includes the
+    resident graph; ``available_bytes`` alone would count that graph twice.
     """
     if isinstance(available_bytes, int) and available_bytes > 0:
+        if isinstance(resident_bytes, int) and resident_bytes > 0:
+            reachable = available_bytes + resident_bytes
+            if isinstance(limit_bytes, int) and limit_bytes > 0:
+                reachable = min(reachable, limit_bytes)
+            return reachable
         return available_bytes
     if isinstance(limit_bytes, int) and limit_bytes > 0:
         return limit_bytes
@@ -651,6 +864,7 @@ def evaluate_projection(
     available_bytes: Optional[int],
     stage: str,
     affected_count: int = 0,
+    resident_bytes: Optional[int] = None,
 ) -> MemoryProjection:
     """Project the peak for a stage and decide whether it crosses the ceiling.
 
@@ -667,10 +881,14 @@ def evaluate_projection(
       no hard ``limit_bytes`` is known there is no deterministic ceiling → the gate
       proceeds and the in-DFS ``DfsMemoryBudget`` (actual-RSS) stays the
       authoritative OOM guard.
-    * **Stage B (``post_dfs``) — unchanged.** It projects the full peak (graph +
-      the affected-aware / density path terms) and compares against the REAL
-      headroom (``available_bytes`` preferred, ``limit_bytes`` fallback), because a
-      post-DFS spike is killed by the memory free RIGHT NOW.
+    * **Stage B (``post_dfs``).** It projects the full peak (graph + the
+      affected-aware / density path terms) and compares against the REAL
+      headroom, because a post-DFS spike is killed by the memory free RIGHT NOW.
+      With ``resident_bytes`` known, that headroom is ``available_bytes`` PLUS
+      the process's own resident memory: the projection is a total that already
+      includes the resident graph, while ``available_bytes`` (``limit - usage``)
+      already subtracts it, so comparing the two directly counted the graph
+      twice and stopped computes that fit.
 
     Args:
         nodes: Graph node count.
@@ -685,6 +903,9 @@ def evaluate_projection(
             post-DFS stage — an upper bound (the domain's enabled-principal count),
             because the true value is not known until after this gate. Ignored on
             the pre-DFS stage. Defaults to ``0`` (base per-raw term only).
+        resident_bytes: The process's resident memory at the seam, or ``None``
+            when it cannot be read. Known, it replaces the modelled floor and
+            graph term with the measured figure (see :func:`project_peak_bytes`).
 
     Returns:
         A :class:`MemoryProjection`. ``exceeds`` is False whenever no ceiling
@@ -692,11 +913,13 @@ def evaluate_projection(
         compute proceeds exactly as it does today.
     """
     if raw_paths is None:
-        projected = project_graph_term_bytes(nodes, edges)
+        projected = project_graph_term_bytes(nodes, edges, resident_bytes)
         ceiling = _resolve_pre_dfs_ceiling(limit_bytes)
     else:
-        projected = project_peak_bytes(nodes, edges, raw_paths, affected_count)
-        ceiling = _resolve_ceiling(limit_bytes, available_bytes)
+        projected = project_peak_bytes(
+            nodes, edges, raw_paths, affected_count, resident_bytes
+        )
+        ceiling = _resolve_ceiling(limit_bytes, available_bytes, resident_bytes)
     if ceiling is None:
         return MemoryProjection(
             projected_peak_bytes=projected,
@@ -709,7 +932,9 @@ def evaluate_projection(
         )
 
     threshold = int(ceiling * SAFETY_FRACTION)
-    exceeds = projected > threshold
+    ratio = projected / threshold if threshold > 0 else None
+    band = projection_band(ratio)
+    exceeds = band == BAND_OVER
     scenario = (
         _classify_scenario(projected, limit_bytes, available_bytes)
         if exceeds
@@ -723,6 +948,8 @@ def evaluate_projection(
         exceeds=exceeds,
         scenario=scenario,
         stage=stage,
+        band=band,
+        ratio=ratio,
     )
 
 
@@ -748,19 +975,20 @@ def operator_message(projection: MemoryProjection) -> str:
         return (
             f"Attack-path discovery needs about {projected} of memory but this "
             f"environment is capped at {ceiling}. Raise the container or VM "
-            "memory limit and re-run to compute the full set of routes."
+            "memory limit, then reopen this workspace and choose Resume to compute "
+            "the full set of routes."
         )
     if projection.scenario == SCENARIO_FREE_MEMORY:
         return (
             f"Attack-path discovery needs about {projected} of memory but only "
             f"{available} is free right now (of {limit}). Close other running "
-            "workloads to free memory, then re-run to compute the full set of "
-            "routes."
+            "workloads to free memory, then reopen this workspace and choose Resume "
+            "to compute the full set of routes."
         )
     return (
         f"Attack-path discovery needs about {projected} of memory, more than this "
-        "environment can provide. Raise the available memory and re-run to compute "
-        "the full set of routes."
+        "environment can provide. Give ADscan more memory, then reopen this "
+        "workspace and choose Resume to compute the full set of routes."
     )
 
 
@@ -916,6 +1144,7 @@ def build_attack_path_coverage(
     examined_routes: int | None = None,
     exposure_source_count: int | None = None,
     reported_routes: int | None = None,
+    not_evaluated_upstream: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``attack_path_coverage`` block for one domain.
 
@@ -951,6 +1180,13 @@ def build_attack_path_coverage(
             Lets anyone reading the block reconcile it with the path set it
             describes. ``None`` when unknown. A COMPLETE block with
             ``reported_routes == 0`` carries an explicit "no route" statement.
+        not_evaluated_upstream: The ``resource_coverage`` stage id whose stop
+            left the domain without a graph (``graph_build``, ``collection``).
+            Discovery did not run at all: the block is BOUNDED with nothing
+            examined and no route reported, and its statement says discovery
+            did not run and why (``resource_coverage.not_evaluated_statement``),
+            so it can never read as "complete, 0 routes". Wins over every other
+            mode.
 
     Returns:
         The block to hand to ``record_attack_path_coverage``. Always carries
@@ -967,7 +1203,19 @@ def build_attack_path_coverage(
         max(0, int(reported_routes)) if isinstance(reported_routes, int) else None
     )
     examined: int | None
-    if bounded:
+    upstream = str(not_evaluated_upstream or "").strip().lower()
+    if upstream:
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            STAGE_ATTACK_PATHS,
+            not_evaluated_statement,
+        )
+
+        mode = COVERAGE_MODE_BOUNDED
+        examined = 0
+        reported = None
+        source_count = None
+        statement = not_evaluated_statement(STAGE_ATTACK_PATHS, upstream)
+    elif bounded:
         mode = COVERAGE_MODE_BOUNDED
         examined = max(0, int(examined_routes or 0))
         statement = _coverage_statement(examined)

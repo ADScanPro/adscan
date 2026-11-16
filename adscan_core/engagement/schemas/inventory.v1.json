@@ -47,13 +47,14 @@
       "properties": {
         "object_id": {"type": "string"},
         "kind": {"type": "string", "$comment": "Directory object class (User, Group, Computer, ...; open vocabulary)."},
-        "name": {"type": "string"},
+        "name": {"type": "string", "$comment": "In gpos.json, the GPO's display name and the first 8 characters of its policy GUID, 'Default Domain Policy (31B2F340)' (the full GUID when two GPOs would share it), or its {GUID} when no display name was readable. Since 1.1; earlier files carry the {GUID}."},
         "domain": {"$ref": "#/$defs/nullable_string"},
         "samaccountname": {"$ref": "#/$defs/nullable_string"},
         "distinguished_name": {"$ref": "#/$defs/nullable_string"},
-        "enabled": {"$ref": "#/$defs/nullable_bool"},
+        "enabled": {"$ref": "#/$defs/nullable_bool", "$comment": "Whether userAccountControl marks the account enabled. On a record with tombstoned set, the value the object had when it was deleted."},
+        "tombstoned": {"type": "boolean", "$comment": "Present and true on a deleted object read from the directory's Deleted Objects container, which only a privileged account can read. Such a record is not an account of the directory: leave it out of any count. Since 1.2; earlier files carry it only as properties.tombstoned."},
         "highvalue": {"type": "boolean"},
-        "properties": {"type": "object"},
+        "properties": {"type": "object", "$comment": "Opaque. A GPO record carries gpo_guid (policy GUID, upper case, no braces) and displayname when readable (since 1.1)."},
         "privilege_class": {"type": "string"},
         "privilege_tier": {"type": "string", "$comment": "tier0_direct, tier0_escalation_capable, tier1, tier2."},
         "privilege_tier_basis": {"type": "string", "$comment": "How a computer's tier was inferred (deterministic membership or a heuristic)."}

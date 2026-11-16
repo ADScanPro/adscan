@@ -36,6 +36,7 @@ from typing import Any
 
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.mitm6.core import (
+    victim_fqdn_in_asset_scope,
     DHCPv6Observation,
     MITM6Callback,
     MITM6Config,
@@ -346,6 +347,8 @@ class DHCPv6Poisoner:
 
     def _should_attack(self, fqdn: str) -> bool:
         if not fqdn and self._config.ignore_no_fqdn:
+            return False
+        if not victim_fqdn_in_asset_scope(fqdn or ""):
             return False
         return matches_filter(
             fqdn or "",

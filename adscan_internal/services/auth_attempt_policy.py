@@ -18,6 +18,10 @@ and installs the live ``badPwdCount`` read (:mod:`adscan_internal.services.locko
 that holds every domain sign-in in a real environment to the counter the domain
 controller holds right now.
 
+The same registration installs the guard's engagement-scope check: an account
+the client excluded is never signed in as, and an excluded host never receives a
+local sign-in (:func:`_register_engagement_scope_for_shell`).
+
 A host-local account or a SQL login (``auth_attempt_guard.local_realm`` /
 ``sql_login_realm``) has its own ledger entry and a budget from the same scan
 policy with the lockout threshold treated as unknown: the host's own policy is
@@ -175,5 +179,33 @@ def register_auth_attempt_guard_for_shell(shell: Any) -> None:
 
         register_live_headroom_for_shell(shell)
     except Exception as exc:  # noqa: BLE001 - rule 3 still runs without it
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    _register_engagement_scope_for_shell(shell)
+
+
+def _register_engagement_scope_for_shell(shell: Any) -> None:
+    """Rule 7: no sign-in as an account, or on a host, the engagement scope excludes.
+
+    Installs the guard's scope check (every sign-in asks the scope SSOT through
+    ``engagement_scope_principals.sign_in_scope_refusal``) and tells the
+    shell-less account lists (the roast transport, the user-enumeration word
+    list) which session they are judged against. Both answer at once when the
+    session has no asset scope.
+    """
+    try:
+        from adscan_core.auth_attempt_guard import register_scope_provider  # noqa: PLC0415
+        from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+            register_principal_scope_session,
+            sign_in_scope_refusal,
+        )
+
+        def _scope(realm: str, principal: str) -> Optional[str]:
+            return sign_in_scope_refusal(shell, realm=realm, principal=principal)
+
+        register_scope_provider(_scope)
+        register_principal_scope_session(shell)
+    except Exception as exc:  # noqa: BLE001 - the lists and step seams still gate
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

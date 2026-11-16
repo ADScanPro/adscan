@@ -40,6 +40,9 @@ from functools import lru_cache
 from typing import Any, Iterable, Literal
 
 from adscan_core.adcs_relations import is_adcs_relation
+from adscan_core.reporting.principal_display import (
+    declares_node_identities as _declares_node_identities,
+)
 from adscan_core.reporting.remediation_tokens import (
     degrade_canonical_tokens,
     domain_to_dn,
@@ -248,7 +251,6 @@ class AttackStepCatalogEntry:
     )
     execution_relation_alias: str | None = None  # canonical execution-family relation
     requires_execution_context: bool = False
-    counts_for_execution_readiness: bool = False
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none"
     # Whether this step's success is crack/guess-gated (probabilistic) or
     # succeeds outright (deterministic). Default deterministic — the conservative
@@ -431,7 +433,6 @@ def _entry(
     is_acl_edge: bool = False,
     execution_relation_alias: str | None = None,
     requires_execution_context: bool = False,
-    counts_for_execution_readiness: bool = False,
     execution_target_access_requirement: ExecutionTargetAccessRequirement = "none",
     execution_determinism: ExecutionDeterminism = "deterministic",
     finding_basis: FindingBasis = "observed_configuration",
@@ -468,7 +469,6 @@ def _entry(
             str(execution_relation_alias or "").strip().lower() or None
         ),
         requires_execution_context=requires_execution_context,
-        counts_for_execution_readiness=counts_for_execution_readiness,
         execution_target_access_requirement=execution_target_access_requirement,
         execution_determinism=execution_determinism,
         finding_basis=finding_basis,
@@ -3685,17 +3685,18 @@ _RELATIONS_REQUIRING_EXECUTION_CONTEXT = _RELATIONS_REQUIRING_EXECUTION_CONTEXT 
     for key, _entry in ATTACK_STEP_CATALOG.items()
     if _entry.category == "adcs" and _entry.support_kind == "supported"
 ) | frozenset({"addkeycredentiallink", "allextendedrights"})
-_RELATIONS_COUNTING_FOR_EXECUTION_READINESS: frozenset[str] = frozenset(
-    _RELATIONS_REQUIRING_EXECUTION_CONTEXT | {"asreproasting"}
-)
+# ``requires_execution_context`` answers ONE question: does this step need a
+# controlled SOURCE principal that the step-actor SSOT must confirm before the
+# route may start. It does NOT decide which step a route starts from: that is
+# the first supported step, whatever its relation (the readiness selector in
+# ``attack_path_execution``). A second flag used to pick that step from this
+# list; every supported technique outside it was skipped and the route was then
+# judged by a later step whose source is only controlled after the earlier ones.
 for _relation, _entry_value in list(ATTACK_STEP_CATALOG.items()):
     ATTACK_STEP_CATALOG[_relation] = replace(
         _entry_value,
         requires_execution_context=(
             _relation in _RELATIONS_REQUIRING_EXECUTION_CONTEXT
-        ),
-        counts_for_execution_readiness=(
-            _relation in _RELATIONS_COUNTING_FOR_EXECUTION_READINESS
         ),
     )
 
@@ -3948,14 +3949,6 @@ def relation_requires_execution_context(relation: str) -> bool:
     if entry is None:
         return False
     return bool(entry.requires_execution_context)
-
-
-def relation_counts_for_execution_readiness(relation: str) -> bool:
-    """Return whether a relation should gate attack-path readiness checks."""
-    entry = get_attack_step_entry(normalize_execution_relation(relation))
-    if entry is None:
-        return False
-    return bool(entry.counts_for_execution_readiness)
 
 
 def relation_requires_reachable_computer_target(relation: str) -> bool:
@@ -12774,6 +12767,7 @@ _SAFETY_ABSTENTION_POSITION_PHRASE: dict[str, str] = {
 }
 
 
+@_declares_node_identities(records="path")
 def render_path_summary(path: dict[str, Any], domain: str = "") -> str:
     """Render a 2-3 sentence executive narrative for a full attack path.
 

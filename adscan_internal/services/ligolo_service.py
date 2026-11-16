@@ -46,6 +46,7 @@ from adscan_core import telemetry
 from adscan_core.local_bind_address import resolve_first_available_bind_addr
 from adscan_core.linux_capabilities import binary_has_capability
 from adscan_core.pal import net as pal_net
+from adscan_core.pal.process import is_specific_process_id
 from adscan_internal.ligolo_manager import (
     LIGOLO_NG_VERSION,
     get_current_ligolo_proxy_target,
@@ -860,7 +861,8 @@ class LigoloProxyService:
         interactive_marker = self._detect_interactive_bootstrap_issue()
         if interactive_marker:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                if is_specific_process_id(process.pid):
+                    os.killpg(process.pid, signal.SIGTERM)
             except OSError:
                 pass
             failed_state = self._build_running_state(
@@ -1638,6 +1640,17 @@ class LigoloProxyService:
             return state
 
         started_at = time.perf_counter()
+        # A recorded id of 0 or 1 (a damaged state file) is a broadcast target
+        # for the signalling calls, never the tunnel process: refuse it.
+        try:
+            recorded_pid = int(pid)  # the state file may hold it as text
+        except (TypeError, ValueError):
+            recorded_pid = 0
+        if not is_specific_process_id(recorded_pid):
+            state["status"] = "stopped"
+            state["updated_at"] = _utc_now_iso()
+            self.save_state(state)
+            return state
         try:
             os.killpg(int(pid), signal.SIGTERM)
         except Exception:

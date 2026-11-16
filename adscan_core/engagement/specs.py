@@ -33,12 +33,18 @@ class ObservationSpec:
         requires_vantage: Minimum run vantage able to observe the item.
         reeval: ``auto`` (absence can prove closure) or ``never_auto``
             (absence never closes it: capture- or execution-derived items).
+        recorded_gap_checks: Checks consulted only when the run recorded them:
+            the item's own detector family, when it is not instrumented. A
+            family that reported it could not read its source on part of the
+            scope (``not_assessed``, ``partial``) blocks closure exactly like a
+            required check; a family that recorded nothing changes nothing.
     """
 
     observed_by: tuple[str, ...]
     scope: str
     requires_vantage: Vantage
     reeval: str = "auto"
+    recorded_gap_checks: tuple[str, ...] = ()
 
 
 # Check ids (coarse, one per scan phase that observes something).
@@ -184,13 +190,20 @@ def _build_finding_specs() -> dict[str, ObservationSpec]:
     put("ldaps_unavailable", _auto((C_ANALYSIS, C_POSTURE_LDAPS), Vantage.UNAUTH))
     # Domain-wide posture probes an unauthenticated vantage can observe too.
     put(
-        "ntlmv1_enabled "
-        "ldap_anonymous smb_signing_disabled smb_relay_targets smbv1_enabled "
-        "smb_v1_enabled smb_null_domain ntlm_min_session_security_weak "
-        "weak_lm_compatibility_level lm_hash_storage_enabled "
-        "reversible_encryption_enabled wdigest_enabled lsa_protection_disabled "
-        "lsass_custom_ssp_allowed http_spn_relay_surface",
+        "ntlmv1_enabled ldap_anonymous smb_relay_targets smb_null_domain "
+        "reversible_encryption_enabled http_spn_relay_surface",
         _auto((C_ANALYSIS,), Vantage.UNAUTH),
+    )
+    # Read per host by the host sweep (SMB negotiate, the local registry): the
+    # finding lists the hosts it was read on, so its absence means "fixed" only
+    # when the sweep examined every host (``domain_collection.hosts``) and, for
+    # the instrumented families, read the source on each of them.
+    put(
+        "smb_signing_disabled smbv1_enabled smb_v1_enabled "
+        "ntlm_min_session_security_weak weak_lm_compatibility_level "
+        "lm_hash_storage_enabled wdigest_enabled lsa_protection_disabled "
+        "lsass_custom_ssp_allowed",
+        _auto((C_ANALYSIS, C_COLLECTION_HOSTS), Vantage.UNAUTH),
     )
     # CVE probes that target domain controllers only: the DC pass covers them.
     put("zerologon nopac", _auto((C_AUDIT,), Vantage.AUTH, "host"))
@@ -330,6 +343,8 @@ def spec_for(kind: str, key: str) -> Optional[ObservationSpec]:
         return spec
     from adscan_core.engagement.detectors import instrumented_check_for  # noqa: PLC0415
 
+    from adscan_core.engagement.detectors import detector_for  # noqa: PLC0415
+
     detector_check = instrumented_check_for(kind, key)
     if detector_check and detector_check not in spec.observed_by:
         return ObservationSpec(
@@ -337,5 +352,17 @@ def spec_for(kind: str, key: str) -> Optional[ObservationSpec]:
             spec.scope,
             spec.requires_vantage,
             spec.reeval,
+        )
+    # A non-instrumented family may still have recorded that it could not read
+    # its source on part of the scope (the CA permissions of ESC7, a positive
+    # it could not assess): that recorded gap is honoured.
+    detector = detector_for(kind, key)
+    if detector is not None and detector.check_id not in spec.observed_by:
+        return ObservationSpec(
+            spec.observed_by,
+            spec.scope,
+            spec.requires_vantage,
+            spec.reeval,
+            recorded_gap_checks=(detector.check_id,),
         )
     return spec

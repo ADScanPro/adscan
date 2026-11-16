@@ -16,6 +16,7 @@ Notes:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections import defaultdict, deque
@@ -25,6 +26,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from adscan_core import graph_secret_refs
+from adscan_core.directory_object_state import is_tombstoned
 from adscan_core.attack_graph_edge_identity import (
     SHARE_ACCESS_RELATION_KEYS,
     share_access_name_from_notes,
@@ -76,6 +78,11 @@ from adscan_internal.services.attack_step_support_registry import (
 from adscan_internal.services.well_known_principals import is_non_compromisable_source
 from adscan_internal.services.path_state import COVERAGE_SAMPLE_STATUS
 from adscan_internal.services.technique_priority import path_technique_keys
+from adscan_internal.services.step_identity import (
+    node_identity_from_node,
+    stamp_gpo_guid,
+    stamp_step_identity,
+)
 from adscan_internal.services.attack_step_catalog import (
     context_requirement_satisfied,
     derive_step_display_status,
@@ -83,7 +90,8 @@ from adscan_internal.services.attack_step_catalog import (
     required_context_for_relation,
 )
 from adscan_internal.services.smb_exclusion_policy import is_globally_excluded_smb_share
-from adscan_internal.workspaces import read_json_file, write_json_file
+from adscan_core.graph_compact import load_graph_file
+from adscan_internal.workspaces import read_json_file
 from adscan_internal.workspaces.state import migrate_legacy_attack_graph
 from adscan_internal.services.tier_lattice import (
     AttackCore,
@@ -1786,8 +1794,26 @@ def _display_record_exact_signature(
     return nodes_sig, rels_sig
 
 
+def drop_format1_edge_knowledge(graph: dict[str, Any]) -> int:
+    """Drop the per-edge ``knowledge`` a format-1 graph carries, in memory.
+
+    Format 2 renders an edge's technique text when it is read
+    (``edge_knowledge.render_edge_knowledge``), so a stored block is never
+    consulted, and keeping it would hold about 10 KB per technique edge in
+    memory for nothing. Returns how many edges carried one.
+    """
+    edges = graph.get("edges") if isinstance(graph, dict) else None
+    if not isinstance(edges, list):
+        return 0
+    dropped = 0
+    for edge in edges:
+        if isinstance(edge, dict) and edge.pop("knowledge", None) is not None:
+            dropped += 1
+    return dropped
+
+
 def load_attack_graph(
-    path: Path, *, domain_data: Any = None
+    path: Path, *, domain_data: Any = None, persist_migration: bool = True
 ) -> dict[str, Any] | None:
     """Load an attack graph from an `attack_graph.json` file path.
 
@@ -1795,9 +1821,11 @@ def load_attack_graph(
     set from :class:`adscan_internal.services.edge_kind.EdgeKind`. Older
     workspaces (schema 1.1) load transparently — this function backfills
     ``kind`` in memory from the edge ``relation`` so downstream
-    classifiers always see a populated value. The JSON on disk is NOT
-    rewritten by this function alone; the next ``save_attack_graph``
-    call will persist the upgraded schema.
+    classifiers always see a populated value. The JSON on disk is never
+    rewritten by this function.
+
+    Formats 1.x and 2.x both load. A format-1 edge's stored ``knowledge`` is
+    dropped in memory (:func:`drop_format1_edge_knowledge`); readers render it.
 
     Args:
         path: Path to `attack_graph.json`.
@@ -1806,6 +1834,10 @@ def load_attack_graph(
             pin a DC-targeted escalation to the domain's recorded primary
             controller); omitting it degrades that one resolution and changes
             nothing else.
+        persist_migration: Accepted for compatibility and ignored. This loader
+            never writes the file: a reader (the web's live path compute, a
+            recheck, the report) must never rewrite a scan's graph, and the
+            graph is persisted only through the store (``graph_runtime``).
 
     Returns:
         The parsed graph dict when readable/valid, otherwise None.
@@ -1816,35 +1848,29 @@ def load_attack_graph(
     except OSError:
         return None
 
-    data = read_json_file(str(path))
+    try:
+        # Compact residency, streamed for the format-2 layout (graph_compact).
+        data = load_graph_file(path)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A corrupt file goes through the reader that keeps a backup of it.
+        data = read_json_file(str(path))
     if not isinstance(data, dict):
         return None
     nodes_map = data.get("nodes")
     edges = data.get("edges")
     if not isinstance(nodes_map, dict) or not isinstance(edges, list):
         return None
-    data, migrated = migrate_legacy_attack_graph(data)
+    data, _migrated = migrate_legacy_attack_graph(data)
     # Never hand a recovered secret to a consumer: replace inline values with
     # references in memory (the web's live compute and the report read this
     # loader). The key is only read, never created, here.
-    extracted = graph_secret_refs.redact_graph_secrets(
+    graph_secret_refs.redact_graph_secrets(
         data,
         key=graph_secret_refs.read_fingerprint_key(
             graph_secret_refs.workspace_root_for_graph_path(path)
         ),
     )
-    if migrated:
-        # A rewrite would drop an inline value that nothing has retained yet:
-        # write only when the values are safe in the sidecar (or there were none).
-        retained = not extracted or graph_secret_refs.retain_extracted_secrets(
-            graph_secret_refs.sidecar_path_for_graph(path), extracted
-        )
-        if retained:
-            try:
-                write_json_file(str(path), data)
-            except OSError:
-                # Best-effort normalisation; in-memory data is already correct.
-                pass
+    drop_format1_edge_knowledge(data)
     _backfill_edge_kinds(data)
     _backfill_privilege_tier(data)
     _backfill_privileged_group_escalations(data, domain_data)
@@ -1856,8 +1882,8 @@ def _backfill_privileged_group_escalations(
 ) -> None:
     """In-memory backfill of the privileged-group escalation edges.
 
-    A fresh scan derives these at collection time
-    (``collector/persistence._persist_derived_attack_steps``). A workspace
+    A fresh scan derives these in the graph build
+    (``graph_build/passes/privileged_groups.py``). A workspace
     collected before that derivation existed carries the ``MemberOf`` edge INTO
     Backup Operators / DnsAdmins / Print Operators but no edge OUT of the group,
     so the group reads as a dead end and a direct member's membership never
@@ -4441,11 +4467,11 @@ def couple_cross_org_tgt_delegation_edges(
       trust attribute but does not (yet) execute the cross-forest ticket capture.
 
     Idempotent (re-adding an existing edge is a no-op). Returns True when it
-    changed the graph. This mints the edge into the passed graph dict; when the
-    dict is the ORIGIN domain's persisted graph (see
-    :func:`attack_graph_service.persist_cross_domain_trust_edges`) the edge
-    survives reloads so an executed escalation keeps its ``success`` status. The
-    query-time merge re-runs this as a no-op once the edge is already present.
+    changed the graph. This mints the edge into the passed graph dict; the graph
+    build runs it for every store-backed graph (``graph_build.passes.trusts``),
+    so the edge is in every build and an executed escalation keeps its
+    ``success`` status through the overlay. The query-time merge re-runs this
+    as a no-op once the edge is already present.
     """
     nodes_map = graph.get("nodes")
     if not isinstance(nodes_map, dict) or not nodes_map:
@@ -4576,10 +4602,10 @@ def couple_raise_child_edges(
     a compromise of the child forest-lets the kill chain continue up to the forest
     root via the trust key + krbtgt SID-history forgery (``raise_child_native``).
 
-    Conservative + idempotent, mirrors the cross-org coupling. Persisted into the
-    origin (child) domain's graph via
-    :func:`attack_graph_service.persist_cross_domain_trust_edges` so its status
-    survives reloads. Returns True when it changed the graph.
+    Conservative + idempotent, mirrors the cross-org coupling. Derived in every
+    build of the origin (child) domain's graph (``graph_build.passes.trusts``),
+    so its status, recorded through the overlay, survives reloads. Returns True
+    when it changed the graph.
     """
     nodes_map = graph.get("nodes")
     if not isinstance(nodes_map, dict) or not nodes_map:
@@ -9009,96 +9035,11 @@ def collect_source_step_signatures_on_high_value_paths(
     return results
 
 
-def _node_identity_from_node(node: Any) -> dict[str, str]:
-    """Return a graph node's REAL, machine-resolvable identifiers.
-
-    The display ``label`` is the humanized, realm-qualified name (e.g.
-    ``"EXCHANGE WINDOWS PERMISSIONS@HTB.LOCAL"``) — good for prose but NOT a
-    value any AD tool resolves: it is neither a real ``sAMAccountName`` (case
-    differs, the ``@REALM`` suffix is not part of the attribute), a
-    distinguished name, nor a DNS hostname. The per-step
-    independent-verification / remediation commands need the object's OWN
-    identifiers, sourced from the graph node's ``properties`` (populated by the
-    native collector), so a copy-pasted ``Get-ADObject``/``-ComputerName``
-    command in the client report actually resolves the finding instead of
-    silently matching nothing. Empty strings when a field is not carried on the
-    node (a Domain object has no ``sAMAccountName``; a Group/User has no
-    ``dNSHostName``) — that honest gap is what the verify renderer degrades to
-    an angle-bracket fill-in token, never a fabricated identifier.
-    """
-    props = (
-        node.get("properties")
-        if isinstance(node, dict) and isinstance(node.get("properties"), dict)
-        else {}
-    )
-    # The node's object class ("Group"/"User"/"Computer"/"Domain"/...) is a
-    # top-level graph-node key (``kind``), not a ``properties`` field. Stamped so
-    # the catalog can select an object-class-aware abuse (a group target is abused
-    # with AddMember, never with a user-only password reset / Shadow Credentials /
-    # SPN write). Empty string when the endpoint is a synthetic label with no node.
-    kind = ""
-    if isinstance(node, dict):
-        raw_kind = node.get("kind") or node.get("type") or node.get("labels")
-        if isinstance(raw_kind, (list, tuple)):
-            raw_kind = raw_kind[0] if raw_kind else ""
-        kind = str(raw_kind or "").strip()
-    # The object's SID (``objectId`` on a native node) — the invariant identifier
-    # a downstream renderer uses to decide, per instance, whether the endpoint is a
-    # DYNAMIC well-known identity with no manageable member list (Everyone /
-    # Authenticated Users / Domain Users), which changes the remediation from
-    # "remove principal X from it" (impossible) to "scope what it is granted".
-    sid = ""
-    if isinstance(node, dict):
-        sid = str(
-            node.get("objectId") or node.get("objectid") or props.get("objectsid") or ""
-        ).strip()
-    return {
-        "dn": str(
-            props.get("distinguishedname") or props.get("distinguishedName") or ""
-        ).strip(),
-        "samaccountname": str(
-            props.get("samaccountname") or props.get("sAMAccountName") or ""
-        ).strip(),
-        "dnshostname": str(
-            props.get("dnshostname") or props.get("dNSHostName") or ""
-        ).strip(),
-        "kind": kind,
-        "sid": sid,
-    }
-
-
-def _stamp_step_identity(
-    details: dict[str, Any],
-    source_node: Any,
-    target_node: Any,
-) -> None:
-    """Stamp the REAL source/target identifiers into a step's ``details``.
-
-    Baked here (never derived downstream from the display label) because this is
-    a layer that holds the graph NODES the step's endpoints resolve to — the
-    same reason ``source_privilege_tier`` is stamped here. Keeps the key order
-    consistent between the eager (``decorate=True``) build and the deferred
-    ``decorate_display_record`` seam so the two decoration modes stay
-    byte-identical.
-    """
-    src = _node_identity_from_node(source_node)
-    tgt = _node_identity_from_node(target_node)
-    details["source_dn"] = src["dn"]
-    details["target_dn"] = tgt["dn"]
-    details["source_samaccountname"] = src["samaccountname"]
-    details["target_samaccountname"] = tgt["samaccountname"]
-    details["source_dnshostname"] = src["dnshostname"]
-    details["target_dnshostname"] = tgt["dnshostname"]
-    details["source_kind"] = src["kind"]
-    details["target_kind"] = tgt["kind"]
-    # Fill the endpoint SIDs from the graph node only when the step does not
-    # already carry one (an edge's own notes may provide a more meaningful
-    # source_sid — e.g. the well-known reader SID on a synthetic unauth entry —
-    # which must win over the node's objectId).
-    if src["sid"] and not str(details.get("source_sid") or "").strip():
-        details["source_sid"] = src["sid"]
-    if tgt["sid"] and not str(details.get("target_sid") or "").strip():
-        details["target_sid"] = tgt["sid"]
+#: The real identifiers of a step's endpoints live in ``step_identity`` (a leaf
+#: module, so the web edge panel can stamp them without importing this engine
+#: module). Kept under their historical names for the callers below.
+_node_identity_from_node = node_identity_from_node
+_stamp_step_identity = stamp_step_identity
 
 
 def path_to_display_record(
@@ -9497,6 +9438,8 @@ def decorate_display_record(
             new_details["source_sid"] = src_identity["sid"]
         if tgt_identity["sid"]:
             new_details["target_sid"] = tgt_identity["sid"]
+        # A GPO endpoint's policy GUID, at the position the eager stamp uses.
+        stamp_gpo_guid(new_details, src_identity, tgt_identity)
         for key, value in old_details.items():
             if key in ("from", "to"):
                 continue
@@ -9604,7 +9547,15 @@ def decorate_display_records(
     if not isinstance(records, list):
         return records
     caches = _DecorationCaches(graph)
+    # Memory check per route (``attack_path_postprocess_bound``), declared by
+    # the caller's seam like a stop in the DFS.
+    from adscan_core.reporting.attack_path_postprocess_bound import (  # noqa: PLC0415
+        PostprocessMemoryBound,
+    )
+
+    memory_bound = PostprocessMemoryBound("decorating the routes for display")
     for record in records:
+        memory_bound.tick()
         if isinstance(record, dict):
             decorate_display_record(graph, record, _caches=caches)
     return records
@@ -9812,6 +9763,9 @@ def _node_is_effectively_high_value(node: dict[str, Any]) -> bool:
 def _node_is_enabled_user(node: dict[str, Any]) -> bool:
     """Return True when the node represents an enabled user principal."""
     if str(node.get("kind") or "") != "User":
+        return False
+    if is_tombstoned(node):
+        # Deleted: reads as enabled, but nobody can sign in as it.
         return False
     props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     enabled = props.get("enabled")

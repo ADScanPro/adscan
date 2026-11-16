@@ -119,6 +119,11 @@ NOT_EXECUTED_REVERT_NOT_PERMITTED: Final[str] = "revert_not_permitted"
 #: never "the step stopped": the step was deliberately not run.
 DECLINED_REASONS: Final[Mapping[str, Mapping[str, str]]] = {
     NOT_EXECUTED_REVERSAL_NOT_PROVEN: {
+        # The chip every report and the platform draw beside the step.
+        "label": (
+            "Not executed: no account could be confirmed to revoke the "
+            "certificate on this certification authority."
+        ),
         "headline": (
             "Not run. ADscan could not confirm that an account can revoke the "
             "certificate on this CA, so it requested none."
@@ -129,6 +134,9 @@ DECLINED_REASONS: Final[Mapping[str, Mapping[str, str]]] = {
         ),
     },
     NOT_EXECUTED_REVERT_NOT_PERMITTED: {
+        "label": (
+            "Not executed: the cleanup account could not be confirmed to undo this change."
+        ),
         "headline": (
             "Not run. The scan policy accepts no manual cleanup, and the cleanup "
             "account could not be confirmed to undo this change."

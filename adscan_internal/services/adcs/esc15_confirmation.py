@@ -273,12 +273,11 @@ def apply_esc15_verdicts_to_graph(
             removed += 1
             continue
         notes = edge.get("notes")
-        if not isinstance(notes, dict):
-            notes = {}
-            edge["notes"] = notes
         update = _select_notes_update(edge, verdicts, notes_by_template, action)
         if update:
-            notes.update(update)
+            # Replace, never update in place: a graph from the compact loader may share
+            # one notes object between edges.
+            edge["notes"] = {**(notes if isinstance(notes, dict) else {}), **update}
             marked += 1
         kept.append(edge)
 

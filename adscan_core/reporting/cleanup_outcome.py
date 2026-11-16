@@ -75,6 +75,15 @@ __all__ = [
     "STILL_IN_PLACE_LABEL",
     "still_in_place_count",
     "cleanup_counters",
+    "OUTCOME_ON_RESUME",
+    "OUTCOME_INTERRUPTED",
+    "RUN_STATE_RUNNING",
+    "RUN_STATE_INTERRUPTED",
+    "RUN_STATE_ENDED",
+    "REVERT_SCHEDULED_KEY",
+    "RESUMABLE_REVERT_KINDS",
+    "surface_bucket",
+    "interrupted_scan_notice",
 ]
 
 # ── Reasons and labels a ledger record carries ────────────────────────────────
@@ -139,9 +148,53 @@ OUTCOME_FAILED = "revert_failed"
 OUTCOME_UNCONFIRMED = "revert_unconfirmed"
 OUTCOME_NO_AUTOMATIC_UNDO = "no_automatic_undo"
 
+#: The scan was interrupted before the change was undone, and a resumed scan
+#: undoes it. Only stated for a scan that can be resumed.
+OUTCOME_ON_RESUME = "undone_on_resume"
+#: The scan ended before the change was undone and ADscan will not undo it.
+OUTCOME_INTERRUPTED = "interrupted_needs_team"
+
+# ── What the caller knows about the run the changes belong to ─────────────────
+#: The engine is still running: an unsettled revert is still coming.
+RUN_STATE_RUNNING = "running"
+#: The scan stopped with its checkpoint saved and can be resumed.
+RUN_STATE_INTERRUPTED = "interrupted"
+#: The scan is over and cannot be resumed.
+RUN_STATE_ENDED = "ended"
+
+#: Ledger key of a revert scheduled for a pass that has not run yet (the final
+#: pass of the run). The record underneath is already a complete manual entry,
+#: so a session that dies before that pass still leaves the client the command.
+REVERT_SCHEDULED_KEY = "revert_scheduled"
+
+#: Change kinds a later run of the same workspace can undo from the ledger
+#: record alone, so a change left behind by an interrupted scan is undone when
+#: the scan is resumed. The engine's final revert pass dispatches exactly these
+#: (``final_revert_pass``; a test keeps the two equal). A kind that is not here
+#: is undone only by the session that made it.
+RESUMABLE_REVERT_KINDS: frozenset[str] = frozenset(
+    {
+        "machine_account_created",
+        "computer_account_created",
+        "rbcd_delegation_added",
+        "keycredentiallink_added",
+        "shadow_credentials_added",
+        "dacl_ace_added",
+        "owner_changed",
+        "spn_added",
+        "group_membership_changed",
+        "group_membership_added",
+        "account_enabled",
+        "issued_certificate",
+        "mssql_xp_cmdshell_enabled",
+    }
+)
+
 #: Display order: what the client must act on first, the good side last.
 OUTCOME_ORDER: tuple[str, ...] = (
     OUTCOME_IN_PROGRESS,
+    OUTCOME_ON_RESUME,
+    OUTCOME_INTERRUPTED,
     OUTCOME_FAILED,
     OUTCOME_NEEDS_RIGHTS,
     OUTCOME_UNCONFIRMED,
@@ -267,6 +320,37 @@ OUTCOME_COPY: dict[str, OutcomeCopy] = {
         next_step="",
         tone="pending",
     ),
+    OUTCOME_ON_RESUME: OutcomeCopy(
+        key=OUTCOME_ON_RESUME,
+        title="Undone when the scan is resumed",
+        chip="Undone on resume",
+        tally="to be undone when the scan is resumed",
+        explanation=(
+            "The scan was interrupted before ADscan undid these changes, so they are still "
+            "in place. When the scan is resumed, ADscan undoes each one and reads the object "
+            "back to confirm it."
+        ),
+        next_step=(
+            "Resume the scan. A change ADscan cannot undo at that point is then listed with "
+            "the command that removes it."
+        ),
+        tone="neutral",
+    ),
+    OUTCOME_INTERRUPTED: OutcomeCopy(
+        key=OUTCOME_INTERRUPTED,
+        title="Not undone before the scan ended",
+        chip="Needs your team",
+        tally="not undone before the scan ended",
+        explanation=(
+            "The scan ended before ADscan undid these changes, and ADscan will not undo "
+            "them itself. They are still in place."
+        ),
+        next_step=(
+            "Your team removes each one. Where a command is shown, it removes the change."
+        ),
+        tone="action",
+        responsibility="client",
+    ),
     OUTCOME_FAILED: OutcomeCopy(
         key=OUTCOME_FAILED,
         title="Revert failed",
@@ -372,7 +456,28 @@ def _text(change: Mapping[str, Any], key: str) -> str:
     return str(change.get(key) or "").strip().lower()
 
 
-def cleanup_outcome(change: Mapping[str, Any]) -> str:
+def surface_bucket(bucket: Any, change: Mapping[str, Any]) -> str:
+    """The bucket a change is SHOWN in, given the bucket of its raw status.
+
+    One correction to the status bucket: a change whose revert is scheduled for
+    a pass that has not run yet (:data:`REVERT_SCHEDULED_KEY`) is stored as a
+    complete manual record, but it is pending, not manual. Showing it as manual
+    told a client "no automatic undo" about certificates ADscan was about to
+    revoke, or would revoke when the scan was resumed.
+
+    The platform calls this, because it knows the state of the run and words a
+    pending change accordingly (:func:`cleanup_outcome` with ``run_state``). A
+    report does not: it is written with no engine running, so a revert still
+    scheduled there never ran, and the record keeps the manual entry it is
+    stored as.
+    """
+    key = str(bucket or "").strip().lower()
+    if key == "manual" and isinstance(change, Mapping) and change.get(REVERT_SCHEDULED_KEY):
+        return "in_progress"
+    return key
+
+
+def cleanup_outcome(change: Mapping[str, Any], *, run_state: str = "") -> str:
     """The outcome of one normalized change (``bucket`` plus ``manual_reason``).
 
     A row that already carries a known ``outcome`` is taken at its word, so a
@@ -380,6 +485,16 @@ def cleanup_outcome(change: Mapping[str, Any]) -> str:
     stamped. Anything else is derived here. A manual change whose reason is
     missing or unknown reads as a failed revert: the safe direction, since it
     never turns ADscan's failure into a request for the client's input.
+
+    Args:
+        change: The normalized row (``bucket``, ``manual_reason``, ``kind``).
+        run_state: What the caller knows about the run (``RUN_STATE_*``), or
+            ``""`` when it knows nothing (a report, written when the run is
+            over and nothing is unsettled). It only matters for a change whose
+            revert never settled. While the engine runs, that revert is still
+            coming. Once the engine is gone it is not: a scan that can be
+            resumed undoes the kinds in :data:`RESUMABLE_REVERT_KINDS` when it
+            resumes, and everything else needs the client's team.
     """
     stamped = _text(change, "outcome")
     if stamped in OUTCOME_COPY:
@@ -389,9 +504,78 @@ def cleanup_outcome(change: Mapping[str, Any]) -> str:
         return OUTCOME_REVERTED
     if bucket == "kept":
         return OUTCOME_KEPT
+    state = str(run_state or "").strip().lower()
+    resumable = (
+        state == RUN_STATE_INTERRUPTED and _text(change, "kind") in RESUMABLE_REVERT_KINDS
+    )
     if bucket == "manual":
-        return _REASON_OUTCOME.get(_text(change, "manual_reason"), OUTCOME_FAILED)
+        reason = _text(change, "manual_reason")
+        if resumable and reason == "session_died":
+            # Recorded by a session that ended before it could try the revert.
+            return OUTCOME_ON_RESUME
+        return _REASON_OUTCOME.get(reason, OUTCOME_FAILED)
+    if state in (RUN_STATE_INTERRUPTED, RUN_STATE_ENDED):
+        return OUTCOME_ON_RESUME if resumable else OUTCOME_INTERRUPTED
     return OUTCOME_IN_PROGRESS
+
+
+def interrupted_scan_notice(changes: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """What an interrupted scan's banner says about the changes it left in place.
+
+    Args:
+        changes: The scan's rows, each with the ``outcome`` derived for an
+            interrupted run (``cleanup_outcome(..., run_state=RUN_STATE_INTERRUPTED)``).
+
+    Returns:
+        ``still_in_place``, ``undone_on_resume``, ``needs_team`` and ``notice``.
+        ``notice`` is empty when nothing is still in place.
+    """
+    still = on_resume = 0
+    for change in changes:
+        if not isinstance(change, Mapping):
+            continue
+        key = cleanup_outcome(change, run_state=RUN_STATE_INTERRUPTED)
+        if not outcome_is_still_in_place(key):
+            continue
+        still += 1
+        if key == OUTCOME_ON_RESUME:
+            on_resume += 1
+    needs_team = still - on_resume
+    notice = ""
+    if still:
+        head = (
+            "1 change made by this scan is still in place."
+            if still == 1
+            else f"{still} changes made by this scan are still in place."
+        )
+        if on_resume == still:
+            tail = (
+                "Resuming the scan undoes it."
+                if still == 1
+                else "Resuming the scan undoes them."
+            )
+        elif on_resume:
+            tail = (
+                f"Resuming the scan undoes the {on_resume} ADscan can undo. "
+                f"The other {needs_team} need your team: see the Cleanup tab."
+                if needs_team != 1
+                else f"Resuming the scan undoes the {on_resume} ADscan can undo. "
+                "The other one needs your team: see the Cleanup tab."
+            )
+        else:
+            tail = (
+                "Resuming the scan does not undo it. It needs your team: see the Cleanup tab."
+                if still == 1
+                else "Resuming the scan does not undo them. They need your team: see the "
+                "Cleanup tab."
+            )
+        notice = f"{head} {tail}"
+    return {
+        "still_in_place": still,
+        "undone_on_resume": on_resume,
+        "needs_team": needs_team,
+        "notice": notice,
+    }
 
 
 def outcome_is_still_in_place(key: str) -> bool:

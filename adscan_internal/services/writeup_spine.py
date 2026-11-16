@@ -1390,6 +1390,13 @@ def _evidence_pairs(details: dict[str, Any] | None) -> tuple[tuple[str, str], ..
 # ── Workspace collection ─────────────────────────────────────────────────────
 
 
+def _read_domain_graph(domain_dir: Path) -> Any:
+    """The domain's attack graph (the live session's, else the export), read only."""
+    from adscan_core.graph_file_reader import read_graph_in_dir
+
+    return read_graph_in_dir(domain_dir)
+
+
 def _read_json(path: str) -> Any:
     """Return parsed JSON from ``path``, or ``None`` when unreadable."""
     try:
@@ -1498,7 +1505,7 @@ def _collect_certificate_authorities(
     Ordered by label so the table is stable across renders, and two CAs sharing
     a host are both kept: that is a fact about the PKI, not a duplicate.
     """
-    graph = _read_json(str(domain_dir / "attack_graph.json"))
+    graph = _read_domain_graph(domain_dir)
     nodes = graph.get("nodes") if isinstance(graph, dict) else None
     if not isinstance(nodes, dict):
         return ()
@@ -2748,7 +2755,7 @@ def _chain_from_graph(
     assembled chain includes. ``primary`` is ``None`` when there is nothing to
     build, so a nothing-proven box never gains a fabricated (claimed) chain.
     """
-    graph = _read_json(str(domain_dir / "attack_graph.json"))
+    graph = _read_domain_graph(domain_dir)
     if not isinstance(graph, dict):
         return None, 0, 0
     nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}

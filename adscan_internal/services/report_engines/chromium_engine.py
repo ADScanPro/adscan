@@ -218,6 +218,11 @@ class ChromiumEngine(ReportEngine):
                 try:
                     context = browser.new_context()
                     page = context.new_page()
+                    # The browser and its renderer are now running: make them
+                    # the kernel's first choice if memory runs out, so a render
+                    # too large for the machine fails as a declared deliverable
+                    # failure instead of the kernel killing the engine.
+                    _prefer_browser_as_oom_victim()
                     page.route("**/*", requests)
 
                     base_url_str = str(base_url) if base_url is not None else None
@@ -257,7 +262,30 @@ class ChromiumEngine(ReportEngine):
         finally:
             requests.report()
 
-        return pdf_bytes
+        # A licensed run's PDF carries its licence trace in the document
+        # information (appended, so the laid-out pages are untouched).
+        from adscan_core.pro_license.traceability import stamp_pdf
+
+        return stamp_pdf(pdf_bytes)
+
+
+#: Process names of the headless browser Playwright launches (Chromium, the
+#: headless shell, and the Playwright driver that owns them).
+_BROWSER_PROCESS_NAMES = ("chrom", "headless_shell", "playwright")
+
+
+def _prefer_browser_as_oom_victim() -> None:
+    """Raise the browser processes' out-of-memory score (Linux; no-op elsewhere)."""
+    try:
+        from adscan_core.pal.process import make_preferred_oom_victims
+
+        make_preferred_oom_victims(_BROWSER_PROCESS_NAMES)
+    except Exception as exc:  # noqa: BLE001 - the adjustment never breaks a render
+        from adscan_core import telemetry
+        from adscan_core.rich_output import print_exception
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _bind_optical_sizes(page: Any) -> None:

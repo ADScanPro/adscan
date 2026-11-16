@@ -1027,6 +1027,26 @@ def orchestrate_ligolo_pivot_tunnel(
     if not gate_check_runner(shell, NETWORK_PIVOT_CHECK_ID, surface="pivot"):
         return False
 
+    # A pivot agent is an artifact deployed and run on ``pivot_host``; a host the
+    # engagement scope excludes is never used as a pivot. Hosts reached BEHIND an
+    # in-scope pivot are judged like any other, each at its own contact seam.
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        require_host_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(shell, [pivot_host], domain=domain)
+    if not require_host_in_scope(
+        shell,
+        host=pivot_host,
+        surface="pivot_deployment",
+        what="Pivot",
+        domain=domain,
+    ):
+        return False
+
     workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "").strip()
     if not workspace_dir:
         print_info_debug(

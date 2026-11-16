@@ -140,6 +140,7 @@ class DomainService(BaseService):
         posture_sink: Optional[PostureSink] = None,
         posture_snapshot: Optional[DomainPosture] = None,
         allowed_partner_domains: Optional[set] = None,
+        partner_in_scope: Optional[Callable[[str], bool]] = None,
     ) -> TrustEnumerationResult:
         """Enumerate trusts recursively over native badldap.
 
@@ -150,7 +151,17 @@ class DomainService(BaseService):
         the BFS only expands INTO those partner domains — the source domain is
         always enumerated, and discovered trusts to non-listed partners are
         still recorded, but ADscan does not recurse into them. ``None`` (the
-        default) enumerates every reachable partner, exactly as before.
+        default) enumerates every reachable partner, exactly as before. An
+        empty set stops the walk at the source domain's own trust list.
+
+        ``partner_in_scope`` is the engagement-scope answer for a partner (the
+        caller binds it to the scope SSOT): a partner it refuses is not expanded
+        either. A callback that raises refuses the partner.
+
+        A partner the walk does not expand into is NOT CONTACTED at all: its
+        domain controller is neither located (locating it probes the directory
+        ports) nor checked for reachability nor bound to. The trust itself is
+        still recorded from the source domain's own data, with no ``target_pdc``.
 
         Args:
             domain: Source domain to enumerate.
@@ -341,8 +352,27 @@ class DomainService(BaseService):
                 if not partner:
                     continue
 
+                # Decide FIRST whether the walk may expand into this partner: the
+                # configured partner list (trust_enumeration.policy "selected",
+                # or the empty list of "origin_only") and the engagement scope.
+                # A partner it may not expand into is not contacted, so nothing
+                # below that locates or probes its domain controller runs.
+                expand_partner = True
+                if (
+                    allowed_partner_domains is not None
+                    and partner.strip().lower() not in allowed_partner_domains
+                ):
+                    expand_partner = False
+                if expand_partner and partner_in_scope is not None:
+                    try:
+                        expand_partner = bool(partner_in_scope(partner))
+                    except Exception as sexc:  # noqa: BLE001 - unknown scope: not contacted
+                        telemetry.capture_exception(sexc)
+                        print_exception(exception=sexc)
+                        expand_partner = False
+
                 partner_pdc = domain_controllers.get(partner)
-                if not partner_pdc and resolve_pdc_ip is not None:
+                if expand_partner and not partner_pdc and resolve_pdc_ip is not None:
                     try:
                         partner_pdc = resolve_pdc_ip(partner, current_resolver)
                     except Exception as rexc:  # noqa: BLE001
@@ -387,16 +417,9 @@ class DomainService(BaseService):
                     )
                 )
 
-                should_enqueue = True
-                # Scope the BFS expansion to the configured partner allowlist
-                # (trust_enumeration.policy == "selected"). The trust to this
-                # partner is still recorded above; we just do not recurse into a
-                # partner the operator did not select.
-                if (
-                    allowed_partner_domains is not None
-                    and partner.strip().lower() not in allowed_partner_domains
-                ):
-                    should_enqueue = False
+                # The trust to this partner is recorded above either way; the
+                # walk only recurses into a partner it may expand into.
+                should_enqueue = expand_partner
                 if should_enqueue and partner_pdc and check_domain_reachability is not None:
                     try:
                         connectivity = check_domain_reachability(
@@ -522,6 +545,16 @@ class DomainService(BaseService):
             message=f"Checking connectivity to {domain}",
         )
         try:
+            # ``ping`` is a child process: the controller is asked of the
+            # engagement scope here, immediately before it is started.
+            from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+                subprocess_host_in_scope,
+            )
+
+            if not subprocess_host_in_scope(
+                None, pdc, surface="domain_connectivity", what="Connectivity check", domain=domain
+            ):
+                return False
             clean_env = get_clean_env_for_compilation()
             result = subprocess.run(
                 ["ping", "-c", "1", "-W", "2", pdc],

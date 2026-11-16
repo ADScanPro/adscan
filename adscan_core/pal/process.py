@@ -27,6 +27,23 @@ import subprocess
 from adscan_core.pal.platform import is_posix, is_windows
 
 
+def is_specific_process_id(pid: object) -> bool:
+    """Return ``True`` only for a real id that names ONE specific process.
+
+    The signalling calls give small and non-positive ids a broadcast meaning:
+    ``0`` is the caller's own process group, ``-1`` is every process the user
+    may signal, and group ``1`` is the same broadcast (``killpg(1, sig)`` is
+    ``kill(-1, sig)``). ``1`` itself is the init process. None of them is ever a
+    child this product started, so they are refused outright.
+
+    The type check is deliberate: an object that merely converts to an integer
+    (a test double whose ``pid`` attribute answers ``__index__`` with ``1``)
+    would otherwise reach the system call as id ``1``. That is exactly how a
+    unit test once ended a whole desktop session.
+    """
+    return type(pid) is int and pid > 1  # noqa: E721 -- bool and int-likes are refused on purpose
+
+
 def terminate_process(pid: int, *, force: bool = False) -> bool:
     """Signal a single process to terminate.
 
@@ -40,8 +57,11 @@ def terminate_process(pid: int, *, force: bool = False) -> bool:
 
     Returns:
         ``True`` if the signal was delivered, ``False`` if the process was already
-        gone (``ProcessLookupError``) or the signal could not be sent.
+        gone (``ProcessLookupError``), the signal could not be sent, or ``pid``
+        does not name one specific process (see :func:`is_specific_process_id`).
     """
+    if not is_specific_process_id(pid):
+        return False
     try:
         if is_windows():
             # Windows maps SIGTERM to TerminateProcess; no SIGKILL concept.
@@ -70,12 +90,23 @@ def terminate_process_group(pid: int, *, force: bool = False) -> bool:
 
     Returns:
         ``True`` if the signal was delivered, ``False`` if the group/process was
-        already gone or the signal could not be sent.
+        already gone, the signal could not be sent, or the target is refused.
+
+    Refused, never signalled: a ``pid`` that does not name one specific process
+    (see :func:`is_specific_process_id`), a resolved group id that is not a
+    specific group (group ``1`` is a broadcast to every process of the user),
+    and the caller's OWN process group (that would end the caller, its parent
+    shell and its siblings). A caller that gets ``False`` falls back to
+    signalling the single child it holds.
     """
+    if not is_specific_process_id(pid):
+        return False
     if is_windows():
         return terminate_process(pid, force=force)
     try:
         pgid = os.getpgid(pid)
+        if not is_specific_process_id(pgid) or pgid == os.getpgrp():
+            return False
         os.killpg(pgid, signal.SIGKILL if force else signal.SIGTERM)
         return True
     except ProcessLookupError:
@@ -131,6 +162,39 @@ def new_session_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def interrupt_main_thread() -> bool:
+    """Deliver an interrupt to the main thread from another thread.
+
+    POSIX sends a real ``SIGINT`` to the main thread (``pthread_kill``), so a
+    blocking system call there returns ``EINTR`` and the Python SIGINT handler
+    runs at once. Windows has no per-thread signals: it schedules the SIGINT
+    handler with ``_thread.interrupt_main``, which runs as soon as the main
+    thread executes Python code again.
+
+    Returns:
+        Whether the interrupt was delivered.
+    """
+    import signal  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    if is_posix() and hasattr(signal, "pthread_kill"):
+        try:
+            ident = threading.main_thread().ident
+            if ident is None:
+                return False
+            signal.pthread_kill(ident, signal.SIGINT)
+            return True
+        except (OSError, ValueError):
+            return False
+    try:
+        import _thread  # noqa: PLC0415
+
+        _thread.interrupt_main(signal.SIGINT)
+        return True
+    except (RuntimeError, ValueError, TypeError):
+        return False
+
+
 def peak_rss_bytes() -> int | None:
     """Return the peak resident set size of the current process, in bytes.
 
@@ -158,6 +222,116 @@ def peak_rss_bytes() -> int | None:
         return int(psutil.Process().memory_info().peak_wset)
     except Exception:
         return None
+
+
+def current_rss_bytes() -> int | None:
+    """Return the LIVE resident set size of the current process, in bytes.
+
+    Unlike :func:`peak_rss_bytes` (a high-water mark that never comes down), this
+    is the memory the process holds right now, which is what a memory guard must
+    compare against its ceiling: a stage that ran after a larger one has to see
+    the memory the larger one released, or it would stop on a peak it no longer
+    holds.
+
+    Every OS reads ``psutil.Process().memory_info().rss`` (the working set on
+    Windows). ``psutil`` is a core dependency; when it cannot be imported or read
+    this returns ``None`` and the caller falls back to the peak.
+
+    Returns:
+        Live RSS in bytes, or ``None`` if it cannot be determined.
+    """
+    try:
+        import psutil
+
+        value = int(psutil.Process().memory_info().rss)
+    except Exception:  # noqa: BLE001 — a memory read must never raise into the caller.
+        return None
+    return value if value > 0 else None
+
+
+#: ``oom_score_adj`` of a process the kernel should kill first when memory runs
+#: out (the maximum). Raising a process's own score needs no privilege.
+PREFERRED_OOM_VICTIM_SCORE = 1000
+
+
+def make_preferred_oom_victims(names: tuple[str, ...]) -> int:
+    """Make this process's descendants whose name matches ``names`` the kernel's
+    first choice when memory runs out. Returns how many were adjusted.
+
+    A child that allocates a lot (the report's headless browser) can push the
+    whole cgroup to the limit; the kernel then kills the process with the
+    highest score, which is otherwise the engine, its parent and the larger of
+    the two. With the child's score raised, the child dies instead and the
+    engine sees a failed render it can declare.
+
+    Linux writes ``/proc/<pid>/oom_score_adj``. Windows has no equivalent (its
+    out-of-memory behaviour fails allocations, it does not kill by score), and
+    there this is a no-op returning ``0``. Never raises.
+
+    Args:
+        names: Substrings matched against each descendant's process name and
+            command line (``"chrom"``, ``"headless_shell"``).
+    """
+    if not is_posix() or is_windows():
+        return 0
+    try:
+        import psutil
+
+        children = psutil.Process().children(recursive=True)
+    except Exception:  # noqa: BLE001 — a best-effort adjustment never raises
+        return 0
+    wanted = tuple(str(n).lower() for n in names if str(n or "").strip())
+    adjusted = 0
+    for child in children:
+        try:
+            label = " ".join([child.name(), *child.cmdline()[:1]]).lower()
+        except Exception:  # noqa: BLE001 — the process may have exited
+            continue
+        if not any(n in label for n in wanted):
+            continue
+        try:
+            with open(f"/proc/{child.pid}/oom_score_adj", "w", encoding="ascii") as handle:
+                handle.write(str(PREFERRED_OOM_VICTIM_SCORE))
+            adjusted += 1
+        except OSError:
+            continue
+    return adjusted
+
+
+def release_free_heap() -> bool:
+    """Ask the C allocator to hand freed heap pages back to the OS, best-effort.
+
+    CPython returns a freed arena to the OS, but glibc ``malloc`` keeps freed
+    small-block pages in the process until something trims them, so after a
+    large stage unwinds the resident set can stay near its peak. A stage that
+    switches to a streamed mode after a memory stop needs that memory to show
+    as released, or its own guard trips at once on memory nobody holds.
+
+    Linux with glibc calls ``malloc_trim(0)``. Other platforms (Windows, musl,
+    macOS) have no equivalent call and this is a no-op.
+
+    The symbol is looked up on ``ctypes.CDLL(None)``, the libraries already loaded
+    into this process, never through ``ctypes.util.find_library``: that spawns
+    ``ldconfig`` or a compiler to search for libc, at exactly the moment memory is
+    short, and can fail inside a frozen (PyInstaller) build.
+
+    Returns:
+        ``True`` when a trim ran, ``False`` otherwise. Never raises.
+    """
+    if not is_posix():
+        return False
+    try:
+        import ctypes
+
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is None:
+            return False
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        trim(0)
+        return True
+    except Exception:  # noqa: BLE001 — best-effort; never break the caller.
+        return False
 
 
 def effective_user_is_root() -> bool:

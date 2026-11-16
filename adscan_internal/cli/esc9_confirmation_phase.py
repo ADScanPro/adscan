@@ -41,6 +41,7 @@ silently dropped.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from adscan_internal import telemetry
@@ -66,6 +67,7 @@ from adscan_internal.services.adcs.scbe_observation import (
     observe_domain_scbe,
     resolve_reading_credential,
 )
+from adscan_internal.services.graph_runtime_edits import apply_graph_edit
 from adscan_internal.services.detection_change_gate import (
     ESC9_CONFIRMATION_CHECK_ID,
     DetectionChangeAuthorization,
@@ -73,6 +75,28 @@ from adscan_internal.services.detection_change_gate import (
 )
 
 _ESC9_RELATIONS = ("ADCSESC9", "ADCSESC10")
+
+
+def _is_esc9_edge(edge: Mapping[str, Any]) -> bool:
+    return str(edge.get("relation") or "").strip() in _ESC9_RELATIONS
+
+
+def _record_esc9_verdict(shell: Any, domain: str, graph: Any, scbe: Any) -> Esc9ApplyResult:
+    """Apply the domain-wide SCBE verdict to the ESC9/10 edges through the runtime facade.
+
+    The verdict is decided by the unchanged pure function; only where its result goes
+    changed: a hardened verdict retires each edge, a kept one patches the confirmation
+    notes onto it, each as one overlay operation (no whole-graph rewrite).
+    """
+    result, _outcome = apply_graph_edit(
+        shell,
+        domain,
+        graph,
+        lambda view: apply_esc9_confirmation_to_graph(view, scbe),
+        edge_filter=_is_esc9_edge,
+        origin="esc9_confirmation",
+    )
+    return result
 
 
 def run_esc9_confirmation_phase(
@@ -91,10 +115,7 @@ def run_esc9_confirmation_phase(
     honest default) rather than dropping them.
     """
     try:
-        from adscan_internal.services.attack_graph_service import (
-            load_attack_graph,
-            save_attack_graph,
-        )
+        from adscan_internal.services.attack_graph_service import load_attack_graph
 
         graph = load_attack_graph(shell, domain)
         if not isinstance(graph, dict) or not graph_has_esc9_edges(graph):
@@ -106,8 +127,7 @@ def run_esc9_confirmation_phase(
             scbe = _pending_verdict(
                 "active ESC9 confirmation opted out (ADSCAN_NO_ESC9_CONFIRM)"
             )
-            result = apply_esc9_confirmation_to_graph(graph, scbe)
-            save_attack_graph(shell, domain, graph)
+            result = _record_esc9_verdict(shell, domain, graph, scbe)
             print_info_verbose(
                 f"ESC9 confirmation skipped for {marked_domain} (opt-out); "
                 f"{result.pending} candidate(s) left confirmation-pending."
@@ -140,8 +160,7 @@ def run_esc9_confirmation_phase(
             if behavioral is not None:
                 scbe = behavioral
 
-        result = apply_esc9_confirmation_to_graph(graph, scbe)
-        save_attack_graph(shell, domain, graph)
+        result = _record_esc9_verdict(shell, domain, graph, scbe)
 
         if scbe.state is ScbeState.HARDENED and result.removed:
             # Every ESC9/10 edge is decided by the single domain-wide SCBE verdict,

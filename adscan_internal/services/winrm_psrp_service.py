@@ -70,6 +70,10 @@ class WinRMPSRPError(RuntimeError):
     """Raised when a PSRP-backed WinRM operation fails."""
 
 
+class WinRMPSRPOutputLimitError(WinRMPSRPError):
+    """A bounded PowerShell execution returned more output than its bound."""
+
+
 def is_clock_skew_error(exc: BaseException) -> bool:
     """Return True when *exc* indicates a Kerberos clock-skew / ticket-not-yet-valid failure.
 
@@ -233,6 +237,14 @@ class WinRMPSRPService:
     def _looks_like_ccache_path(self) -> bool:
         """Return True when the configured secret points to a Kerberos ccache."""
         return str(self.password or "").strip().lower().endswith(".ccache")
+
+    def _has_ntlm_secret(self) -> bool:
+        """True when NTLM has something to send (a password or an NT hash, not a ticket)."""
+        from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+            ntlm_secret_available,
+        )
+
+        return ntlm_secret_available(password=self.password)
 
     def _looks_like_nt_hash(self) -> bool:
         """Return True when the configured secret is a bare 32-hex NT hash."""
@@ -468,6 +480,7 @@ class WinRMPSRPService:
             plan = build_winrm_plan(
                 requested_auth_mode=self.auth_mode,
                 posture=self._posture_snapshot,
+                ntlm_secret_available=self._has_ntlm_secret(),
             )
             self._ntlm_fallback_allowed = plan.ntlm_fallback_allowed
             if plan.is_pruned:
@@ -487,7 +500,7 @@ class WinRMPSRPService:
             if KERBEROS_FIRST_POLICY:
                 effective_auth = "kerberos"
                 if self._posture_snapshot is None:
-                    self._ntlm_fallback_allowed = True
+                    self._ntlm_fallback_allowed = self._has_ntlm_secret()
             else:
                 effective_auth = (
                     "kerberos" if self._looks_like_ccache_path() else "ntlm"
@@ -1259,15 +1272,23 @@ class WinRMPSRPService:
         had_errors: bool,
         duration_seconds: float,
         operation_name: str | None = None,
+        output_preview: bool = True,
     ) -> None:
-        """Emit one Rich debug summary for a PSRP execution result."""
+        """Emit one Rich debug summary for a PSRP execution result.
+
+        ``output_preview=False`` writes the result line only (no command panel,
+        no output preview): for a caller that runs many small queries.
+        """
         try:
-            command_preview = build_text_preview(script or "", head=20, tail=20, max_line_length=300)
-            print_info_debug(
-                "[winrm_psrp] Command:\n"
-                + mark_sensitive(command_preview or script or "", "text"),
-                panel=True,
-            )
+            if output_preview:
+                command_preview = build_text_preview(
+                    script or "", head=20, tail=20, max_line_length=300
+                )
+                print_info_debug(
+                    "[winrm_psrp] Command:\n"
+                    + mark_sensitive(command_preview or script or "", "text"),
+                    panel=True,
+                )
             synthetic_result = subprocess.CompletedProcess(
                 args="[winrm_psrp]",
                 returncode=1 if had_errors else 0,
@@ -1296,6 +1317,8 @@ class WinRMPSRPService:
                 f"duration={duration_text}"
             )
 
+            if not output_preview:
+                return
             preview_text = build_execution_output_preview(
                 synthetic_result,
                 stdout_head=12,
@@ -1422,21 +1445,108 @@ class WinRMPSRPService:
             message="NTLM authentication via WinRM succeeded",
         )
 
+    @staticmethod
+    def _load_pipeline_classes():
+        """The pypsrp runspace-pool and pipeline classes (lazy import)."""
+        from pypsrp.complex_objects import PSInvocationState  # noqa: PLC0415
+        from pypsrp.powershell import PowerShell, RunspacePool  # noqa: PLC0415
+
+        return RunspacePool, PowerShell, PSInvocationState
+
+    def _execute_ps_bounded(self, client, script: str, max_output_chars: int):
+        """Run ``script`` like ``client.execute_ps``, holding at most the bound.
+
+        ``pypsrp.Client.execute_ps`` waits for the pipeline to end, keeping
+        every output line, then joins them. This runs the same pipeline
+        (``Invoke-Expression`` piped to ``Out-String -Stream``) but receives it
+        poll by poll and counts what arrives: past ``max_output_chars`` the
+        pipeline is stopped on the host and the execution is refused, so a
+        reply of any size never grows in memory past the bound.
+
+        Raises:
+            WinRMPSRPOutputLimitError: the output passed ``max_output_chars``.
+        """
+        runspace_pool, pipeline_class, invocation_state = self._load_pipeline_classes()
+        bound = max(int(max_output_chars), 0)
+        with runspace_pool(client.wsman) as pool:
+            pipeline = pipeline_class(pool)
+            pipeline.add_cmdlet("Invoke-Expression").add_parameter("Command", script)
+            pipeline.add_cmdlet("Out-String").add_parameter("Stream")
+            pipeline.begin_invoke()
+            counted = 0
+            received = 0
+            while True:
+                output = pipeline.output
+                while counted < len(output):
+                    received += len(str(output[counted])) + 1
+                    counted += 1
+                if received > bound:
+                    try:
+                        pipeline.stop()
+                    except Exception:  # noqa: BLE001 - the refusal stands either way
+                        pass
+                    del output[:]
+                    raise WinRMPSRPOutputLimitError(
+                        f"The PowerShell output on {self.host} passed its bound of "
+                        f"{bound:,} characters and was refused."
+                    )
+                if pipeline.state != invocation_state.RUNNING:
+                    break
+                pipeline.poll_invoke()
+        return (
+            "\n".join(str(item) for item in pipeline.output),
+            pipeline.streams,
+            pipeline.had_errors,
+        )
+
     def execute_powershell(
         self,
         script: str,
         *,
         operation_name: str | None = None,
         require_logon_bypass: bool = False,
+        max_output_chars: int | None = None,
+        debug_output_preview: bool = True,
     ) -> WinRMPSRPExecutionResult:
-        """Execute PowerShell over PSRP and return structured output."""
+        """Execute PowerShell over PSRP and return structured output.
+
+        Args:
+            script: The PowerShell to run.
+            operation_name: Name of the operation, for the debug log.
+            require_logon_bypass: Unused; kept for callers that pass it.
+            max_output_chars: Bound on the output held in memory. When set, the
+                output is counted while it is received and the execution is
+                refused past the bound (see :meth:`_execute_ps_bounded`). A
+                caller that reads replies of a size the HOST decides (a file
+                listing) passes it; ``None`` keeps the unbounded execution.
+            debug_output_preview: Write the command and an output preview to
+                the debug log. A caller that runs hundreds of small queries
+                whose output is an encoded payload turns it off; the result
+                line is still written.
+
+        Raises:
+            WinRMPSRPOutputLimitError: the output passed ``max_output_chars``.
+            WinRMPSRPError: the execution failed.
+        """
         _ = require_logon_bypass
         started_at = time.perf_counter()
+        if max_output_chars is None:
+
+            def _operation(client, _auth_settings):
+                return client.execute_ps(script)
+
+        else:
+
+            def _operation(client, _auth_settings):
+                return self._execute_ps_bounded(client, script, max_output_chars)
+
         try:
             stdout, streams, had_errors = self._execute_with_kerberos_service_fallback(
-                lambda client, _auth_settings: client.execute_ps(script),
+                _operation,
                 operation_name=operation_name or "winrm_powershell",
             )
+        except WinRMPSRPOutputLimitError:
+            raise
         except Exception as exc:  # pragma: no cover - network/runtime specific
             self._emit_winrm_failure_posture(exc=exc)
             raise WinRMPSRPError(
@@ -1462,6 +1572,7 @@ class WinRMPSRPService:
             had_errors=bool(had_errors),
             duration_seconds=duration_seconds,
             operation_name=operation_name,
+            output_preview=debug_output_preview,
         )
 
         return WinRMPSRPExecutionResult(

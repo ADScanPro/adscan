@@ -636,11 +636,19 @@ def _discover_pdc_from_entered_ip(
     byte-identical.
     """
     from adscan_internal.cli.dns import (  # noqa: PLC0415
+        dc_candidate_scope_error,
         preflight_domain_pdc_noninteractive,
         persist_pdc_preflight_result,
     )
 
     marked_domain = mark_sensitive(domain, "domain")
+    # Engagement scope first: the preflight queries and probes the entered IP,
+    # and an excluded domain controller gets a row that says why it was not used
+    # (the preflight itself also refuses it).
+    scope_error = dc_candidate_scope_error(shell, domain=domain, candidate_ip=entered_ip)
+    if scope_error:
+        report.add("DNS resolution", "fail", scope_error)
+        return ""
     decision = preflight_domain_pdc_noninteractive(
         shell,
         domain=domain,
@@ -831,6 +839,34 @@ def _ensure_dc_fqdn(shell: Any, domain: str, pdc_ip: str) -> None:
         print_exception(exception=exc)
 
 
+def _dc_in_engagement_scope(shell: Any, dc_ip: str) -> bool:
+    """Whether the engagement scope lets the health check contact ``dc_ip``.
+
+    The connectivity probe covers the directory ports of a domain controller,
+    so it is described as an LDAP contact. Asked of the scope SSOT, which records the
+    refusal and prints its one line. Fails closed.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            require_host_in_scope,
+        )
+
+        return bool(
+            require_host_in_scope(
+                shell,
+                host=dc_ip,
+                contact=Contact("ldap"),
+                surface="doctor",
+                what="Connectivity check",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - an unknown verdict contacts nobody
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def _check_connectivity(report: Any, shell: Any, dc_ip: str) -> bool:
     """TCP reachability of the DC's AD ports (route + port probe).
 
@@ -838,6 +874,16 @@ def _check_connectivity(report: Any, shell: Any, dc_ip: str) -> bool:
     """
     if not dc_ip:
         report.add("DC connectivity", "skip", "No DC IP resolved.")
+        return False
+    if not _dc_in_engagement_scope(shell, dc_ip):
+        # Not probed at all: an excluded domain controller is "not checked",
+        # never "no AD ports open".
+        report.add(
+            "DC connectivity",
+            "skip",
+            f"{mark_sensitive(dc_ip, 'ip')} is excluded from the engagement scope; "
+            "it was not contacted.",
+        )
         return False
     try:
         from adscan_internal.services.network_preflight_service import (  # noqa: PLC0415

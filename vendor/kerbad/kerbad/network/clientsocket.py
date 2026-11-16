@@ -2,7 +2,7 @@
 import socket
 
 from kerbad.protocol.asn1_structs import KerberosResponse
-from kerbad.protocol.errors import KerberosErrorCode, KerberosError
+from kerbad.protocol.errors import KerberosErrorCode, KerberosError, KerberosReplyMalformedError
 from asysocks.unicomm.common.target import UniProto
 
 class KerberosClientSocket:
@@ -50,10 +50,17 @@ class KerberosClientSocket:
 					temp = b''
 					temp = self.soc.recv(4096)
 					if temp == b'':
+						if buff != b'':
+							# The peer closed with the record mark (and possibly part
+							# of the message) still in the buffer: never hand that to
+							# the asn1 decoder as if it were a reply.
+							raise KerberosReplyMalformedError(
+								'The KDC at %s closed the connection before a complete reply was received (truncated KDC reply)' % self.get_addr_str()
+							)
 						break
 					buff += temp
 					if total_length == -1:
-						if len(buff) > 4:
+						if len(buff) >= 4:
 							total_length = int.from_bytes(buff[:4], byteorder = 'big', signed = False)
 							if total_length == 0:
 								raise Exception('Returned data length is 0! This means the server did not understand our message')
@@ -80,7 +87,12 @@ class KerberosClientSocket:
 						continue
 			if buff == b'':
 				raise Exception('Server closed the connection!')
-			krb_message = KerberosResponse.load(buff)
+			try:
+				krb_message = KerberosResponse.load(buff)
+			except (ValueError, TypeError) as e:
+				raise KerberosReplyMalformedError(
+					'Malformed or truncated KDC reply from %s (%d bytes): %s' % (self.get_addr_str(), len(buff), e)
+				) from e
 			if krb_message.name == 'KRB_ERROR' and throw == True:
 				raise KerberosError(krb_message)
 			return krb_message

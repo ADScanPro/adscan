@@ -125,6 +125,61 @@ def _split_share_rows(
     return writable, readable
 
 
+def _share_rows_in_scope(
+    shell: Any,
+    rows: list[dict[str, Any]],
+    *,
+    domain: str,
+    what: str,
+) -> list[dict[str, Any]]:
+    """The share rows whose host the engagement scope lets ADscan contact.
+
+    The overview still lists every exposed share (directory and collection data
+    about an excluded host is mapped, never acted on); only the rows a sub-step
+    is about to ACT on are narrowed. One partition over the distinct hosts, so
+    the operator reads one line with a host count, and a row's host is judged by
+    its name (the FQDN behind a ``HOST$@REALM`` label) and its collected address.
+    The purpose is the ordinary host purpose: reading or writing a share on a
+    domain controller the scope keeps to directory reads is host work.
+    """
+    from adscan_internal.cli.smb import _normalize_smb_host_for_resolution  # noqa: PLC0415
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        partition_targets_in_scope,
+    )
+
+    hosts: dict[str, tuple[str, str]] = {}
+    for row in rows:
+        label = str(row.get("host") or "").strip()
+        if label and label not in hosts:
+            hosts[label] = (
+                _normalize_smb_host_for_resolution(label, domain) or label,
+                str(row.get("host_ip") or "").strip(),
+            )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(
+        shell,
+        list(hosts),
+        key=lambda label: hosts[label][0],
+        address=lambda label: hosts[label][1],
+        domain=domain,
+    )
+    allowed = set(
+        partition_targets_in_scope(
+            shell,
+            list(hosts),
+            key=lambda label: hosts[label][0],
+            address=lambda label: hosts[label][1],
+            surface="smb_share_hunt",
+            what=what,
+            domain=domain,
+        ).allowed
+    )
+    return [row for row in rows if str(row.get("host") or "").strip() in allowed]
+
+
 def _group_writable_share_names_by_host(
     writable: list[dict[str, Any]],
 ) -> dict[str, list[str]]:
@@ -210,6 +265,91 @@ def _select_shares_for_hunt(
         return []
     chosen_set = set(chosen)
     return [r for r, opt in zip(rows, options) if opt in chosen_set]
+
+
+def _writable_host_option_label(host: str, names: list[str]) -> str:
+    r"""Picker label: ``\\host  (N writable share(s): a, b, c)``."""
+    shown = ", ".join(names[:3])
+    more = f", +{len(names) - 3} more" if len(names) > 3 else ""
+    plural = "" if len(names) == 1 else "s"
+    return f"\\\\{host}  ({len(names)} writable share{plural}: {shown}{more})"
+
+
+def _select_writable_hosts_for_capture(
+    shell: Any,
+    by_host: dict[str, list[str]],
+    *,
+    _non_interactive: Callable[[Any], bool] | None = None,
+) -> tuple[dict[str, list[str]], bool]:
+    """Let the operator pick which writable hosts to plant capture bait on.
+
+    ONE multi-select up front (mirroring :func:`_select_shares_for_hunt`),
+    replacing the former per-host consent prompt: the loop then iterates only the
+    selected hosts without asking again. Returns ``(selected_by_host,
+    consent_given)``. ``consent_given`` is ``True`` only when the operator made an
+    interactive selection, which IS the per-host consent: the launch seam reads it
+    to skip its own per-host confirm. When non-interactive or no checkbox is
+    available, every host flows through unchanged (``consent_given=False``), so the
+    seam keeps its own non-interactive auto-launch / per-host confirm behaviour.
+
+    Unlike the read-only credential hunt, writable-share bait PLANTS a file on the
+    client's share (an environment change with a cleanup ledger), so the default
+    pre-selection follows the engagement's bait posture
+    (:func:`writeshare_bait_enabled`), not a blanket top-N: an audit (bait
+    default-off) pre-selects nothing and the operator opts in by selecting, exactly
+    as the old per-host confirm defaulted to the resolved enable.
+
+    ``_non_interactive`` is injectable for tests; defaults to the canonical
+    predicate.
+    """
+    if _non_interactive is None:
+        from adscan_internal.interaction import is_non_interactive as _non_interactive  # noqa: PLC0415
+    from adscan_internal.services.background_jobs.scan_seam import (  # noqa: PLC0415
+        writeshare_bait_enabled,
+    )
+    hosts = list(by_host)
+    # Non-interactive: never prompt. Mirror the readable picker's auto-resolution
+    # (wide reach -> all; audit -> top-N by risk). ``by_host`` preserves the
+    # risk-ranked order, so ``hosts[:N]`` is the top-N. The seam still applies its
+    # own enable gate per host, so CI behaviour is preserved (no bait unless the
+    # posture enables it).
+    if _non_interactive(shell):
+        if policy_settings.reaches_wide(shell) or len(hosts) <= _AUDIT_HUNT_SHARE_LIMIT:
+            return by_host, False
+        print_info(
+            f"Audit: writable-share capture bounded to the top "
+            f"{_AUDIT_HUNT_SHARE_LIMIT} of {len(hosts)} writable hosts by risk; "
+            "re-run interactively to capture on more."
+        )
+        return {h: by_host[h] for h in hosts[:_AUDIT_HUNT_SHARE_LIMIT]}, False
+    checkbox = getattr(shell, "_questionary_checkbox", None)
+    if not callable(checkbox):
+        return by_host, False
+    options = [_writable_host_option_label(h, by_host[h]) for h in hosts]
+    if not writeshare_bait_enabled(shell):
+        # Bait disabled by posture (audit default-off): pre-select nothing. The
+        # operator opts in by selecting, mirroring the per-host confirm's old
+        # default of off.
+        default_values: list[str] = []
+    elif policy_settings.reaches_wide(shell) or len(options) <= _AUDIT_HUNT_SHARE_LIMIT:
+        default_values = options
+    else:
+        default_values = options[:_AUDIT_HUNT_SHARE_LIMIT]
+        print_info(
+            f"Pre-selected the top {_AUDIT_HUNT_SHARE_LIMIT} of {len(options)} "
+            "writable hosts by risk; select more to widen the capture."
+        )
+    chosen = checkbox(
+        "Select writable hosts to plant NTLMv2 capture bait on "
+        "(a browsing user then leaks a hash; the bait is tracked and removed at scan end):",
+        options,
+        default_values=default_values,
+    )
+    if not chosen:
+        return {}, True
+    chosen_set = set(chosen)
+    selected = {h: by_host[h] for h, opt in zip(hosts, options) if opt in chosen_set}
+    return selected, True
 
 
 def _select_droppable_shares(
@@ -304,6 +444,11 @@ def _run_writable_capture_substep(
     from adscan_internal.cli.smb import run_ntlmv2_capture_for_writable_shares  # noqa: PLC0415
     from adscan_internal.services.sweep_credential import SweepLockoutGuard  # noqa: PLC0415
 
+    # Engagement scope before anything is planted, in the foreground or by the
+    # background job: no bait is written to a share of an excluded host.
+    writable = _share_rows_in_scope(
+        shell, writable, domain=domain, what="Writable-share capture"
+    )
     by_host = _group_writable_share_names_by_host(writable)
     if not by_host:
         print_info_verbose("No writable shares — skipping Step 1/2 (writable-share capture).")
@@ -365,6 +510,17 @@ def _run_writable_capture_substep(
         row_host_ip = str(row.get("host_ip") or "").strip()
         if row_host and row_host_ip and row_host not in host_ip_by_label:
             host_ip_by_label[row_host] = row_host_ip
+    # ONE multi-select up front instead of a prompt per host: the operator picks
+    # which writable hosts to plant bait on, and the loop below iterates only the
+    # selected hosts without asking again (the selection is the consent, carried
+    # to the launch seam as ``capture_consent_given``).
+    by_host, capture_consent_given = _select_writable_hosts_for_capture(shell, by_host)
+    if not by_host:
+        print_info_verbose(
+            "No writable hosts selected for capture. Skipping Step 1/2 "
+            "(writable-share capture)."
+        )
+        return
     print_phase_header(
         "Step 1/2 · Writable-Share Capture",
         details={"Domain": domain, "Writable hosts": str(len(by_host))},
@@ -380,11 +536,31 @@ def _run_writable_capture_substep(
     estimator = ProgressEstimator()
     from adscan_core.scan_control import scan_control  # noqa: PLC0415
 
+    # The rows passed the engagement scope above, at the start of the step. The
+    # loop below can run for a long time (one sign-in and one write per host),
+    # so each host is asked about again right before anything is resolved for
+    # it or written to it: a host excluded meanwhile gets no bait.
+    from adscan_internal.cli.smb import _normalize_smb_host_for_resolution  # noqa: PLC0415
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        host_contact_gate,
+    )
+
+    capture_gate = host_contact_gate(
+        shell,
+        list(by_host),
+        surface="smb_share_hunt",
+        what="Writable-share capture",
+        key=lambda label: _normalize_smb_host_for_resolution(label, domain) or label,
+        address=lambda label: host_ip_by_label.get(label, ""),
+        domain=domain,
+    )
     for index, (host, names) in enumerate(by_host.items(), start=1):
         # Scan control checkpoint: stop dropping bait on new hosts once the
         # operator stopped the step.
         if scan_control().should_stop():
             break
+        if not capture_gate.admits(host):
+            continue
         _emit_share_operation_progress(
             label="Share enumeration",
             phase="share_credential_hunt",
@@ -525,6 +701,7 @@ def _run_writable_capture_substep(
                 listener_ip=listener_ip,
                 listener_bind_ip=listener_bind_ip,
                 pivot_plan=pivot_plan,
+                consent_granted=capture_consent_given,
             )
             continue  # background — never block the audit scan on this host
 
@@ -584,6 +761,11 @@ def _run_readable_hunt_substep(
 
     from adscan_internal.cli.smb import run_smb_share_credential_hunt  # noqa: PLC0415
 
+    # Engagement scope before the picker: a share on an excluded host is never
+    # offered, mapped or downloaded.
+    readable = _share_rows_in_scope(
+        shell, readable, domain=domain, what="Readable-share credential hunt"
+    )
     if not readable:
         print_info_verbose("No readable shares — skipping Step 2/2 (credential hunt).")
         return
@@ -684,7 +866,13 @@ def run_smb_share_exposure_phase(shell: Any, *, domain: str) -> None:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
 
-    writable, readable = _split_share_rows(rows)
+    # The overview above lists every exposed share; what the two sub-steps ACT
+    # on is narrowed to the engagement scope here, once, so the step's share
+    # total counts only shares ADscan may read (the sub-steps ask again and
+    # find nothing left to refuse).
+    writable, readable = _split_share_rows(
+        _share_rows_in_scope(shell, rows, domain=domain, what="SMB share hunt")
+    )
 
     # ONE credential (the domain-active / assessed principal), ONE guard —
     # shared across BOTH sub-steps so a lockout / repeated logon failure

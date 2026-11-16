@@ -18,10 +18,11 @@ Scope (v1, see ``docs/superpowers/specs/2026-06-16-mssql-collector-design.md`` �
   * SID correlation — hex SID → ``S-1-5-…`` → match the graph node by ``objectId``.
     A **group** login attaches the edge to the GROUP node, so the existing
     ``MemberOf`` edges deliver the blast radius for free.
-  * Edge upsert — effective ``SQLAccess`` (CONNECT) / ``SQLAdmin`` (effective
-    sysadmin / CONTROL SERVER) into ``attack_graph.json``, following the canonical
-    ``upsert_*`` pattern. Negative facts (no SQLAccess on instance X) are recorded
-    on the node so re-collection knows what was already checked.
+  * Store commit — each enumerated instance is one ``mssql`` unit of the domain's
+    graph store (its principals, permissions, linked servers and the host it
+    resolved to). The build derives the effective ``SQLAccess`` (CONNECT) /
+    ``SQLAdmin`` (effective sysadmin / CONTROL SERVER) and the linked-server
+    edges from it (``graph_build/passes/mssql.py``); this module writes no edge.
 
 The **escalation actions** (xp_cmdshell, EXECUTE AS, CLR → SYSTEM) are NOT here —
 they stay lazy in the ``ask_for_user_privs`` followup (out of scope, §9). This
@@ -511,6 +512,30 @@ def _spn_hosts_from_graph(graph: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def _spn_hosts_from_store(shell: object, domain: str) -> dict[str, str]:
+    """``{spn_host_fqdn: spn}`` from the domain's collected objects (the graph store).
+
+    The directory stages are in the store by the time MSSQL collection runs; a
+    domain without a store yields no SPN-seeded target (the SYN and pivot
+    sources still apply). Best-effort.
+    """
+    try:
+        from adscan_internal.services.graph_runtime import graph_store_for  # noqa: PLC0415
+
+        store = graph_store_for(shell, domain, create=False)
+        if store is None:
+            return {}
+        nodes = {
+            record.object_id: {"properties": dict(record.properties or {})}
+            for record in store.iter_objects(kinds=("Computer", "User"))
+        }
+        return _spn_hosts_from_graph({"nodes": nodes})
+    except Exception as exc:  # noqa: BLE001 — SPN enrichment is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return {}
+
+
 def _instances_owned_by_domain(
     shell: object, domain: str, instances: list[MSSQLInstance]
 ) -> list[MSSQLInstance]:
@@ -523,8 +548,12 @@ def _instances_owned_by_domain(
     from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
         collection_host_verdict,
         note_collection_host_skipped,
+        prepare_scope_targets,
     )
 
+    # The verdict only reads what the session was told: one batch lookup of the
+    # instance hosts first (a no-op when the scope has no address rule).
+    prepare_scope_targets(shell, [i.fqdn or i.host for i in instances], domain=domain)
     kept: list[MSSQLInstance] = []
     for instance in instances:
         verdict = collection_host_verdict(
@@ -568,16 +597,9 @@ def discover_mssql_instances(
         return []
 
     if graph is None:
-        try:
-            from adscan_internal.services.attack_graph_service import load_attack_graph
-
-            graph = load_attack_graph(shell, domain_clean)
-        except Exception as exc:  # noqa: BLE001 — SPN enrichment is best-effort
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
-            graph = {}
-
-    spn_by_host = _spn_hosts_from_graph(graph or {})
+        spn_by_host = _spn_hosts_from_store(shell, domain_clean)
+    else:
+        spn_by_host = _spn_hosts_from_graph(graph)
 
     from adscan_internal.services.service_target_resolution import (
         resolve_service_targets,
@@ -1008,21 +1030,6 @@ async def _enumerate_instances(
 # ---------------------------------------------------------------------------
 
 
-def _build_sid_index(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Build ``{UPPER(objectId): node}`` for every node carrying a SID."""
-    from adscan_internal.services.attack_graph_service import _extract_node_object_id
-
-    index: dict[str, dict[str, Any]] = {}
-    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    for node in nodes.values():
-        if not isinstance(node, dict):
-            continue
-        oid = _extract_node_object_id(node)
-        if oid:
-            index[oid.strip().upper()] = node
-    return index
-
-
 def _resolve_instance_host_node(
     shell: object,
     domain: str,
@@ -1071,167 +1078,6 @@ def _principal_evidence(fact: MSSQLPrincipalFact) -> dict[str, Any]:
     }
 
 
-def upsert_mssql_access_edges(
-    shell: object,
-    domain: str,
-    authorization: MSSQLInstanceAuthorization,
-    *,
-    graph: dict[str, Any] | None = None,
-    save: bool = True,
-) -> tuple[int, int]:
-    """Upsert effective ``SQLAccess`` / ``SQLAdmin`` edges for one instance.
-
-    Follows the canonical ``upsert_*`` pattern (``load_attack_graph`` →
-    ``upsert_nodes``/``upsert_edge`` → ``save_attack_graph``). An AD-backed login
-    correlates to its graph node by SID; a **group** login attaches the edge to
-    the GROUP node so the existing ``MemberOf`` edges deliver the blast radius.
-    Effective sysadmin / CONTROL SERVER → ``SQLAdmin``, otherwise ``SQLAccess``.
-    The raw principal fact is stored as edge ``evidence``.
-
-    Returns ``(sqlaccess_edges, sqladmin_edges)`` newly upserted.
-    """
-    from adscan_internal.services.attack_graph_service import (
-        _node_id,
-        load_attack_graph,
-        save_attack_graph,
-        upsert_edge,
-        upsert_nodes,
-    )
-
-    domain_clean = str(domain or "").strip()
-    if not domain_clean or not authorization.connected:
-        return 0, 0
-
-    host_node, fqdn = _resolve_instance_host_node(
-        shell, domain_clean, authorization.instance
-    )
-    if not isinstance(host_node, dict) or not fqdn:
-        print_info_verbose(
-            "[mssql-collector] no graph Computer node for instance "
-            f"{mark_sensitive(authorization.instance.host, 'ip')}; "
-            "skipping edge upsert (node not in graph)"
-        )
-        return 0, 0
-
-    if graph is None:
-        graph = load_attack_graph(shell, domain_clean)
-
-    comp_record = {
-        "name": str(host_node.get("name") or fqdn),
-        "kind": ["Computer"],
-        "objectId": host_node.get("objectid") or host_node.get("objectId"),
-        "properties": host_node,
-    }
-    upsert_nodes(graph, [comp_record])
-    to_id = _node_id(comp_record)
-    if not to_id:
-        return 0, 0
-
-    sid_index = _build_sid_index(graph)
-    spn_label = authorization.instance.spn or f"MSSQLSvc/{fqdn}"
-
-    # Robustness gate inputs — principals that CANNOT connect must not get a
-    # SQLAccess/SQLAdmin edge. We gate on the two AUTHORITATIVE "cannot connect"
-    # signals only: a disabled login, and an explicit ``CONNECT SQL`` DENY (DENY
-    # always wins in SQL Server). We deliberately do NOT require an explicit
-    # CONNECT SQL GRANT — CONNECT can be conferred via a server role and the
-    # connecting login's metadata visibility may be degraded, so requiring an
-    # explicit grant would risk false NEGATIVES (dropping real access). Removing
-    # only disabled / DENY'd logins strips false positives without that risk.
-    connect_denied_ids: set[int] = set()
-    for _perm_row in authorization.permissions or []:
-        if str(_perm_row.get("permission_name") or "").strip().upper() != "CONNECT SQL":
-            continue
-        if str(_perm_row.get("state_desc") or "").strip().upper() != "DENY":
-            continue
-        _denied_pid = _to_int(_perm_row.get("grantee_principal_id"))
-        if _denied_pid is not None:
-            connect_denied_ids.add(_denied_pid)
-
-    sqlaccess = 0
-    sqladmin = 0
-    for fact in authorization.principals:
-        # Only AD-backed logins (Windows user / group) correlate to a graph node.
-        if fact.type_code not in _AD_BACKED_PRINCIPAL_TYPES or not fact.sid:
-            continue
-        # Connect gate: skip logins that cannot actually authenticate.
-        if fact.is_disabled or fact.principal_id in connect_denied_ids:
-            continue
-        principal_node = sid_index.get(fact.sid.strip().upper())
-        if not isinstance(principal_node, dict):
-            # SID not in the graph (foreign principal, stale node). Record as a
-            # principal-level note on the host so re-collection sees it; do not
-            # invent a node.
-            continue
-        from_id = _node_id(principal_node)
-        if not from_id or from_id == to_id:
-            continue
-        fact.matched_object_id = fact.sid
-        fact.matched_label = str(
-            principal_node.get("label") or principal_node.get("name") or ""
-        )
-
-        relation = "SQLAdmin" if fact.effective_sysadmin else "SQLAccess"
-        notes: dict[str, Any] = {
-            "source": "mssql_collector",
-            "ip": authorization.instance.host,
-            "fqdn": fqdn,
-            "spn": spn_label,
-            "via_group": fact.is_group,
-            "connecting_login": authorization.connecting_login,
-            "view_any_definition": authorization.view_any_definition,
-            "evidence": _principal_evidence(fact),
-            # Per-principal ADMINISTER BULK OPERATIONS capability — the signal
-            # the MssqlOpenRowsetBulkRead overlay reads to decide whether the
-            # OPENROWSET(BULK ...) arbitrary-file-read step is reachable on a
-            # below-sysadmin SQLAccess login (SQLAdmin is always capable —
-            # sysadmin bypasses this permission check entirely).
-            "bulk_ops_capable": fact.effective_bulk_admin,
-        }
-        upsert_edge(
-            graph,
-            from_id=from_id,
-            to_id=to_id,
-            relation=relation,
-            edge_type="mssql_collector",
-            status="discovered",
-            notes=notes,
-        )
-        if relation == "SQLAdmin":
-            sqladmin += 1
-        else:
-            sqlaccess += 1
-
-    # Negative / coverage fact on the host node so re-collection knows this
-    # instance was enumerated under this login (and at what visibility).
-    try:
-        props = comp_record["properties"]
-        if isinstance(props, dict):
-            coverage = props.setdefault("mssql_authorization_coverage", {})
-            if isinstance(coverage, dict):
-                coverage[authorization.connecting_login or "?"] = {
-                    "view_any_definition": authorization.view_any_definition,
-                    "sysadmin": authorization.connecting_is_sysadmin,
-                    "sqlaccess_edges": sqlaccess,
-                    "sqladmin_edges": sqladmin,
-                }
-    except Exception as exc:  # noqa: BLE001 — coverage note is best-effort
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-
-    if save:
-        save_attack_graph(shell, domain_clean, graph)
-
-    print_info_debug(
-        "[mssql-collector] upserted edges for "
-        f"{mark_sensitive(fqdn, 'host')}: "
-        f"SQLAccess={sqlaccess} SQLAdmin={sqladmin} "
-        f"connecting_login={mark_sensitive(authorization.connecting_login or '-', 'user')} "
-        f"view_any_definition={authorization.view_any_definition}"
-    )
-    return sqlaccess, sqladmin
-
-
 # ---------------------------------------------------------------------------
 # Linked-server lateral edges — theoretical MssqlLinkedServerLateral (READ-ONLY)
 # ---------------------------------------------------------------------------
@@ -1257,66 +1103,6 @@ def _normalize_linked_data_source(data_source: str) -> str | None:
     host = host.split("\\", 1)[0]
     host = host.split(",", 1)[0]
     return host.strip().rstrip(".").lower() or None
-
-
-def _resolve_linked_server_target_node(
-    graph: dict[str, Any],
-    data_source_host: str,
-) -> tuple[str, bool]:
-    """Resolve a linked-server target host to a graph node id, creating one if needed.
-
-    The linked-server ``data_source`` is frequently a host in a DIFFERENT domain
-    (e.g. ``DC02.darkzero.ext`` reached from ``darkzero.htb``), which will NOT
-    exist in the current domain's graph. Resolution:
-
-    1. Reuse an EXISTING node whose FQDN (``name`` / ``label`` / ``dnshostname``)
-       matches ``data_source_host`` exactly (case-insensitive) — this attaches to
-       the real host node when the linked server points back into the same graph.
-    2. Otherwise create a MINIMAL foreign Computer node keyed by the FQDN, tagged
-       as a linked-server target with the derived (foreign) domain. We deliberately
-       match ONLY on the exact FQDN — never on a fuzzy short-name — so a
-       cross-domain ``DC02.darkzero.ext`` is never mis-merged onto a same-domain
-       ``DC02`` node.
-
-    Returns ``(target_node_id, created_foreign_node)``.
-    """
-    from adscan_internal.services.attack_graph_service import _node_id, upsert_nodes
-
-    host = data_source_host.strip().lower()
-    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
-    for node in nodes.values():
-        if not isinstance(node, dict):
-            continue
-        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-        candidates = {
-            str(node.get("name") or "").strip().lower(),
-            str(node.get("label") or "").strip().lower(),
-            str(props.get("name") or "").strip().lower(),
-            str(props.get("dnshostname") or "").strip().lower(),
-        }
-        candidates.discard("")
-        if host in candidates:
-            return _node_id(node), False
-
-    # Cross-domain / unknown host: create a minimal foreign Computer placeholder.
-    # NOTE: keyed by the FQDN (never a short name) so it cannot collide with a
-    # same-domain node; the derived domain is best-effort from the FQDN suffix.
-    foreign_domain = host.split(".", 1)[1] if "." in host else ""
-    record = {
-        "name": host,
-        "label": host,
-        "kind": ["Computer"],
-        "properties": {
-            "name": host,
-            "dnshostname": host,
-            "type": "Computer",
-            "mssql_linked_server_target": True,
-        },
-    }
-    if foreign_domain:
-        record["properties"]["domain"] = foreign_domain.upper()
-    upsert_nodes(graph, [record])
-    return _node_id(record), True
 
 
 def _linked_server_edge_notes(
@@ -1402,114 +1188,6 @@ def _linked_server_edge_notes(
     }
 
 
-def upsert_mssql_linked_server_edges(
-    shell: object,
-    domain: str,
-    authorization: MSSQLInstanceAuthorization,
-    *,
-    graph: dict[str, Any] | None = None,
-    save: bool = True,
-) -> int:
-    """Upsert theoretical ``MssqlLinkedServerLateral`` edges for one instance.
-
-    Emits ``<source instance host> -MssqlLinkedServerLateral-> <linked data_source
-    host>`` for every configured linked server, marked THEORETICAL
-    (``status="discovered"`` + ``notes.theoretical=True``). The linked target host
-    node is resolved (or minimally created when cross-domain) by
-    :func:`_resolve_linked_server_target_node`. Read-only: the collector never
-    enables xp_cmdshell or runs any escalation — it records the DISCOVERED
-    capability so attack-paths / web / report can render the linked-server hop.
-
-    Returns the number of linked-server edges newly upserted.
-
-    NOTE: when the SOURCE instance host is itself a Tier-0 asset (e.g. the SQL
-    instance runs ON a domain controller, as in HTB DarkZero), the graph's
-    Tier-0-source suppression (``_edge_has_tier0_source`` in
-    ``attack_graph_service``) drops actionable outgoing edges — so the edge will
-    not persist in that specific topology. That filter assumes "owning a Tier-0
-    source means you already own the domain", which does NOT hold for a linked
-    server reaching a DIFFERENT forest. Exempting cross-domain
-    ``MssqlLinkedServerLateral`` from that filter is a follow-up in
-    ``attack_graph_service`` (out of this collector's scope).
-    """
-    from adscan_internal.services.attack_graph_service import (
-        _node_id,
-        load_attack_graph,
-        save_attack_graph,
-        upsert_edge,
-        upsert_nodes,
-    )
-
-    domain_clean = str(domain or "").strip()
-    if not domain_clean or not authorization.connected:
-        return 0
-    linked_servers = [
-        ls
-        for ls in (authorization.linked_servers or [])
-        if _normalize_linked_data_source(getattr(ls, "data_source", ""))
-    ]
-    if not linked_servers:
-        return 0
-
-    host_node, fqdn = _resolve_instance_host_node(
-        shell, domain_clean, authorization.instance
-    )
-    if not isinstance(host_node, dict) or not fqdn:
-        print_info_verbose(
-            "[mssql-collector] no graph Computer node for linked-server source "
-            f"{mark_sensitive(authorization.instance.host, 'ip')}; "
-            "skipping linked-server edge upsert (node not in graph)"
-        )
-        return 0
-
-    if graph is None:
-        graph = load_attack_graph(shell, domain_clean)
-
-    comp_record = {
-        "name": str(host_node.get("name") or fqdn),
-        "kind": ["Computer"],
-        "objectId": host_node.get("objectid") or host_node.get("objectId"),
-        "properties": host_node,
-    }
-    upsert_nodes(graph, [comp_record])
-    from_id = _node_id(comp_record)
-    if not from_id:
-        return 0
-
-    emitted = 0
-    for linked_server in linked_servers:
-        target_host = _normalize_linked_data_source(linked_server.data_source)
-        if not target_host:
-            continue
-        to_id, created_foreign = _resolve_linked_server_target_node(graph, target_host)
-        if not to_id or to_id == from_id:
-            continue
-        notes = _linked_server_edge_notes(authorization, fqdn, linked_server)
-        notes["cross_domain_target_created"] = created_foreign
-        edge = upsert_edge(
-            graph,
-            from_id=from_id,
-            to_id=to_id,
-            relation="MssqlLinkedServerLateral",
-            edge_type="mssql_collector",
-            status="discovered",
-            notes=notes,
-        )
-        if edge:
-            emitted += 1
-
-    if save:
-        save_attack_graph(shell, domain_clean, graph)
-
-    if emitted:
-        print_info_debug(
-            "[mssql-collector] upserted linked-server edges for "
-            f"{mark_sensitive(fqdn, 'host')}: "
-            f"MssqlLinkedServerLateral={emitted}"
-        )
-    return emitted
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -1571,6 +1249,98 @@ def _record_bulk_operations_overprivilege_finding(
             "[mssql-collector] bulk-ops over-privilege finding record failed: "
             f"{exc}"
         )
+
+
+def _commit_instance_units(
+    shell: object,
+    domain: str,
+    results: list[MSSQLInstanceAuthorization],
+    summary: MSSQLCollectionSummary,
+) -> int:
+    """Commit every connected instance as one ``mssql`` unit; end the stage.
+
+    The unit holds one datum (``passes.mssql.DATUM_MSSQL_AUTHORIZATION``): the
+    instance's principals, permissions and linked servers, and the Computer
+    node it resolved to (resolved HERE, with the shell's resolver, because the
+    build has none). Principals that would get an edge are correlated to the
+    store's objects by SID so the bulk-operations finding and the summary
+    counts name real principals. A throttled export follows the stage.
+    Returns how many units were committed; a store problem is logged and the
+    MSSQL stage is recorded ``failed``.
+    """
+    from adscan_core.graph_store.records import STAGE_MSSQL  # noqa: PLC0415
+    from adscan_internal.services.collector.store_writer import (  # noqa: PLC0415
+        UnitSource,
+        store_writer_for_shell,
+    )
+    from adscan_internal.services.graph_build.passes import mssql as mssql_pass  # noqa: PLC0415
+    from adscan_internal.services.graph_runtime import export_graph_if_due  # noqa: PLC0415
+    from adscan_core.graph_store import DatumRecord  # noqa: PLC0415
+
+    committed = 0
+    writer = None
+    try:
+        writer = store_writer_for_shell(shell, domain)
+        writer.store.begin_stage(STAGE_MSSQL)
+        for result in results:
+            if not result.connected:
+                continue
+            summary.instances_connected += 1
+            host_node, fqdn = _resolve_instance_host_node(shell, domain, result.instance)
+            if not isinstance(host_node, dict) or not fqdn:
+                print_info_verbose(
+                    "[mssql-collector] no graph Computer node for instance "
+                    f"{mark_sensitive(result.instance.host, 'ip')}; its edges are not derived"
+                )
+                summary.negative_facts += 1
+                continue
+            access = admin = 0
+            for fact in mssql_pass.connectable_ad_principals(result):
+                record = writer.store.get_object(fact.sid)
+                if record is None:
+                    continue
+                fact.matched_object_id = fact.sid
+                fact.matched_label = str(record.name or "")
+                if fact.effective_sysadmin:
+                    admin += 1
+                else:
+                    access += 1
+            linked = sum(
+                1
+                for ls in result.linked_servers or ()
+                if _normalize_linked_data_source(getattr(ls, "data_source", ""))
+            )
+            summary.sqlaccess_edges += access
+            summary.sqladmin_edges += admin
+            summary.linked_server_edges += linked
+            if not (access or admin or linked):
+                summary.negative_facts += 1
+            unit = mssql_pass.instance_unit(result.instance)
+            body = mssql_pass.authorization_body(
+                result, host_record=mssql_pass.host_record_for(host_node, fqdn), fqdn=fqdn
+            )
+            writer.commit_unit(
+                STAGE_MSSQL,
+                unit,
+                UnitSource(data=[DatumRecord(kind=mssql_pass.DATUM_MSSQL_AUTHORIZATION, key=unit, body=body)]),
+                force=True,
+            )
+            committed += 1
+        writer.store.end_stage(STAGE_MSSQL, "complete")
+    except Exception as exc:  # noqa: BLE001 — collection must never raise upward
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        if writer is not None:
+            writer._end_quietly(STAGE_MSSQL, "failed", reason="store_error", detail=type(exc).__name__)  # noqa: SLF001
+        return committed
+    except BaseException:
+        if writer is not None:
+            writer._end_quietly(STAGE_MSSQL, "stopped", reason="abort_scan")  # noqa: SLF001
+        raise
+    # Throttled: the file is made current by the next export (a reader that
+    # opens it calls ``ensure_export_fresh``; the session end exports).
+    export_graph_if_due(shell, domain)
+    return committed
 
 
 async def collect_mssql_authorization(
@@ -1641,16 +1411,12 @@ async def collect_mssql_authorization(
             results = await _enumerate_instances(instances, config)
         _announce_unprobed_links(shell, domain_clean, results)
 
-        # Load the graph ONCE, upsert all instances, save ONCE — avoids re-reading
-        # a potentially large attack_graph.json per instance.
-        from adscan_internal.services.attack_graph_service import (
-            load_attack_graph,
-            save_attack_graph,
-        )
-
-        graph = load_attack_graph(shell, domain_clean)
-        any_edges = False
+        # Each instance is one ``mssql`` store unit holding what it said and
+        # the host it resolved to; the graph build derives the SQLAccess /
+        # SQLAdmin / MssqlLinkedServerLateral edges from it
+        # (``graph_build/passes/mssql.py``). Nothing here writes the graph.
         cut_off: list[Any] = []
+        units = _commit_instance_units(shell, domain_clean, results, summary)
         for result in results:
             if result.error:
                 summary.errors += 1
@@ -1666,24 +1432,7 @@ async def collect_mssql_authorization(
                 summary.errors += 1
                 summary.incomplete_reads += 1
                 cut_off.append(CollectionStageFailure(stage, reason))
-            if not result.connected:
-                continue
-            summary.instances_connected += 1
-            access, admin = upsert_mssql_access_edges(
-                shell, domain_clean, result, graph=graph, save=False
-            )
-            linked = upsert_mssql_linked_server_edges(
-                shell, domain_clean, result, graph=graph, save=False
-            )
-            summary.sqlaccess_edges += access
-            summary.sqladmin_edges += admin
-            summary.linked_server_edges += linked
-            if not (access or admin or linked):
-                summary.negative_facts += 1
-            else:
-                any_edges = True
-        if any_edges or summary.instances_connected:
-            save_attack_graph(shell, domain_clean, graph)
+        del units
         # Surface the non-sysadmin ADMINISTER BULK OPERATIONS over-privilege as a
         # VULNERABILITY finding (arbitrary file read via OPENROWSET(BULK ...)) — no
         # longer modelled as a MssqlOpenRowsetBulkRead attack edge. Reads the
@@ -1745,8 +1494,6 @@ __all__ = [
     "compute_effective_bulk_admin_ids",
     "parse_mssql_spn_host",
     "discover_mssql_instances",
-    "upsert_mssql_access_edges",
-    "upsert_mssql_linked_server_edges",
     "collect_mssql_authorization",
     "collect_mssql_authorization_sync",
 ]

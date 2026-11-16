@@ -110,15 +110,23 @@ def maybe_offer_incomplete_scan_resume(shell: Any) -> bool:
         # this domain again this session.
         seen.add(domain)
 
-        _render_offer_panel(candidate)
+        # The same comparison ``adscan ci`` asks before it resumes. Here an
+        # operator decides, so the offer says what changed before the choice.
+        scope_change = _scope_change(shell, domain)
+        _render_offer_panel(
+            candidate,
+            bounded_discovery=_discovery_was_bounded(shell, domain),
+            scope_change=scope_change,
+        )
+        resume_label = f"Resume from {candidate.incomplete_resume_phase}"
+        if not scope_change.same:
+            resume_label += " under the current scope"
         idx = questionary_select_index(
             title=f"Incomplete scan for {mark_sensitive(domain, 'domain')}",
-            options=[
-                f"Resume from {candidate.incomplete_resume_phase}",
-                "Start a fresh scan",
-                "Not now",
-            ],
-            default_idx=0,
+            options=[resume_label, "Start a fresh scan", "Not now"],
+            # A scope that may hold assets the interrupted scan never assessed:
+            # the fresh scan is the choice that assesses them, so it leads.
+            default_idx=1 if scope_change.may_add_assets else 0,
             shell=shell,
         )
 
@@ -169,7 +177,13 @@ def _launch_resume(shell: Any, candidate: Any) -> None:
         shell._resume_action_predecided = WorkspaceAction.RESUME
     except Exception:  # noqa: BLE001 - best-effort; a set failure just re-shows the panel
         pass
-    shell.do_enum_domain_auth(candidate.domain)
+    # Run the enumeration AND the scan-end steps through the one seam
+    # ``run_start_auth`` uses, so the resumed scan re-materializes the
+    # attack-path snapshot and renders the "Scan complete" moment instead of
+    # dropping silently back to the prompt (the two paths cannot drift again).
+    from adscan_internal.cli.start import run_authenticated_enumeration_and_finalize
+
+    run_authenticated_enumeration_and_finalize(shell, candidate.domain)
 
 
 def _launch_fresh(shell: Any, candidate: Any) -> None:
@@ -187,7 +201,37 @@ def _launch_fresh(shell: Any, candidate: Any) -> None:
     shell.do_enum_domain_auth(candidate.domain)
 
 
-def _render_offer_panel(candidate: Any) -> None:
+def _discovery_was_bounded(shell: Any, domain: str) -> bool:
+    """True when attack-path discovery was stopped by the memory ceiling last run.
+
+    Drives the one plain line that tells the operator why the resume is offered
+    and what it will do. Never raises.
+    """
+    try:
+        from adscan_internal.services import scan_progress as sp
+        from adscan_internal.services.attack_paths_phase import (
+            ATTACK_PATHS_DISCOVERY_PHASE_ID,
+        )
+
+        return ATTACK_PATHS_DISCOVERY_PHASE_ID in sp.resumable_recomputable_phases(
+            shell, domain
+        )
+    except Exception:  # noqa: BLE001 - a pure read must never break the offer
+        return False
+
+
+def _scope_change(shell: Any, domain: str) -> Any:
+    """How the engagement scope differs from the one the interrupted scan ran under."""
+    from adscan_internal.services.scan_scope_lineage import (
+        asset_scope_change_since_scan,
+    )
+
+    return asset_scope_change_since_scan(shell, domain)
+
+
+def _render_offer_panel(
+    candidate: Any, *, bounded_discovery: bool = False, scope_change: Any = None
+) -> None:
     """Render the premium offer panel for one interrupted scan.
 
     Doubles as the resume orientation: alongside the stopped-at phase and the
@@ -196,6 +240,14 @@ def _render_offer_panel(candidate: Any) -> None:
     the operator's "Resume" choice is pre-decided downstream (``_launch_resume``
     → ``_run_enum_domain_auth``), this is the SINGLE panel shown before the scan
     resumes — no redundant workspace-action panel follows.
+
+    ``bounded_discovery`` adds one plain line when the last run's route discovery
+    was stopped by the memory ceiling, so the operator knows the resume will
+    recompute it (and that everything else is kept).
+
+    ``scope_change`` (``scan_scope_lineage.ScanScopeChange``) adds, when the
+    engagement scope is not the one the scan ran under, one line naming the
+    change and one saying what a resume does about it, before the choice.
     """
     from rich.console import Group
     from rich.table import Table
@@ -231,12 +283,27 @@ def _render_offer_panel(candidate: Any) -> None:
 
     hint = Text(
         "Resume continues from that phase with the stored credential. "
-        "The phases already finished are skipped.",
+        "The phases already finished are kept and skipped.",
         style="dim",
     )
 
+    body = [head, Text(""), detail, Text(""), hint]
+    if bounded_discovery:
+        body.append(
+            Text(
+                "Route discovery stopped early last time (not enough memory); "
+                "it will run again. Everything else collected is kept.",
+                style="dim",
+            )
+        )
+
+    if scope_change is not None and not scope_change.same:
+        body.append(Text(""))
+        body.append(Text(scope_change.headline(), style="bold yellow"))
+        body.append(Text(scope_change.resume_consequence(), style="dim"))
+
     print_panel(
-        Group(head, Text(""), detail, Text(""), hint),
+        Group(*body),
         title=f"[bold {ADSCAN_PRIMARY}]Resume interrupted scan[/]",
         title_align="left",
         border_style=ADSCAN_PRIMARY,

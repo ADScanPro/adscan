@@ -165,10 +165,16 @@ class ImpacketMSSQLBackend:
 
     @staticmethod
     def _default_client_factory(host: str, port: int, remote_name: str) -> Any:
-        """Build the default Impacket MSSQL client."""
-        from impacket import tds
+        """Build the default Impacket MSSQL client.
 
-        return tds.MSSQL(host, port=port, remoteName=remote_name)
+        The bounded subclass: impacket's own parse holds one copy of the rest of
+        the reply per row, so memory grows with the square of the row count.
+        """
+        from adscan_internal.integrations.mssql.bounded_client import (
+            bounded_mssql_client,
+        )
+
+        return bounded_mssql_client(host, port, remote_name)
 
     @staticmethod
     def _is_ccache_secret(secret: str | None) -> bool:

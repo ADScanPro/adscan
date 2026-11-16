@@ -3,6 +3,16 @@ import struct
 
 from .asn1_structs import KERB_ERROR_DATA
 
+class KerberosReplyMalformedError(Exception):
+	"""The KDC's reply could not be read as a Kerberos message.
+
+	Raised when the reply is truncated (the peer closed before the announced
+	length arrived) or does not decode as AS-REP / TGS-REP / KRB-ERROR. It is
+	a transport/protocol fault, never a verdict about the credential, so a
+	caller must not read it as "wrong password" nor as a generic failure.
+	"""
+
+
 class KerberosError(Exception):
 	def __init__(self, krb_err_msg, extra_msg = ''):
 		self.krb_err_msg = krb_err_msg.native

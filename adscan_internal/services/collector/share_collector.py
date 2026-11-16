@@ -171,6 +171,14 @@ def mask_to_edge_kinds(mask: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+#: ``sd_source`` of a share whose ACEs came from its own permissions (SRVSVC
+#: level 502, local administrator).
+SD_SOURCE_SRVSVC_502 = "srvsvc502"
+#: ``sd_source`` of a share whose ACEs came from its root FOLDER's NTFS DACL
+#: (SMB2 QueryInfo on the share root), because level 502 was refused.
+SD_SOURCE_FOLDER_ROOT = "smb2_path_root"
+
+
 @dataclass
 class _ShareInfo:
     name: str
@@ -183,8 +191,15 @@ class _ShareInfo:
     # verification (share ACL ∩ NTFS folder-root ACL). ``aces`` is derived
     # from whichever SD was used as the primary lead; these carry the raw
     # bytes for both layers so the host-collector can intersect them.
-    share_sd_bytes: bytes = b""  # share-level SD (SRVSVC 502 or SMB2 share root)
-    ntfs_sd_bytes: bytes = b""  # NTFS folder-root SD (SMB2 directory QueryInfo)
+    # Each descriptor is recorded under the OBJECT it came from, never under the
+    # other one. ``share_sd_bytes`` is the share's own permissions and is filled
+    # ONLY by SRVSVC level 502 (local admin). ``ntfs_sd_bytes`` is the share
+    # ROOT FOLDER's file-system DACL, read by an SMB2 QueryInfo on the share
+    # root. No SMB2 operation returns the share permissions: a QueryInfo on the
+    # share root opens the root folder (``CREATE ""``) and returns its NTFS
+    # descriptor, so it must never populate ``share_sd_bytes`` (gate finding R53).
+    share_sd_bytes: bytes = b""  # share permissions (SRVSVC 502 only)
+    ntfs_sd_bytes: bytes = b""  # share root folder NTFS DACL (SMB2 QueryInfo)
     # Scanning-identity effective-access mask at the share root, from an MxAc
     # (MAXIMUM_ALLOWED) probe. Populated ONLY when the NTFS root SD was
     # unreadable (the share_acl_only fallback) so the classifier can tag the
@@ -205,6 +220,34 @@ class _ShareInfo:
     # ``aces`` when reporting "who can access this share", since the NTFS
     # layer can independently narrow (or deny) a share-level grant.
     ntfs_read_set: list[tuple[str, int]] = field(default_factory=list)
+
+
+def share_descriptor_read(share: _ShareInfo) -> bool:
+    """Whether this share's own SHARE-LEVEL security descriptor was read.
+
+    The share-permission findings (FullControlShare, ReadShare, WriteShare and
+    the rest of the ``smb.share_access`` family) are graded from the share's
+    permissions, which only SRVSVC level 502 returns (``share_sd_bytes``). The
+    SMB2 QueryInfo on the share root returns the root FOLDER's NTFS DACL
+    (``ntfs_sd_bytes``), a different object that does not carry the share-level
+    grant, so a run that read only it has NOT read the level those findings
+    derive from. Counting such a host as examined closed FullControlShare on a
+    DC whose share permissions were unchanged, after a lower-access re-scan was
+    denied level 502 (gate finding R53).
+    """
+    return bool(share.share_sd_bytes)
+
+
+def shares_acl_fully_read(shares: list[_ShareInfo]) -> bool:
+    """Whether every listed share's SHARE-LEVEL security descriptor was read.
+
+    A host counts as examined for the share-permission family only when the
+    source those findings derive from (the share-level descriptor) was read on
+    every share it listed. A share whose descriptor the account could not read
+    yields no share edge, which is a read not obtained, never evidence of no
+    access.
+    """
+    return all(share_descriptor_read(share) for share in shares or ())
 
 
 def _sd_object_to_bytes(sd_object: object) -> bytes:
@@ -230,30 +273,18 @@ def _build_unc_path(host: str, share: str, path: str = "") -> str:
     return f"\\\\{host}\\{share}"
 
 
-async def _read_share_level_sd(
-    machine: Any,
-    target_host: str,
-    share_name: str,
-) -> bytes:
-    """Read the SHARE-level security descriptor (SMB2 share-root QueryInfo)."""
-    from aiosmb.commons.interfaces.share import SMBShare
-
-    share = SMBShare(
-        name=share_name,
-        fullpath=_build_unc_path(target_host, share_name),
-    )
-    sd_object, err = await share.get_security_descriptor(machine.connection)
-    if err is not None:
-        raise err
-    return _sd_object_to_bytes(sd_object)
-
-
 async def _read_ntfs_root_sd(
     machine: Any,
     target_host: str,
     share_name: str,
 ) -> bytes:
-    """Read the NTFS folder-root security descriptor (SMB2 directory QueryInfo)."""
+    """Read the share root FOLDER's NTFS security descriptor (SMB2 QueryInfo).
+
+    This is the only descriptor SMB2 can return for a share: a QueryInfo on the
+    share root opens the root directory and returns its file-system DACL. It is
+    NOT the share's permissions (those come only from SRVSVC level 502), so the
+    caller records it as ``ntfs_sd_bytes`` and never as ``share_sd_bytes``.
+    """
     from aiosmb.commons.interfaces.directory import SMBDirectory
 
     last_error: Exception | None = None
@@ -275,82 +306,20 @@ async def _read_ntfs_root_sd(
     return b""
 
 
-async def read_share_root_sd(
-    machine: Any,
-    target_host: str,
-    share_name: str,
-) -> tuple[bytes, str]:
-    """Read one share/root security descriptor using SMB2 QueryInfo fallbacks.
-
-    Returns the first SD that could be read (share-level preferred, NTFS
-    folder-root as fallback) together with a ``sd_source`` label. Kept for
-    back-compat with callers that only need a single primary SD;
-    :func:`read_share_and_ntfs_sds` returns both layers for verification.
-    """
-    last_error: Exception | None = None
-    try:
-        sd_bytes = await _read_share_level_sd(machine, target_host, share_name)
-        if sd_bytes:
-            return sd_bytes, "smb2_share_root"
-    except Exception as exc:
-        last_error = exc
-
-    try:
-        sd_bytes = await _read_ntfs_root_sd(machine, target_host, share_name)
-        if sd_bytes:
-            return sd_bytes, "smb2_path_root"
-    except Exception as exc:
-        last_error = exc
-
-    if last_error is not None:
-        raise last_error
-    return b"", "unavailable"
-
-
-async def read_share_and_ntfs_sds(
-    machine: Any,
-    target_host: str,
-    share_name: str,
-) -> tuple[bytes, bytes]:
-    """Read BOTH the share-level SD and the NTFS folder-root SD.
-
-    Either may be empty when its QueryInfo fails — the caller decides the
-    verification tier from which SDs are present. Failures on one layer never
-    suppress the other (a low-priv principal may read the share SD but not the
-    NTFS root, or vice versa).
-
-    Returns:
-        ``(share_sd_bytes, ntfs_sd_bytes)``. Each is ``b""`` when unreadable.
-    """
-    share_sd = b""
-    ntfs_sd = b""
-    try:
-        share_sd = await _read_share_level_sd(machine, target_host, share_name)
-    except Exception as exc:
-        print_info_debug(
-            "[share-collector] share-level SD read failed: "
-            f"host={target_host} share={share_name} error={exc}"
-        )
-    try:
-        ntfs_sd = await _read_ntfs_root_sd(machine, target_host, share_name)
-    except Exception as exc:
-        print_info_debug(
-            "[share-collector] NTFS root SD read failed: "
-            f"host={target_host} share={share_name} error={exc}"
-        )
-    return share_sd, ntfs_sd
-
-
 async def fill_missing_share_sds(
     machine: Any,
     target_host: str,
     shares: list[_ShareInfo],
 ) -> dict[str, int]:
-    """Populate missing share ACEs through low-privileged SMB2 root SD reads.
+    """Read the root folder's NTFS DACL for shares SRVSVC 502 gave no ACEs for.
 
-    Reads both the share-level and NTFS folder-root SDs so downstream
-    effective-access verification can intersect them. The primary ``aces`` are
-    derived from the share-level SD when available, otherwise the NTFS root SD.
+    Without local administrator rights level 502 is refused, so the only
+    descriptor left is the share root FOLDER's NTFS DACL. It is recorded as
+    ``ntfs_sd_bytes`` (its real object) and its ACEs become the share's lead
+    with ``sd_source="smb2_path_root"``; ``share_sd_bytes`` stays empty, so the
+    share is never treated as having had its share permissions read: the host
+    is not counted as examined for the share-permission findings, and its edges
+    are never tagged as a verified share ∩ NTFS intersection (gate finding R53).
     """
     stats = {
         "attempted": 0,
@@ -363,35 +332,28 @@ async def fill_missing_share_sds(
         if share.aces:
             continue
         stats["attempted"] += 1
-        try:
-            share_sd_bytes, ntfs_sd_bytes = await read_share_and_ntfs_sds(
-                machine, target_host, share.name
-            )
-        except Exception as exc:
+        ntfs_sd_bytes = share.ntfs_sd_bytes
+        if not ntfs_sd_bytes:
+            try:
+                ntfs_sd_bytes = await _read_ntfs_root_sd(machine, target_host, share.name)
+            except Exception as exc:
+                stats["failed"] += 1
+                print_info_debug(
+                    "[share-collector] SMB2 root folder SD fallback failed: "
+                    f"host={target_host} share={share.name} error={exc}"
+                )
+                continue
+        if not ntfs_sd_bytes:
             stats["failed"] += 1
-            print_info_debug(
-                "[share-collector] SMB2 root SD fallback failed: "
-                f"host={target_host} share={share.name} error={exc}"
-            )
             continue
-
-        if share_sd_bytes:
-            share.share_sd_bytes = share_sd_bytes
-        if ntfs_sd_bytes:
-            share.ntfs_sd_bytes = ntfs_sd_bytes
-            stats["ntfs_sd"] += 1
-
-        # Primary lead: share SD preferred (it is the share-access boundary);
-        # NTFS root SD as fallback so a share with no readable share SD still
-        # surfaces a lead.
-        primary_bytes = share_sd_bytes or ntfs_sd_bytes
-        sd_source = "smb2_share_root" if share_sd_bytes else "smb2_path_root"
-        aces = parse_sd_aces(primary_bytes) if primary_bytes else []
+        share.ntfs_sd_bytes = ntfs_sd_bytes
+        stats["ntfs_sd"] += 1
+        aces = parse_sd_aces(ntfs_sd_bytes)
         if not aces:
             stats["failed"] += 1
             continue
         share.aces = aces
-        share.sd_source = sd_source
+        share.sd_source = SD_SOURCE_FOLDER_ROOT
         stats["succeeded"] += 1
         stats["aces"] += len(aces)
     return stats
@@ -458,7 +420,7 @@ async def collect_shares_for_host(
                                 comment=remark,
                                 hidden=name.endswith("$"),
                                 aces=aces,
-                                sd_source="srvsvc502" if raw_bytes else "unavailable",
+                                sd_source=SD_SOURCE_SRVSVC_502 if raw_bytes else "unavailable",
                                 # Level 502 returns the SHARE-level SD.
                                 share_sd_bytes=raw_bytes,
                             )
@@ -508,7 +470,7 @@ async def collect_shares_for_host(
         stats = await fill_missing_share_sds(machine, target_host, shares)
         if stats["attempted"]:
             print_info_debug(
-                "[share-collector] SMB2 root SD fallback: "
+                "[share-collector] SMB2 root folder SD fallback: "
                 f"host={target_host} attempted={stats['attempted']} "
                 f"succeeded={stats['succeeded']} failed={stats['failed']} "
                 f"aces={stats['aces']} ntfs_sd={stats['ntfs_sd']}"

@@ -224,9 +224,11 @@ def notify_policy_skip(
         visible = inline and _shows_step_lines(shell)
         marked_target = ""
         if target:
-            from adscan_internal.rich_output import mark_sensitive  # noqa: PLC0415
+            # A real category: "node" is display-only and never wrapped, so a
+            # target marked with it (a GPO's GUID) reached recordings in clear.
+            from adscan_core.sensitive import mark_object_label  # noqa: PLC0415
 
-            marked_target = mark_sensitive(target, "node")
+            marked_target = mark_object_label(target)
         if not entry.get("shown"):
             _emit(shell, copy.notice_groups(notice, target=marked_target), visible=visible)
             entry["shown"] = True

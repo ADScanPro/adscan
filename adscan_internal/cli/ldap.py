@@ -2331,6 +2331,14 @@ def _run_enum_domain_auth(
                 print_info_debug(
                     "[ldap._run_enum_domain_auth] RESUME branch: clock sync + run_enumeration (no collection)"
                 )
+                # The one seam where a resume starts, whichever offer led here:
+                # a scan continued under another engagement scope than the one it
+                # ran under is held to the current one, and says so.
+                from adscan_internal.services.scan_scope_lineage import (
+                    apply_asset_scope_change_on_resume,
+                )
+
+                apply_asset_scope_change_on_resume(shell, domain)
                 try:
                     shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
                 except Exception as exc:  # noqa: BLE001
@@ -2355,8 +2363,18 @@ def _run_enum_domain_auth(
                 from adscan_internal.services.scan_progress import (
                     reset_scan_progress,
                 )
+                from adscan_internal.services.scan_scope_lineage import (
+                    asset_scope_change_since_scan,
+                    declare_replay_under_changed_scope,
+                )
 
+                # Read before the checkpoint is dropped: it holds the scope the
+                # collected data was read under. A replay runs every phase again
+                # but not the collection, so under a wider scope the collection
+                # is the gap to declare.
+                scope_change = asset_scope_change_since_scan(shell, domain)
                 reset_scan_progress(shell, domain)
+                declare_replay_under_changed_scope(shell, domain, scope_change)
                 try:
                     shell.do_sync_clock_with_pdc(domain)  # type: ignore[attr-defined]
                 except Exception as exc:  # noqa: BLE001
@@ -3548,6 +3566,20 @@ def run_kerberos_enum_users(shell: LdapShell, domain: str) -> None:
     )
 
 
+def _wordlist_candidate_count(wordlist: str) -> int | None:
+    """Count the non-empty lines of a username wordlist, for the stop statement.
+
+    Lets the Kerberos user-enum long step declare "stopped after N of M candidate
+    usernames" when the operator stops it. Best-effort: an unreadable file leaves
+    the total unknown (the gap statement then omits the count), never an error.
+    """
+    try:
+        with open(wordlist, encoding="utf-8", errors="ignore") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return None
+
+
 def _run_kerberos_username_wordlist(
     shell: LdapShell,
     domain: str,
@@ -3619,6 +3651,8 @@ def _run_kerberos_username_wordlist(
             "Kerberos user enumeration: stopping early and continuing the scan "
             "with the usernames found so far."
         ),
+        unit="candidate usernames",
+        total=_wordlist_candidate_count(wordlist),
     ):
         return enum_service.kerberos.enumerate_users_kerberos(
             domain=domain,
@@ -4348,6 +4382,8 @@ def _kerberos_auto_detect_then_build(
             "Kerberos auto-detect: stopping the broad sweep early and continuing "
             "with the usernames found so far."
         ),
+        unit="candidate usernames",
+        total=candidate_count or _wordlist_candidate_count(str(large_wordlist)),
     ):
         users = EnumerationService().kerberos.enumerate_users_kerberos(
             domain=domain,

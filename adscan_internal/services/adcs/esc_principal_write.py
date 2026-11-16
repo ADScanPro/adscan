@@ -21,6 +21,7 @@ from adscan_internal.services.adcs.cert_request import (
     request_certificate_native,
 )
 from adscan_internal.services.adcs.esc_cleanup import (
+    discard_ldap_change,
     esc_revert_ldap_change,
     esc_rollback_scope,
     register_ldap_change,
@@ -489,6 +490,12 @@ async def run_esc9(config: EscConfig) -> EscResult:
 
         ok = await asyncio.to_thread(_set_target_upn)
         if not ok:
+            # The UPN write failed atomically (the directory refused the modify,
+            # e.g. the target no longer exists): nothing was applied, so discard
+            # the write-ahead record and suppress its revert rather than leave a
+            # phantom manual-cleanup instruction (gate finding R54).
+            discard_ldap_change(config.shell, upn_change_id)
+            upn_revert_ran = True
             raise RuntimeError(f"Failed to set UPN on {config.target_account_dn}")
 
         # Step 4: Request certificate — authenticate as target_account using NT hash
@@ -813,6 +820,14 @@ async def _run_esc14_write_access(config: EscConfig) -> EscResult:
 
         ok = await asyncio.to_thread(_write_altsec)
         if not ok:
+            # The altSecurityIdentities write failed atomically (the directory
+            # refused the modify, e.g. ``noSuchObject`` on a target an earlier
+            # run had deleted): nothing was applied, so discard the write-ahead
+            # record and suppress its revert rather than leave a phantom
+            # manual-cleanup instruction to remove a mapping never written
+            # (gate finding R54).
+            discard_ldap_change(config.shell, altsec_change_id)
+            altsec_revert_ran = True
             raise RuntimeError(
                 f"Failed to write altSecurityIdentities on {config.target_account_dn}"
             )
@@ -1045,6 +1060,12 @@ async def _run_esc14_weak_mapping_scoped(
                 return _replace_attribute(conn, victim_dn, attribute, match_value)
 
         if not await asyncio.to_thread(_write_attr):
+            # The victim-attribute write failed atomically (the directory refused
+            # the modify): nothing was applied, so discard the write-ahead record
+            # and suppress its revert rather than leave a phantom manual-cleanup
+            # instruction (gate finding R54).
+            discard_ldap_change(config.shell, attr_change_id)
+            attribute_revert_ran = True
             raise RuntimeError(
                 f"Failed to set {attribute} on victim {victim_dn}"
             )

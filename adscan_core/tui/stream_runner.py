@@ -113,6 +113,54 @@ class StreamedProcessResult:
 _CANCEL_CHECK_INTERVAL_SECS = 0.5
 
 
+def _terminal_isolation_kwargs() -> dict:
+    """``subprocess`` kwargs that detach a non-interactive tool from Ctrl+C.
+
+    POSIX: a new session (``start_new_session``). Windows: a new process group.
+    Both with ``/dev/null`` on stdin. Resolved through the PAL so the same call
+    works on Linux and Windows; falls back to a POSIX-ish default if the PAL
+    cannot be imported (``adscan_core`` is always importable, so this is only
+    belt-and-braces).
+    """
+    try:
+        from adscan_core.pal.process import new_session_kwargs  # noqa: PLC0415
+
+        kwargs = dict(new_session_kwargs())
+    except Exception:  # noqa: BLE001 -- never block a stream on an import quirk
+        kwargs = {"start_new_session": True}
+    kwargs["stdin"] = subprocess.DEVNULL
+    return kwargs
+
+
+def _kill_process(proc: "subprocess.Popen[str]", *, own_session: bool) -> None:
+    """Kill a streamed child; signal its whole session group when it owns one.
+
+    A ``shell=True`` launch (or ``sudo``) leaves a shell between us and the real
+    worker, so killing the direct child can leave the worker running. When the
+    child was launched into its own session (``isolate_terminal``), signal the
+    whole group so the worker dies with it. Best-effort throughout.
+    """
+    if own_session:
+        try:
+            from adscan_core.pal.process import (  # noqa: PLC0415
+                is_specific_process_id,
+                terminate_process_group,
+            )
+
+            # Only a real child id reaches the group signal. Anything else (a
+            # test double, an id of 0 or 1) would address a broadcast target;
+            # the PAL refuses those too, this keeps the intent visible here.
+            pid = getattr(proc, "pid", None)
+            if is_specific_process_id(pid) and terminate_process_group(pid, force=True):
+                return
+        except Exception:  # noqa: BLE001 -- fall back to a direct kill
+            pass
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001 -- kill is best-effort
+        pass
+
+
 def stream_command_lines(
     spawn: _SpawnCallable,
     *,
@@ -123,6 +171,8 @@ def stream_command_lines(
     on_drain: Optional[Callable[[], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     on_cancel: Optional[Callable[[], None]] = None,
+    spawn_kwargs: Optional[dict] = None,
+    isolate_terminal: bool = True,
 ) -> Optional[StreamedProcessResult]:
     """Spawn ``command`` and stream its stdout line-by-line through ``on_line``.
 
@@ -165,11 +215,39 @@ def stream_command_lines(
             ``should_cancel`` triggers a stop, before the result is returned.
             Mirrors ``on_timeout`` for the cancellation case (e.g. push a
             final dashboard frame so the partial progress is visible).
+        spawn_kwargs: Optional extra keyword arguments forwarded verbatim to
+            ``spawn`` (e.g. ``terminal_isolated_subprocess_kwargs()`` so the
+            tool runs in its own session and the terminal's Ctrl+C does not kill
+            it — the scan control plane then stops it cooperatively through
+            ``should_cancel`` instead of the key press). Never overrides the
+            stdout/stderr/text/bufsize this function needs.
+        isolate_terminal: When ``True`` (the default) the tool is launched in its
+            own session with ``/dev/null`` on stdin, so the terminal's Ctrl+C
+            never reaches it: a streamed tool reads no terminal input (its
+            progress is parsed from stdout), so the key press belongs to the scan
+            control plane, which stops it through ``should_cancel``. A stop then
+            signals the whole session group, so the real worker dies even behind
+            a ``shell=True`` shell or ``sudo``. Pass ``False`` for a tool that
+            genuinely must share the terminal.
 
     Returns:
         A :class:`StreamedProcessResult` on completion, or ``None`` if the
         process could not be spawned (the caller falls back to a buffered path).
     """
+    extra = dict(spawn_kwargs or {})
+    # The runner owns these: a caller's spawn_kwargs must not break the stream.
+    for reserved in ("stdout", "stderr", "text", "bufsize"):
+        extra.pop(reserved, None)
+    own_session = False
+    if isolate_terminal:
+        # Default isolation: a new session + DEVNULL stdin, unless the caller
+        # already set them. The caller's own spawn_kwargs win.
+        for key, value in _terminal_isolation_kwargs().items():
+            if key not in extra:
+                extra[key] = value
+        own_session = bool(
+            extra.get("start_new_session") or extra.get("creationflags")
+        )
     proc = spawn(
         command,
         shell=True,
@@ -177,6 +255,7 @@ def stream_command_lines(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        **extra,
     )
     if proc is None or proc.stdout is None:
         return None
@@ -206,10 +285,7 @@ def stream_command_lines(
                     break
     finally:
         if timed_out or cancelled:
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001 -- kill is best-effort
-                pass
+            _kill_process(proc, own_session=own_session)
 
     if not timed_out and not cancelled and on_drain is not None:
         try:
@@ -221,10 +297,7 @@ def stream_command_lines(
         remaining_out, stderr_text = proc.communicate(timeout=10)
     except Exception:  # noqa: BLE001 -- communicate may itself time out post-kill
         remaining_out, stderr_text = "", ""
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        _kill_process(proc, own_session=own_session)
     if remaining_out:
         stdout_lines.append(remaining_out)
 

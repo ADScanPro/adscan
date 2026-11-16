@@ -6,6 +6,12 @@ Distinguishes three network states before committing to a full auth attempt:
   closed   — TCP RST received: host up, port explicitly refused (service down/disabled).
   filtered — Timeout or ICMP unreachable: host offline, firewall dropping, or no route.
 
+A fourth outcome is not a network state at all:
+
+  excluded — the engagement scope keeps this host out, so NOTHING was sent. It
+             is never folded into ``closed`` or ``filtered``: a host the client
+             excluded is "not checked", not offline.
+
 Intentionally has zero dependency on the skelsec native stack — this is a raw
 asyncio probe, not an AD protocol. asysocks is correct for protocol traffic that
 needs to traverse proxies; a 3-second TCP check before auth does not.
@@ -21,14 +27,97 @@ import re
 import socket
 import time
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Callable, Literal, Optional
 
+from adscan_core.scan_control.fanout import SweepCoverage
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
 from adscan_core.scan_pacing.pacing_runtime import Outcome, RateLimiter, active_runtime
 
 
-ProbeStatus = Literal["open", "closed", "filtered"]
+ProbeStatus = Literal["open", "closed", "filtered", "excluded"]
+
+#: The status of a probe the engagement scope kept from being sent.
+PROBE_EXCLUDED: ProbeStatus = "excluded"
+
+#: Class name of the in-process egress guard's refusal (a ``PermissionError``
+#: raised at the socket when a connection would reach an excluded host). Matched
+#: by name so this module needs no import of the guard.
+_EGRESS_REFUSAL_CLASS = "AssetScopeEgressRefused"
+
+
+def _probe_target_in_scope(target: str, port: int) -> bool:
+    """Whether the engagement scope lets a probe be sent to ``target``.
+
+    The one primitive under every TCP probe and the Windows connect scan asks
+    the scope SSOT (shell-less: the session registered with it). A directory
+    port on a domain controller is a directory contact, any other a host
+    contact. Fails closed: a verdict that cannot be computed sends nothing.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            session_host_verdict,
+        )
+        from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+            prepare_targets_for_scope,
+        )
+
+        if not _is_ip_literal(target):
+            # A probe of one host known by its name: the session is told about
+            # that name (once; it remembers the answer), then judges it. An
+            # address needs nothing.
+            prepare_targets_for_scope(None, [target])
+        return bool(session_host_verdict(host=target, port=port).allowed)
+    except Exception as exc:  # noqa: BLE001 - never probe on an unknown verdict
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
+def _probe_fanout_scope_gate(hosts: list[str], port: int, surface: str) -> Callable[[str], bool] | None:
+    """The per-host scope check of a probe fan-out (``None`` without an asset scope).
+
+    The shared gate every host fan-out uses, asked against the registered
+    session (a probe primitive receives no shell). What a probe of ``port``
+    opens is read from the port. Fails closed: when the gate cannot be built
+    under a recorded scope, no host of the fan-out is probed.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            contact_for_port,
+        )
+        from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+            fanout_scope_gate,
+        )
+
+        return fanout_scope_gate(None, hosts, surface=surface, contact=contact_for_port(port))
+    except Exception as exc:  # noqa: BLE001 - never probe on an unknown verdict
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return lambda _host: False
+
+
+def is_scope_egress_refusal(exc: BaseException | None) -> bool:
+    """Whether ``exc`` (or its cause) is the egress guard refusing an excluded host.
+
+    The guard raises a ``PermissionError`` subclass, which is an ``OSError``:
+    read as a plain connect failure it would persist "port filtered" or "host
+    offline" for a host that was never contacted.
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(cls.__name__ == _EGRESS_REFUSAL_CLASS for cls in type(current).__mro__):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 # Per-service canonical port list (primary first).
 SERVICE_PROBE_PORTS: dict[str, list[int]] = {
@@ -97,7 +186,13 @@ async def _resolve_candidate_ips(host: str, port: int) -> list[str]:
 
 
 async def _connect_probe(target: str, port: int, timeout: float) -> tuple[ProbeStatus, float]:
-    """Single TCP connect attempt against ONE address. Never raises."""
+    """Single TCP connect attempt against ONE address. Never raises.
+
+    A target the engagement scope excludes is not contacted and reads
+    ``excluded``, as does a connection the egress guard refuses at the socket.
+    """
+    if not _probe_target_in_scope(target, port):
+        return PROBE_EXCLUDED, 0.0
     t0 = time.monotonic()
     try:
         _, writer = await asyncio.wait_for(
@@ -113,7 +208,9 @@ async def _connect_probe(target: str, port: int, timeout: float) -> tuple[ProbeS
         return "open", elapsed
     except ConnectionRefusedError:
         return "closed", (time.monotonic() - t0) * 1000
-    except (asyncio.TimeoutError, OSError, Exception):  # noqa: BLE001
+    except (asyncio.TimeoutError, OSError, Exception) as exc:  # noqa: BLE001
+        if is_scope_egress_refusal(exc):
+            return PROBE_EXCLUDED, (time.monotonic() - t0) * 1000
         return "filtered", (time.monotonic() - t0) * 1000
 
 
@@ -150,7 +247,13 @@ async def tcp_probe(
     within one shared budget. The verdict is the reachable candidate's (open >
     closed > filtered). A single-address host or IP literal keeps the original
     direct-connect behavior.
+
+    A host the engagement scope excludes reads ``excluded`` and is not
+    contacted: a name is checked before it is resolved, each address before it
+    is connected to.
     """
+    if not _is_ip_literal(host) and not _probe_target_in_scope(host, port):
+        return TCPProbeResult(host=host, port=port, status=PROBE_EXCLUDED, elapsed_ms=0.0)
     candidates = await _resolve_candidate_ips(host, port)
     if len(candidates) > 1:
         results = await asyncio.gather(
@@ -207,8 +310,18 @@ async def tcp_probe_hosts(
     *,
     timeout: float | None = None,
     max_concurrency: int | None = None,
+    scope_surface: str = "reachability_probe",
 ) -> dict[str, TCPProbeResult]:
     """Probe ONE port across MANY hosts with bounded concurrency.
+
+    Engagement scope: this is a host fan-out, and it can be a long one (a
+    liveness gate over every host of a domain). Each host is asked about right
+    before its probe through the shared per-host gate: the chunk the fan-out
+    has reached is prepared, the host's verdict is read, and a host the scope
+    keeps out now reads ``excluded`` and is recorded under ``scope_surface``
+    (pass the surface of the sweep this gate belongs to). The caller's
+    partition is from the start of its sweep; this is the answer at the
+    moment of contact.
 
     The bounded semaphore is mandatory at scale: 1000 simultaneous open sockets
     would exhaust file-descriptor limits (default 1024) and saturate kernel TCP
@@ -233,10 +346,17 @@ async def tcp_probe_hosts(
         pacing["max_concurrency"] if max_concurrency is None else max_concurrency
     )
 
+    scope_gate = _probe_fanout_scope_gate(hosts, port, scope_surface)
+
     async def _bounded(h: str) -> TCPProbeResult:
         async with sem:
+            if scope_gate is not None and not await asyncio.to_thread(scope_gate, h):
+                return TCPProbeResult(host=h, port=port, status=PROBE_EXCLUDED, elapsed_ms=0.0)
             await runtime.before_op(h)
             result = await tcp_probe(h, port, timeout=probe_timeout)
+        if result.status == PROBE_EXCLUDED:
+            # Nothing was sent: no health sample for the strain safeguard.
+            return result
         runtime.record(
             h,
             Outcome.TIMEOUT if result.status == "filtered" else Outcome.OK,
@@ -488,6 +608,9 @@ async def connect_scan_open_ports(
     timeout: float | None = None,
     concurrency: int | None = None,
     pacing: ScanPacing | None = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    coverage: Optional["SweepCoverage"] = None,
+    scope_surface: str = "port_scan",
 ) -> dict[str, set[int]]:
     """Async TCP connect-scan over ``hosts`` x ``ports``. Never raises.
 
@@ -501,6 +624,14 @@ async def connect_scan_open_ports(
     adaptive backoff. ``timeout``/``concurrency`` are kept as back-compat scalar
     overrides — when given they layer onto the resolved pacing — so existing call
     sites keep working. On total failure returns ``{}``.
+
+    ``should_stop`` is a cooperative stop (the scan control plane's). It is
+    checked per host-port probe BEFORE the probe runs, so once a stop is
+    requested no new host is contacted and the scan returns what it has. The
+    pacing is untouched: the stop only skips launching new probes. When
+    ``coverage`` is given it is filled with the hosts checked and the hosts a
+    stop left unchecked, so the caller marks the unchecked ones not-checked
+    (never "no open ports").
     """
     if not hosts or not ports:
         return {}
@@ -512,6 +643,16 @@ async def connect_scan_open_ports(
         resolved = replace(resolved, timeout=timeout)
 
     results: dict[str, set[int]] = {}
+    skipped_hosts: set[str] = set()
+    excluded_hosts: set[str] = set()
+
+    def _stop() -> bool:
+        if should_stop is None:
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:  # noqa: BLE001 — a broken predicate never breaks the scan
+            return False
     nmap_pacing = component_pacing(active_pacing(), "portscan.nmap")
     # Same port-scan knobs the Linux nmap path gets (--max-rate / --scan-delay);
     # both are unset at the default level, so the probe loop is unchanged there.
@@ -528,10 +669,29 @@ async def connect_scan_open_ports(
             if start > now:
                 await asyncio.sleep(start - now)
 
+    # Engagement scope, host by host: a connect scan over a domain's hosts can
+    # outlast what the session knows, and the scope can be replaced meanwhile.
+    # The shared per-host gate prepares the chunk the scan has reached and reads
+    # the host's verdict right before its probes (the address check inside
+    # ``_connect_probe`` stays as the last line). One gate per port, because
+    # what a probe opens is read from its port: a directory port on a domain
+    # controller is a directory contact, any other port a host contact.
+    scope_gates = {port: _probe_fanout_scope_gate(hosts, port, scope_surface) for port in ports}
+
     try:
         gate = _AdaptiveGate(resolved)
 
         async def _probe(host: str, port: int) -> None:
+            if _stop():
+                # A stop was requested: this host-port is never contacted. The
+                # host is counted not-checked (its ports may be partly probed,
+                # so a host with any skipped port is reported unchecked).
+                skipped_hosts.add(host)
+                return
+            scope_gate = scope_gates.get(port)
+            if scope_gate is not None and not await asyncio.to_thread(scope_gate, host):
+                excluded_hosts.add(host)
+                return
             host_sem = gate._host_sem(host)
             async with gate._global:
                 if host_sem is not None:
@@ -545,6 +705,11 @@ async def connect_scan_open_ports(
                     status, _elapsed = await _connect_probe(
                         host, port, resolved.timeout
                     )
+            if status == PROBE_EXCLUDED:
+                # The engagement scope kept this host out: nothing was sent, so
+                # it is neither an answer nor a timeout for the backoff.
+                excluded_hosts.add(host)
+                return
             if status == "open":
                 results.setdefault(host, set()).add(port)
             await gate.record(status)
@@ -553,8 +718,38 @@ async def connect_scan_open_ports(
             *(_probe(host, port) for host in hosts for port in ports)
         )
     except Exception:  # noqa: BLE001 — a connect scan must never break the flow
+        _fill_coverage(coverage, hosts, skipped_hosts, excluded_hosts)
         return {host: ports_set for host, ports_set in results.items() if ports_set}
+    _fill_coverage(coverage, hosts, skipped_hosts, excluded_hosts)
     return {host: ports_set for host, ports_set in results.items() if ports_set}
+
+
+def _fill_coverage(
+    coverage: "SweepCoverage | None",
+    hosts: list[str],
+    skipped_hosts: set[str],
+    excluded_hosts: set[str] | None = None,
+) -> None:
+    """Record which hosts a stop left unchecked, for the caller's gap statement.
+
+    Hosts the engagement scope kept out are recorded apart, in
+    ``coverage.outside_scope``: they were not checked, but no stop left them
+    out, and they must never read as "no open ports".
+    """
+    if coverage is None:
+        return
+    outside = [h for h in hosts if h in (excluded_hosts or ())]
+    not_checked = [h for h in hosts if h in skipped_hosts and h not in outside]
+    coverage.total += len(hosts)
+    coverage.checked += len(hosts) - len(not_checked) - len(outside)
+    coverage.not_checked.extend(not_checked)
+    coverage.stopped = coverage.stopped or bool(not_checked)
+    if outside:
+        recorded = getattr(coverage, "outside_scope", None)
+        if isinstance(recorded, list):
+            recorded.extend(outside)
+        else:
+            coverage.outside_scope = list(outside)
 
 
 def connect_scan_open_ports_sync(
@@ -564,6 +759,8 @@ def connect_scan_open_ports_sync(
     timeout: float | None = None,
     concurrency: int | None = None,
     pacing: ScanPacing | None = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    coverage: Optional["SweepCoverage"] = None,
 ) -> dict[str, set[int]]:
     """Synchronous wrapper around :func:`connect_scan_open_ports`."""
     from adscan_internal.services.async_bridge import run_async_sync
@@ -576,6 +773,8 @@ def connect_scan_open_ports_sync(
                 timeout=timeout,
                 concurrency=concurrency,
                 pacing=pacing,
+                should_stop=should_stop,
+                coverage=coverage,
             )
         )
     except Exception:  # noqa: BLE001 — never raise into the sync caller

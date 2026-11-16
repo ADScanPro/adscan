@@ -107,7 +107,9 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from rich.markup import escape
+# No `rich` import at module level: the licence server imports this module (the
+# registry host names, through registry_assertion) from a venv that has no
+# `rich`. cta_markup imports it where it is used.
 
 if TYPE_CHECKING:
     # Type-only import so the ``"CtaLane"`` forward-ref annotation resolves for
@@ -116,12 +118,16 @@ if TYPE_CHECKING:
     from adscan_core.operator_role import CtaLane
 
 __all__ = [
+    "ADSCAN_CONTACT_EMAIL",
+    "ADSCAN_REGISTRY_BLOB_HOST",
+    "ADSCAN_REGISTRY_HOST",
     "ADSCAN_SITE_HOST",
     "ADSCAN_SITE_URL",
     "GO_LINKS_SCHEMA_VERSION",
     "GO_PATH_PREFIX",
     "UTM_MEDIUM_README",
     "UTM_SOURCE",
+    "UTM_SOURCE_APP",
     "UTM_SOURCE_GITHUB",
     "UTM_SOURCE_REPORT",
     "cta_destination_path",
@@ -132,6 +138,7 @@ __all__ = [
     "cta_markup",
     "cta_placement_for_lane",
     "cta_url",
+    "console_placements",
     "export_go_links",
     "is_external",
     "known_placements",
@@ -145,6 +152,21 @@ ADSCAN_SITE_HOST = "adscanpro.com"
 
 #: Canonical public origin.
 ADSCAN_SITE_URL = f"https://{ADSCAN_SITE_HOST}"
+
+#: The licence-authorised image registry (PRO image, appliance online channel).
+#: Spec docs/superpowers/specs/2026-11-12-licence-authorised-pro-registry.md.
+ADSCAN_REGISTRY_HOST = f"registry.{ADSCAN_SITE_HOST}"
+
+#: Where the registry redirects blob downloads: the EU-jurisdiction S3 endpoint
+#: of ADscan's Cloudflare R2 account (``<account id>.eu.r2.cloudflarestorage.com``).
+#: An appliance firewall must allow it with the registry host while online
+#: updates are on. Empty until the R2 bucket exists (registry RUNBOOK step R1);
+#: ``scripts/appliance_release.py publish`` refuses to publish while it is empty,
+#: and the appliance console mirrors it (locked by a test).
+ADSCAN_REGISTRY_BLOB_HOST = "30a00df227342bc59cd28667cbbef025.eu.r2.cloudflarestorage.com"
+
+#: Where an operator is told to write about a licence.
+ADSCAN_CONTACT_EMAIL = f"hello@{ADSCAN_SITE_HOST}"
 
 #: Site path under which every clean CLI link lives. The site redirects
 #: ``/go/<slug>`` to the attributed destination.
@@ -164,6 +186,10 @@ UTM_SOURCE = "cli"
 #: often not the operator: the exposure report is built to be forwarded, so
 #: this click typically comes from whoever received the PDF.
 UTM_SOURCE_REPORT = "report"
+
+#: ``utm_source`` for a link in the Enterprise web console (the value the
+#: console's links carried before they moved to ``/go``).
+UTM_SOURCE_APP = "app"
 
 #: ``utm_source`` for a link in the public repository's README.
 UTM_SOURCE_GITHUB = "github"
@@ -404,6 +430,18 @@ _PLACEMENTS: dict[str, _Placement] = {
     "report_footer": _Placement(
         "credit", "/", _BRAND, source=UTM_SOURCE_REPORT
     ),
+    # ── Enterprise web console ──────────────────────────────────────────────
+    # The console's Documentation links. They used to carry their UTM
+    # parameters in the visible href (utm_source=app&utm_medium=<placement>);
+    # the placement names and source are kept, so each series continues.
+    # The frontend links to these slugs from lib/outbound-links.ts, and
+    # tests/unit/web/test_web_outbound_links.py keeps the two in step.
+    "sidebar": _Placement("app-docs", "/docs", _DOCS, source=UTM_SOURCE_APP),
+    "mobile_sidebar": _Placement("app-docs-mobile", "/docs", _DOCS, source=UTM_SOURCE_APP),
+    "command_palette": _Placement("app-docs-palette", "/docs", _DOCS, source=UTM_SOURCE_APP),
+    "dashboard_empty_state": _Placement(
+        "app-docs-start", "/docs", _DOCS, source=UTM_SOURCE_APP
+    ),
     # ── GitHub README (also the PyPI project page) ──────────────────────────
     # Not printed by the CLI: README.md links to these, and
     # tests/unit/test_readme_outbound_links.py keeps the two in step. The
@@ -577,6 +615,8 @@ def cta_markup(placement: str, label: str | None = None) -> str:
     Returns:
         e.g. ``[link=https://adscanpro.com/go/docs]adscanpro.com/go/docs[/link]``
     """
+    from rich.markup import escape
+
     text = cta_display(placement) if label is None else label
     return f"[link={cta_url(placement)}]{escape(text)}[/link]"
 
@@ -598,6 +638,19 @@ def cta_link_style(placement: str, base_style: str = "") -> str:
 def known_placements() -> frozenset[str]:
     """Return every registered placement name."""
     return frozenset(_PLACEMENTS)
+
+
+def console_placements() -> frozenset[str]:
+    """Return the placements the Enterprise web console links to (``utm_source=app``).
+
+    The console is TypeScript, so these have no Python call site;
+    ``tests/unit/web/test_web_outbound_links.py`` checks both directions.
+    """
+    return frozenset(
+        name
+        for name, target in _PLACEMENTS.items()
+        if target.source == UTM_SOURCE_APP
+    )
 
 
 def readme_placements() -> frozenset[str]:

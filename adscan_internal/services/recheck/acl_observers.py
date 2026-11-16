@@ -453,8 +453,14 @@ def read_targets(ctx: Any, targets: Mapping[str, str], *, domain_sid_value: str)
                 reads[target] = TargetRead(READ_UNREADABLE)
             return
         found: set[str] = set()
+        unidentified = False
         for entry in entries:
             target = key_of(ldap_entry_attributes(entry), entry)
+            if not target:
+                # An object answered the filter but came back without the id it
+                # was asked by: it is one of this batch, and which one is not known.
+                unidentified = True
+                continue
             if target not in batch:
                 continue
             found.add(target)
@@ -469,7 +475,7 @@ def read_targets(ctx: Any, targets: Mapping[str, str], *, domain_sid_value: str)
             reads[target] = TargetRead(READ_OK, rights)
         for target in batch:
             if target not in found:
-                reads[target] = TargetRead(READ_GONE)
+                reads[target] = TargetRead(READ_UNREADABLE if unidentified else READ_GONE)
 
     def sid_of(attrs: dict[str, list[Any]], _entry: Any) -> str:
         for key, values in attrs.items():
@@ -528,12 +534,16 @@ def read_gmsa_rights(ctx: Any) -> tuple[dict[str, TargetRead], bool]:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         return {}, False
+    complete = True
     for entry in entries:
         sid = ""
         for key, values in ldap_entry_attributes(entry).items():
             if key.casefold() == "objectsid" and values:
                 sid = decode_object_sid(values[0]).upper()
         if not sid:
+            # A gMSA returned without its identity: its retrieval list cannot be
+            # attributed, so the domain-wide read is not complete.
+            complete = False
             continue
         sd = raw_attribute_bytes(entry, "msDS-GroupMSAMembership")
         if not sd:
@@ -543,7 +553,7 @@ def read_gmsa_rights(ctx: Any) -> tuple[dict[str, TargetRead], bool]:
         for edge in parse_gmsa_membership_sd(sd, target_object_id=sid):
             rights.setdefault(str(edge.source_object_id).upper(), set()).add(edge.relation)
         reads[sid] = TargetRead(READ_OK, rights)
-    return reads, True
+    return reads, complete
 
 
 def membership_closure(ctx: Any) -> dict[str, frozenset[str]]:
@@ -659,6 +669,10 @@ def observe_acl_family(family: AclFamily, ctx: Any, objects: Optional[frozenset[
         if family.scope == SCOPE_DOMAIN_OBJECT and own_sid:
             targets.setdefault(own_sid, "Domain")
         reads = read_targets(ctx, targets, domain_sid_value=own_sid)
+        if own_sid and reads.get(own_sid, TargetRead(READ_OK)).status == READ_GONE:
+            # The domain object cannot be gone from its own directory: a search
+            # that did not return it was not answered. Its steps stay undecided.
+            reads[own_sid] = TargetRead(READ_UNREADABLE)
         domain_wide = (
             family.scope == SCOPE_DOMAIN_OBJECT
             and bool(own_sid)

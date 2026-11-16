@@ -4,7 +4,7 @@ Subcommands:
 
 - ``cves scan [--targets <file>] [--cve <id|aka> ...]`` — run a scan with
   the premium Rich Live dashboard.
-- ``cves list`` — print the catalog with CVSS, scope, protocol.
+- ``cves list`` — print the catalog with severity, scope, protocol.
 - ``cves report`` — show a summary of the most recent scan in the
   current workspace.
 
@@ -50,6 +50,7 @@ from adscan_internal.services.cve_scanner.result import (
     CVEResult,
     CVEStatus,
     Severity,
+    public_cve_reference,
 )
 from adscan_internal.services.cve_scanner.ux.dashboard import (
     CVEDashboard,
@@ -160,7 +161,6 @@ def _run_list() -> None:
     table = Table(title="ADscan native CVE catalog", header_style="bold magenta")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("AKA", style="bold")
-    table.add_column("CVSS", justify="right")
     table.add_column("Severity")
     table.add_column("Protocol")
     table.add_column("Scope")
@@ -168,7 +168,6 @@ def _run_list() -> None:
         table.add_row(
             cve.id,
             cve.aka,
-            f"{cve.cvss_v3:.1f}",
             cve.severity.value.upper(),
             cve.affects_protocol,
             cve.target_scope.value,
@@ -207,11 +206,11 @@ def _run_report(shell: Any) -> None:
         print_info("  no confirmed findings.")
         return
     for result in vulnerable[:10]:
+        cve_ref = public_cve_reference(result.get("cve_id"))
         print_info(
             f"  - {result['aka']} on "
             f"{mark_sensitive(result['host'], 'host')} "
-            f"({result['severity'].upper()}, CVSS "
-            f"{result.get('cvss_v3') or '—'})"
+            f"({result['severity'].upper()}{', ' + cve_ref if cve_ref else ''})"
         )
 
 
@@ -289,6 +288,14 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
         targets_path, shell=shell, domain=domain, force_dc=force_dc
     )
     if not targets:
+        if int(getattr(shell, _SCOPE_EXCLUDED_ATTR, 0) or 0):
+            # The file had targets; the engagement scope kept every one out.
+            # Nothing was probed, so nothing here reads as "not vulnerable".
+            print_info(
+                "Vulnerability verification contacted no host: every target is "
+                "outside the engagement scope."
+            )
+            return
         print_error("No targets to scan. Pass --targets <file> with one host per line.")
         return
 
@@ -341,6 +348,7 @@ def _run_scan(shell: Any, argv: list[str]) -> None:
         workspace_dir=Path(workspace_dir),
         listener_host=listener_host,
         event_bus=event_bus,
+        targets=targets,
     )
 
     state = build_state(
@@ -388,12 +396,19 @@ def build_scan_context(
     workspace_dir: Path,
     listener_host: str | None = None,
     event_bus: EventBus | None = None,
+    targets: Any = (),
 ) -> tuple[ScanContext, Any | None]:
     """Build the ``ScanContext`` and the credential bundle one CVE scan runs with.
 
     Shared by the CVE phase and the post-collection patch-level re-run, so both
     resolve credentials, the DC, the host inventory and the patch-level cache
     the same way.
+
+    ``targets`` are the hosts the scan will work through. They passed the
+    engagement scope when they were loaded; the context carries the scope's
+    per-host check over them, which the runner asks right before each check, so
+    a scope narrowed while the scan runs is honoured for every host it has not
+    contacted yet (and for the re-run, which starts long after the phase).
     """
     # Resolve credentials + DC IP once from the shell. These wire both the
     # SMB factory used by the coercion adapter and the cred bundle that
@@ -424,10 +439,42 @@ def build_scan_context(
         ),
         patch_level=_patch_level_cache_for(shell, domain=domain, dc_ip=dc_ip),
     )
+    _attach_scope_gate(ctx, shell, targets)
     creds_obj = _build_creds_object(
         cred_info=cred_info, dc_ip=dc_ip, target_domain=domain
     )
     return ctx, creds_obj
+
+
+def _attach_scope_gate(ctx: ScanContext, shell: Any, targets: Any) -> None:
+    """Give the scan context the engagement scope's per-host check over ``targets``.
+
+    The shared gate of every host fan-out, with the surface and the reading of a
+    target (its host, judged in whatever domain it belongs to) that
+    :func:`_targets_in_engagement_scope` used when the list was loaded.
+    """
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        HELD_UNCONFIRMED_TEXT,
+        host_contact_gate,
+    )
+
+    gate = host_contact_gate(
+        shell,
+        list(targets or ()),
+        surface="cve_probe",
+        what="Vulnerability verification",
+        key=lambda target: target.host,
+    )
+    ctx.scope_admit = gate.admits
+
+    def _unconfirmed(target: Any) -> bool:
+        # Asked only for a target something kept out. One the preflight's own
+        # gate held is judged here once, so this gate knows why.
+        if not gate.held_reason(target):
+            gate.admits(target)
+        return gate.held_reason(target) == HELD_UNCONFIRMED_TEXT
+
+    ctx.scope_unconfirmed = _unconfirmed
 
 
 def _patch_level_cache_for(shell: Any, *, domain: str | None, dc_ip: str | None) -> Any | None:
@@ -524,6 +571,43 @@ async def _run_async(
     persist_report(persist_target_dir, report)
     _emit_cve_positive_control_evidence(shell, report, targets, ctx)
     _remember_scan(shell, report=report, targets=targets, ctx=ctx)
+    _declare_lost_domain_controllers(shell, report=report, targets=targets, ctx=ctx)
+
+
+#: The scan phase CVE verification runs in (``scan_phases``).
+CVE_PHASE_ID = "audit_extras"
+
+
+def _declare_lost_domain_controllers(
+    shell: Any, *, report: Any, targets: tuple[ScanTarget, ...], ctx: ScanContext
+) -> None:
+    """A domain controller that answered no CVE check makes the phase incomplete.
+
+    Its checks were skipped, not passed, so the run must not read as a complete
+    assessment of the domain (``target_loss`` SSOT). Never raises.
+    """
+    try:
+        from adscan_internal.services.cve_scanner.runner import (  # noqa: PLC0415
+            lost_domain_controllers,
+        )
+        from adscan_internal.services.target_loss import (  # noqa: PLC0415
+            declare_target_unreachable,
+        )
+
+        lost = lost_domain_controllers(
+            targets,
+            getattr(report, "results", ()) or (),
+            default_domain=str(getattr(ctx, "domain", "") or "") or None,
+        )
+        known = getattr(shell, "domains_data", None) or {}
+        for domain, hosts in lost.items():
+            if domain in known:
+                declare_target_unreachable(
+                    shell, domain, CVE_PHASE_ID, hosts=hosts, what="its CVE checks"
+                )
+    except Exception as exc:  # noqa: BLE001 - declaring a gap never breaks the scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _remember_scan(shell: Any, *, report: Any, targets: tuple[ScanTarget, ...], ctx: ScanContext) -> None:
@@ -615,6 +699,47 @@ def _findings_line(report: Any, rel: str) -> str:
     )
 
 
+def _not_evaluated_line(report: Any) -> str:
+    """Describe the checks that returned no verdict ("" when every check did).
+
+    A check skipped because its host did not answer, or one that failed, was
+    never evaluated: the host is neither vulnerable nor clean for it.
+    """
+    from adscan_internal.services.cve_scanner.runner import (  # noqa: PLC0415
+        is_scope_excluded_result,
+        is_scope_unconfirmed_result,
+    )
+
+    skipped = [
+        r
+        for r in getattr(report, "results", ()) or ()
+        if r.status in (CVEStatus.SKIPPED, CVEStatus.ERROR)
+    ]
+    # Two causes, never merged: a check the engagement scope kept off its host
+    # was not sent at all; any other one found the host silent or failed.
+    kept_off = [r for r in skipped if is_scope_excluded_result(r)]
+    gaps = [r for r in skipped if not is_scope_excluded_result(r)]
+    parts: list[str] = []
+    if gaps:
+        parts.append(
+            f"{len(gaps)} check(s) on {len({r.host for r in gaps})} host(s) were not "
+            "evaluated (the host did not answer or the check failed)"
+        )
+    if kept_off:
+        unconfirmed = sum(1 for r in kept_off if is_scope_unconfirmed_result(r))
+        if unconfirmed == len(kept_off):
+            why = "the host is not confirmed inside the engagement scope"
+        elif unconfirmed:
+            why = "the host is excluded from the engagement scope, or not confirmed inside it"
+        else:
+            why = "the host is excluded from the engagement scope"
+        parts.append(
+            f"{len(kept_off)} check(s) on {len({r.host for r in kept_off})} host(s) were "
+            f"not sent ({why})"
+        )
+    return " and ".join(parts)
+
+
 def _print_persistent_summary(*, report: Any) -> None:
     """Emit the post-scan persistent summary block to the scrollback.
 
@@ -626,8 +751,9 @@ def _print_persistent_summary(*, report: Any) -> None:
     When there is at least one confirmed finding, a severity-tagged line
     is rendered per finding (sorted by severity descending, then by CVSS
     descending) so the operator can act without having to open
-    ``report.md`` first. With zero findings, a clean "lab/host appears
-    clean" message is printed instead.
+    ``report.md`` first. With zero findings, the "lab/host appears clean"
+    message is printed ONLY when every check returned a verdict; a check that
+    was skipped or failed turns it into a warning that names the gap.
 
     Args:
         report: The :class:`CVEScanReport` returned by
@@ -637,13 +763,22 @@ def _print_persistent_summary(*, report: Any) -> None:
 
     rel = f"cves/{report.scan_id}"
     vulnerable: list[CVEResult] = list(report.vulnerable)
+    gap_line = _not_evaluated_line(report)
 
     if not vulnerable:
-        print_success(
-            f"CVE scan complete: 0 confirmed finding(s) across "
-            f"{len(report.targets)} host(s). "
-            "Lab/host appears clean for the scanned CVEs."
-        )
+        if gap_line:
+            # A skipped or failed check is not a pass: never call this clean.
+            print_warning(
+                f"CVE scan finished: 0 confirmed finding(s) across "
+                f"{len(report.targets)} host(s), but {gap_line}, so this is not a "
+                "clean result."
+            )
+        else:
+            print_success(
+                f"CVE scan complete: 0 confirmed finding(s) across "
+                f"{len(report.targets)} host(s). "
+                "Lab/host appears clean for the scanned CVEs."
+            )
         print_info(f"  Report:    {rel}/report.md")
         print_info(_findings_line(report, rel))
         print_info(f"  Scan log:  {rel}/scan.log")
@@ -653,13 +788,15 @@ def _print_persistent_summary(*, report: Any) -> None:
         f"CVE scan complete: {len(vulnerable)} confirmed finding(s) "
         f"across {len(report.targets)} host(s)."
     )
+    if gap_line:
+        print_warning(f"Not every check ran: {gap_line}.")
 
-    # Sort by severity descending, then by CVSS descending, then by aka
-    # so the highest-impact finding lands at the top of the block.
+    # Sort by ADscan severity, then by name and host. Never by a CVSS number:
+    # no ordering is derived from one (CLAUDE.md § "No CVSS on a client
+    # surface").
     vulnerable.sort(
         key=lambda r: (
             _SEVERITY_RANK.get(r.severity, 99),
-            -(r.cvss_v3 or 0.0),
             r.aka,
             r.host,
         )
@@ -668,15 +805,20 @@ def _print_persistent_summary(*, report: Any) -> None:
     # Compute padding so columns line up regardless of finding count.
     sev_width = max(len(r.severity.value.upper()) for r in vulnerable)
     aka_width = max(len(r.aka) for r in vulnerable)
+    host_width = max(len(r.host) for r in vulnerable)
 
     console = _get_console()
     for result in vulnerable:
         sev_label = result.severity.value.upper().ljust(sev_width)
         aka_label = result.aka.ljust(aka_width)
-        host_label = mark_sensitive(result.host, "host")
-        cvss_label = (
-            f"CVSS {result.cvss_v3:>4.1f}" if result.cvss_v3 is not None else "CVSS  — "
+        # Pad outside the marker so the zero-width telemetry markers do not
+        # count toward the column.
+        host_label = mark_sensitive(result.host, "host") + " " * (
+            host_width - len(result.host)
         )
+        # The public CVE id is the checkable anchor; an ADscan-defined check
+        # (PrinterBugSurface) has none and prints nothing there.
+        cve_ref = public_cve_reference(result.cve_id)
         style = _SUMMARY_SEVERITY_STYLE.get(result.severity, "white")
         # Print directly through the shared console so the severity tag
         # carries its colour into the persistent scrollback. ``print_*``
@@ -684,10 +826,10 @@ def _print_persistent_summary(*, report: Any) -> None:
         # the console here while keeping the surrounding paths on the
         # plain ``print_info`` channel for consistency with the rest of
         # the CLI.
-        console.print(
-            f"  [{style}]{sev_label}[/]  {aka_label}  "
-            f"[cyan]{host_label}[/cyan]  [dim]{cvss_label}[/dim]"
-        )
+        line = f"  [{style}]{sev_label}[/]  {aka_label}  [cyan]{host_label}[/cyan]"
+        if cve_ref:
+            line += f"  [dim]{cve_ref}[/dim]"
+        console.print(line)
 
     print_info(f"  Report:    {rel}/report.md")
     print_info(_findings_line(report, rel))
@@ -897,7 +1039,87 @@ def _load_targets(
             target_domain, matched_foreign_dc = domain, False
         is_dc = force_dc or matched_foreign_dc or _target_is_dc(host, domain, dc_tokens)
         out.append(ScanTarget(host=host, is_dc=is_dc, domain=target_domain))
-    return tuple(out)
+    if shell is None:
+        return tuple(out)
+    return _targets_in_engagement_scope(shell, out, scan_domain=domain)
+
+
+#: Shell attribute: how many targets the engagement scope kept out of the last
+#: probe run (so "nothing to scan" can say why).
+_SCOPE_EXCLUDED_ATTR = "_cve_targets_outside_engagement_scope"
+
+
+def _targets_in_engagement_scope(
+    shell: Any, targets: list[ScanTarget], *, scan_domain: str | None
+) -> tuple[ScanTarget, ...]:
+    """Keep only the probe targets the engagement scope lets the scan contact.
+
+    Two questions, both answered by the scope SSOT, never here:
+
+    * the DOMAIN the host belongs to must be in the engagement scope. A host
+      whose domain is another one the scope does not include is not probed, and
+      neither is a host whose domain cannot be determined: an unknown domain is
+      never assumed in scope;
+    * the HOST itself must pass the asset scope (deny-list and allow-list). A
+      vulnerability probe is host assessment, so a domain controller the scope
+      keeps to directory reads is not probed.
+
+    One partition call for the whole target list; each refusal is recorded by
+    the SSOT and summarised in one operator line.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        domain_scope_verdict,
+        host_owner_domain,
+        outside_scope_line,
+        partition_targets_in_scope,
+        prepare_scope_targets,
+    )
+
+    in_domain: list[ScanTarget] = []
+    outside: dict[str, list[str]] = {}
+    for target in targets:
+        owner = str(target.domain or "").strip().lower()
+        if "." in target.host and not is_ip_address(target.host):
+            # A named host is attributed by its own name (the longest known
+            # domain suffix), so a host of another domain listed in this
+            # domain's target file is judged against ITS domain.
+            owner = (
+                host_owner_domain(shell, target.host, collecting_domain=owner) or owner
+            )
+        verdict = domain_scope_verdict(shell, owner or None, path_domain=None)
+        if verdict.in_scope:
+            in_domain.append(target)
+        else:
+            outside.setdefault(verdict.domain or "", []).append(target.host)
+    for owner, hosts in outside.items():
+        noun = "host" if len(hosts) == 1 else "hosts"
+        print_info(
+            outside_scope_line(
+                f"Vulnerability verification of {len(hosts)} {noun}", "", owner
+            )
+        )
+        print_info_verbose(
+            "Vulnerability verification, not contacted: "
+            + mark_sensitive(", ".join(sorted(hosts)[:50]), "hostname")
+        )
+    # The targets are known by name or address only: the session is told what
+    # it needs to judge them ONCE for the whole list (a verdict looks nothing up).
+    prepare_scope_targets(shell, [target.host for target in in_domain], domain=scan_domain)
+    split = partition_targets_in_scope(
+        shell,
+        in_domain,
+        key=lambda target: target.host,
+        surface="cve_probe",
+        what="Vulnerability verification",
+        domain=None,
+    )
+    excluded = sum(len(hosts) for hosts in outside.values()) + len(split.refused)
+    try:
+        setattr(shell, _SCOPE_EXCLUDED_ATTR, excluded)
+    except Exception:  # noqa: BLE001 - a frozen double still gets its targets
+        pass
+    del scan_domain
+    return tuple(split.allowed)
 
 
 def _workspace_dir(shell: Any) -> Path | None:

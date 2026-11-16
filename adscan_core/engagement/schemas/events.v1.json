@@ -14,7 +14,8 @@
     {"$ref": "#/$defs/stream_header"},
     {"$ref": "#/$defs/run_started"},
     {"$ref": "#/$defs/run_completed"},
-    {"$ref": "#/$defs/engine_event"}
+    {"$ref": "#/$defs/engine_event"},
+    {"$ref": "#/$defs/licence_notice_event"}
   ],
   "$defs": {
     "timestamp": {
@@ -74,11 +75,56 @@
         "type": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]{0,63}$",
-          "not": {"enum": ["stream_header", "run_started", "run_completed"]}
+          "not": {"enum": ["stream_header", "run_started", "run_completed", "licence_notice"]}
         },
         "seq": {"type": "integer", "minimum": 2},
         "timestamp": {"$ref": "#/$defs/timestamp"}
       }
-    }
+    },
+    "licence_notice_event": {
+      "type": "object",
+      "$comment": "Since engine 15.0.0. Emitted once at launch by a run under an online PRO licence when the licence server was not reached, a domain is waiting to be registered, or the contract end is near; absent otherwise. A licence notice never changes the run's exit code: 78 (with license_refusal.json) is the only exit code the licence produces, and only for a refusal.",
+      "required": ["type", "seq", "timestamp", "licence_notice"],
+      "properties": {
+        "type": {"const": "licence_notice"},
+        "seq": {"type": "integer", "minimum": 2},
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "licence_notice": {"$ref": "#/$defs/licence_notice"}
+      }
+    },
+    "licence_notice": {
+      "type": "object",
+      "$comment": "Written by adscan_core/pro_license/connection.py (LicenceNotice.to_dict). The same block in license_status, license_check and the licence_notice event; tests/unit/contracts/test_licence_notice_contract.py keeps the three copies identical. Present only when the licence server was not reached at the latest check-in, a domain is waiting to be registered, or the contract end is near.",
+      "required": ["level", "server_reached", "check_in_result", "last_contact", "unreachable_since", "works_offline_until", "offline_days_left", "contract_ends_on", "contract_days_left", "registered_domains", "pending_domains"],
+      "properties": {
+        "level": {"enum": ["none", "note", "warning", "urgent", "critical"]},
+        "server_reached": {"type": ["boolean", "null"], "$comment": "Whether the licence server answered the latest check-in (this launch's when one ran)."},
+        "check_in_result": {"type": ["string", "null"], "$comment": "current, refreshed, notice, revoked, rejected or unreachable."},
+        "last_contact": {"$ref": "#/$defs/nullable_licence_timestamp"},
+        "unreachable_since": {"$ref": "#/$defs/nullable_licence_timestamp", "$comment": "First failed check-in of the current run of failures."},
+        "works_offline_until": {"$ref": "#/$defs/licence_nullable_date", "$comment": "Last day new assessments can start on this machine without reaching the licence server (document end plus its grace)."},
+        "offline_days_left": {"$ref": "#/$defs/licence_nullable_days"},
+        "contract_ends_on": {"$ref": "#/$defs/licence_nullable_date"},
+        "contract_days_left": {"$ref": "#/$defs/licence_nullable_days"},
+        "registered_domains": {"type": "integer", "minimum": 0},
+        "pending_domains": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["domain_code", "first_seen", "assessment_allowed_until", "days_left"],
+            "properties": {
+              "domain_code": {"type": "string"},
+              "first_seen": {"$ref": "#/$defs/nullable_licence_timestamp"},
+              "assessment_allowed_until": {"$ref": "#/$defs/licence_nullable_date", "$comment": "Last day a new assessment of this domain may start without registering it; null when it never blocks."},
+              "days_left": {"$ref": "#/$defs/licence_nullable_days"}
+            }
+          }
+        }
+      }
+    },
+    "licence_timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nullable_licence_timestamp": {"oneOf": [{"$ref": "#/$defs/licence_timestamp"}, {"type": "null"}]},
+    "licence_nullable_date": {"oneOf": [{"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}, {"type": "null"}]},
+    "licence_nullable_days": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}
   }
 }

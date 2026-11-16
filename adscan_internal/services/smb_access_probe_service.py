@@ -20,13 +20,16 @@ pre-filter on 445 performed by the caller before the sweep starts.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from adscan_internal import print_info_debug
+from adscan_core.scan_control.fanout import SweepCoverage
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
 from adscan_internal.services.service_access_results import ServiceAccessFinding
+from adscan_internal.services.sweep_stop import note_outside_scope
 from adscan_internal.services.smb_privilege import (
     SMBPrivilegeConfig,
     SMBPrivilegeResult,
@@ -137,8 +140,20 @@ async def run_smb_access_probe_sweep(
     max_workers: int | None = None,
     posture_sink: Optional[PostureSink] = None,
     posture_snapshot: Optional["DomainPosture"] = None,
+    should_stop: Callable[[], bool] | None = None,
+    coverage: SweepCoverage | None = None,
+    shell: Any | None = None,
 ) -> list[ServiceAccessFinding]:
     """Probe SMB admin access concurrently using the native aiosmb primitive.
+
+    Engagement scope: the targets are partitioned before the 445 liveness
+    gate, so a host the scope excludes gets neither the probe nor the check
+    (``shell`` is the session whose scope applies; excluded hosts go to
+    ``coverage.outside_scope``). That partition is from the start of the sweep.
+    Both fan-outs behind it, the liveness gate and the access check, ask about
+    each host again right before its contact, so a scope narrowed while the
+    sweep runs is honoured for every host not yet contacted, and such a host
+    reads as outside the scope, never as down or as "no access".
 
     Args:
         domain: Target domain of the hosts being probed.
@@ -161,6 +176,9 @@ async def run_smb_access_probe_sweep(
             transport when it observes a domain-wide hardening signal.
         posture_snapshot: Posture snapshot threaded into the ``SMBConfig`` so
             the planner prunes impossible auth combinations on the first try.
+        should_stop: Scan-control stop check (default: the running step's).
+            After a stop no new host is contacted.
+        coverage: Filled with how many hosts were checked and which were not.
 
     Returns:
         One :class:`ServiceAccessFinding` per resolved target, ordered to match
@@ -176,6 +194,33 @@ async def run_smb_access_probe_sweep(
         seen.add(target.lower())
         resolved_targets.append(target)
 
+    hostname_map = {
+        _normalize_target(ip).lower(): _normalize_target(host)
+        for ip, host in (target_hostnames or {}).items()
+        if _normalize_target(host)
+    }
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(
+        shell,
+        resolved_targets,
+        key=lambda target: hostname_map.get(target.lower()) or target,
+        address=lambda target: target,
+        domain=domain,
+    )
+    scope = partition_targets_in_scope(
+        shell,
+        resolved_targets,
+        key=lambda target: hostname_map.get(target.lower()) or target,
+        address=lambda target: target,
+        surface="smb_access_sweep",
+        what="SMB access sweep",
+        domain=domain,
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    resolved_targets = scope.allowed
     if not resolved_targets:
         return []
 
@@ -191,6 +236,7 @@ async def run_smb_access_probe_sweep(
     # (TCP-accept) but then hang the SMB negotiate / Kerberos.
     from adscan_internal.services.host_reachability_filter import (
         filter_reachable_hosts,
+        scope_excluded_hosts,
     )
 
     # Scale the gate fan-out with the fleet: a TCP connect is cheap (no auth), so
@@ -204,14 +250,19 @@ async def run_smb_access_probe_sweep(
     )
     if timeout is None:
         timeout = component_pacing(active_pacing(), "sweep.smb_access")["timeout_s"]
+    # The gate is a fan-out of its own over every host of the sweep: it asks the
+    # engagement scope about each host right before its probe. A host the scope
+    # keeps out since the partition above is outside the scope, not "down".
     reach = await filter_reachable_hosts(
-        resolved_targets, 445, max_concurrency=gate_concurrency
+        resolved_targets, 445, max_concurrency=gate_concurrency, scope_surface="smb_access_sweep"
     )
+    note_outside_scope(coverage, scope_excluded_hosts(reach))
     if len(reach.reachable) != len(resolved_targets):
         print_info_debug(
             f"[smb_probe] 445 liveness gate: {len(reach.reachable)}/"
             f"{len(resolved_targets)} reachable now "
             f"({len(reach.offline)} down since the port scan, skipped; "
+            f"{len(scope_excluded_hosts(reach))} outside the engagement scope, not contacted; "
             f"{reach.elapsed_ms:.0f}ms)"
         )
     resolved_targets = list(reach.reachable)
@@ -221,11 +272,6 @@ async def run_smb_access_probe_sweep(
     worker_count = max(
         1, min(max_workers or get_smb_probe_worker_count(), len(resolved_targets))
     )
-    hostname_map = {
-        _normalize_target(ip).lower(): _normalize_target(host)
-        for ip, host in (target_hostnames or {}).items()
-        if _normalize_target(host)
-    }
 
     print_info_debug(
         "[smb_probe] starting native SMB access sweep: "
@@ -255,7 +301,13 @@ async def run_smb_access_probe_sweep(
         for target in resolved_targets
     ]
 
-    results = await check_smb_privilege_batch(configs, max_concurrency=worker_count)
+    results = await check_smb_privilege_batch(
+        configs,
+        max_concurrency=worker_count,
+        should_stop=should_stop,
+        coverage=coverage,
+        shell=shell,
+    )
 
     findings = [_status_to_finding(result, username=username) for result in results]
     confirmed = sum(1 for finding in findings if finding.is_confirmed)

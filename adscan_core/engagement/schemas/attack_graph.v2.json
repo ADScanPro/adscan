@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.attack_graph/2",
+  "title": "ADscan attack graph v2",
+  "description": "domains/<domain>/attack_graph.json: the directory objects of one domain (nodes) and every relation between them that grants access or control (edges), with the execution status ADscan recorded on each edge. Written by one writer (save_attack_graph in adscan_internal/services/attack_graph_service.py). Version marker: schema_version, '2.<minor>'. Format 2 removed the per-edge knowledge object of format 1: the generic description, remediation and verification text of each technique is written once per relation under technique_knowledge, and an edge's own filled-in text is rendered from that block and the edge's fields when it is read. Format 1.x files stay readable for two minor engine releases or 90 days, whichever is longer (schema adscan.attack_graph/1). Declared objects may gain fields within a major; do not reject unknown keys. properties, notes, evidence, maintenance and each technique_knowledge block are opaque. No recovered password, hash or key value is ever written into this file.",
+  "type": "object",
+  "required": ["schema_version", "domain", "generated_at", "nodes", "edges"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^2\\.[0-9]+$"},
+    "domain": {"type": "string", "minLength": 1, "maxLength": 255},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "coverage_run_id": {"type": "string", "maxLength": 64},
+    "maintenance": {"type": "object", "$comment": "Engine bookkeeping for one-time graph migrations. Not for consumers."},
+    "dc_ip": {"type": "string", "$comment": "Domain controller address the verification commands are filled with."},
+    "dc_fqdn": {"type": "string"},
+    "netbios": {"type": "string"},
+    "scan_principal": {"type": "string", "$comment": "The account the scan authenticated as. Never a secret."},
+    "ca_name": {"type": "string"},
+    "ca_host": {"type": "string"},
+    "technique_knowledge": {
+      "type": "object",
+      "$comment": "One generic block per relation that has a technique, keyed by knowledge_ref: the relation name, plus the suffix '#tier0_direct' for the block an edge whose source is already Tier 0 direct reads (it carries the structural-hierarchy line instead of removal advice). Commands in a block keep fill-in tokens such as <dc_ip>; an edge's filled-in text is not stored.",
+      "additionalProperties": {"type": "object"}
+    },
+    "collection": {
+      "type": "object",
+      "$comment": "Which collection stages ran for this graph and how each ended. A stage that was stopped or skipped is a declared coverage gap.",
+      "properties": {
+        "stages": {"type": "array", "items": {"$ref": "#/$defs/collection_stage"}}
+      }
+    },
+    "export_state": {
+      "type": "object",
+      "$comment": "Present only on a file a stopped build left behind: the store moved past this export and the build that would replace it did not finish. current is always false; stage and reason name the stop, at is when it was declared (ISO 8601 UTC). A reader treats the file as out of date (a declared coverage gap), never as the current graph. The next full export drops it.",
+      "required": ["current"],
+      "properties": {
+        "current": {"type": "boolean"},
+        "stage": {"type": "string"},
+        "reason": {"type": "string"},
+        "at": {"type": "string"}
+      }
+    },
+    "nodes": {
+      "type": "object",
+      "$comment": "Keyed by node id, the same value as the node's id field.",
+      "additionalProperties": {"$ref": "#/$defs/node"}
+    },
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nullable_string": {"type": ["string", "null"]},
+    "collection_stage": {
+      "type": "object",
+      "required": ["stage", "status"],
+      "properties": {
+        "stage": {"type": "string", "minLength": 1, "$comment": "ldap_objects, ldap_acls, ldap_relationships, well_known_principals, adcs, adcs_ca_registry, trusts, smb_hosts, smb_shares, mssql, unauthenticated, cve_checks, legacy_graph_import (open vocabulary)."},
+        "status": {"type": "string", "enum": ["running", "complete", "stopped", "skipped", "failed"]},
+        "reason": {"type": "string"},
+        "units_done": {"type": "integer", "minimum": 0},
+        "units_total": {"type": "integer", "minimum": 0, "$comment": "0 when the stage did not know its total up front."}
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": ["id", "label", "kind"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "$comment": "The name a person reads. A GPO (kind GPO) is labelled with its display name and the first 8 characters of its policy GUID, 'Default Domain Policy (31B2F340)', or the full GUID when two GPOs would share a label. A GPO whose display name could not be read keeps its {GUID} label. Since 2.1; earlier files label a GPO with its {GUID}."},
+        "name": {"type": "string"},
+        "kind": {"type": "string", "minLength": 1, "$comment": "Directory object class: User, Group, Computer, Domain, GPO, OU, Container, CertTemplate, EnterpriseCA, RootCA, AIACA, NTAuthStore, ... (open vocabulary)."},
+        "objectId": {"$ref": "#/$defs/nullable_string"},
+        "properties": {"type": "object", "$comment": "Opaque. A GPO carries gpo_guid (its policy GUID, upper case, no braces: the GPMC Unique ID and Get-GPO -Guid value) and displayname when the directory returned one (since 2.1)."},
+        "highvalue": {"type": "boolean"},
+        "is_high_value": {"type": "boolean"},
+        "isTierZero": {"type": "boolean", "$comment": "Legacy collection-time flag. The authoritative tier is properties.privilege_tier (tier0_direct, tier0_escalation_capable, tier1, tier2), or privilege_tier on the node itself."},
+        "privilege_tier": {"$ref": "#/$defs/nullable_string"},
+        "system_tags": {"type": "array", "items": {"type": "string"}},
+        "target_terminal_class": {"$ref": "#/$defs/nullable_string"},
+        "tier0_inherited": {"type": "boolean"},
+        "compromise_class": {"$ref": "#/$defs/nullable_string"}
+      }
+    },
+    "edge": {
+      "type": "object",
+      "$comment": "Endpoints are from/to (node ids). Edges derived from a host check (unpatched vulnerabilities, NTLMv1 relay avenues) name their endpoints as source/target, and some carry both pairs: read from/to and fall back to source/target. An edge carries no technique text: read technique_knowledge for the generic block.",
+      "required": ["relation"],
+      "properties": {
+        "id": {"type": "string"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "source": {"type": "string"},
+        "target": {"type": "string"},
+        "relation": {"type": "string", "minLength": 1, "$comment": "Relation name (GenericAll, AdminTo, ADCSESC1, DCSync, ...; open vocabulary)."},
+        "kind": {"type": "string", "$comment": "control, auth, membership, trust, derived, escalation or unknown."},
+        "status": {"type": "string", "$comment": "discovered, theoretical, attempted, success, blocked, closed_by_configuration, unsupported, ... (open vocabulary)."},
+        "edge_type": {"type": "string"},
+        "category": {"$ref": "#/$defs/nullable_string"},
+        "vuln_key": {"$ref": "#/$defs/nullable_string"},
+        "notes": {"type": "object"},
+        "evidence": {"type": "object"},
+        "first_seen": {"$ref": "#/$defs/timestamp"},
+        "last_seen": {"$ref": "#/$defs/timestamp"},
+        "discovered_at": {"$ref": "#/$defs/timestamp"},
+        "recorded_at": {"$ref": "#/$defs/timestamp"}
+      }
+    }
+  }
+}

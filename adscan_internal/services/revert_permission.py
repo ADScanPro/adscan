@@ -87,6 +87,13 @@ def refresh_policy_revert_permission(shell: Any) -> None:
         )
         # Verdicts were established for the previous account; drop them.
         setattr(shell, _SHELL_CACHE_ATTR, {})
+        # The policy object was replaced: the engagement scope's cached verdicts
+        # were computed under the previous one.
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            invalidate_scope_verdicts,
+        )
+
+        invalidate_scope_verdicts(shell)
     except Exception as exc:  # noqa: BLE001 - the previous resolution stays in force
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

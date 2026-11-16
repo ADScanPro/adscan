@@ -668,11 +668,9 @@ def load_asset_index(workspace_dir: str | Path, domain: str) -> AssetIndex:
     enrichment rather than an exception).
     """
     try:
-        graph_path = Path(workspace_dir) / "domains" / str(domain) / "attack_graph.json"
-        if not graph_path.exists():
-            return AssetIndex(domain=str(domain))
-        with graph_path.open("r", encoding="utf-8") as handle:
-            graph = json.load(handle)
+        from adscan_core.graph_file_reader import read_domain_graph
+
+        graph = read_domain_graph(workspace_dir, str(domain))
         if not isinstance(graph, dict):
             return AssetIndex(domain=str(domain))
         index = build_asset_index_from_graph(graph)
@@ -2333,8 +2331,20 @@ def build_group_member_example_resolver(
     sid_to_label = sid_to_label if isinstance(sid_to_label, dict) else {}
     controlled = _controlled_account_names(workspace_dir, domain_name)
     realm = str(domain_name or "").strip().upper()
+    # One answer per (identifier, SID): the stamp asks for the same group once
+    # per finding and per entity, and a broad group's answer sorts every member
+    # (tens of thousands on a large directory) each time it is asked.
+    answers: dict[tuple[str, str], tuple[str, bool] | None] = {}
 
     def _resolve(identifier: str, sid: str) -> tuple[str, bool] | None:
+        cache_key = (str(identifier or ""), str(sid or ""))
+        if cache_key in answers:
+            return answers[cache_key]
+        answer = _resolve_uncached(identifier, sid)
+        answers[cache_key] = answer
+        return answer
+
+    def _resolve_uncached(identifier: str, sid: str) -> tuple[str, bool] | None:
         keys = []
         label = sid_to_label.get(str(sid or "").strip().upper()) or sid_to_label.get(
             str(sid or "").strip()

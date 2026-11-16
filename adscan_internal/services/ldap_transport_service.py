@@ -810,6 +810,30 @@ def _build_ldap_connection_url(config: "ADscanLDAPConfig") -> tuple[str, bool]:
     return url, False
 
 
+#: Entries read between two memory checks of a paged search under a guarded
+#: stage. One check is a rate-limited read of a few small pseudo-files.
+_SEARCH_MEMORY_CHECK_EVERY = 256
+
+
+async def _close_pages(pages: Any) -> None:
+    """Close a paged search the caller stops early (best-effort)."""
+    closer = getattr(pages, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:  # noqa: BLE001 - the stop stands whatever the close does
+        pass
+
+
+class _SearchStoppedForMemory(Exception):
+    """A paged search stopped because its stage crossed the memory line."""
+
+    def __init__(self, entries_read: int) -> None:
+        super().__init__(f"paged search stopped after {entries_read} entries")
+        self.entries_read = int(entries_read)
+
+
 class ADscanLDAPConnection:
     """badldap-backed LDAP context manager for ADscan collectors."""
 
@@ -977,16 +1001,25 @@ class ADscanLDAPConnection:
         # badldap uses the value from MSLDAPTarget.ldap_query_page_size.
         _ = paged_size
 
+        # The memory guard of the enclosing pipeline stage (directory
+        # collection), when there is one: a paged read of a large directory is
+        # where the collection's memory grows, so it is watched per page of
+        # entries and stopped before the system would kill the process.
+        from adscan_core.memory_guard import current_guard  # noqa: PLC0415
+
+        guard = current_guard()
+
         async def _collect_entries() -> list[LDAPEntry]:
             collected: list[LDAPEntry] = []
-            async for item, err in self._conn.pagedsearch(  # type: ignore[union-attr]
+            pages = self._conn.pagedsearch(  # type: ignore[union-attr]
                 search_filter,
                 effective_attrs,
                 controls=_resolve_sd_flags_control(controls),
                 tree=search_base or None,
                 search_scope=scope_int,
                 raw=True,
-            ):
+            )
+            async for item, err in pages:
                 if err is not None:
                     raise err
                 raw_attrs = {
@@ -997,9 +1030,28 @@ class ADscanLDAPConnection:
                 }
                 dn = str(item.get("objectName", "") or "")
                 collected.append(LDAPEntry(dn=dn, _raw_attrs=raw_attrs))
+                if (
+                    guard is not None
+                    and len(collected) % _SEARCH_MEMORY_CHECK_EVERY == 0
+                    and guard.over_line()
+                ):
+                    stopped = len(collected)
+                    collected.clear()
+                    await _close_pages(pages)
+                    raise _SearchStoppedForMemory(stopped)
             return collected
 
-        self._entries = list(self._run_coroutine(_collect_entries()) or [])
+        try:
+            self._entries = list(self._run_coroutine(_collect_entries()) or [])
+        except _SearchStoppedForMemory as stop:
+            # Raised as a plain exception inside the loop (a BaseException would
+            # break out of the event loop), turned into the stage's stop here,
+            # on the thread that runs the stage boundary.
+            self._entries = []
+            if guard is None:
+                raise
+            guard.progress(guard.units_done + stop.entries_read)
+            guard.stop_now()
 
     def add(self, dn: str, object_class: list[str], attributes: dict[str, Any]) -> bool:
         """Add a new LDAP object.

@@ -21,6 +21,8 @@ class LicensedIdentity:
     license_id: str
     edition: str
     partner_tag: str
+    grant_id: str = ""
+    installation_id: str = ""
 
 
 _CACHE: dict[str, tuple[tuple[int, int], LicensedIdentity | None]] = {}
@@ -44,7 +46,13 @@ def installed_licence_identity(directory: Path | None = None) -> LicensedIdentit
             return cached[1]
         licence, _error = store.load_licence()
         identity = (
-            LicensedIdentity(licence.license_id, licence.edition, licence.partner_tag)
+            LicensedIdentity(
+                licence.license_id,
+                licence.edition,
+                licence.partner_tag,
+                grant_id=licence.grant_id,
+                installation_id=licence.installation_id,
+            )
             if licence is not None
             else None
         )

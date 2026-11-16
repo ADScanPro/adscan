@@ -9,10 +9,47 @@
     "schema_version": {"type": "string", "pattern": "^2\\.[0-9]+$"},
     "generated_at": {"$ref": "#/$defs/timestamp"},
     "coverage_run_id": {"type": "string", "maxLength": 64, "$comment": "Id of the recorded run that last wrote the file; coverage.json is trusted for this file only when its run_id matches."},
+    "licence": {
+      "type": "object",
+      "$comment": "Since 2.5. Present only when the run was made under a PRO licence: the identifiers the licence server issued (grant, licence document, installation), so a report traces back to the grant that produced it. Never a secret.",
+      "required": ["license_id", "grant_id"],
+      "properties": {
+        "license_id": {"type": "string"},
+        "grant_id": {"type": "string"},
+        "installation_id": {"type": "string"},
+        "edition": {"type": "string"},
+        "partner_tag": {"type": "string"}
+      }
+    },
     "domains": {
       "type": "object",
       "$comment": "Keyed by domain FQDN (lower case). A domain is listed as soon as any producer names it; assessment.enumerated says whether it was actually enumerated.",
       "additionalProperties": {"$ref": "#/$defs/domain"}
+    },
+    "asset_scope": {
+      "type": "object",
+      "$comment": "Since 2.9. Present when the run had an asset scope: the scope revision and digest it ended under (scope.json asset_scope), who decided it and when, and the run-wide counts. Per-domain detail is in domains.<d>.asset_scope_coverage.",
+      "required": ["revision", "digest", "mode"],
+      "properties": {
+        "revision": {"type": "integer"},
+        "digest": {"type": "string"},
+        "decided_by": {"type": "string"},
+        "decided_at": {"type": "string"},
+        "clock_frame": {"type": "string"},
+        "mode": {"type": "string", "enum": ["allow", "deny", "allow_and_deny"]},
+        "dc_access": {"type": "string"},
+        "entries_allow": {"type": "integer"},
+        "entries_deny": {"type": "integer"},
+        "entries_unresolved": {"type": "integer"},
+        "excluded_computers": {"type": "integer"},
+        "excluded_accounts": {"type": "integer"},
+        "excluded_other": {"type": "integer"},
+        "unconfirmed_computers": {"type": "integer"},
+        "unconfirmed_accounts": {"type": "integer"},
+        "unconfirmed_other": {"type": "integer"},
+        "refused_contacts": {"type": "integer"},
+        "backstop_hits": {"type": "integer"}
+      }
     },
     "environment_changes": {"type": "object", "$comment": "Copy of the change ledger attached at session end ({summary, changes}); environment_changes.json is the authoritative file."},
     "attack_fanout_rollup": {"type": "array", "items": {"type": "object"}},
@@ -30,6 +67,22 @@
   },
   "$defs": {
     "timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "asset_scope_item": {
+      "type": "object",
+      "$comment": "Since 2.7. One object the asset scope kept out of the assessment. entry_written_as is how the deciding scope entry was written and known_as how the target was known, so an address entry that matched a host reached by name is stated in both forms.",
+      "required": ["kind", "label", "reason"],
+      "properties": {
+        "kind": {"type": "string"},
+        "label": {"type": "string"},
+        "object_id": {"type": "string"},
+        "reason": {"type": "string"},
+        "entry": {"type": "string"},
+        "how": {"type": "string"},
+        "entry_written_as": {"type": "string"},
+        "known_as": {"type": "string"},
+        "cause": {"type": "string"}
+      }
+    },
     "domain": {
       "type": "object",
       "required": ["findings", "control_evidence", "events", "attack_paths"],
@@ -38,7 +91,128 @@
         "control_evidence": {"type": "array", "items": {"$ref": "#/$defs/control_evidence"}},
         "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
         "attack_paths": {"type": "array", "items": {"type": "object"}},
-        "assessment": {"type": "object"},
+        "assessment": {
+          "type": "object",
+          "$comment": "Whether the domain was enumerated (record_domain_assessment) and, since 2.11, whether the assessment finished (record_assessment_integrity). complete is false and incomplete_phases names each phase that ran but did not finish its work (a domain controller that stopped answering, a lost collection connection, a memory stop, an operator stop); both are absent when no phase was recorded incomplete, which is not by itself a claim that every check ran. A reason starting target_unreachable means the phase's domain controller stopped answering and its checks were not evaluated.",
+          "properties": {
+            "enumerated": {"type": "boolean"},
+            "recorded_at": {"type": "string"},
+            "basis": {"type": "string"},
+            "complete": {"type": "boolean"},
+            "incomplete_phases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "phase_id": {"type": "string"},
+                  "title": {"type": "string"},
+                  "reasons": {"type": "array", "items": {"type": "string"}},
+                  "detail": {"type": "string"}
+                },
+                "required": ["phase_id", "reasons"]
+              }
+            }
+          }
+        },
+        "asset_scope_coverage": {
+          "type": "object",
+          "$comment": "Since 2.9. Present when the run had an asset scope (an allow or deny list of hosts and directory objects, scope.json asset_scope). Built by adscan_core/reporting/engagement_scope.py build_asset_scope_coverage. excluded lists the objects of this domain the scope kept out of the assessment (at most 200; excluded_omitted counts the rest), each with how it was identified; the counts are exact. directory_only_dcs are domain controllers used for directory reads only. routes_not_executed and steps_not_executed are null until the scan counted them. statement is the sentence the report prints. An excluded object was never contacted or acted on: it is never a finding and never clean.",
+          "required": ["format", "entries", "excluded_computers", "excluded_accounts", "excluded", "statement"],
+          "properties": {
+            "format": {"type": "integer"},
+            "domain": {"type": "string"},
+            "revision": {"type": "integer"},
+            "digest": {"type": "string"},
+            "decided_by": {"type": "string"},
+            "decided_by_label": {"type": "string"},
+            "decided_at": {"type": "string"},
+            "clock_frame": {"type": "string"},
+            "mode": {"type": "string", "enum": ["allow", "deny", "allow_and_deny"]},
+            "dc_access": {"type": "string"},
+            "entries": {
+              "type": "object",
+              "properties": {
+                "allow": {"type": "integer"},
+                "deny": {"type": "integer"},
+                "by_type": {"type": "object"}
+              }
+            },
+            "excluded_computers": {"type": "integer"},
+            "excluded_accounts": {"type": "integer"},
+            "excluded_other": {"type": "integer"},
+            "excluded": {
+              "type": "array",
+              "$comment": "Population 1: objects the client excluded, or did not list on an allow list (reason denied_entry or not_in_allow_list).",
+              "items": {"$ref": "#/$defs/asset_scope_item"}
+            },
+            "excluded_omitted": {"type": "integer"},
+            "unconfirmed_computers": {"type": "integer"},
+            "unconfirmed_accounts": {"type": "integer"},
+            "unconfirmed_other": {"type": "integer"},
+            "unconfirmed": {
+              "type": "array",
+              "$comment": "Population 2, never merged with the first: objects ADscan could not confirm as within the scope and left alone as a precaution (reason identity_undetermined or scope_record_unreadable). cause says what was missing: name_not_resolved, address_not_attributed, entry_not_matched, affected_hosts_unknown, scope_record_unreadable or unknown.",
+              "items": {"$ref": "#/$defs/asset_scope_item"}
+            },
+            "unconfirmed_omitted": {"type": "integer"},
+            "routes_unconfirmed": {"type": ["integer", "null"]},
+            "steps_unconfirmed": {"type": ["integer", "null"]},
+            "directory_only_dcs": {"type": "array", "items": {"type": "string"}},
+            "unresolved_entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {"type": "string"},
+                  "list": {"type": "string"},
+                  "type": {"type": "string"},
+                  "value": {"type": "string"},
+                  "status": {"type": "string"}
+                }
+              }
+            },
+            "unresolved_omitted": {"type": "integer"},
+            "entry_outcomes": {
+              "type": "object",
+              "$comment": "Since 2.10. What became of each scope entry the client wrote, for this domain: entries (at most 200, the ones needing attention first; omitted counts the rest), counts by outcome, and deny_matched_nothing. outcome is one of matched, matched_assessed, matched_excluded, matched_not_reached, matched_not_confirmed, matched_nothing. An entry tied to no domain (an address no computer holds, a name that matched nothing) is listed under every domain.",
+              "properties": {
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["id", "side", "type", "value", "outcome", "matched", "statement"],
+                    "properties": {
+                      "id": {"type": "string"},
+                      "side": {"type": "string", "enum": ["allow", "deny"]},
+                      "type": {"type": "string"},
+                      "value": {"type": "string"},
+                      "outcome": {"type": "string", "enum": ["matched", "matched_assessed", "matched_excluded", "matched_not_reached", "matched_not_confirmed", "matched_nothing"]},
+                      "cause": {"type": "string"},
+                      "matched": {
+                        "type": "object",
+                        "properties": {
+                          "computers": {"type": "integer"},
+                          "accounts": {"type": "integer"},
+                          "other": {"type": "integer"}
+                        }
+                      },
+                      "labels": {"type": "array", "items": {"type": "string"}},
+                      "labels_omitted": {"type": "integer"},
+                      "states": {"type": "object"},
+                      "statement": {"type": "string"}
+                    }
+                  }
+                },
+                "omitted": {"type": "integer"},
+                "counts": {"type": "object"},
+                "deny_matched_nothing": {"type": "integer"}
+              }
+            },
+            "routes_not_executed": {"type": ["integer", "null"]},
+            "steps_not_executed": {"type": ["integer", "null"]},
+            "statement": {"type": "string"}
+          }
+        },
         "attack_path_coverage": {"type": "object"},
         "chokepoint_cardinality": {"type": "object"},
         "collection_coverage": {"type": "object"},
@@ -48,8 +222,45 @@
         "exposure_kpis": {"type": "object"},
         "exposure_score": {"type": "object"},
         "host_enrichment_coverage": {"type": "object"},
+        "guest_access_coverage": {
+          "type": "object",
+          "$comment": "Since 2.8. Hosts guest SMB access was never asked of, because the guest name's absence from the directory could not be confirmed and guest probing stopped after a few refusals (adscan_core/reporting/guest_access_coverage.py). Absent when every host was asked.",
+          "properties": {
+            "complete": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "hosts_not_checked": {"type": "integer"},
+            "statement": {"type": "string"}
+          }
+        },
         "host_reach_coverage": {"type": "object"},
         "kit_facts": {"type": "object"},
+        "resource_coverage": {
+          "type": "object",
+          "$comment": "Since 2.6. Every pipeline stage that stopped at the memory ceiling for this domain (adscan_core/reporting/resource_coverage.py): stage is collection, graph_build, graph_export, attack_paths, report or unknown (no stage was running); examined and total count the stage's unit; statement is the sentence the report prints. Absent when every stage finished. Since 2.12 a stage may also be mssql_post_auth (the work on a database server after sign-in) or mssql_file_review (the file listing on a database server), and reason may be listing_limit: the listing stopped at its fixed bound, with examined the files listed. Since 2.13 a stage may also be winrm_post_auth (the file search on a host over Windows Remote Management after sign-in) or winrm_file_review (the file listing on such a host, which stops at a fixed bound the same way), share_mapping (the file review of network shares, counted in shares, stopped for memory) or share_file_listing (shares whose file listing was cut short: examined counts the shares listed whole, total every share listed), and reason may also be listing_incomplete: a listing ran out of its time budget or ended on an error.",
+          "properties": {
+            "complete": {"type": "boolean"},
+            "stages": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "stage": {"type": "string"},
+                  "unit": {"type": "string"},
+                  "examined": {"type": ["integer", "null"], "$comment": "null when the stage's progress is unknown (the memory sentinel stopped a stage that does not count its units)."},
+                  "total": {"type": ["integer", "null"]},
+                  "reason": {"type": "string"},
+                  "statement": {"type": "string"},
+                  "run_id": {
+                    "type": "string",
+                    "$comment": "Since 2.7. The run that recorded the stop: the same run does not retry a stopped graph build, a later run does and clears the stop on success."
+                  }
+                },
+                "required": ["stage", "statement"]
+              }
+            }
+          },
+          "required": ["stages"]
+        },
         "operator_stop_coverage": {"type": "object", "$comment": "Since 2.4. {stops: [{action, step_id, label, phase_id, phase_title, examined, total, unit, source, statement}]}: every step the operator stopped, phase skipped or scan stopped early, with the client statement (adscan_core/reporting/operator_stop_coverage.py). Absent when nothing was stopped."},
         "scan_pacing": {"type": "object"},
         "scan_policy_coverage": {"type": "object", "$comment": "Self-versioned block (adscan_core/scan_policy/coverage.py). Since 2.2 it may carry agreed_policy: {name, revision, digest, matches, reason?}, the policy agreed with the client for the engagement and whether this run's digest matches it; absent when none was agreed."},

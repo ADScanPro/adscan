@@ -67,6 +67,7 @@ from adscan_internal.services.exploitation.rodc_krbtgt import (
     MIMIKATZ_RODC_CMD_PATCH,
     RodcKrbtgtExtractionRequest,
     RodcKrbtgtExtractionService,
+    record_mimikatz_offline_gap,
     resolve_mimikatz_for_rodc,
 )
 from adscan_internal.services.rodc_host_access import parse_rodc_host_access_outcome
@@ -539,6 +540,14 @@ def _run_user_share_followup(
         "title='Enumerate SMB Shares' "
         f"user={marked_user} domain={marked_domain}"
     )
+    # The live share view below connects to the domain's PDC (no host named):
+    # listing a host's shares is host work, asked of the engagement scope first.
+    from adscan_internal.cli.smb import pdc_share_host_in_scope  # noqa: PLC0415
+
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="smb_share_enumeration", what="SMB share enumeration"
+    ):
+        return
     with active_step_followup(
         shell,
         source="attack_path_runtime_followup",
@@ -808,6 +817,13 @@ def _run_rbcd_share_followup(
         "Enumerating SMB shares via prepared RBCD ticket for "
         f"{mark_sensitive(delegated_user, 'user')}."
     )
+    # The live share view below connects to the domain's PDC (no host named).
+    from adscan_internal.cli.smb import pdc_share_host_in_scope  # noqa: PLC0415
+
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="smb_share_enumeration", what="SMB share enumeration"
+    ):
+        return
     with active_step_followup(
         shell,
         source="attack_path_runtime_followup",
@@ -1210,6 +1226,10 @@ def _run_rodc_krbtgt_followup(
     print_info("Resolving mimikatz from catalog...")
     mimikatz_path = resolve_mimikatz_for_rodc()
     if not mimikatz_path:
+        offline_detail = record_mimikatz_offline_gap(shell, effective_domain)
+        if offline_detail:
+            print_warning(offline_detail)
+            return
         print_error(
             "mimikatz is not available in the binary_ops cache. "
             "Run 'adscan install' to download it, or check your network."
@@ -1321,8 +1341,14 @@ def _run_rodc_krbtgt_followup(
     # so the synthetic FollowupState nodes are absent and edge updates silently
     # fail with edge_nodes_not_found.  Idempotent — safe to call each time.
     try:
-        _graph = load_attack_graph(shell, effective_domain)
-        persist_rodc_followup_chain_edges(shell, effective_domain, _graph)
+        from adscan_internal.services import graph_runtime  # noqa: PLC0415
+
+        # The chain is written into the loaded graph; inside the write scope that graph
+        # is the recorded live one, so each node and edge becomes an overlay op that
+        # survives a rebuild (outside it the change would live in memory only).
+        with graph_runtime.write_scope(shell, origin="rodc_followup_chain"):
+            _graph = load_attack_graph(shell, effective_domain)
+            persist_rodc_followup_chain_edges(shell, effective_domain, _graph)
     except Exception:
         pass
 

@@ -11,6 +11,7 @@ Design: docs/superpowers/specs/2026-11-04-scan-policy-checks-by-family-design.md
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from adscan_core.scan_policy.model import (
@@ -35,7 +36,11 @@ from adscan_core.scan_policy.model import (
 from adscan_core.scan_policy.model import CheckDefinition
 from adscan_core.scan_policy.policy import BASE_RULES
 from adscan_core.scan_policy.registry import CheckRegistry, load_registry
-from adscan_core.scan_policy.resolve import ResolvedScanPolicy
+from adscan_core.scan_policy.resolve import (
+    ResolvedScanPolicy,
+    RevertPermissionContext,
+    re_resolve_with_revert_permission,
+)
 
 
 def _n(count: int, singular: str, plural: str) -> str:
@@ -236,6 +241,115 @@ def dependency_lines(
     return lines
 
 
+def _client_units(reg: CheckRegistry) -> tuple[list[CheckDefinition], list[CheckDefinition]]:
+    """The two sets a client counts: attack steps, and vulnerability checks.
+
+    Paired detections are reported with their step, so they are not counted as
+    checks of their own, collection is neither group, and a check ADscan never
+    executes is not something a policy can turn on.
+    """
+    runnable = [c for c in reg.checks if c.locked_state != LOCKED_NEVER_EXECUTED]
+    steps = [c for c in runnable if c.group == GROUP_ATTACK_STEPS and c.kind == KIND_TECHNIQUE]
+    vulns = [
+        c for c in runnable if c.group == GROUP_VULNERABILITIES and not c.is_paired_detection
+    ]
+    return steps, vulns
+
+
+@dataclass(frozen=True)
+class PolicyCounts:
+    """How many attack steps and vulnerability checks a policy runs.
+
+    The figure belongs to the POLICY, not to the moment it is read: a step whose
+    change only a cleanup account can undo runs with such an account and is
+    left out without one, so a figure taken from whatever context the caller
+    resolved in moved when the account was loaded (the editor said 35 of 81 and
+    ``policy use`` 59 of 81 for one policy). Both figures are therefore always
+    derived from the definition itself, and both are stated when they differ.
+
+    Attributes:
+        attack_steps_enabled: Attack steps the policy runs on its own.
+        attack_steps_with_cleanup_account: Attack steps it runs when a cleanup
+            account is supplied for the scan.
+        attack_steps_total: Attack steps a policy can turn on.
+        vulnerability_checks_enabled: Vulnerability checks it runs on its own.
+        vulnerability_checks_with_cleanup_account: The same with a cleanup account.
+        vulnerability_checks_total: Vulnerability checks a policy can turn on.
+    """
+
+    attack_steps_enabled: int
+    attack_steps_with_cleanup_account: int
+    attack_steps_total: int
+    vulnerability_checks_enabled: int
+    vulnerability_checks_with_cleanup_account: int
+    vulnerability_checks_total: int
+
+    @property
+    def line(self) -> str:
+        """``N of M attack steps, or K with a cleanup account; X of Y vulnerability checks``."""
+        steps = f"{self.attack_steps_enabled} of {self.attack_steps_total} attack steps"
+        vulns = (
+            f"{self.vulnerability_checks_enabled} of {self.vulnerability_checks_total} "
+            "vulnerability checks"
+        )
+        conditional_steps = self.attack_steps_with_cleanup_account != self.attack_steps_enabled
+        conditional_vulns = (
+            self.vulnerability_checks_with_cleanup_account != self.vulnerability_checks_enabled
+        )
+        if conditional_steps:
+            steps += f", or {self.attack_steps_with_cleanup_account} with a cleanup account"
+        if conditional_vulns:
+            vulns += f", or {self.vulnerability_checks_with_cleanup_account} with a cleanup account"
+        return f"{steps}; {vulns}" if conditional_steps or conditional_vulns else f"{steps}, {vulns}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attack_steps_enabled": self.attack_steps_enabled,
+            "attack_steps_with_cleanup_account": self.attack_steps_with_cleanup_account,
+            "attack_steps_total": self.attack_steps_total,
+            "vulnerability_checks_enabled": self.vulnerability_checks_enabled,
+            "vulnerability_checks_with_cleanup_account": self.vulnerability_checks_with_cleanup_account,
+            "vulnerability_checks_total": self.vulnerability_checks_total,
+            "line": self.line,
+        }
+
+
+def policy_views(
+    resolved: ResolvedScanPolicy, registry: CheckRegistry | None = None
+) -> tuple[ResolvedScanPolicy, ResolvedScanPolicy]:
+    """The policy resolved on its own and with a cleanup account, whatever ``resolved`` assumed."""
+    reg = registry or load_registry()
+    alone = re_resolve_with_revert_permission(resolved, None, reg)
+    with_account = re_resolve_with_revert_permission(
+        resolved, RevertPermissionContext(cleanup_account_supplied=True), reg
+    )
+    return alone, with_account
+
+
+def policy_counts(resolved: ResolvedScanPolicy, registry: CheckRegistry | None = None) -> PolicyCounts:
+    """THE "N of M attack steps" figure of a policy, for every surface.
+
+    Independent of the run context ``resolved`` was resolved in (see
+    :class:`PolicyCounts`), so the editor, ``policy use``, ``policy show``,
+    ``policy list`` and the web never print two totals for one policy.
+    """
+    reg = registry or load_registry()
+    steps, vulns = _client_units(reg)
+    alone, with_account = policy_views(resolved, reg)
+
+    def _on(view: ResolvedScanPolicy, checks: list[CheckDefinition]) -> int:
+        return sum(1 for c in checks if c.check_id in view.effective_ids)
+
+    return PolicyCounts(
+        attack_steps_enabled=_on(alone, steps),
+        attack_steps_with_cleanup_account=_on(with_account, steps),
+        attack_steps_total=len(steps),
+        vulnerability_checks_enabled=_on(alone, vulns),
+        vulnerability_checks_with_cleanup_account=_on(with_account, vulns),
+        vulnerability_checks_total=len(vulns),
+    )
+
+
 def build_policy_safety_summary(
     resolved: ResolvedScanPolicy, registry: CheckRegistry | None = None
 ) -> dict[str, Any]:
@@ -278,11 +392,7 @@ def build_policy_safety_summary(
     # is neither group. Every figure below, the "N of M" and each safety count,
     # is computed over these two sets, so a delta between two policies is a plain
     # subtraction of the same figures (``tests/unit/scan_policy/test_summary_units.py``).
-    runnable = [c for c in reg.checks if c.locked_state != LOCKED_NEVER_EXECUTED]
-    steps = [c for c in runnable if c.group == GROUP_ATTACK_STEPS and c.kind == KIND_TECHNIQUE]
-    vulns = [
-        c for c in runnable if c.group == GROUP_VULNERABILITIES and not c.is_paired_detection
-    ]
+    steps, vulns = _client_units(reg)
     steps_on = [c for c in steps if c.check_id in resolved.effective_ids]
     vulns_on = [c for c in vulns if c.check_id in resolved.effective_ids]
 
@@ -419,7 +529,10 @@ def policy_sends_password_attempts(safety_summary: Any) -> bool | None:
 
 
 __all__ = (
+    "PolicyCounts",
     "build_policy_safety_summary",
+    "policy_counts",
+    "policy_views",
     "policy_sends_password_attempts",
     "dependency_lines",
     "revert_permission_lines",

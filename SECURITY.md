@@ -6,8 +6,8 @@ Security fixes ship in a new release of the latest major version. We do not back
 
 | Version | Security fixes |
 |---------|----------------|
-| 14.x    | Yes            |
-| < 14.0  | No. Update to the latest release |
+| 15.x    | Yes            |
+| < 15.0  | No. Update to the latest release |
 
 To update on Linux or macOS, run `adscan update`. On Windows, download the latest `adscan.exe` from the [releases page](https://github.com/ADScanPro/adscan/releases/latest).
 

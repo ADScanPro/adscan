@@ -6,6 +6,12 @@ backend: skelsec-native transports bubble up kerbad/asyauth text, pypsrp uses
 pyspnego/GSSAPI wording, and Impacket TDS raises Impacket Kerberos/socket
 errors.  Keep those catalogues separate so one backend's broad marker does not
 silently change another backend's retry behaviour.
+
+One outcome sits above every catalogue: a contact the engagement-scope egress
+guard stopped (:func:`is_scope_egress_refusal`). The target was never contacted,
+so it is "not checked: excluded from the engagement scope", never a closed port,
+an offline host, a credential rejection or a reason to retry another way. Every
+classifier here answers ``False`` for it.
 """
 
 from __future__ import annotations
@@ -127,9 +133,73 @@ def exception_chain_text(exc_or_msg: Any) -> str:
     return " | ".join(part for part in parts if part)
 
 
+#: How a target the egress guard refused is reported: it was not checked. Never
+#: "closed", "offline" or "no access", which are facts about a contacted host.
+SCOPE_EGRESS_REFUSAL_STATUS = "excluded"
+SCOPE_EGRESS_REFUSAL_LABEL = "not checked: excluded from the engagement scope"
+
+
+def is_scope_egress_refusal(exc_or_msg: Any) -> bool:
+    """Return True when the engagement-scope egress guard stopped the contact.
+
+    Typed first (``AssetScopeEgressRefused`` anywhere in the cause, context or
+    exception-group chain), then the guard's message marker, which survives a
+    library re-raising the error as text and asyncio merging several per-address
+    errors into one ``OSError``. Check it BEFORE any other classifier: the
+    outcome is :data:`SCOPE_EGRESS_REFUSAL_LABEL`, and nothing is retried.
+    """
+    from adscan_core.net_egress_guard import is_egress_refusal  # noqa: PLC0415
+
+    return is_egress_refusal(exc_or_msg)
+
+
 def _matches_any_marker(exc_or_msg: Any, markers: tuple[str, ...]) -> bool:
+    if is_scope_egress_refusal(exc_or_msg):
+        # Not a transport failure, an infrastructure error or a credential
+        # rejection: no catalogue applies, so no fallback or retry is triggered.
+        return False
     text_upper = exception_chain_text(exc_or_msg).upper()
     return any(marker in text_upper for marker in markers)
+
+
+#: Markers of a KDC reply that could not be read as a Kerberos message. The
+#: first two are the vendored Kerberos client's own wording
+#: (``KerberosReplyMalformedError``); the last is the raw decoder message, kept
+#: so a reply that fails to decode on any other path is still named.
+MALFORMED_KDC_REPLY_MARKERS: tuple[str, ...] = (
+    "TRUNCATED KDC REPLY",
+    "MALFORMED OR TRUNCATED KDC REPLY",
+    "INSUFFICIENT DATA -",
+)
+
+#: Operator wording for that condition, one sentence, shared by every surface.
+MALFORMED_KDC_REPLY_SUMMARY = (
+    "The domain controller's Kerberos reply arrived malformed or truncated, so "
+    "it could not be read. This is a transport or protocol fault, not a verdict "
+    "on the credential and not a rejection by the service."
+)
+
+
+def is_malformed_kdc_reply(exc_or_msg: Any) -> bool:
+    """Return True when a Kerberos reply could not be decoded or was cut short.
+
+    Typed first (``KerberosReplyMalformedError`` anywhere in the chain), then
+    the message markers, which survive a library re-raising the error as text.
+    It is never a credential rejection and never retried silently: the caller
+    reports it as what it is.
+    """
+    if is_scope_egress_refusal(exc_or_msg):
+        return False
+    if isinstance(exc_or_msg, BaseException):
+        seen: set[int] = set()
+        current: BaseException | None = exc_or_msg
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if type(current).__name__ == "KerberosReplyMalformedError":
+                return True
+            current = current.__cause__ or current.__context__
+    text_upper = exception_chain_text(exc_or_msg).upper()
+    return any(marker in text_upper for marker in MALFORMED_KDC_REPLY_MARKERS)
 
 
 def is_native_kerberos_infra_error(exc_or_msg: Any) -> bool:
@@ -241,6 +311,8 @@ def is_transport_loss_error(exc_or_msg: Any) -> bool:
     import asyncio  # noqa: PLC0415 - keep the module import-light
     import errno  # noqa: PLC0415
 
+    if is_scope_egress_refusal(exc_or_msg):
+        return False
     network_errnos = {
         getattr(errno, name)
         for name in (

@@ -55,6 +55,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from adscan_core.reporting.user_exposure_ranking import affected_user_key
 from adscan_internal.services.attack_relation_labels import (
     format_business_relation_label,
 )
@@ -489,7 +490,7 @@ def _build_domain_tier2_set(paths: Iterable[Mapping[str, Any]]) -> set[str] | No
                 and user.strip()
                 and str(tier).strip().lower() == "tier2"
             ):
-                result.add(user.strip().lower())
+                result.add(affected_user_key(user))
     return result if saw_tier_data else None
 
 
@@ -522,10 +523,29 @@ def _path_affected_users(
     users = meta.get("affected_users")
     if not isinstance(users, (list, tuple, set)):
         return set()
-    names = {u.strip().lower() for u in users if isinstance(u, str) and u.strip()}
+    # One key for both sides: the affected list names an account bare or as its
+    # graph label (``ADSCAN@CORP.EXAMPLE``), the tier map names it bare.
+    names = {affected_user_key(u) for u in users if isinstance(u, str) and u.strip()}
     if tier2_set is not None:
         return names & tier2_set
     return names
+
+
+def _path_source_kind(path: Mapping[str, Any]) -> str:
+    """Return the object kind of the principal a path STARTS from, lower-cased.
+
+    Read from the first step's ``details.source_kind``, which the engine stamps
+    from the graph node (directory data, never the name's shape). ``""`` when the
+    record does not carry it.
+    """
+    steps = path.get("steps")
+    if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)) or not steps:
+        return ""
+    first = steps[0]
+    details = first.get("details") if isinstance(first, Mapping) else None
+    if not isinstance(details, Mapping):
+        return ""
+    return str(details.get("source_kind") or "").strip().lower()
 
 
 def domain_affected_user_total(paths: Iterable[Mapping[str, Any]]) -> int:
@@ -653,6 +673,11 @@ class TechniquePriority:
     #: ``meta.affected_users`` (an older snapshot), which degrades reach to the
     #: legacy path-count lead rather than fabricating a number.
     reach_users: int = 0
+    #: The distinct object kinds (``user`` / ``group`` / ``computer`` / ...) of the
+    #: principals this technique's paths START from, sorted. ``"unknown"`` stands
+    #: for a path whose record carries no source kind. The copy reads it to say
+    #: where a fix's paths originate; it never assumes a kind.
+    source_kinds: tuple[str, ...] = ()
     #: The HOLDER-aware remediation verdict, taken from the instance of this
     #: technique the client can actually CHANGE, not from the technique itself.
     #:
@@ -958,6 +983,7 @@ def compute_technique_priorities(
                     "paths_affected": 0,
                     "principals": set(),
                     "affected_users": set(),
+                    "source_kinds": set(),
                     "domains": set(),
                     "exploited_paths": 0,
                     "worst_severity": severity,
@@ -980,6 +1006,7 @@ def compute_technique_priorities(
             # A set union, so a user on several of this technique's paths counts
             # once — the overlap-honesty rule.
             state["affected_users"] |= path_users
+            state["source_kinds"].add(_path_source_kind(path) or "unknown")
             if path_domain:
                 state["domains"].add(path_domain)
             if status == "exploited":
@@ -1095,6 +1122,7 @@ def compute_technique_priorities(
                 mitre_technique_id=metadata["mitre_technique_id"],
                 mitre_technique_name=metadata["mitre_technique_name"],
                 reach_users=len(state["affected_users"]),
+                source_kinds=tuple(sorted(state["source_kinds"])),
                 remediability_kind=holder_kind,
                 remediability_verb=holder_verb,
                 holder_label=holder_label,

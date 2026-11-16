@@ -20,13 +20,16 @@ and a TCP pre-filter on the MSSQL port performed by the caller.
 from __future__ import annotations
 
 import asyncio
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from adscan_internal import print_info_debug, telemetry
+from adscan_core.scan_control.fanout import SweepCoverage, run_stoppable_fanout
 from adscan_internal.integrations.mssql import queries
 from adscan_internal.integrations.mssql.native_backend import ImpacketMSSQLBackend
 from adscan_internal.rich_output import mark_sensitive
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
 from adscan_internal.services.service_access_results import ServiceAccessFinding
+from adscan_internal.services.sweep_stop import note_outside_scope
 from adscan_core.rich_output import print_exception
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
@@ -199,8 +202,15 @@ async def run_mssql_access_probe_sweep(
     timeout: int | None = None,
     max_workers: int | None = None,
     ntlm_fallback_secret: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    coverage: SweepCoverage | None = None,
+    shell: Any | None = None,
 ) -> list[ServiceAccessFinding]:
     """Probe MSSQL login access concurrently using the native impacket backend.
+
+    Engagement scope: the targets are partitioned once, before the fan-out, so
+    a host the scope excludes never reaches a worker (``shell`` is the session
+    whose scope applies; excluded hosts go to ``coverage.outside_scope``).
 
     Args:
         domain: Target domain of the SQL hosts.
@@ -225,10 +235,14 @@ async def run_mssql_access_probe_sweep(
             (Kerberos → ``KDC_ERR_S_PRINCIPAL_UNKNOWN``). Callers must gate this
             on NTLM not being known-blocked by domain posture, and must never
             pass a ccache here.
+        should_stop: Scan-control stop check (default: the running step's).
+            After a stop no new host is contacted.
+        coverage: Filled with how many hosts were checked and which were not.
 
     Returns:
-        One :class:`ServiceAccessFinding` per resolved target, ordered to match
-        the input ``targets`` order. Never raises.
+        One :class:`ServiceAccessFinding` per CHECKED target, ordered to match
+        the input ``targets`` order (a stop leaves the rest out; see
+        ``coverage``). Never raises.
     """
     resolved_targets: list[str] = []
     seen: set[str] = set()
@@ -239,6 +253,34 @@ async def run_mssql_access_probe_sweep(
         seen.add(target.lower())
         resolved_targets.append(target)
 
+    hostname_map = {
+        _normalize_target(ip).lower(): _normalize_target(host)
+        for ip, host in (target_hostnames or {}).items()
+        if _normalize_target(host)
+    }
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        fanout_scope_gate,
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(
+        shell,
+        resolved_targets,
+        key=lambda target: hostname_map.get(target.lower()) or target,
+        address=lambda target: target,
+        domain=domain,
+    )
+    scope = partition_targets_in_scope(
+        shell,
+        resolved_targets,
+        key=lambda target: hostname_map.get(target.lower()) or target,
+        address=lambda target: target,
+        surface="mssql_access_sweep",
+        what="SQL Server access sweep",
+        domain=domain,
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    resolved_targets = scope.allowed
     if not resolved_targets:
         return []
 
@@ -248,11 +290,6 @@ async def run_mssql_access_probe_sweep(
     worker_count = max(
         1, min(max_workers or get_mssql_probe_worker_count(), len(resolved_targets))
     )
-    hostname_map = {
-        _normalize_target(ip).lower(): _normalize_target(host)
-        for ip, host in (target_hostnames or {}).items()
-        if _normalize_target(host)
-    }
 
     print_info_debug(
         "[mssql_probe] starting native MSSQL access sweep: "
@@ -311,9 +348,25 @@ async def run_mssql_access_probe_sweep(
                     backend=MSSQL_ACCESS_PROBE_BACKEND,
                 )
 
-    findings = list(
-        await asyncio.gather(*(_bounded(host) for host in resolved_targets))
+    outcome = await run_stoppable_fanout(
+        resolved_targets,
+        _bounded,
+        concurrency=worker_count,
+        should_stop=should_stop,
+        # A long sweep: each chunk is prepared and each host judged again right
+        # before its contact (the partition above is from the sweep's start).
+        before_item=fanout_scope_gate(
+            shell,
+            resolved_targets,
+            surface="mssql_access_sweep",
+            key=lambda target: hostname_map.get(target.lower()) or target,
+            address=lambda target: target,
+            domain=domain,
+        ),
     )
+    findings = outcome.completed_results()
+    if coverage is not None:
+        coverage.absorb(outcome, resolved_targets)
 
     confirmed = sum(1 for finding in findings if finding.is_confirmed)
     for finding in findings:

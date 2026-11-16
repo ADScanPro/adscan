@@ -60,7 +60,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import asyncio
 import ipaddress
-import socket
 import threading
 from typing import Any, Callable, Literal
 
@@ -240,13 +239,13 @@ def kernel_source_ip_toward(target_ip: str, port: int = _ROUTE_PROBE_PORT) -> st
     target = _valid_ip(target_ip)
     if target is None:
         return None
-    family = socket.AF_INET6 if ":" in target else socket.AF_INET
-    try:
-        with socket.socket(family, socket.SOCK_DGRAM) as sock:
-            sock.connect((target, port))
-            return str(sock.getsockname()[0])
-    except OSError:
-        return None
+    # Through the egress guard's own route-query helper: asking the routing
+    # table sends no packet, so it is not outbound contact and the engagement
+    # scope backstop must not judge it (a connect on a plain socket would be
+    # refused toward a directory-only controller and degrade the answer).
+    from adscan_core.net_egress_guard import route_source_ip  # noqa: PLC0415
+
+    return route_source_ip(target, port)
 
 
 

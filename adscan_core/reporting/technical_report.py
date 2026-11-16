@@ -353,6 +353,9 @@ def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
     """
     report_path = _get_technical_report_path(shell)
     if report_path.exists():
+        refused = _refuse_a_report_that_does_not_fit(report_path)
+        if refused is not None:
+            return refused
         try:
             with report_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -364,6 +367,75 @@ def _load_technical_report(shell: ReportShell) -> dict[str, Any]:
             print_warning("Failed to load technical report; creating a new one.")
             print_exception(show_locals=False, exception=exc)
     return _init_technical_report()
+
+
+#: Key of the placeholder :func:`_load_technical_report` returns when the file
+#: does not fit in memory. :func:`_save_technical_report` refuses to write such
+#: a placeholder, so a recorder never replaces the real file with it.
+_LOAD_REFUSED_KEY = "__adscan_load_refused__"
+
+#: Below this size the report is always read: its whole load costs a few tens
+#: of megabytes at most, and refusing it would also refuse the small writes that
+#: record a stop while memory is still being released (the last-resort sentinel
+#: covers that margin). The refusal exists for the partner-sized document
+#: (tens of megabytes on disk, three times that while loading).
+_REFUSAL_MIN_BYTES = 16 * 1024 * 1024
+
+#: Stages whose work IS the report: a report they cannot read stops them (their
+#: boundary declares it). Any other stage gets the placeholder.
+_REPORT_READING_STAGES = frozenset({"report", "web_ingestion"})
+
+#: Report files this process already told the operator it could not load.
+_REFUSED_WARNED: set[str] = set()
+_REFUSED_WARNED_LOCK = threading.Lock()
+
+
+def _refuse_a_report_that_does_not_fit(report_path: Path) -> dict[str, Any] | None:
+    """``None`` when the whole report fits in memory, else a placeholder.
+
+    The report is read whole (one ``json.load``, which no guard can interrupt),
+    so the read is refused up front when it would not fit, the way a 14.0.x
+    graph file is (``memory_guard.refuse_whole_load``). Inside the report render
+    or the platform ingestion (stages whose work IS the report) the refusal is
+    that stage's stop, declared by its boundary. Anywhere else the operator is
+    told once and the caller gets an empty placeholder that is never saved:
+    readers see no record, writers write nothing, and the file on disk stays
+    whole for a larger machine. A report under :data:`_REFUSAL_MIN_BYTES` is
+    always read.
+    """
+    try:
+        from adscan_core.memory_guard import (  # noqa: PLC0415
+            MemoryCeilingReached,
+            current_guard,
+            refuse_whole_load,
+        )
+        from adscan_core.reporting.resource_coverage import STAGE_REPORT  # noqa: PLC0415
+
+        size = report_path.stat().st_size
+    except (ImportError, OSError):
+        return None
+    if size < _REFUSAL_MIN_BYTES:
+        return None
+    try:
+        refuse_whole_load(size, stage=STAGE_REPORT)
+        return None
+    except MemoryCeilingReached:
+        guard = current_guard()
+        if guard is not None and guard.stage in _REPORT_READING_STAGES:
+            raise
+    key = str(report_path)
+    with _REFUSED_WARNED_LOCK:
+        first = key not in _REFUSED_WARNED
+        _REFUSED_WARNED.add(key)
+    if first:
+        print_warning(
+            f"The technical report ({size / (1024 * 1024):,.0f} MB) does not fit in the "
+            "memory available here, so it was not read and nothing will be written to "
+            "it in this session. Run on a machine with more memory to update it."
+        )
+    placeholder = _init_technical_report()
+    placeholder[_LOAD_REFUSED_KEY] = True
+    return placeholder
 
 
 # ---------------------------------------------------------------------------
@@ -565,10 +637,21 @@ def _save_technical_report(shell: ReportShell, report: dict[str, Any]) -> None:
     if write_blocked(report_path):
         # A frozen workspace (a recheck) keeps the scan's report byte-identical.
         return
+    if report.get(_LOAD_REFUSED_KEY):
+        # The file did not fit in memory and was never read: writing the
+        # placeholder would replace every finding with nothing.
+        return
     _stamp_coverage_run_id(shell, report)
     # The writer states the format it writes: a report an earlier build created
     # and this one re-saves is in this build's format now.
     report[SCHEMA_VERSION_KEY] = TECHNICAL_REPORT_SCHEMA_VERSION
+    # A licensed run names the licence that produced it (issued identifiers,
+    # never a secret), so a leaked report traces back to its grant.
+    from adscan_core.pro_license.traceability import licence_trace
+
+    trace = licence_trace()
+    if trace:
+        report["licence"] = trace
     # The artifact feeds the deliverable kit and the web platform, so no
     # recovered secret value is ever written into it: the credential store
     # holds the values, the report holds a reference (account + kind).
@@ -1141,6 +1224,85 @@ def record_attack_path_coverage(
     _save_technical_report(shell, report)
 
 
+def record_resource_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+    replace_stage: str | None = None,
+) -> dict[str, Any] | None:
+    """Persist a stage that stopped at its resource ceiling for *domain*.
+
+    Write-side single source of truth for the honest answer to "did every stage
+    of the pipeline finish". A stage stopped by the memory guard
+    (:mod:`adscan_core.memory_guard`) left a result that is not exhaustive; that
+    is a DATA GAP (see :mod:`adscan_core.reporting.resource_coverage`). The
+    block is folded into ``domains[<domain>]["resource_coverage"]``: one entry
+    per stage, the weakest coverage wins (:func:`merge_stage_coverage`), so a
+    later, better run of the same stage never hides an earlier stop the result
+    still rests on. ``replace_stage`` sets or clears that one stage's entry
+    instead (a stage whose declaration describes its latest computation, such as
+    attack-path discovery); ``coverage`` may then be an empty block to clear it.
+
+    Returns the domain's block as persisted, or ``None`` when nothing was
+    written. Best-effort: never raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict):
+        return None
+    try:
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            RESOURCE_COVERAGE_KEY,
+            merge_stage_coverage,
+            replace_stage_coverage,
+        )
+
+        report = _load_technical_report(shell)
+        domain_entry = _ensure_technical_domain(report, domain)
+        current = domain_entry.get(RESOURCE_COVERAGE_KEY)
+        if replace_stage:
+            merged = replace_stage_coverage(current, replace_stage, coverage)
+        else:
+            merged = merge_stage_coverage(current, coverage)
+        if not merged.get("stages"):
+            if RESOURCE_COVERAGE_KEY not in domain_entry:
+                return merged
+            domain_entry.pop(RESOURCE_COVERAGE_KEY, None)
+        else:
+            domain_entry[RESOURCE_COVERAGE_KEY] = merged
+        _save_technical_report(shell, report)
+        return merged
+    except Exception as exc:  # noqa: BLE001 - a coverage write is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
+def read_resource_coverage(
+    shell: ReportShell,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Return the PERSISTED ``resource_coverage`` block for *domain*, or ``None``."""
+    if not domain:
+        return None
+    try:
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            RESOURCE_COVERAGE_KEY,
+        )
+
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        if not isinstance(domains, dict):
+            return None
+        entry = domains.get(domain)
+        if not isinstance(entry, dict):
+            return None
+        block = entry.get(RESOURCE_COVERAGE_KEY)
+        return block if isinstance(block, dict) else None
+    except Exception as exc:  # noqa: BLE001 - a coverage read is best-effort
+        telemetry.capture_exception(exc)
+        return None
+
+
 def read_cracking_coverage(
     shell: ReportShell,
     domain: str,
@@ -1339,6 +1501,30 @@ def record_operator_stop(
     _save_technical_report(shell, report)
 
 
+def record_guest_access_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the guest-access coverage statement for *domain*.
+
+    Write-side SSOT for "on which hosts was guest SMB access never asked". The
+    block (:mod:`adscan_core.reporting.guest_access_coverage`) REPLACES any
+    earlier one: it carries the latest count. Stamped onto
+    ``domains[<domain>]["guest_access_coverage"]`` so the PDF report, the LITE
+    report and ``adscan_web`` render the SAME statement. Best-effort.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    from adscan_core.reporting.guest_access_coverage import GUEST_ACCESS_COVERAGE_KEY
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[GUEST_ACCESS_COVERAGE_KEY] = coverage
+    _save_technical_report(shell, report)
+
+
 def record_host_reach_coverage(
     shell: ReportShell,
     domain: str,
@@ -1369,6 +1555,59 @@ def record_host_reach_coverage(
     report = _load_technical_report(shell)
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry[HOST_REACH_COVERAGE_KEY] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_asset_scope_coverage(
+    shell: ReportShell,
+    domain: str,
+    *,
+    coverage: dict[str, Any],
+) -> None:
+    """Persist the asset-scope coverage block for *domain*.
+
+    Write-side single source of truth for "which hosts and accounts did the
+    client exclude from this assessment, and what did that leave unassessed".
+    An excluded object is a coverage gap the client asked for: it was never
+    contacted or acted on, so it must never read as checked and clean. The block
+    is built by
+    :func:`adscan_core.reporting.engagement_scope.build_asset_scope_coverage`
+    and REPLACES any earlier one for the domain (each stamp re-derives from the
+    latest scope record and verdicts). The PDF report, the LITE report and
+    ``adscan_web`` render it through ``asset_scope_coverage_view``. Best-effort:
+    ignores a missing/invalid payload and never raises into the caller.
+    """
+    if not domain or not isinstance(coverage, dict) or "statement" not in coverage:
+        return
+    from adscan_core.reporting.engagement_scope import ASSET_SCOPE_COVERAGE_KEY
+
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    domain_entry[ASSET_SCOPE_COVERAGE_KEY] = coverage
+    _save_technical_report(shell, report)
+
+
+def record_asset_scope_summary(
+    shell: ReportShell,
+    *,
+    summary: dict[str, Any] | None,
+) -> None:
+    """Persist (or clear) the run-level asset-scope summary.
+
+    ``technical_report.json`` ``asset_scope``: the scope revision and digest the
+    run ended under, who decided it and the run-wide counts, built by
+    :func:`adscan_core.reporting.engagement_scope.build_asset_scope_summary`.
+    ``None`` removes a stale summary (the scope was cleared). Best-effort.
+    """
+    from adscan_core.reporting.engagement_scope import ASSET_SCOPE_SUMMARY_KEY
+
+    report = _load_technical_report(shell)
+    if isinstance(summary, dict) and summary:
+        report[ASSET_SCOPE_SUMMARY_KEY] = summary
+    elif ASSET_SCOPE_SUMMARY_KEY in report:
+        report.pop(ASSET_SCOPE_SUMMARY_KEY, None)
+    else:
+        return
     _save_technical_report(shell, report)
 
 
@@ -1571,6 +1810,53 @@ def record_domain_assessment(
     }
     if basis:
         marker["basis"] = str(basis)
+    previous = domain_entry.get("assessment")
+    if isinstance(previous, dict):
+        # The integrity verdict has its own writer (record_assessment_integrity);
+        # re-recording the enumeration fact must not erase it.
+        for key in _ASSESSMENT_INTEGRITY_KEYS:
+            if key in previous:
+                marker[key] = previous[key]
+    domain_entry["assessment"] = marker
+    _save_technical_report(shell, report)
+
+
+#: Keys of the ``assessment`` block written by :func:`record_assessment_integrity`.
+_ASSESSMENT_INTEGRITY_KEYS = ("complete", "incomplete_phases")
+
+
+def record_assessment_integrity(
+    shell: ReportShell,
+    domain: str,
+    *,
+    incomplete_phases: list[dict[str, Any]],
+) -> None:
+    """Record which scan phases of *domain* ran but did not finish their work.
+
+    The JSON half of the run's completeness verdict: the console, ``adscan ci``'s
+    exit status and ``coverage.json`` read the same record
+    (``scan_progress.mark_phase_incomplete``). Each entry carries ``phase_id``,
+    ``title``, ``reasons`` and ``detail``. With entries the block reads
+    ``complete: false``; with none, both keys are removed (absence means no gap
+    was recorded, never a claim the phase was checked). Stamped inside
+    ``domains[<domain>]["assessment"]`` so a deliverable rendered later from this
+    file knows the assessment was incomplete. Best-effort, never raises.
+    """
+    if not domain:
+        return
+    report = _load_technical_report(shell)
+    domain_entry = _ensure_technical_domain(report, domain)
+    previous = domain_entry.get("assessment")
+    marker: dict[str, Any] = dict(previous) if isinstance(previous, dict) else {}
+    rows = [dict(row) for row in incomplete_phases or () if isinstance(row, dict) and row.get("phase_id")]
+    if rows:
+        marker["complete"] = False
+        marker["incomplete_phases"] = rows
+    else:
+        for key in _ASSESSMENT_INTEGRITY_KEYS:
+            marker.pop(key, None)
+    if marker == previous or (not marker and previous is None):
+        return
     domain_entry["assessment"] = marker
     _save_technical_report(shell, report)
 
@@ -1597,6 +1883,44 @@ def record_exposure_score(
     domain_entry = _ensure_technical_domain(report, domain)
     domain_entry["exposure_score"] = exposure
     _save_technical_report(shell, report)
+
+
+#: The per-domain blocks derived from the domain's attack-path listing. When
+#: the domain's graph is not available they describe nothing this run measured,
+#: so they are removed rather than left from an earlier run or recomputed over an
+#: empty graph (where they would read as a clean domain).
+ROUTE_DERIVED_DOMAIN_BLOCKS: tuple[str, ...] = (
+    "exposure_score",
+    "exposure_kpis",
+    "chokepoint_cardinality",
+)
+
+
+def clear_route_derived_blocks(shell: ReportShell, domain: str) -> list[str]:
+    """Remove *domain*'s route-derived blocks (:data:`ROUTE_DERIVED_DOMAIN_BLOCKS`).
+
+    Writes only when a block was present. Returns the keys removed. Best-effort:
+    never raises into the caller.
+    """
+    if not domain:
+        return []
+    try:
+        report = _load_technical_report(shell)
+        domains = report.get("domains")
+        entry = domains.get(domain) if isinstance(domains, dict) else None
+        if not isinstance(entry, dict):
+            return []
+        removed = [key for key in ROUTE_DERIVED_DOMAIN_BLOCKS if key in entry]
+        if not removed:
+            return []
+        for key in removed:
+            entry.pop(key, None)
+        _save_technical_report(shell, report)
+        return removed
+    except Exception as exc:  # noqa: BLE001 - clearing a block is best-effort
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
 
 
 def record_attack_fanout_rollup(

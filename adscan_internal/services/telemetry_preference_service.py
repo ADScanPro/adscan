@@ -23,6 +23,12 @@ from adscan_core.telemetry_preference import (
     resolve_effective_telemetry,
     save_global_preference,
 )
+from adscan_core.telemetry_disclosure import (
+    TELEMETRY_GLOBAL_KEYWORD,
+    TELEMETRY_OFF_GLOBAL_COMMAND,
+    TELEMETRY_ON_GLOBAL_COMMAND,
+    TELEMETRY_ON_WORKSPACE_COMMAND,
+)
 from adscan_internal import telemetry
 from adscan_internal.rich_output import (
     print_error,
@@ -31,7 +37,7 @@ from adscan_internal.rich_output import (
     print_warning,
 )
 
-SCOPE_GLOBAL = "global"
+SCOPE_GLOBAL = TELEMETRY_GLOBAL_KEYWORD
 SCOPE_WORKSPACE = "workspace"
 
 _ON_TOKENS = {"true", "on", "1", "yes", "enable", "enabled"}
@@ -49,8 +55,8 @@ _SCOPE_TOKENS = {
 # No square brackets: Rich parses them as markup and would swallow the token.
 USAGE = (
     "Usage: set telemetry <on|off> — applies to this workspace. "
-    "Add 'global' to change the default for every workspace: "
-    "set telemetry off global"
+    f"Add '{TELEMETRY_GLOBAL_KEYWORD}' to change the default for every workspace: "
+    f"{TELEMETRY_OFF_GLOBAL_COMMAND}"
 )
 
 
@@ -194,8 +200,8 @@ def _report(
                 "including new ones, and it persists across sessions."
             )
             print_info(
-                "Turn it back on everywhere with 'set telemetry on global', or "
-                "just for this workspace with 'set telemetry on'."
+                f"Turn it back on everywhere with '{TELEMETRY_ON_GLOBAL_COMMAND}', or "
+                f"just for this workspace with '{TELEMETRY_ON_WORKSPACE_COMMAND}'."
             )
         return
 
@@ -206,14 +212,14 @@ def _report(
         if global_preference is False:
             print_info(
                 "This overrides your global opt-out for this workspace only. "
-                "Opt in everywhere with 'set telemetry on global'."
+                f"Opt in everywhere with '{TELEMETRY_ON_GLOBAL_COMMAND}'."
             )
         return
 
     print_success(f"Telemetry is off for {workspace_label} (this engagement only).")
     print_info(
         "Other workspaces are unaffected. Re-enable it here with "
-        "'set telemetry on', or opt out everywhere with 'set telemetry off global'."
+        f"'{TELEMETRY_ON_WORKSPACE_COMMAND}', or opt out everywhere with '{TELEMETRY_OFF_GLOBAL_COMMAND}'."
     )
 
 

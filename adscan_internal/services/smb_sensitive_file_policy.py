@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Final
 
 
@@ -213,6 +212,19 @@ def get_production_sensitive_scan_phase_sequence() -> tuple[str, ...]:
     )
 
 
+def _casefolded_suffixes(path: str) -> list[str]:
+    """The suffixes of a path's file name, lower case (``a/b.tar.gz`` -> ``.tar``, ``.gz``).
+
+    Same answer as ``pathlib.Path(path).suffixes`` for a file name, computed on
+    the string: this runs once per listed file of a share, and ``pathlib``
+    interns every path part it parses, which grows with the listing.
+    """
+    name = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith("."):
+        return []
+    return [f".{part.casefold()}" for part in name.lstrip(".").split(".")[1:]]
+
+
 def resolve_effective_sensitive_extension(
     path: str,
     *,
@@ -226,7 +238,7 @@ def resolve_effective_sensitive_extension(
         ``vault.kdbx.old`` -> ``.kdbx``
         ``report.txt`` -> ``.txt``
     """
-    suffixes = [suffix.casefold() for suffix in Path(str(path or "")).suffixes]
+    suffixes = _casefolded_suffixes(str(path or ""))
     if not suffixes:
         return ""
     normalized_allowed = {

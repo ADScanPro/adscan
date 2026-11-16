@@ -20,6 +20,16 @@ were lost. Now the shell hands every SIGINT to :func:`handle_sigint` first:
      and the REPL returns to its prompt. Ctrl+C never ends an interactive CLI;
    * unattended: the graceful shutdown, as before.
 
+The interactive shell runs every REPL command inside a command scope
+(:meth:`ScanControl.command`), so case 3 is only reached between commands.
+Inside a command outside any scan the menu offers "Stop this command and return
+to the prompt" and "Keep going". A stop unwinds at the command's next boundary;
+when the command has none left to reach (no long step draining its work), a
+watchdog stops it after :data:`COMMAND_STOP_GRACE_SECONDS` by raising
+:class:`ScanAbortRequested` on the main thread, and a further Ctrl+C after the
+stop was chosen does that at once. The REPL reports the command as stopped and
+the session goes on.
+
 The menu renders on its own daemon thread so the scan keeps working while the
 operator reads it. Before rendering it pauses every ``LiveSession`` and holds the
 visible console (other threads' output is captured and replayed afterwards,
@@ -34,7 +44,11 @@ import threading
 import time
 from typing import Any, Callable
 
-from adscan_core.scan_control.controller import ScanControl, scan_control
+from adscan_core.scan_control.controller import (
+    ScanAbortRequested,
+    ScanControl,
+    scan_control,
+)
 from adscan_core.scan_control.vocabulary import (
     SOURCE_OPERATOR_MENU,
     SOURCE_SIGNAL,
@@ -75,6 +89,21 @@ _MENU_OPEN = threading.Event()
 #: A second Ctrl+C within this many seconds of a command cancel is absorbed.
 COMMAND_CANCEL_DEBOUNCE_SECONDS = 1.0
 _LAST_COMMAND_CANCEL = -1e9
+#: Seconds a stopped command gets to reach a boundary on its own when no long
+#: step is draining work in flight. After that it is stopped on the main thread.
+COMMAND_STOP_GRACE_SECONDS = 5.0
+#: Seconds a stopped command gets when a long step saw the stop and is draining
+#: its work in flight (a host fan-out gives in-flight hosts about 20 s, then
+#: persists what it found).
+COMMAND_STOP_DRAIN_SECONDS = 60.0
+_WATCH_POLL_SECONDS = 0.25
+#: Shown when a stopped command had to be stopped on the main thread.
+COMMAND_FORCED_STOP_NOTICE = (
+    "The command did not reach a safe stopping point in time; stopping it now."
+)
+#: Shown when Ctrl+C is pressed again after "Stop this command" was chosen.
+COMMAND_IMMEDIATE_STOP_NOTICE = "Stopping the command now."
+_LAST_COMMAND_STOP_CHOICE = -1e9
 
 
 def menu_is_open() -> bool:
@@ -118,6 +147,10 @@ def handle_sigint(
         open_menu: Menu launcher (default: :func:`open_operator_menu`).
     """
     ctl = control or scan_control()
+    forced = ctl.consume_hard_cancel()
+    if forced is not None:
+        # The stop watchdog: a stopped command had no boundary left to reach.
+        raise ScanAbortRequested(forced)
     if _main_thread_in_prompt():
         raise KeyboardInterrupt
     if ctl.active():
@@ -128,11 +161,38 @@ def handle_sigint(
                 ctl.request(ControlRequest(ControlAction.ABORT_SCAN, source=SOURCE_OPERATOR_MENU))
                 _warn(_DECISION_NOTICES[ControlAction.ABORT_SCAN])
                 return
+            if ctl.command_stop_pending():
+                # The operator already chose "Stop this command"; pressing
+                # Ctrl+C again means now. A press right behind the choice (a
+                # doubled delivery) is absorbed.
+                if time.monotonic() - _LAST_COMMAND_STOP_CHOICE < COMMAND_CANCEL_DEBOUNCE_SECONDS:
+                    return
+                _warn(COMMAND_IMMEDIATE_STOP_NOTICE)
+                raise ScanAbortRequested(ctl.abort_request())
             (open_menu or open_operator_menu)(ctl)
             return
-        if ctl.note_signal() == 1:
+        now = time.monotonic()
+        # The first signal's time is recorded by the controller BEFORE anything
+        # else happens here. A second delivery of the same Ctrl+C can run this
+        # handler NESTED inside the first one (CPython checks for signals between
+        # the bytecodes of a running handler too); when the time was a module
+        # global set after the notice, the nested call saw no clean stop yet and
+        # took the immediate shutdown: exit 130, no coverage, no notice (F29).
+        if ctl.note_first_signal(now):
             ctl.request(ControlRequest(ControlAction.ABORT_SCAN, source=SOURCE_SIGNAL))
             _warn(UNATTENDED_STOP_NOTICE)
+            return
+        # A terminal delivers one Ctrl+C as a signal to the whole foreground
+        # process group, and a parent that forwards signals (a `docker -it` TTY,
+        # a onefile bootloader) makes the engine see it twice; a panicked user
+        # also double-taps. A second SIGINT within the debounce of the clean stop
+        # is that, not a deliberate "stop immediately", so absorb it: the clean
+        # stop is already unwinding (it exits 3). Only a press AFTER the window
+        # escalates to the immediate graceful shutdown. Mirrors the idle-prompt
+        # debounce above.
+        since_first = ctl.seconds_since_first_signal(now)
+        if since_first is not None and since_first < COMMAND_CANCEL_DEBOUNCE_SECONDS:
+            _debug("scan-control: repeated unattended Ctrl+C absorbed; clean stop already in progress")
             return
         fallback(signum, frame)
         return
@@ -233,6 +293,7 @@ def open_operator_menu(
 
 
 def _run_menu(control: ScanControl, *, prompt: MenuPrompt | None) -> None:
+    global _LAST_COMMAND_STOP_CHOICE
     held = _hold_console()
     paused = _pause_live()
     action = ControlAction.CONTINUE
@@ -240,15 +301,84 @@ def _run_menu(control: ScanControl, *, prompt: MenuPrompt | None) -> None:
         action = resolve_menu_choice(control, interactive=True, prompt=prompt)
         accepted = apply_menu_choice(control, action)
         notice = _DECISION_NOTICES.get(action, "")
+        if action == ControlAction.ABORT_SCAN and not control.in_scan():
+            notice = _COMMAND_STOP_NOTICE
         if action != ControlAction.CONTINUE and not accepted:
             notice = "That step finished while the menu was open. Continuing."
         _info(notice)
+        if accepted and action == ControlAction.ABORT_SCAN and control.command_stop_pending():
+            _LAST_COMMAND_STOP_CHOICE = time.monotonic()
+            start_command_stop_watchdog(control)
     except Exception as exc:  # noqa: BLE001 - the menu must never break the scan
         _debug(f"scan-control: operator menu failed ({type(exc).__name__}: {exc})")
     finally:
         _resume_live(paused)
         if held:
             _release_console()
+
+
+_COMMAND_STOP_NOTICE = (
+    "Stopping this command: finishing the work already in flight, then returning "
+    "to the prompt. Results found so far are kept. Press Ctrl+C again to stop now."
+)
+
+
+def watch_command_stop(
+    control: ScanControl,
+    generation: int,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    interrupt: Callable[[], bool] | None = None,
+) -> bool:
+    """Stop a stopped command on the main thread once its grace is spent.
+
+    Returns ``True`` when it had to (the command never reached a boundary),
+    ``False`` when the command ended on its own first. A long step that saw the
+    stop and is draining its in-flight work extends the grace to
+    :data:`COMMAND_STOP_DRAIN_SECONDS`, so a sweep keeps what it found.
+    """
+    started = clock()
+    draining = False
+    while True:
+        if control.command_generation != generation or not control.command_stop_pending():
+            return False
+        step = control.current_step()
+        if step is not None and step.long and step.stopped:
+            draining = True
+        allowed = COMMAND_STOP_DRAIN_SECONDS if draining else COMMAND_STOP_GRACE_SECONDS
+        if clock() - started >= allowed:
+            if not control.request_hard_cancel(generation=generation):
+                return False
+            _warn(COMMAND_FORCED_STOP_NOTICE)
+            (interrupt or _interrupt_main)()
+            return True
+        sleep(_WATCH_POLL_SECONDS)
+
+
+def start_command_stop_watchdog(control: ScanControl) -> threading.Thread | None:
+    """Run :func:`watch_command_stop` for the current command on a daemon thread."""
+    generation = control.command_generation
+    thread = threading.Thread(
+        target=watch_command_stop,
+        args=(control, generation),
+        name="adscan-command-stop-watchdog",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        return None
+    return thread
+
+
+def _interrupt_main() -> bool:
+    try:
+        from adscan_core.pal.process import interrupt_main_thread  # noqa: PLC0415
+
+        return interrupt_main_thread()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _questionary_menu_prompt(title: str, options: list[str]) -> int | None:
@@ -304,6 +434,46 @@ def hint_text(control: ScanControl | None = None) -> str:
     if step.stopped or ctl.stop_pending():
         return "Stopping: finishing the work already in flight. Ctrl+C for more options."
     return "Ctrl+C for options: stop this step, skip the phase or stop the scan."
+
+
+#: How each menu action reads inside the options hint.
+_HINT_PHRASES: dict[ControlAction, str] = {
+    ControlAction.SKIP_STEP: "stop this step",
+    ControlAction.SKIP_PHASE: "skip the rest of the phase",
+}
+
+
+def options_hint_text(control: ScanControl | None = None) -> str:
+    """The Ctrl+C hint for a stage that is not a long step, or ``""``.
+
+    :func:`hint_text` speaks only for a long step, which can stop half-way. A
+    stage that cannot (the directory read, the graph save) still runs inside a
+    scan whose menu can skip the rest of the phase or stop the scan; this names
+    exactly the choices the menu will offer at this position, derived from
+    :meth:`ScanControl.menu_choices`, so the hint never promises one it lacks.
+    """
+    ctl = control or scan_control()
+    if not ctl.active() or not ctl.interactive():
+        return ""
+    if ctl.stop_pending():
+        return "Stopping after this stage. Ctrl+C for more options."
+    phrases: list[str] = []
+    for action, _label in ctl.menu_choices():
+        if action == ControlAction.CONTINUE:
+            continue
+        if action == ControlAction.ABORT_SCAN:
+            phrases.append("stop the scan" if ctl.in_scan() else "stop the command")
+            continue
+        phrase = _HINT_PHRASES.get(action)
+        if phrase:
+            phrases.append(phrase)
+    if not phrases:
+        return ""
+    if len(phrases) == 1:
+        joined = phrases[0]
+    else:
+        joined = ", ".join(phrases[:-1]) + " or " + phrases[-1]
+    return f"Ctrl+C for options: {joined}."
 
 
 # ----------------------------------------------------------------------------
@@ -387,11 +557,16 @@ def _telemetry_line(message: str) -> None:
 
 
 __all__ = [
+    "COMMAND_STOP_DRAIN_SECONDS",
+    "COMMAND_STOP_GRACE_SECONDS",
     "UNATTENDED_STOP_NOTICE",
     "apply_menu_choice",
     "handle_sigint",
     "hint_text",
+    "options_hint_text",
     "menu_is_open",
     "open_operator_menu",
     "resolve_menu_choice",
+    "start_command_stop_watchdog",
+    "watch_command_stop",
 ]

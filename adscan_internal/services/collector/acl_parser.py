@@ -7,6 +7,14 @@ from adscan_internal import telemetry
 from adscan_internal.rich_output import print_info_debug, print_warning_debug
 from adscan_internal.services.collector.models import CollectorEdge, NodeKind
 from adscan_core.rich_output import print_exception
+from adscan_core.ad_public_guids import (
+    EXTENDED_RIGHT_GUID_TO_RELATION,
+    PROPERTY_SET_GUID_TO_RELATION,
+    SELF_WRITE_GUID_TO_RELATION,
+)
+from adscan_core.ad_public_guids import (
+    WELL_KNOWN_SCHEMA_ID_GUIDS as _WELL_KNOWN_SCHEMA_ID_GUIDS,
+)
 
 if TYPE_CHECKING:
     from adscan_internal.services.ldap_transport_service import ADscanLDAPConnection
@@ -68,61 +76,11 @@ READ_PROPERTY_GUID_TO_RELATION: dict[str, str] = {
     "msLAPS-EncryptedPassword": "ReadLAPSPassword",
 }
 
-# Well-known property-set GUIDs. Granted via DS_WRITE_PROP on the property set.
-# These are stable Windows constants — no LDAP schema lookup needed.
-PROPERTY_SET_GUID_TO_RELATION: dict[str, str] = {
-    "4c164200-20c0-11d0-a768-00aa006e0529": "WriteAccountRestrictions",  # User-Account-Restrictions
-}
-
-# Well-known extended-right GUIDs (CN=Extended-Rights,CN=Configuration).
-# Granted via DS_CONTROL_ACCESS on an OBJECT_ACE. Stable across all AD environments.
-EXTENDED_RIGHT_GUID_TO_RELATION: dict[str, str] = {
-    "00299570-246d-11d0-a768-00aa006e0529": "ForceChangePassword",
-    "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddSelf",  # Self-Membership
-    "0e10c968-78fb-11d2-90d4-00c04f79dc55": "Enroll",  # Certificate-Enrollment
-    "a05b8cc2-17bc-4802-a710-e7c15ab866a2": "AutoEnroll",  # Certificate-AutoEnrollment
-    "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "GetChanges",
-    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "GetChangesAll",
-    "89e95b76-444d-4c62-991a-0facbeda640c": "GetChangesInFilteredSet",
-}
-
-# Validated-write GUIDs for DS_SELF (0x8) ACEs.
-# DS_SELF + one of these GUIDs means the trustee can perform the named validated
-# write against their own identity only — distinct from DS_WRITE_PROP (AddMember)
-# which grants unrestricted writes.  AD encodes the Self-Membership validated
-# write via the *same* GUID as the `member` attribute (bf9679c0-…) but with
-# the DS_SELF bit instead of DS_WRITE_PROP.  This is a deliberate AD design:
-# the GUID distinguishes *which* attribute; the mask bit determines *who* can
-# be written (self only vs anyone).
-SELF_WRITE_GUID_TO_RELATION: dict[str, str] = {
-    "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddSelf",  # member — Self-Membership
-}
-
-# Static, PRIMARY source for attribute schemaIDGUIDs.
-#
-# Base-schema attributes are defined by MS-ADSC and their schemaIDGUID is FIXED
-# across every AD forest — Microsoft never regenerates them — so resolving them
-# needs no per-attribute CN=Schema query. Querying the DC once per attribute is
-# both fragile (a transient LDAP failure could drop the scoped ACL edge) and
-# unnecessary for these constants, so they are served from this table and the
-# live schema lookup is kept only as a fallback for the rest.
-#
-# Sourcing note: reference/ (SharpHound/BloodHound common-lib well-known-GUID
-# lists, bloodyAD, ldeep) was NOT populated when this table was authored, so
-# every GUID below is a base-schema MS-ADSC constant taken from the published
-# schema — not invented from memory. ``member`` is additionally cross-checked
-# against SELF_WRITE_GUID_TO_RELATION in this same file (same GUID,
-# bf9679c0-…). Attributes whose schemaIDGUID is per-forest / schema-extension
-# generated and therefore NOT fixed — legacy LAPS ``ms-Mcs-AdmPwd``, the
-# Windows LAPS ``msLAPS-*`` attributes, and the RODC reveal groups
-# ``msDS-RevealOnDemandGroup`` / ``msDS-NeverRevealGroup`` — are deliberately
-# ABSENT here and resolve through the live CN=Schema fallback instead.
-_WELL_KNOWN_SCHEMA_ID_GUIDS: dict[str, str] = {
-    "scriptPath": "bf9679a8-0de6-11d0-a285-00aa003049e2",
-    "member": "bf9679c0-0de6-11d0-a285-00aa003049e2",
-    "servicePrincipalName": "f3a64788-5306-11d1-a9c5-0000f80367c1",
-    "msDS-KeyCredentialLink": "5b47d60f-6090-40b2-9f37-2a4de88f3063",
-}
+# The public GUID tables (property sets, extended rights, validated writes and
+# base-schema attribute schemaIDGUIDs) live in ``adscan_core.ad_public_guids``,
+# the one place that says which GUIDs are the same in every forest; telemetry
+# reads the same set to keep them readable. Imported at the top of this module
+# under their historical names.
 
 PROPERTY_GUID_TO_RELATION: dict[str, str] = {
     **WRITE_PROPERTY_GUID_TO_RELATION,

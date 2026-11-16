@@ -90,7 +90,6 @@ PASSTHROUGH_CATEGORIES: frozenset[str] = frozenset(
         "interface",
         "json",
         "lab",
-        "node",
         "pid",
         "provider",
         "status",
@@ -100,6 +99,106 @@ PASSTHROUGH_CATEGORIES: frozenset[str] = frozenset(
         "url",
     }
 )
+
+# Built-in AD principal names (users, groups, NT AUTHORITY identities, with the
+# common Spanish equivalents). Public, not org-specific: telemetry keeps them
+# readable in a domain-qualified label and scrubs only the domain part, and the
+# ``node`` category below leaves such a label for that rule to handle. Moved
+# here from ``adscan_core.telemetry`` (which reads it) so the marker SSOT does
+# not import the telemetry module.
+WELL_KNOWN_PRINCIPAL_NAMES: frozenset[str] = frozenset(
+    {
+        # Built-in users (commonly referenced across tool outputs)
+        "administrator",
+        "guest",
+        "krbtgt",
+        # Spanish built-in user names
+        "administrador",
+        "invitado",
+        # Common well-known groups
+        "domain admins",
+        "enterprise admins",
+        "schema admins",
+        "administrators",
+        "remote management users",
+        "remote desktop users",
+        "account operators",
+        "backup operators",
+        "server operators",
+        "print operators",
+        "dnsadmins",
+        "cert publishers",
+        "protected users",
+        "authenticated users",
+        "everyone",
+        # NT AUTHORITY well-known security principals (public SIDs, not org-specific).
+        # Both the bare label and the "NT AUTHORITY\<name>" qualified form resolve
+        # via _is_well_known_principal (whole-string) and _preserve_well_known_qualified
+        # (split on \\). S-1-5-18 / -19 / -20 / -11 / -9 / -2 / -7.
+        "system",
+        "nt authority\\system",
+        "local service",
+        "nt authority\\local service",
+        "network service",
+        "nt authority\\network service",
+        "authenticated users",
+        "nt authority\\authenticated users",
+        "enterprise domain controllers",
+        "nt authority\\enterprise domain controllers",
+        "anonymous logon",
+        "nt authority\\anonymous logon",
+        # Additional public BUILTIN groups
+        "users",
+        "guests",
+        "replicator",
+        "performance log users",
+        "performance monitor users",
+        "distributed com users",
+        "network configuration operators",
+        "iis_iusrs",
+        "event log readers",
+        "access control assistance operators",
+        "rds remote access servers",
+        "rds endpoint servers",
+        "rds management servers",
+        "hyper-v administrators",
+        "key admins",
+        "enterprise key admins",
+        "cloneable domain controllers",
+        "dnsupdateproxy",
+        "group policy creator owners",
+        "read-only domain controllers",
+        "enterprise read-only domain controllers",
+        "domain controllers",
+        "domain computers",
+        "domain users",
+        "domain guests",
+        # Spanish group name equivalents (best-effort; environments may differ)
+        "administradores del dominio",
+        "usuarios del dominio",
+        "invitados del dominio",
+        "administradores de empresa",
+        "administradores de esquema",
+        "administradores",
+        "usuarios de administracion remota",
+        "usuarios de administracion",
+        "usuarios de escritorio remoto",
+        "operadores de cuenta",
+        "operadores de copia de seguridad",
+        "operadores de servidor",
+        "operadores de impresion",
+        "usuarios autenticados",
+        "todos",
+    }
+)
+
+# Categories whose REAL marker is chosen from the value's shape at mark time.
+# ``node`` is an attack-graph object label: a user, a group, a host, a domain, a
+# Group Policy object. It used to be a passthrough, which left about 55 call
+# sites printing object labels unmarked (a GPO's {GUID} reached a recording in
+# clear). Routing it here covers every call site without editing one; see
+# :func:`_mark_object_label_by_shape`.
+SHAPE_ROUTED_CATEGORIES: frozenset[str] = frozenset({"node"})
 
 # Passthrough markers (invisible) for non-sensitive values.
 PASSTHROUGH_MARKERS: Dict[str, Tuple[str, str]] = {
@@ -245,6 +344,8 @@ def mark_sensitive(value: str, data_type: str) -> str:
         return value
 
     resolved = resolve_category(data_type)
+    if resolved in SHAPE_ROUTED_CATEGORIES:
+        return _mark_object_label_by_shape(value)
     markers = SENSITIVE_MARKERS.get(resolved)
     if markers is None:
         if resolved not in PASSTHROUGH_CATEGORIES:
@@ -252,3 +353,82 @@ def mark_sensitive(value: str, data_type: str) -> str:
         return value
     start, end = markers
     return f"{start}{value}{end}"
+
+
+_NETBIOS_SEPARATOR = "\\"
+
+
+def _is_public_constant(value: str) -> bool:
+    """A label that identifies no client: a public SID or a public AD GUID.
+
+    Never raises (a print path calls it): when the check cannot run, the label
+    is treated as client data and gets marked, the safe direction.
+    """
+    try:
+        from adscan_core.ad_public_guids import is_public_ad_guid  # noqa: PLC0415
+        from adscan_core.reporting.well_known_principals import (  # noqa: PLC0415
+            is_public_well_known_sid,
+        )
+
+        return is_public_well_known_sid(value) or is_public_ad_guid(value)
+    except Exception:  # noqa: BLE001 - marking must never break a print
+        return False
+
+
+def _is_well_known_name(name: str) -> bool:
+    return name.strip().lower() in WELL_KNOWN_PRINCIPAL_NAMES
+
+
+def _mark_name_part(name: str) -> str:
+    if _is_public_constant(name):
+        return name
+    return mark_sensitive(name, "hostname" if name.endswith("$") else "user")
+
+
+def _mark_object_label_by_shape(label: str) -> str:
+    """Mark an attack-graph object label with the real category its shape names.
+
+    * A public constant (a SID with no domain part, an extended-right, schema
+      or default-GPO GUID) is returned as it is: it names no client and a
+      reviewer needs it readable. That is what the old passthrough did for it.
+    * ``name@realm`` and ``REALM`` + backslash + ``name``: a built-in name
+      (Domain Admins, Everyone) marks the whole label as a user, so telemetry
+      keeps the public name and scrubs only the realm; otherwise the name is
+      marked as a user (a host for ``NAME$``) and the realm as a domain,
+      separately, so the realm gets the same pseudonym it gets everywhere else.
+      The ``@WELLKNOWN`` sentinel is not a directory and is left as it is.
+    * A dotted label with no space, or ``NAME$``: a host (the hostname/domain pair).
+    * Anything else (a group or GPO name, a ``{GUID}``): a user name.
+
+    On screen the label is unchanged: only invisible markers are added.
+    """
+    text = label.strip()
+    if _is_public_constant(text):
+        return label
+    if "@" in text:
+        name, _, realm = text.rpartition("@")
+        if realm.upper() == "WELLKNOWN":
+            return label
+        if name and realm:
+            if _is_well_known_name(name):
+                return mark_sensitive(label, "user")
+            return f"{_mark_name_part(name)}@{mark_sensitive(realm, 'domain')}"
+    if _NETBIOS_SEPARATOR in text:
+        realm, _, name = text.partition(_NETBIOS_SEPARATOR)
+        if name and realm:
+            if _is_well_known_name(text) or _is_well_known_name(name):
+                return mark_sensitive(label, "user")
+            return f"{mark_sensitive(realm, 'domain')}{_NETBIOS_SEPARATOR}{_mark_name_part(name)}"
+    if text.endswith("$") or ("." in text and not any(ch.isspace() for ch in text)):
+        return mark_sensitive(label, "hostname")
+    return mark_sensitive(label, "user")
+
+
+def mark_object_label(label: str) -> str:
+    """Mark a directory object's label for telemetry: ``mark_sensitive(label, "node")``.
+
+    Kept as the readable name for call sites that mark an object label; the
+    routing itself lives in :func:`mark_sensitive` so every ``"node"`` call
+    site gets it too.
+    """
+    return mark_sensitive(label, "node")

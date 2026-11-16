@@ -730,25 +730,32 @@ def run_native_collection(
                     else None
                 )
             )
-            with cli_host_sweep_stop(host_cancellation, shell=shell):
-                result = CollectionOrchestrator().collect_scope(
-                    shell=shell,
-                    scopes=[scope],
-                    credential=credential,
-                    collection_scope=collection_scope,
-                    collect_smb=selection.collect_samr,
-                    collect_shares=selection.collect_shares,
-                    posture_sink=posture_sink,
-                    posture_snapshot=posture_snapshot,
-                    progress_callback=_make_collector_progress_callback(target_domain),
-                    host_progress_callback=_make_host_progress_callback(target_domain),
-                    host_stage_timing_beacon=_make_host_stage_timing_beacon(
-                        shell, target_domain
-                    ),
-                    host_cancellation=host_cancellation,
-                    host_cap=_resolve_host_cap(shell),
-                    scale_gate_callback=_make_scale_gate_callback(shell),
-                )
+            # The operator-stoppable "SMB host enrichment" step wraps the
+            # per-host sweep ONLY (the orchestrator enters it), never the
+            # directory read, the AD CS probes or the graph save: a Ctrl+C there
+            # is not a stop of host enrichment, and with both SMB stages
+            # deselected the step is never opened.
+            result = CollectionOrchestrator().collect_scope(
+                shell=shell,
+                scopes=[scope],
+                credential=credential,
+                collection_scope=collection_scope,
+                collect_smb=selection.collect_samr,
+                collect_shares=selection.collect_shares,
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+                progress_callback=_make_collector_progress_callback(target_domain),
+                host_progress_callback=_make_host_progress_callback(target_domain),
+                host_stage_timing_beacon=_make_host_stage_timing_beacon(
+                    shell, target_domain
+                ),
+                host_cancellation=host_cancellation,
+                host_cap=_resolve_host_cap(shell),
+                scale_gate_callback=_make_scale_gate_callback(shell),
+                host_sweep_scope=lambda: cli_host_sweep_stop(
+                    host_cancellation, shell=shell
+                ),
+            )
             return result[0], result[1], result[2], host_cancellation
 
         # Sweep, then offer the post-stop decision. On "continue enriching" the
@@ -1177,18 +1184,42 @@ def _surface_host_enrichment_coverage(
 
     Best-effort: a persistence failure never aborts the scan.
     """
+    from adscan_core.reporting.host_enrichment_coverage import (
+        PART_SESSIONS_LOCAL_ADMINS,
+        REASON_DESELECTED,
+    )
+
     coverage = getattr(timing, "host_coverage", None) or {}
     reason = str(coverage.get("reason") or "").strip()
     if coverage.get("early_stopped") and not reason:
         reason = "early_stop"
-    if reason not in ("cap", "skip", "early_stop"):
+    if reason not in ("cap", "skip", "early_stop", REASON_DESELECTED):
         return
     swept = int(coverage.get("hosts_swept", 0))
     total = int(coverage.get("hosts_total", 0))
     remaining = int(coverage.get("hosts_remaining", max(0, total - swept)))
     source = str(coverage.get("source") or "cli")
+    deselected_parts = list(coverage.get("deselected_parts") or [])
 
-    if reason == "early_stop":
+    if reason == REASON_DESELECTED:
+        if len(deselected_parts) != 1:
+            print_info(
+                "SMB host enrichment not run: both SMB sub-collections were "
+                "deselected, so no host was contacted for sessions, local "
+                "administrators or shares. The report records them as not "
+                "collected."
+            )
+        else:
+            missing = (
+                "Sessions and local administrators"
+                if deselected_parts[0] == PART_SESSIONS_LOCAL_ADMINS
+                else "Shares and share permissions"
+            )
+            print_info(
+                f"{missing} not collected: deselected for this scan. The report "
+                "records them as not collected."
+            )
+    elif reason == "early_stop":
         print_warning(
             "SMB host enrichment stopped early "
             f"({'platform' if source == 'platform' else 'operator'}). Coverage — "
@@ -1226,6 +1257,7 @@ def _surface_host_enrichment_coverage(
                 reason=reason,
                 hosts_swept=swept,
                 hosts_total=total,
+                deselected_parts=deselected_parts,
             ),
         )
     except Exception as exc:  # noqa: BLE001 — coverage persistence is best-effort
@@ -3217,7 +3249,23 @@ def _build_tactical_findings(
             esc_label = relation[len("ADCSESC"):]
             esc_label = f"ESC{esc_label}" if esc_label else relation
             raw_target = str(to_node.get("label") or to_node.get("name") or "")
-            esc_target = format_graph_node_label(raw_target, domain) or raw_target
+            _target_kind = to_node.get("kind")
+            if isinstance(_target_kind, (list, tuple)):
+                _target_kind = _target_kind[0] if _target_kind else ""
+            _target_props = to_node.get("properties")
+            esc_target = (
+                format_graph_node_label(
+                    raw_target,
+                    domain,
+                    kind=str(_target_kind or ""),
+                    samaccountname=str(
+                        (_target_props or {}).get("samaccountname") or ""
+                    )
+                    if isinstance(_target_props, dict)
+                    else "",
+                )
+                or raw_target
+            )
             esc_template = _adcs_edge_template_name(edge, to_node, domain)
             esc_status = _adcs_edge_display_status(edge)
             esc_key = (

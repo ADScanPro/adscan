@@ -32,6 +32,7 @@ from adscan_internal import (
     print_warning,
     telemetry,
 )
+from adscan_core.memory_guard import check_enclosing_stage
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.cli.scan_outcome_flow import (
     render_no_extracted_findings_preview,
@@ -73,8 +74,17 @@ from adscan_internal.services.winrm_exclusion_policy import (
     get_winrm_phase_excluded_path_prefixes,
 )
 from adscan_internal.services.winrm_file_mapping_service import (
+    WINRM_FILE_MAP_LIMITS,
     WinRMFileMapEntry,
     WinRMFileMappingService,
+)
+from adscan_internal.services.host_review_coverage import (
+    WINRM_REVIEW,
+    record_listing_state,
+    run_post_auth_bounded,
+)
+from adscan_internal.services.windows_file_review_scope import (
+    review_listing_extensions,
 )
 from adscan_internal.services.winrm_psrp_service import (
     WinRMPSRPError,
@@ -2461,8 +2471,13 @@ def _is_winrm_mapping_cache_compatible(
     *,
     cache_payload: dict[str, object],
     expected_metadata: dict[str, object],
+    review_extensions: tuple[str, ...] | None = None,
 ) -> tuple[bool, str]:
-    """Validate whether one cached WinRM manifest can be safely reused."""
+    """Validate whether one cached WinRM manifest can be safely reused.
+
+    ``review_extensions`` is the extension filter this review lists with (empty
+    for a review that reads every file); ``None`` skips that comparison.
+    """
     schema_version = int(cache_payload.get("schema_version") or 0)
     if schema_version != WinRMFileMappingService.SCHEMA_VERSION:
         return False, "schema version mismatch"
@@ -2472,6 +2487,17 @@ def _is_winrm_mapping_cache_compatible(
     entries = list(cache_payload.get("entries") or [])
     if not entries:
         return False, "cached mapping has no entries"
+    if review_extensions is not None:
+        # A map listed with an extension filter serves only a review that reads
+        # no extension outside it (the AI review reads every file). A map
+        # listed without a filter, or before bounded listings, holds every file.
+        cached_extensions = set(
+            dict(cache_payload.get("listing") or {}).get("included_extensions") or ()
+        )
+        if cached_extensions and (
+            not review_extensions or not set(review_extensions) <= cached_extensions
+        ):
+            return False, "cached mapping was listed for other file types"
     return True, "compatible"
 
 
@@ -2671,6 +2697,7 @@ def _fetch_winrm_phase_files(
         download_dir: str,
     ) -> WindowsArtifactAcquisitionResult:
         try:
+            check_enclosing_stage()
             batch_result = service.fetch_files_batched(
                 files=targets,
                 download_dir=download_dir,
@@ -2685,6 +2712,8 @@ def _fetch_winrm_phase_files(
             raise exc
 
     def _file_fetcher(remote_path: str, save_path: str) -> str:
+        # Each fetch asks the enclosing memory stage whether to go on.
+        check_enclosing_stage()
         return service.fetch_file(remote_path, save_path)
 
     result = WindowsArtifactAcquisitionService().acquire_files(
@@ -2808,6 +2837,61 @@ def _run_winrm_ai_sensitive_data_scan(
 def run_winrm_sensitive_data_scan(
     shell: Any, *, domain: str, host: str, username: str, password: str
 ) -> dict[str, Any]:
+    """Run the WinRM file search under its memory boundary.
+
+    The search (:func:`_run_winrm_sensitive_data_scan`) lists a host's drives,
+    fetches the files its review reads and analyses them: how much that is, the
+    host decides. It runs as the ``winrm_post_auth`` stage: past the stage line
+    it stops with a declared coverage gap instead of growing until the process
+    is killed. The listing asks the stage before each reply and each fetch
+    before each file.
+    """
+    try:
+        from adscan_internal.workspaces import (  # noqa: PLC0415
+            DEFAULT_DOMAIN_LAYOUT,
+            domain_subpath,
+        )
+
+        workspace_cwd = (
+            shell._get_workspace_cwd()
+            if callable(getattr(shell, "_get_workspace_cwd", None))
+            else os.getcwd()
+        )
+        state_dir: str | None = domain_subpath(
+            workspace_cwd, shell.domains_dir, domain, DEFAULT_DOMAIN_LAYOUT.winrm
+        )
+    except Exception:  # noqa: BLE001 - no workspace: the stop is still declared
+        state_dir = None
+    stopped, result = run_post_auth_bounded(
+        WINRM_REVIEW,
+        shell,
+        domain,
+        host,
+        lambda: _run_winrm_sensitive_data_scan(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+        ),
+        state_dir=state_dir,
+        # A search that was skipped or failed says nothing about an earlier
+        # stop on this host: only a search that completed clears it.
+        clears_stop=lambda outcome: isinstance(outcome, dict)
+        and bool(outcome.get("completed")),
+    )
+    if stopped:
+        return {
+            "completed": False,
+            "stopped_for_memory": True,
+            "error": "The WinRM file search stopped within the available memory.",
+        }
+    return result
+
+
+def _run_winrm_sensitive_data_scan(
+    shell: Any, *, domain: str, host: str, username: str, password: str
+) -> dict[str, Any]:
     """Run deterministic sensitive-data analysis over WinRM using PSRP mapping."""
     from adscan_internal.workspaces import (
         DEFAULT_DOMAIN_LAYOUT,
@@ -2896,6 +2980,10 @@ def run_winrm_sensitive_data_scan(
         excluded_directory_names=excluded_directory_names,
     )
     mapping_mode = _resolve_winrm_mapping_mode(shell)
+    # What a file IS decides whether the listing keeps it (an extension filter
+    # applied on the host); where it is never does. The AI review reads every
+    # file name, so its listing is unfiltered.
+    review_extensions = review_listing_extensions(method)
     if method == "ai":
         print_info(
             "AI WinRM backend: "
@@ -2924,6 +3012,7 @@ def run_winrm_sensitive_data_scan(
         _forced = mapping_service.load_file_map(input_path=cache_manifest_abs) if os.path.exists(cache_manifest_abs) else None
         _forced_compat = _forced and _is_winrm_mapping_cache_compatible(
             cache_payload=_forced, expected_metadata=expected_cache_metadata,
+            review_extensions=review_extensions,
         )[0]
         if _forced_compat:
             _ecount = len(list((_forced or {}).get("entries") or []))
@@ -2939,6 +3028,7 @@ def run_winrm_sensitive_data_scan(
             data = mapping_service.load_file_map(input_path=cache_manifest_abs)
             ok, reason = _is_winrm_mapping_cache_compatible(
                 cache_payload=data, expected_metadata=expected_cache_metadata,
+                review_extensions=review_extensions,
             )
             if not ok:
                 print_info_debug(
@@ -2971,7 +3061,16 @@ def run_winrm_sensitive_data_scan(
             )
         mapping_started_at = time.perf_counter()
         try:
-            mapping_result = mapping_service.generate_file_map(
+            # pypsrp holds a pipeline's whole output and joins it, so one
+            # listing of a whole drive is held several times over. The listing
+            # is read in bounded replies instead. Every drive is still walked
+            # whole: only the WinRM noise folders are left out, never a path
+            # allowlist, so a custom location (C:\backups) is listed like any
+            # other, and before the operating system's and vendors' folders.
+            # Volume is cut by the extension filter, a cap per reply and a
+            # total; past the total the listing stops and the gap is declared
+            # below.
+            mapping_result = mapping_service.generate_bounded_file_map(
                 psrp_service=_build_winrm_psrp_service(
                     domain=domain,
                     host=host,
@@ -2979,9 +3078,12 @@ def run_winrm_sensitive_data_scan(
                     password=password,
                 ),
                 output_path=cache_manifest_abs,
+                limits=WINRM_FILE_MAP_LIMITS,
                 excluded_path_prefixes=excluded_path_prefixes,
                 excluded_directory_names=excluded_directory_names,
+                included_extensions=review_extensions,
                 metadata=expected_cache_metadata,
+                on_query=check_enclosing_stage,
             )
         except WinRMPSRPError as exc:
             print_error(f"WinRM PSRP mapping failed: {exc}")
@@ -3008,6 +3110,17 @@ def run_winrm_sensitive_data_scan(
             }
         mapping_duration_seconds = time.perf_counter() - mapping_started_at
 
+    # A listing that stopped at its total is a declared coverage gap, for a
+    # fresh listing and a reused one alike; one that completed clears this
+    # host's earlier gap.
+    listing_complete = record_listing_state(
+        WINRM_REVIEW,
+        shell,
+        domain=domain,
+        host=host,
+        manifest_path=cache_manifest_abs,
+        listing=mapping_result.get("listing"),
+    )
     entries = list(mapping_result.get("entries") or [])
     mapping_roots = list(mapping_result.get("roots") or [])
     mapping_excluded_prefixes = list(mapping_result.get("excluded_path_prefixes") or [])
@@ -3037,7 +3150,11 @@ def run_winrm_sensitive_data_scan(
     )
     if not entries:
         print_info("No files were discovered in the selected WinRM roots.")
-        return {"completed": True, "phases_run": []}
+        return {
+            "completed": True,
+            "phases_run": [],
+            "listing_complete": listing_complete,
+        }
 
     if method == "ai":
         return _run_winrm_ai_sensitive_data_scan(
@@ -3059,7 +3176,11 @@ def run_winrm_sensitive_data_scan(
     )
     if not selected_phases:
         print_info("No WinRM credential-hunt phases selected — skipping analysis.")
-        return {"completed": True, "phases_run": []}
+        return {
+            "completed": True,
+            "phases_run": [],
+            "listing_complete": listing_complete,
+        }
 
     results: list[dict[str, Any]] = []
     for phase in get_production_sensitive_scan_phase_sequence():
@@ -3082,7 +3203,11 @@ def run_winrm_sensitive_data_scan(
                 "Stopping remaining deterministic WinRM phases because the active "
                 "WinRM credentials became invalid during this CTF workflow."
             )
-            return {"completed": False, "phases_run": results}
+            return {
+                "completed": False,
+                "phases_run": results,
+                "listing_complete": listing_complete,
+            }
 
     loot_root_rel = domain_relpath(
         shell.domains_dir,
@@ -3099,4 +3224,5 @@ def run_winrm_sensitive_data_scan(
     return {
         "completed": all(bool(item.get("completed")) for item in results if item),
         "phases_run": results,
+        "listing_complete": listing_complete,
     }

@@ -49,7 +49,7 @@
         "step": {"type": "integer", "minimum": 1},
         "action": {"type": "string"},
         "status": {"type": "string", "$comment": "success, attempted, blocked, theoretical, structural, discovered, closed_by_configuration, unsupported (open vocabulary)."},
-        "details": {"type": "object"},
+        "details": {"type": "object", "$comment": "Opaque. Since 1.2 a step whose endpoint is a GPO carries source_gpo_guid or target_gpo_guid (the policy GUID, upper case, no braces) next to source_dn / target_dn."},
         "knowledge": {"type": "object"},
         "remediability": {"type": "object"}
       }

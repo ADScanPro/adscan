@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adscan"
-version = "14.0.0"
+version = "15.0.0"
 description = "Free Active Directory pentesting CLI for AD enumeration, attack paths, Kerberoasting, AS-REP roasting, ADCS, DCSync, password spraying, and CTF labs."
 readme = "README.md"
 authors = [{ name = "ADscan" }]
@@ -113,6 +113,12 @@ cli = [
     # full-bleed client cover/back pages around the body PDF (composition-seam
     # 3-render concat in pro/reporting/orchestrator.py). BSD-licensed.
     "pypdf>=5.0,<7.0",
+    # KeePass database extraction and Group Policy cpassword decryption. Both
+    # were installed by hand in the Linux images only, so the Windows bundle
+    # (built from this extra) shipped without them and the two features were off
+    # there. Pins match Dockerfile.runtime and dockerfile.
+    "pykeepass==4.1.1.post1",
+    "gpp-decrypt==2.0.0",
     "playwright==1.62.0",
     "jinja2>=3.0",
     "graphviz>=0.20",

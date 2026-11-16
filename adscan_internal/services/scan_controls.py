@@ -127,6 +127,25 @@ class ScanControlsError(ValueError):
 # above) so the report's scope section and the web read the same name.
 
 
+def _policy_replaced(shell: Any) -> None:
+    """Tell the engagement scope that the session's scan policy was replaced.
+
+    A scope verdict depends on the policy (whether trusts are followed on their
+    own), so the verdicts computed under the previous policy are dropped
+    everywhere the policy attribute is written. Never raises: the engine also
+    reads the policy's answer on every verdict, so this is the immediate form
+    of something it would notice anyway.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            invalidate_scope_verdicts,
+        )
+
+        invalidate_scope_verdicts(shell)
+    except Exception:  # noqa: BLE001 - the policy is applied either way
+        pass
+
+
 def short_digest(digest: str) -> str:
     """``sha256:1a2b3c4d5e6f`` from a full ``sha256:<hex>`` digest."""
     algo, _, hexpart = str(digest or "").partition(":")
@@ -626,6 +645,7 @@ def apply_workspace_scan_controls(
             )
     setattr(shell, ATTR_POLICY, policy)
     setattr(shell, ATTR_POLICY_SOURCE, source)
+    _policy_replaced(shell)
     ceiling = pacing_ceiling_for_policy(policy) or record.pacing_ceiling
     request = workspace_pacing_request(shell) or policy_pacing_request(policy)
     pacing = publish_pacing(shell, request, ceiling)
@@ -693,6 +713,7 @@ def apply_ci_scan_controls(
         warnings.append(message)
     setattr(shell, ATTR_POLICY, policy)
     setattr(shell, ATTR_POLICY_SOURCE, source)
+    _policy_replaced(shell)
 
     # Pace: scan config request or a saved profile (or the workspace's, or the
     # policy's), then the CLI layer; capped by the scan config's ceiling or the
@@ -803,6 +824,7 @@ def set_policy(
         setattr(shell, ATTR_POLICY_CLEARED, None)
         # The new policy replaces whatever pace ceiling the previous one carried.
         setattr(shell, ATTR_PACING_CEILING, None)
+    _policy_replaced(shell)
     ceiling = session_pacing_ceiling(shell)
     request = workspace_pacing_request(shell) or policy_pacing_request(resolved)
     pacing = publish_pacing(shell, request, ceiling)
@@ -868,6 +890,7 @@ def adopt_policy(
     setattr(shell, ATTR_POLICY_SOURCE, source)
     setattr(shell, ATTR_POLICY_CLEARED, None)
     setattr(shell, ATTR_PACING_CEILING, None)
+    _policy_replaced(shell)
     return resolved
 
 

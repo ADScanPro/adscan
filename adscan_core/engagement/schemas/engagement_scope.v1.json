@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.engagement_scope/1",
+  "title": "ADscan engagement scope v1",
+  "description": "scope.json: what the engagement was authorised to touch. The domain scope (which domains are in scope, who decided it, and the cross-domain steps it kept from running) and, from 1.2, the asset scope (the allow-list and deny-list of hosts and accounts, how each entry resolved against the directory, and what was refused because of it). Written by one writer (save_scope in adscan_internal/services/collector/scope.py, fed by adscan_internal/services/engagement_scope.py). Version marker: schema_version, 'scope-1.<minor>'; 1.0 and 1.1 files carry no asset_scope. Declared objects may gain fields within a major; do not reject unknown keys. Carries no secret.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "entries"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^scope-1\\.[0-9]+$"},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/domain_entry"}},
+    "origin_domains": {"type": "array", "items": {"type": "string"}, "$comment": "The domains the scan targeted (in scope unless a later decision excluded them)."},
+    "decided_by": {"type": "string", "$comment": "Who settled the domain scope: scan_configuration, scan_policy, operator, default (open vocabulary)."},
+    "withheld": {"type": "array", "items": {"$ref": "#/$defs/withheld_step"}},
+    "asset_scope": {"$ref": "#/$defs/asset_scope"}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "maxLength": 64},
+    "count": {"type": "integer", "minimum": 0},
+    "nullable_string": {"type": ["string", "null"]},
+    "domain_entry": {
+      "type": "object",
+      "required": ["domain", "in_scope"],
+      "properties": {
+        "domain": {"type": "string"},
+        "dc_address": {"type": "string"},
+        "auth_domain": {"type": "string"},
+        "auth_kdc": {"type": "string"},
+        "reachability": {"type": "string", "$comment": "reachable_ldap, reachable_kerberos, dns_only, unreachable, degraded."},
+        "in_scope": {"type": "boolean"},
+        "kerberos_target_hostname": {"$ref": "#/$defs/nullable_string"},
+        "degraded_reason": {"$ref": "#/$defs/nullable_string"},
+        "trust_type": {"$ref": "#/$defs/nullable_string"},
+        "trust_direction": {"$ref": "#/$defs/nullable_string"}
+      }
+    },
+    "withheld_step": {
+      "type": "object",
+      "properties": {
+        "source_domain": {"type": "string"},
+        "target_domain": {"type": "string"},
+        "technique": {"type": "string"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "surface": {"type": "string"}
+      }
+    },
+    "scope_entry": {
+      "type": "object",
+      "required": ["id", "type", "value"],
+      "$comment": "One normalised entry. type: ip, cidr, range, fqdn, dns_suffix, short_host, sid, dn, principal, upn. A range keeps its two ends (first-last); a dn entry covers the object and everything below it.",
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "$comment": "a<n> in the allow-list, d<n> in the deny-list; stable within a revision."},
+        "type": {"enum": ["ip", "cidr", "range", "fqdn", "dns_suffix", "short_host", "sid", "dn", "principal", "upn"]},
+        "value": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "$comment": "Kind hint: computer, user or group."},
+        "origin": {"type": "string", "$comment": "Where the entry came from: cli, web, file:<name>:<line>..."}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "$comment": "What the directory and name resolution said about the object an entry names. Every field is optional.",
+      "properties": {
+        "kind": {"type": "string"},
+        "object_id": {"type": "string"},
+        "domain": {"type": "string"},
+        "dn": {"type": "string"},
+        "fqdn": {"type": "string"},
+        "samaccountname": {"type": "string"},
+        "netbios": {"type": "string"},
+        "upn": {"type": "string"},
+        "addresses": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "resolution_entry": {
+      "type": "object",
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"type": "string"},
+        "status": {"enum": ["resolved", "pending", "ambiguous", "unresolvable"]},
+        "identities": {"type": "array", "items": {"$ref": "#/$defs/identity"}},
+        "candidates": {"type": "array", "items": {"type": "string"}, "$comment": "The objects an ambiguous short name matches."},
+        "leaf": {"type": "boolean", "$comment": "dn entries: true when the DN names one object, false when it is a container (a subtree)."},
+        "uncollected": {"type": "boolean", "$comment": "True while a directory that could hold the name has not been read: the entry may still gain identities."}
+      }
+    },
+    "refusal": {
+      "type": "object",
+      "required": ["surface", "target", "reason", "count"],
+      "properties": {
+        "surface": {"type": "string", "$comment": "The seam that refused (smb_collection, attack_path, repl...)."},
+        "kind": {"type": "string"},
+        "target": {"type": "string"},
+        "reason": {"type": "string", "$comment": "denied_entry, not_in_allow_list, identity_undetermined, domain_outside_scope, dc_directory_only, scope_record_unreadable (open vocabulary)."},
+        "entry": {"type": "string", "$comment": "The entry id that decided it, empty when none."},
+        "count": {"$ref": "#/$defs/count"},
+        "outcome": {"enum": ["excluded", "unconfirmed"], "$comment": "excluded: the client's scope keeps the object out (an established exclusion). unconfirmed: the scan could not establish that the object is inside the scope and left it alone; never to be worded as an exclusion."},
+        "cause": {"type": "string", "$comment": "Why an unconfirmed object could not be established: name_not_resolved, address_not_attributed, entry_not_matched, affected_hosts_unknown, scope_record_unreadable (open vocabulary). Empty for an exclusion."},
+        "known_as": {"type": "string", "$comment": "The form in which the seam knew the target (an address, a host name, an account label)."},
+        "label": {"type": "string", "$comment": "The object as the directory names it, when the scan knows it; else the target as given."},
+        "domain": {"type": "string", "$comment": "The domain the object belongs to, or the domain whose operation met it; empty when neither is known."}
+      }
+    },
+    "revision_summary": {
+      "type": "object",
+      "properties": {
+        "revision": {"$ref": "#/$defs/count"},
+        "digest": {"type": "string"},
+        "decided_by": {"type": "string"},
+        "decided_at": {"type": "string"},
+        "allow": {"$ref": "#/$defs/count"},
+        "deny": {"$ref": "#/$defs/count"},
+        "out_of_band": {"type": "boolean", "$comment": "True for a change of the lists made outside ADscan at the same revision (a hand edit with a matching digest) that a session adopted: the entry holds the digest and counts it replaced, and when it was noticed."}
+      }
+    },
+    "asset_scope": {
+      "type": "object",
+      "required": ["format", "revision", "record_id", "digest", "dc_access", "allow", "deny"],
+      "properties": {
+        "format": {"const": 1},
+        "revision": {"type": "integer", "minimum": 1},
+        "record_id": {"type": "string", "$comment": "The identity of this record's lineage. Given when a scope is recorded where no usable record exists (a first scope, a deleted or damaged file being replaced) and kept by every later revision. Revisions are comparable only between blocks with the same record_id; a writer holding another record_id never writes its lists over this one."},
+        "supersedes": {
+          "type": "object",
+          "$comment": "The record this one replaced, when the writer that re-created it knew it.",
+          "properties": {
+            "record_id": {"type": "string"},
+            "revision": {"$ref": "#/$defs/count"}
+          }
+        },
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "$comment": "Over the canonical, order-independent entry lists and dc_access."},
+        "decided_by": {"type": "string", "$comment": "operator, scan_configuration, scan_policy, web_user (open vocabulary)."},
+        "decided_by_label": {"type": "string"},
+        "decided_at": {"$ref": "#/$defs/timestamp"},
+        "clock_frame": {"type": "string", "$comment": "Which clock decided_at came from (adscan_core/reporting/clock_frame.py)."},
+        "source": {"type": "object", "$comment": "How the scope was given (kind: cli_flags, file, repl, scan_config, web; files with their sha256). Opaque."},
+        "dc_access": {"enum": ["directory_only", "full"]},
+        "allow": {"type": "array", "items": {"$ref": "#/$defs/scope_entry"}},
+        "deny": {"type": "array", "items": {"$ref": "#/$defs/scope_entry"}},
+        "resolution": {
+          "type": "object",
+          "properties": {
+            "resolved_at": {"type": "string"},
+            "entries": {"type": "array", "items": {"$ref": "#/$defs/resolution_entry"}}
+          }
+        },
+        "refusals": {"type": "array", "items": {"$ref": "#/$defs/refusal"}},
+        "refusals_truncated": {"$ref": "#/$defs/count"},
+        "backstop_hits": {"$ref": "#/$defs/count", "$comment": "Connections the in-process egress backstop refused (each one is a missed primary seam)."},
+        "names_not_looked_up": {"$ref": "#/$defs/count", "$comment": "Host names whose addresses the scan had not been able to look up when the record was written (the name service did not answer in time). They stay 'not confirmed' until answered; at the end of a run this is a declared coverage gap."},
+        "backstop_disabled": {"type": "boolean", "$comment": "True when the operator switched the egress backstop off for the session (the primary checks still applied)."},
+        "revisions": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/revision_summary"}}
+      }
+    }
+  }
+}

@@ -54,6 +54,55 @@ HOST_ENRICHMENT_COVERAGE_KEY = "host_enrichment_coverage"
 REASON_CAP = "cap"
 REASON_SKIP = "skip"
 REASON_EARLY_STOP = "early_stop"
+#: The operator deselected an SMB sub-collection before the scan (the collector
+#: selector, a scan config or a scan policy). Nothing of that stage was collected
+#: on any host. Recorded so the report never reads a deselected stage as a clean
+#: one ("no local admins found" when nobody looked).
+REASON_DESELECTED = "deselected"
+
+_REASONS = (REASON_CAP, REASON_SKIP, REASON_EARLY_STOP, REASON_DESELECTED)
+
+#: The two SMB host-enrichment stages an operator can deselect, in display order.
+PART_SESSIONS_LOCAL_ADMINS = "sessions_local_admins"
+PART_SHARES = "shares"
+_PART_PHRASES = {
+    PART_SESSIONS_LOCAL_ADMINS: "logged-on sessions and local-administrator membership",
+    PART_SHARES: "share exposure",
+}
+
+
+def deselected_host_parts(*, collect_smb: bool, collect_shares: bool) -> tuple[str, ...]:
+    """The SMB host-enrichment stages the operator deselected, in display order.
+
+    ``collect_smb`` is the sessions and local-administrators stage (SAMR);
+    ``collect_shares`` the shares and share-permissions stage (SRVSVC).
+    """
+    parts: list[str] = []
+    if not collect_smb:
+        parts.append(PART_SESSIONS_LOCAL_ADMINS)
+    if not collect_shares:
+        parts.append(PART_SHARES)
+    return tuple(parts)
+
+
+def _clean_parts(parts: Any) -> tuple[str, ...]:
+    if not isinstance(parts, (list, tuple)):
+        return ()
+    return tuple(p for p in _PART_PHRASES if p in {str(x) for x in parts})
+
+
+def _deselected_sentence(parts: tuple[str, ...]) -> str:
+    """One sentence naming the stages that were not collected on any host."""
+    phrases = [_PART_PHRASES[p] for p in parts]
+    if not phrases:
+        return ""
+    what = " and ".join(phrases)
+    plural = len(phrases) > 1 or " and " in phrases[0]
+    verb, pronoun = ("were", "them") if plural else ("was", "it")
+    return (
+        f"{what[:1].upper()}{what[1:]} {verb} not collected on any host: the "
+        f"operator deselected {pronoun} for this assessment."
+    )
 
 _COMPLETE_STATEMENT = (
     "SMB host enrichment covered every reachable host: logged-on sessions, "
@@ -107,8 +156,29 @@ def _early_stop_statement(hosts_swept: int, hosts_total: int) -> str:
     )
 
 
-def _statement_for(reason: str, hosts_swept: int, hosts_total: int) -> str:
+def _deselected_statement(parts: tuple[str, ...]) -> str:
+    """Render the client-facing sentence when SMB host enrichment was deselected."""
+    lead = (
+        "The identity graph is complete: every user, group, computer, ACL and "
+        "trust was mapped, and attack paths and reach are computed over the full "
+        "directory. "
+    )
+    if not parts or set(parts) == set(_PART_PHRASES):
+        return lead + (
+            "SMB host enrichment (logged-on sessions, local-administrator "
+            "membership and share exposure) was not collected on any host: the "
+            "operator deselected it for this assessment, so those exposures were "
+            "not evaluated."
+        )
+    return lead + _deselected_sentence(parts)
+
+
+def _statement_for(
+    reason: str, hosts_swept: int, hosts_total: int, parts: tuple[str, ...] = ()
+) -> str:
     """Dispatch to the sentence for a given bounding reason."""
+    if reason == REASON_DESELECTED:
+        return _deselected_statement(parts)
     if reason == REASON_SKIP:
         return _skip_statement(hosts_total)
     if reason == REASON_EARLY_STOP:
@@ -122,6 +192,7 @@ def build_host_enrichment_coverage(
     reason: str = REASON_CAP,
     hosts_swept: int = 0,
     hosts_total: int = 0,
+    deselected_parts: Any = (),
 ) -> dict[str, Any]:
     """Build the ``host_enrichment_coverage`` block for one domain.
 
@@ -135,30 +206,40 @@ def build_host_enrichment_coverage(
             ``bounded`` is ``False``.
         hosts_swept: Reachable hosts actually enriched.
         hosts_total: Reachable hosts in the estate (the denominator).
+        deselected_parts: SMB stages the operator deselected
+            (:func:`deselected_host_parts`). With another bounding reason, a
+            sentence naming them is appended; with :data:`REASON_DESELECTED`
+            they shape the sentence itself. A deselected stage always makes the
+            block a gap.
 
     Returns:
         The block to hand to ``record_host_enrichment_coverage``. Always carries
         ``statement`` so the recorder accepts it.
     """
-    complete = not bounded
+    parts = _clean_parts(deselected_parts)
+    complete = not bounded and not parts
     swept = max(0, int(hosts_swept))
     total = max(swept, int(hosts_total))
-    clean_reason = (
-        reason if reason in (REASON_CAP, REASON_SKIP, REASON_EARLY_STOP) else REASON_CAP
-    )
-    return {
+    clean_reason = reason if reason in _REASONS else REASON_CAP
+    if not bounded and parts:
+        clean_reason = REASON_DESELECTED
+    statement = _COMPLETE_STATEMENT
+    if not complete:
+        statement = _statement_for(clean_reason, swept, total, parts)
+        if parts and clean_reason != REASON_DESELECTED:
+            statement = f"{statement} {_deselected_sentence(parts)}"
+    block = {
         "complete": complete,
         "reason": "" if complete else clean_reason,
         "hosts_swept": swept,
         "hosts_total": total,
         "hosts_remaining": max(0, total - swept),
         "identity_graph_complete": True,
-        "statement": (
-            _COMPLETE_STATEMENT
-            if complete
-            else _statement_for(clean_reason, swept, total)
-        ),
+        "statement": statement,
     }
+    if parts:
+        block["deselected_parts"] = list(parts)
+    return block
 
 
 def host_enrichment_coverage_view(coverage: Any) -> dict[str, Any]:
@@ -221,6 +302,8 @@ def merge_host_enrichment_coverage(domain_entries: Any) -> dict[str, Any]:
     ``has_gap=False`` — the pre-existing render, unchanged.
     """
     statements: list[str] = []
+    reasons: set[str] = set()
+    parts: set[str] = set()
     swept_sum = 0
     total_sum = 0
     saw_gap = False
@@ -232,6 +315,8 @@ def merge_host_enrichment_coverage(domain_entries: Any) -> dict[str, Any]:
         if not view["has_gap"]:
             continue
         saw_gap = True
+        reasons.add(str(block.get("reason") or REASON_CAP))
+        parts.update(_clean_parts(block.get("deselected_parts")))
         swept_sum += int(view["hosts_swept"])
         total_sum += int(view["hosts_total"])
         if view["statement"] not in statements:
@@ -240,7 +325,11 @@ def merge_host_enrichment_coverage(domain_entries: Any) -> dict[str, Any]:
         return host_enrichment_coverage_view(None)
 
     merged = build_host_enrichment_coverage(
-        bounded=True, hosts_swept=swept_sum, hosts_total=total_sum
+        bounded=True,
+        reason=reasons.pop() if len(reasons) == 1 else REASON_CAP,
+        hosts_swept=swept_sum,
+        hosts_total=total_sum,
+        deselected_parts=sorted(parts),
     )
     if len(statements) == 1:
         merged["statement"] = statements[0]
@@ -249,10 +338,14 @@ def merge_host_enrichment_coverage(domain_entries: Any) -> dict[str, Any]:
 
 __all__ = [
     "HOST_ENRICHMENT_COVERAGE_KEY",
+    "PART_SESSIONS_LOCAL_ADMINS",
+    "PART_SHARES",
     "REASON_CAP",
+    "REASON_DESELECTED",
     "REASON_EARLY_STOP",
     "REASON_SKIP",
     "build_host_enrichment_coverage",
+    "deselected_host_parts",
     "host_enrichment_coverage_view",
     "merge_host_enrichment_coverage",
 ]

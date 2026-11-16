@@ -59,6 +59,18 @@ def _read_json(path: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _scope_excluded_hostnames(report: dict[str, Any] | None) -> set[str]:
+    """Hostnames the reachability pass left out because of the engagement scope."""
+    block = (report or {}).get("excluded_by_engagement_scope")
+    if not isinstance(block, dict):
+        return set()
+    return {
+        str(name).strip().rstrip(".").lower()
+        for name in block.get("hostnames") or ()
+        if str(name or "").strip()
+    }
+
+
 def _interface_can_receive_callback(name: str) -> bool:
     from adscan_core.callback_interfaces import (  # noqa: PLC0415
         interface_can_receive_callback,
@@ -120,6 +132,88 @@ def _resolve_idle_interfaces(shell: Any) -> list[dict[str, str]]:
         return []
 
 
+def _scoped_reach_inputs(
+    shell: Any, domain: str
+) -> tuple[list[str], Any, frozenset[str], frozenset[str]] | None:
+    """What the network-reach figures of one domain are derived from.
+
+    ``(enabled computers, reachability report, excluded hosts, unconfirmed hosts)``,
+    or ``None`` when the domain has neither a computer list nor a reachability
+    measurement. The ONE place the engagement scope's two populations are read
+    for a count of computers: the stamped block and the usage register's
+    asset-scope counts (:func:`asset_scope_computer_counts`) both start here.
+    """
+    domain_dir = _domain_dir(shell, domain)
+    if not domain_dir or not os.path.isdir(domain_dir):
+        return None
+    computers = _read_lines(os.path.join(domain_dir, _ENABLED_COMPUTERS_FILE))
+    report = _read_json(os.path.join(domain_dir, _REACHABILITY_REPORT_FILE))
+    if not computers and report is None:
+        return None
+    # Computers the client excluded from the engagement scope leave every
+    # figure: ADscan never contacted them on purpose, so they must not read
+    # as computers that did not answer.
+    from adscan_internal.services.asset_scope_coverage_stamp import (  # noqa: PLC0415
+        excluded_host_names,
+    )
+
+    # Which of the two populations a computer is in (excluded by the client,
+    # or not confirmed as within the scope) is the scope record's to say.
+    excluded_hosts = excluded_host_names(shell, domain, population="excluded")
+    unconfirmed_hosts = excluded_host_names(shell, domain, population="unconfirmed")
+    # A computer the reachability pass itself left out because of the scope
+    # was not measured on purpose either: when the scope record no longer
+    # places it in one of the two populations, it still leaves the
+    # denominator, so it never reads as a computer that did not answer.
+    classified = {str(name).strip().rstrip(".").lower() for name in excluded_hosts}
+    classified |= {str(name).strip().rstrip(".").lower() for name in unconfirmed_hosts}
+    left_out = _scope_excluded_hostnames(report) - classified
+    if left_out:
+        computers = [name for name in computers if name.strip().rstrip(".").lower() not in left_out]
+    return computers, report, excluded_hosts, unconfirmed_hosts
+
+
+def asset_scope_computer_counts(shell: Any, domain: str) -> tuple[int, int, int] | None:
+    """Enabled computers of ``domain`` inside the asset scope, excluded by it, not confirmed.
+
+    The three figures of the report's network-reach statement, from the same
+    derivation (:func:`build_host_reach_coverage` over the enabled computer
+    list, with the scope record's two populations): ``computers_in_scope``,
+    ``computers_excluded_by_scope`` and ``computers_unconfirmed_scope``. Nothing
+    is derived here, so the usage register can never state a number the report
+    does not.
+
+    ``None`` when the run has no asset scope, or the domain has no enabled
+    computer list to count (the directory was not collected). Never raises.
+    """
+    try:
+        from adscan_internal.services.asset_scope_coverage_stamp import (  # noqa: PLC0415
+            asset_scope_block_for_domain,
+        )
+
+        if asset_scope_block_for_domain(shell, domain) is None:
+            return None
+        inputs = _scoped_reach_inputs(shell, domain)
+        if inputs is None or not inputs[0]:
+            return None
+        computers, report, excluded_hosts, unconfirmed_hosts = inputs
+        block = build_host_reach_coverage(
+            enabled_computers=computers,
+            reachability_report=report,
+            excluded_hosts=excluded_hosts,
+            unconfirmed_hosts=unconfirmed_hosts,
+        )
+        return (
+            int(block.get("computers_in_scope") or 0),
+            int(block.get("computers_excluded_by_scope") or 0),
+            int(block.get("computers_unconfirmed_scope") or 0),
+        )
+    except Exception as exc:  # noqa: BLE001 - a count never breaks a scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return None
+
+
 def stamp_host_reach_coverage(shell: Any, domain: str) -> dict[str, Any] | None:
     """Derive and persist the ``host_reach_coverage`` block for one domain.
 
@@ -128,18 +222,17 @@ def stamp_host_reach_coverage(shell: Any, domain: str) -> dict[str, Any] | None:
     workspace cannot be resolved. Never raises.
     """
     try:
-        domain_dir = _domain_dir(shell, domain)
-        if not domain_dir or not os.path.isdir(domain_dir):
+        inputs = _scoped_reach_inputs(shell, domain)
+        if inputs is None:
             return None
-        computers = _read_lines(os.path.join(domain_dir, _ENABLED_COMPUTERS_FILE))
-        report = _read_json(os.path.join(domain_dir, _REACHABILITY_REPORT_FILE))
-        if not computers and report is None:
-            return None
+        computers, report, excluded_hosts, unconfirmed_hosts = inputs
         block = build_host_reach_coverage(
             enabled_computers=computers,
             reachability_report=report,
             vantage=_resolve_vantage(shell, domain),
             idle_interfaces=_resolve_idle_interfaces(shell),
+            excluded_hosts=excluded_hosts,
+            unconfirmed_hosts=unconfirmed_hosts,
         )
         if block["computers_in_scope"] <= 0:
             return None
@@ -175,6 +268,7 @@ def stamp_host_reach_coverage_for_all_domains(shell: Any) -> None:
 
 
 __all__ = [
+    "asset_scope_computer_counts",
     "stamp_host_reach_coverage",
     "stamp_host_reach_coverage_for_all_domains",
 ]

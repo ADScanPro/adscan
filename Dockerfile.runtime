@@ -1248,25 +1248,19 @@ RUN chmod +x /usr/local/bin/adscan-entrypoint
 ###############################################################################
 FROM runtime-common AS runtime-pro
 
-# NOTE: ADSCAN_RUNTIME_VERSION and ADSCAN_PARTNER_TAG are declared LATER
+# NOTE: ADSCAN_RUNTIME_VERSION is declared LATER
 # in this stage (at the point of use), not here. BuildKit binds
 # `--build-arg` values to ARG variables at their declaration line and
 # hashes the bound value into the cache key of every layer in the ARG's
 # scope — even when no upstream layer references the variable. Declaring
 # ARG at the point of use narrows the scope so upstream layers stay
-# cacheable across builds with different version timestamps / partner
-# tags. (PRO's COPY dist/adscan invalidates downstream layers on every
+# cacheable across builds with different version timestamps. (PRO's COPY dist/adscan invalidates downstream layers on every
 # build anyway because PyArmor is non-deterministic, but keeping this
 # pattern consistent with LITE makes the file easier to reason about.)
 
 ENV ADSCAN_RUNTIME_LICENSE_MODE=PRO
 
 COPY dist/adscan /usr/local/bin/adscan
-
-# Partner tag baked at build time — identifies which partner this image was built for.
-# Passed via: docker build --build-arg ADSCAN_PARTNER_TAG=glenn-mssp-beta1
-# Empty in untagged builds (dev/CI). Used by telemetry for partner-level filtering.
-ARG ADSCAN_PARTNER_TAG=""
 
 # ADSCAN_RUNTIME_VERSION enters scope HERE — narrowest possible.
 ARG ADSCAN_RUNTIME_VERSION=""
@@ -1315,7 +1309,6 @@ RUN set -eux; \
 # Bake build-time ARGs into the image ENV only at the end, after every
 # expensive layer above. The running container still exposes both
 # variables without contaminating upstream cache keys.
-ENV ADSCAN_PARTNER_TAG=${ADSCAN_PARTNER_TAG}
 ENV ADSCAN_RUNTIME_VERSION=${ADSCAN_RUNTIME_VERSION}
 ENV ADSCAN_BUILD_COMMIT=${ADSCAN_BUILD_COMMIT}
 ENV ADSCAN_BUILD_DESCRIBE=${ADSCAN_BUILD_DESCRIBE}
@@ -1388,7 +1381,7 @@ RUN --mount=type=cache,target=/var/cache/adscan-pip,sharing=locked \
     textual==0.80.1 \
     "redis>=5.0.0,<8.2.0" \
     playwright==1.62.0 \
-    jinja2>=3.0 \
+    "jinja2>=3.0" \
     "scapy>=2.5.0,<3.0"
 
 # Vendored skelsec native AD stack — installed from local source at vendor/.

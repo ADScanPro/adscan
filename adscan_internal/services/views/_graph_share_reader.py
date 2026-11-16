@@ -58,7 +58,9 @@ class GraphShareACL:
 
     share_name: str
     principals: List[GraphSharePrincipal] = field(default_factory=list)
-    sd_source: str = "unknown"  # srvsvc502 / smb2_root_sd / registry / unavailable
+    # srvsvc502 (share permissions) / smb2_path_root (root folder NTFS DACL,
+    # read when level 502 is refused) / registry / unavailable
+    sd_source: str = "unknown"
     # NTFS-aware effective-access verification tier (the strongest tier seen
     # across the share's edges). ``ntfs_computed`` means the graph access was
     # confirmed against the NTFS folder ACL (share ∩ NTFS); ``share_acl_only``

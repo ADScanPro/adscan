@@ -346,6 +346,9 @@ def get_local_update_recency_summary(
                 "install_initialized_at": str(payload.get("install_initialized_at") or "").strip() or None,
                 "message": f"Previous local update attempt failed: {last_attempt_raw}",
             }
+        installed = _installed_summary(payload, current_time)
+        if installed is not None:
+            return installed
         install_initialized_at = str(payload.get("install_initialized_at") or "").strip()
         if not install_initialized_at:
             install_initialized_at = current_time.replace(microsecond=0).isoformat()
@@ -392,6 +395,64 @@ def get_local_update_recency_summary(
             else f"Last successful local update: {last_success_raw} ({age_days}d old)"
         ),
     }
+
+
+#: Key of the moment ``adscan install`` last finished successfully. An install
+#: pulls the current runtime image, so it is a recorded state of its own: the
+#: recency line used to say "No successful local update recorded yet" right
+#: after a successful install.
+INSTALL_COMPLETED_KEY = "install_completed_at"
+
+
+def _installed_summary(payload: dict[str, object], current_time: datetime) -> dict[str, object] | None:
+    """The recency summary of a machine that installed and has not updated since."""
+    raw = str(payload.get(INSTALL_COMPLETED_KEY) or "").strip()
+    if not raw:
+        return None
+    try:
+        installed_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if installed_at.tzinfo is None:
+        installed_at = installed_at.replace(tzinfo=timezone.utc)
+    age_days = max(0, int((current_time - installed_at).total_seconds() // 86400))
+    is_stale = age_days >= _STALE_UPDATE_WARNING_DAYS
+    message = f"Installed: {raw}. No `adscan update` has run since."
+    if is_stale:
+        message = f"Installed: {raw} ({age_days}d ago). No `adscan update` has run since."
+    return {
+        "status": "installed",
+        "has_successful_update": False,
+        "is_stale": is_stale,
+        "age_days": age_days,
+        "install_initialized_at": str(payload.get("install_initialized_at") or "").strip() or raw,
+        "message": message,
+    }
+
+
+def record_successful_install(
+    adscan_base_dir: str,
+    *,
+    docker_image: str = "",
+    launcher_version: str = "",
+    now: datetime | None = None,
+) -> None:
+    """Record that ``adscan install`` finished and pulled its runtime image.
+
+    Best-effort: a state directory that cannot be written never fails an install.
+    """
+    moment = (now or datetime.now(timezone.utc)).replace(microsecond=0).isoformat()
+    payload = read_local_update_health(adscan_base_dir)
+    payload[INSTALL_COMPLETED_KEY] = moment
+    payload.setdefault("install_initialized_at", moment)
+    if docker_image:
+        payload["docker_image"] = docker_image
+    if launcher_version:
+        payload["launcher_version"] = launcher_version
+    try:
+        _write_local_update_health(adscan_base_dir, payload)
+    except OSError:
+        pass
 
 
 def _write_local_update_health(adscan_base_dir: str, payload: dict[str, object]) -> None:
@@ -552,6 +613,23 @@ def _extract_index_digest_from_verbose(stdout: str) -> str | None:
 
 
 def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
+    """Return the remote INDEX digest for a tag (best-effort; see ``_remote_image_digest``).
+
+    An image on the licence-authorised PRO registry is inspected with a fresh
+    installation-signed credential in ADscan's private Docker config, exactly
+    like its pull; every other image is inspected as before.
+    """
+    from adscan_launcher.pro_registry import RegistryCredentialUnavailable, registry_pull_config
+
+    try:
+        with registry_pull_config(image) as config_dir:
+            docker = ["docker"] + (["--config", str(config_dir)] if config_dir is not None else [])
+            return _remote_image_digest(ctx, image, docker)
+    except RegistryCredentialUnavailable as exc:
+        return {"digest": None, "error": str(exc)}
+
+
+def _remote_image_digest(ctx: UpdateContext, image: str, docker: list[str]) -> dict:
     """Return the remote INDEX digest for a tag (best-effort).
 
     The comparison that determines ``needs_update`` must be type-consistent:
@@ -579,7 +657,7 @@ def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
     try:
         proc = ctx.run_docker(
             [
-                "docker",
+                *docker,
                 "buildx",
                 "imagetools",
                 "inspect",
@@ -606,7 +684,7 @@ def _get_remote_image_digest(ctx: UpdateContext, image: str) -> dict:
     # `.Descriptor.digest`. (The non-verbose form does NOT — never use it here.)
     try:
         proc = ctx.run_docker(
-            ["docker", "manifest", "inspect", "--verbose", image],
+            [*docker, "manifest", "inspect", "--verbose", image],
             check=False,
             capture_output=True,
         )
@@ -1386,6 +1464,20 @@ def offer_updates_for_command(
             )
 
 
+def _is_enterprise_appliance_host() -> bool:
+    """True on an Enterprise appliance: the edition marker, or its update state on disk."""
+    try:
+        from adscan_core.tier import is_enterprise_edition
+
+        if is_enterprise_edition():
+            return True
+        override = os.environ.get("ADSCAN_APPLIANCE_STATE_DIR", "").strip()
+        state = Path(override) if override else Path.home() / ".adscan" / "appliance"
+        return (state / "release.json").is_file()
+    except Exception:  # noqa: BLE001 - never block an ordinary host on a probe error
+        return False
+
+
 def run_update_command(ctx: UpdateContext) -> bool:
     """Update both launcher and Docker image.
 
@@ -1395,6 +1487,22 @@ def run_update_command(ctx: UpdateContext) -> bool:
     if ctx.is_container_runtime():
         ctx.print_warning("Update must be run on the host, not inside the container.")
         return False
+    if _is_enterprise_appliance_host():
+        # Engine, web platform and host files ship as ONE signed release on the
+        # appliance (docs/appliance-updates-design.md § coherent set). Pulling an
+        # engine alone would break the CLI/web lockstep, so refuse.
+        ctx.print_warning(
+            "This is an ADscan Enterprise appliance. Its engine, web platform and host files are "
+            "updated together as one signed release from the About & updates page, never with "
+            "`adscan update`."
+        )
+        return False
+    # The edition follows the licence: check in first, so a licence revoked or
+    # ended since the last launch updates LITE (with one line saying why) rather
+    # than asking the PRO registry for an image it will refuse.
+    from adscan_launcher.edition import refresh_licence_status
+
+    refresh_licence_status()
     launcher_info = get_launcher_update_info(ctx)
     docker_info = get_docker_update_info(ctx)
     _render_update_panel(ctx, launcher_info, docker_info)

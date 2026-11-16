@@ -55,6 +55,7 @@ from adscan_core.reporting.technical_report import (
 )
 from adscan_core import telemetry
 from adscan_core.reporting.unauthenticated_reach import reached_via_from_notes
+from adscan_core.reporting.value_identity import UniqueAppender
 from adscan_core.rich_output import (
     mark_sensitive,
     print_exception,
@@ -270,6 +271,8 @@ def _stamp_attack_graph_context_into_details(
 
     tier_zero_targets: list[str] = []
     dc_targets: list[str] = []
+    unique_tier_zero = UniqueAppender(tier_zero_targets)
+    unique_dc = UniqueAppender(dc_targets)
     exploitation_confirmed = False
 
     for edge in edges:
@@ -289,12 +292,12 @@ def _stamp_attack_graph_context_into_details(
         # ``privilege_tier`` SSOT first and only falls back to the legacy
         # ``isTierZero`` / ``highvalue`` booleans. Never re-tiers.
         if _node_tier_zero_flagged(node):
-            _append_unique(tier_zero_targets, label)
+            unique_tier_zero.append(label)
 
         # Domain Controller — alias/role-aware classification of Computer nodes
         # via the single source of truth (reads primaryGroupID / SPN / UAC).
         if classify_computer_node_role(node) in ("writable_dc", "rodc"):
-            _append_unique(dc_targets, label)
+            unique_dc.append(label)
 
     if tier_zero_targets:
         details["tier_zero_accounts"] = tier_zero_targets
@@ -689,6 +692,8 @@ def _graph_node_kind(node: dict[str, Any]) -> str:
 def stamp_adcs_edge_display_contract(
     graph: dict[str, Any],
     domains_data: Any = None,
+    *,
+    edges: Iterable[Any] | None = None,
 ) -> int:
     """Give every AD CS edge the same display contract before it is persisted.
 
@@ -710,14 +715,22 @@ def stamp_adcs_edge_display_contract(
       so it remains an attack-path stepping stone even though it is not a
       finding of its own (the exposure is the step that reaches the host).
 
+    Each edge's stamps are a function of that edge, its two endpoint nodes and
+    ``domains_data`` only, so ``edges`` restricts the pass to the edges a
+    runtime write touched (the live graph's incremental post-overlay pass):
+    every other edge's stamps are already current.
+
     Returns:
         The number of AD CS edges stamped.
     """
     from adscan_core.adcs_relations import is_adcs_relation  # noqa: PLC0415
 
-    edges = graph.get("edges")
     nodes_map = graph.get("nodes")
-    if not isinstance(edges, list) or not isinstance(nodes_map, dict):
+    if edges is None:
+        edges = graph.get("edges")
+        if not isinstance(edges, list):
+            return 0
+    if not isinstance(nodes_map, dict):
         return 0
     stamped = 0
     for edge in edges:
@@ -725,24 +738,27 @@ def stamp_adcs_edge_display_contract(
             continue
         if not is_adcs_relation(str(edge.get("relation") or "")):
             continue
-        notes = edge.get("notes")
-        if not isinstance(notes, dict):
-            notes = {}
-            edge["notes"] = notes
+        current = edge.get("notes")
+        current = current if isinstance(current, dict) else {}
+        # Replaced, never mutated: a notes object may be shared between edges
+        # (``adscan_core.graph_compact.SharedNotes``).
+        additions: dict[str, Any] = {}
         for side, key in (("from", "source"), ("to", "target")):
             node_id = str(edge.get(side) or "").strip()
             node = nodes_map.get(node_id)
             if not isinstance(node, dict):
                 continue
             label = str(node.get("label") or node.get("name") or "").strip()
-            if label and not str(notes.get(f"{key}_label") or "").strip():
-                notes[f"{key}_label"] = label
+            if label and not str(current.get(f"{key}_label") or "").strip():
+                additions[f"{key}_label"] = label
             kind = _graph_node_kind(node)
-            if kind and not str(notes.get(f"{key}_kind") or "").strip():
-                notes[f"{key}_kind"] = kind
-        notes["client_finding"] = bool(
-            edge_qualifies_as_finding(edge, nodes_map, domains_data)
-        )
+            if kind and not str(current.get(f"{key}_kind") or "").strip():
+                additions[f"{key}_kind"] = kind
+        if additions or not isinstance(edge.get("notes"), dict):
+            edge["notes"] = {**current, **additions}
+        finding = bool(edge_qualifies_as_finding(edge, nodes_map, domains_data))
+        if edge["notes"].get("client_finding") is not finding or "client_finding" not in edge["notes"]:
+            edge["notes"] = {**edge["notes"], "client_finding": finding}
         stamped += 1
     return stamped
 
@@ -2366,14 +2382,16 @@ def sync_attack_graph_findings(
     edges_by_key: dict[str, list[dict[str, Any]]] = {}
     for vuln_key, key_edges in raw_edges_by_key.items():
         entries: list[dict[str, Any]] = []
+        # Linear dedupe, same result as ``_append_unique`` per entry: a key can
+        # carry hundreds of thousands of edges on a large directory.
+        unique_entries = UniqueAppender(entries)
         for edge in key_edges:
             # Status is now carried by the shared ``_edge_report_entry`` helper
             # (so the suppressed-edge builder stays byte-identical for the prune).
-            _append_unique(
-                entries,
+            unique_entries.append(
                 _edge_report_entry(
                     edge, _label, nodes_map=nodes_map, report_domain=domain
-                ),
+                )
             )
         edges_by_key[vuln_key] = entries
 
@@ -2771,6 +2789,136 @@ def _workspace_graph_path(workspace_dir: str, domain: str) -> str:
     )
 
 
+#: File, beside each domain's ``attack_graph.json``, recording the state its last
+#: findings reconcile left (an internal cache: never read by a report or the web).
+_RECONCILE_MARKER_NAME = ".findings_reconcile.json"
+#: Bump when what the reconcile derives changes without the inputs below moving.
+_RECONCILE_MARKER_VERSION = 1
+
+
+def _reconcile_code_identity() -> list[Any]:
+    """What identifies the reconcile's own code: engine version and finding catalog.
+
+    A different engine build or catalog can derive different findings from the
+    same export, so it never skips on a marker an earlier build wrote.
+    """
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    try:
+        from adscan_core.version import get_version  # noqa: PLC0415
+
+        version = str(get_version() or "")
+    except Exception:  # noqa: BLE001 - an unknown version only means "re-derive"
+        version = ""
+    try:
+        catalog = json.dumps(_resolve_finding_catalog(), sort_keys=True, default=str)
+    except Exception:  # noqa: BLE001
+        catalog = ""
+    try:
+        own = os.stat(__file__)
+        module = [own.st_size, own.st_mtime_ns]
+    except OSError:
+        module = []
+    return [
+        _RECONCILE_MARKER_VERSION,
+        version,
+        hashlib.sha256(catalog.encode("utf-8")).hexdigest(),
+        module,
+    ]
+
+
+def _reconcile_state(graph_path: str, report: Any, domain: str) -> str | None:
+    """Digest of everything a domain's findings reconcile reads and writes.
+
+    The export (path, size, mtime), the domain's ``findings``, its
+    ``control_evidence`` (the positive-control items the sync emits), its scan
+    policy coverage block (the exclusion gate's input) and the reconcile's code.
+    The reconcile runs off a bare workspace shell, so no session state enters it.
+    ``None`` when the export cannot be read: the reconcile then always runs.
+    """
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from adscan_core.scan_policy.coverage import SCAN_POLICY_COVERAGE_KEY  # noqa: PLC0415
+
+    try:
+        stat = os.stat(graph_path)
+        domains = report.get("domains") if isinstance(report, dict) else None
+        entry = domains.get(domain) if isinstance(domains, dict) else None
+        entry = entry if isinstance(entry, dict) else {}
+        document = {
+            "code": _reconcile_code_identity(),
+            "graph": [os.path.abspath(graph_path), stat.st_size, stat.st_mtime_ns],
+            "findings": entry.get("findings"),
+            "control_evidence": entry.get("control_evidence"),
+            "policy": entry.get(SCAN_POLICY_COVERAGE_KEY),
+        }
+        text = json.dumps(document, sort_keys=True, default=str, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 - no state means "run the reconcile"
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _reconcile_marker_path(graph_path: str) -> str:
+    return os.path.join(os.path.dirname(graph_path), _RECONCILE_MARKER_NAME)
+
+
+def _read_reconcile_marker(graph_path: str) -> dict[str, Any] | None:
+    """The state the last reconcile of this domain left, or ``None``."""
+    import json  # noqa: PLC0415
+
+    try:
+        with open(_reconcile_marker_path(graph_path), encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _write_reconcile_marker(graph_path: str, state: str | None, errors: list[str]) -> None:
+    """Record the state a reconcile left (best-effort; a frozen workspace keeps none)."""
+    import json  # noqa: PLC0415
+
+    from adscan_core.workspace_freeze import write_blocked  # noqa: PLC0415
+
+    path = _reconcile_marker_path(graph_path)
+    if write_blocked(path):
+        return
+    if state is None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"state": state, "errors": list(errors)}, handle)
+        os.replace(tmp, path)
+    except OSError as exc:
+        telemetry.capture_exception(exc)
+
+
+def _load_export_for_reconcile(graph_path: str) -> dict[str, Any] | None:
+    """The export as plain-equal dicts, read line by line (no whole-text peak).
+
+    A private load, never the shared reader's memo: the sync is handed a graph
+    it may treat as its own. ``graph_compact.load_graph_file`` is ``==`` to a
+    ``json.load`` of the file at about a third of its residency; notes are not
+    shared, so the graph behaves exactly like the ``json.load`` it replaces.
+    """
+    from adscan_core.graph_compact import load_graph_file  # noqa: PLC0415
+
+    try:
+        graph = load_graph_file(graph_path, shared_notes=False)
+    except (OSError, ValueError):
+        from adscan_internal.workspaces import read_json_file  # noqa: PLC0415
+
+        graph = read_json_file(graph_path)
+    return graph if isinstance(graph, dict) else None
+
+
 def _discover_graph_domains(workspace_dir: str) -> list[str]:
     """Return the workspace domains that have an ``attack_graph.json`` on disk.
 
@@ -2833,7 +2981,6 @@ def reconcile_workspace_attack_graph_findings(
     from adscan_core.reporting.technical_report import (  # noqa: PLC0415
         scrub_technical_report_secrets,
     )
-    from adscan_internal.workspaces import read_json_file  # noqa: PLC0415
 
     residual: list[str] = []
     try:
@@ -2881,16 +3028,30 @@ def reconcile_workspace_attack_graph_findings(
             graph_path = _workspace_graph_path(workspace_dir, domain)
             if not os.path.isfile(graph_path):
                 continue
-            graph = read_json_file(graph_path)
-            if not isinstance(graph, dict):
-                continue
-            sync_attack_graph_findings(shell, domain, graph)
-            errors = validate_attack_graph_findings_correlation(
-                graph,
-                _load_technical_report(shell),
-                domain=domain,
-                trust_domains_data=getattr(shell, "domains_data", {}) or {},
-            )
+            # Once per export and findings state: when neither the export nor
+            # the report state the sync reads and writes moved since the last
+            # reconcile (this run or an earlier process), the sync is a fixed
+            # point and the correlation verdict is the one recorded then.
+            state_before = _reconcile_state(graph_path, _load_technical_report(shell), domain)
+            recorded = _read_reconcile_marker(graph_path)
+            if state_before is not None and recorded is not None and recorded.get("state") == state_before:
+                errors = [str(message) for message in recorded.get("errors") or []]
+            else:
+                graph = _load_export_for_reconcile(graph_path)
+                if not isinstance(graph, dict):
+                    continue
+                sync_attack_graph_findings(shell, domain, graph)
+                report_after = _load_technical_report(shell)
+                errors = validate_attack_graph_findings_correlation(
+                    graph,
+                    report_after,
+                    domain=domain,
+                    trust_domains_data=getattr(shell, "domains_data", {}) or {},
+                )
+                del graph
+                _write_reconcile_marker(
+                    graph_path, _reconcile_state(graph_path, report_after, domain), errors
+                )
             if errors:
                 residual.extend(errors)
                 print_warning(

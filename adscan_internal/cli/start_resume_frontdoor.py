@@ -56,6 +56,9 @@ class ResumableDomain:
     ``incomplete_resume_phase`` is the human title of the phase a crash-interrupted
     scan will re-enter at (``None`` when the last run finished cleanly). It is the
     STRONGER resume signal — the front door surfaces it as "continue from <phase>".
+
+    ``scope_change`` is the same comparison ``adscan ci`` asks before it resumes:
+    the front door names a changed scope before the operator chooses.
     """
 
     domain: str
@@ -63,6 +66,9 @@ class ResumableDomain:
     pdc: str
     snapshot: WorkspaceSnapshot
     incomplete_resume_phase: str | None = None
+    #: How the engagement scope differs from the one this domain's scan ran
+    #: under (``scan_scope_lineage.ScanScopeChange``); ``None`` reads unchanged.
+    scope_change: Any = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,7 @@ def detect_resumable_domains(shell: Any) -> list[ResumableDomain]:
                 pdc=str(pdc).strip(),
                 snapshot=snapshot,
                 incomplete_resume_phase=_incomplete_resume_phase(shell, str(domain)),
+                scope_change=_scope_change(shell, str(domain)),
             )
         )
     # Incomplete (crash-interrupted) scans first — they carry the stronger
@@ -144,6 +151,26 @@ def detect_resumable_domains(shell: Any) -> list[ResumableDomain]:
     return resumable
 
 
+def _scope_change(shell: Any, domain: str) -> Any:
+    """How the engagement scope differs from the one the domain's scan ran under.
+
+    ``None`` when it cannot be asked (a pure read must never break the flow);
+    the resume seam asks again before anything runs.
+    """
+    try:
+        from adscan_internal.services.scan_scope_lineage import (
+            asset_scope_change_since_scan,
+        )
+
+        return asset_scope_change_since_scan(shell, domain)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _scope_changed(item: ResumableDomain) -> bool:
+    return item.scope_change is not None and not item.scope_change.same
+
+
 def _incomplete_resume_phase(shell: Any, domain: str) -> str | None:
     """Return the human phase title a crash-interrupted scan will resume from.
 
@@ -154,7 +181,15 @@ def _incomplete_resume_phase(shell: Any, domain: str) -> str | None:
     try:
         from adscan_internal.services import scan_progress as sp
 
-        if not sp.is_incomplete(shell, domain):
+        # Two resume triggers: an interrupted scan (status still ``running``), and
+        # a scan that reached its end but left a phase a re-run can still finish —
+        # a bounded attack-path discovery stopped at the memory ceiling. The
+        # second lets a reopen with more memory recompute it even though the scan
+        # "completed".
+        if not (
+            sp.is_incomplete(shell, domain)
+            or sp.has_recomputable_phase_gap(shell, domain)
+        ):
             return None
         record = sp.read_scan_progress(shell, domain)
         from adscan_core.scan_policy.settings import scan_phase_family  # noqa: PLC0415
@@ -199,6 +234,8 @@ def prompt_frontdoor_choice(
             tail = f"  ·  continue from {item.incomplete_resume_phase}"
         else:
             tail = f"  ·  {age}"
+        if _scope_changed(item):
+            tail += f"  ·  scope {item.scope_change.direction}"
         # Primary, one-click resume row — visually dominant, the default choice.
         options.append(
             f"Continue {mark_sensitive(item.domain, 'domain')}"
@@ -217,10 +254,15 @@ def prompt_frontdoor_choice(
     options.append("Scan a new domain")
     actions.append(NEW_SCAN)
 
+    # The most recent domain's Continue row leads, unless its scope may now hold
+    # assets its scan never assessed: then its "other actions" row leads, where
+    # Refresh starts clean under the current scope.
+    first = resumable[0]
+    default_idx = 1 if _scope_changed(first) and first.scope_change.may_add_assets else 0
     idx = questionary_select_index(
         title="How do you want to proceed?",
         options=options,
-        default_idx=0,
+        default_idx=default_idx,
         shell=shell,
     )
     if idx is None or idx < 0 or idx >= len(actions):
@@ -360,6 +402,14 @@ def _render_frontdoor_panel(resumable: list[ResumableDomain]) -> None:
         detail = f"    [dim]credential[/]  {mark_sensitive(item.username, 'user')}"
         listing.add_row(head)
         listing.add_row(detail)
+        if _scope_changed(item):
+            # Said before the operator chooses: what changed, what continuing
+            # does about it, and how to start clean instead.
+            listing.add_row(f"    [bold yellow]{item.scope_change.headline()}[/]")
+            listing.add_row(
+                f"    [dim]{item.scope_change.resume_consequence()} "
+                "To start clean, choose other actions, then Refresh.[/]"
+            )
 
     body = Group(
         intro,

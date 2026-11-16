@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
@@ -170,6 +172,100 @@ def run_in_worker_thread(awaitable: Awaitable[T]) -> T:
         return pool.submit(run_on_bare_loop, awaitable, set_as_current=True).result()
 
 
+class WorkerAbandoned(RuntimeError):
+    """The scan was aborted and the worker thread did not finish in time.
+
+    Raised by :func:`run_in_worker_thread_abortable` once the work ignored both
+    the grace period and a cancellation (its event loop was blocked). The
+    thread is a daemon and is left behind; the caller unwinds the abort.
+    """
+
+
+#: How often the waiting thread re-checks the abort predicate.
+_ABORTABLE_POLL_SECS = 0.25
+
+
+def run_in_worker_thread_abortable(
+    awaitable: Awaitable[T],
+    *,
+    abort_requested: Callable[[], bool],
+    grace: float,
+    abandon_after: float,
+) -> T:
+    """:func:`run_in_worker_thread`, with a way out once the scan is aborted.
+
+    Until ``abort_requested()`` returns True this is exactly
+    :func:`run_in_worker_thread`: a fresh loop on a fresh thread, installed as
+    that thread's current loop, the caller blocked until it returns, exceptions
+    propagated unchanged. Once an abort is seen, the work gets ``grace`` seconds
+    to return on its own (it is expected to honour the abort itself); then its
+    top task is cancelled from this thread (``call_soon_threadsafe``); if it has
+    still not returned ``abandon_after`` seconds later, :class:`WorkerAbandoned`
+    is raised and the daemon thread is left behind. A ``BaseException`` raised
+    into the waiting thread (a shutdown) cancels the work, waits at most
+    ``grace`` for it, and propagates.
+
+    Why: ``run_in_worker_thread`` waits in an executor exit with no bound, so a
+    worker whose loop was blocked made "Stop the scan" unable to leave.
+    """
+    done = threading.Event()
+    holder: dict[str, object] = {}
+
+    async def _tracked() -> T:
+        holder["loop"] = asyncio.get_running_loop()
+        holder["task"] = asyncio.current_task()
+        return await awaitable  # type: ignore[misc]
+
+    def _thread() -> None:
+        try:
+            holder["result"] = run_on_bare_loop(_tracked(), set_as_current=True)
+        except BaseException as exc:  # noqa: BLE001 - handed to the waiting thread
+            holder["error"] = exc
+        finally:
+            done.set()
+
+    def _cancel_work() -> bool:
+        """Ask the work's loop to cancel its top task. False until it has one."""
+        loop = holder.get("loop")
+        task = holder.get("task")
+        if loop is None or task is None:
+            return False
+        try:
+            loop.call_soon_threadsafe(task.cancel)  # type: ignore[attr-defined]
+        except RuntimeError:
+            pass  # the loop already closed: the work is finishing
+        return True
+
+    worker = threading.Thread(target=_thread, name="adscan-async-worker", daemon=True)
+    worker.start()
+    abort_seen_at: float | None = None
+    cancel_sent_at: float | None = None
+    try:
+        while not done.wait(_ABORTABLE_POLL_SECS):
+            if abort_seen_at is None:
+                if not abort_requested():
+                    continue
+                abort_seen_at = time.monotonic()
+            now = time.monotonic()
+            if cancel_sent_at is None:
+                if now - abort_seen_at >= grace and _cancel_work():
+                    cancel_sent_at = now
+            elif now - cancel_sent_at >= abandon_after:
+                raise WorkerAbandoned(
+                    "worker thread did not stop after the scan was aborted "
+                    f"({grace:.0f}s grace, then {abandon_after:.0f}s after cancel)"
+                )
+    except WorkerAbandoned:
+        raise
+    except BaseException:
+        _cancel_work()
+        done.wait(max(0.0, grace))
+        raise
+    if "error" in holder:
+        raise holder["error"]  # type: ignore[misc]
+    return holder["result"]  # type: ignore[return-value]
+
+
 def run_sync_off_loop(fn: Callable[..., T], *args: object, **kwargs: object) -> T:
     """Run a SYNC callable that internally drives its own event loop.
 
@@ -202,7 +298,9 @@ __all__ = [
     "is_cross_loop_error",
     "report_cross_loop_error",
     "run_async_sync",
+    "WorkerAbandoned",
     "run_in_worker_thread",
+    "run_in_worker_thread_abortable",
     "run_on_bare_loop",
     "run_on_new_loop",
     "run_sync_off_loop",

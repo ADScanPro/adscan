@@ -14,8 +14,27 @@ from adscan_core.async_bridge import run_async_sync, run_on_new_loop
 from adscan_core.scan_policy import settings as policy_settings
 from adscan_core.scan_control import scan_control
 from adscan_core.scan_control.isolation import terminal_isolated_subprocess_kwargs
+from adscan_core.scan_control.fanout import SweepCoverage
+from adscan_internal.services.engagement_scope import (
+    Contact,
+    asset_scope_recorded,
+    partition_targets_in_scope,
+    require_host_in_scope,
+)
+from adscan_internal.services.engagement_scope_targets import (
+    host_contact_gate,
+    prepare_targets_for_scope,
+    subprocess_targets_in_scope,
+)
+from adscan_internal.services.sweep_stop import (
+    announce_not_checked,
+    finish_sweep_step,
+    note_outside_scope,
+    stop_ends_operation,
+    sweep_step,
+)
 
-from typing import Any
+from typing import Any, Callable
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -79,7 +98,9 @@ from adscan_internal.rich_output import (
     questionary_ordered_selection,
 )
 from adscan_internal.services.smb_guest_auth_service import (
-    is_guest_alias,
+    authorize_smb_guest_identity,
+    build_smb_guest_config,
+    is_guest_sign_in_request,
     resolve_smb_guest_username,
 )
 from adscan_internal.services.credsweeper_service import (
@@ -363,6 +384,118 @@ def _filter_share_map_by_global_mapping_exclusions(
 ) -> dict[str, dict[str, str]] | None:
     """Filter host/share permissions map according to global mapping exclusions."""
     return filter_share_map_by_global_smb_exclusions(share_map)
+
+
+#: Engagement-scope surface of every share read, mapping and download.
+_SHARE_SCOPE_SURFACE = "smb_share_hunt"
+
+
+def _smb_hosts_in_scope(
+    shell: Any,
+    hosts: Any,
+    *,
+    domain: str | None,
+    surface: str,
+    what: str,
+    coverage: SweepCoverage | None = None,
+) -> list[str]:
+    """The hosts of a multi-host SMB operation the engagement scope allows.
+
+    One partition per operation, asked BEFORE any pre-flight probe: a host the
+    scope excludes gets no packet, and the scope SSOT tells the operator once
+    ("... skipped N hosts excluded by the engagement scope"). The purpose is the
+    ordinary host purpose, so a domain controller kept to directory reads is
+    left out of host work too.
+    """
+    named = [str(host).strip() for host in (hosts or []) if str(host or "").strip()]
+    scope_domain = str(domain or "").strip() or None
+    # The hosts arrive as names or addresses: the session is told about the
+    # whole list once, then judges it (a verdict looks nothing up).
+    prepare_targets_for_scope(shell, named, domain=scope_domain)
+    scope = partition_targets_in_scope(
+        shell,
+        named,
+        surface=surface,
+        what=what,
+        domain=scope_domain,
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    return list(scope.allowed)
+
+
+def _without_held_hosts(hosts: list[str], gate: Any) -> list[str]:
+    """``hosts`` minus the ones the per-host scope gate kept out during the fan-out.
+
+    They were not contacted, so nothing is recorded for them: not "offline",
+    not "no access", not a negative result.
+    """
+    held = {str(host).strip().lower() for host in gate.held}
+    if not held:
+        return hosts
+    return [host for host in hosts if str(host).strip().lower() not in held]
+
+
+def pdc_share_host_in_scope(shell: Any, domain: str, *, surface: str, what: str) -> bool:
+    """Scope gate of a share operation that defaults to the domain's PDC.
+
+    The live share view connects to the PDC when no host is named. Listing and
+    reading a host's shares is host work, so the purpose is the ordinary host
+    purpose. True when there is no recorded PDC to judge (nothing to contact).
+    """
+    domain_data = (getattr(shell, "domains_data", None) or {}).get(domain, {}) or {}
+    fqdn = str(domain_data.get("pdc_hostname_fqdn") or "").strip()
+    short = str(domain_data.get("pdc_hostname") or "").strip()
+    address = str(domain_data.get("pdc") or "").strip()
+    host = fqdn or (f"{short}.{domain}" if short and "." not in short else short) or address
+    if not host:
+        return True
+    prepare_targets_for_scope(shell, [host], address=lambda _host: address, domain=domain or None)
+    return require_host_in_scope(
+        shell,
+        host=host,
+        connect_address=address or None,
+        surface=surface,
+        what=what,
+        domain=str(domain or "").strip() or None,
+    )
+
+
+def _share_targets_in_scope(
+    shell: Any,
+    *,
+    domain: str | None,
+    hosts: list[str] | None,
+    share_map: dict[str, dict[str, str]] | None,
+    what: str,
+) -> tuple[list[str], dict[str, dict[str, str]] | None]:
+    """A share operation's hosts and host->shares map, narrowed to the scope.
+
+    Both are filtered with ONE partition (one operator line), so the hosts list
+    and the map can never disagree about an excluded host. Everything handed to
+    a child process (rclone, a CIFS mount, the legacy spider) is built from the
+    result, because an in-process check cannot see what a child connects to.
+    """
+    map_hosts = list(share_map.keys()) if isinstance(share_map, dict) else []
+    candidates = list(
+        dict.fromkeys(
+            str(host).strip() for host in [*(hosts or []), *map_hosts] if str(host or "").strip()
+        )
+    )
+    allowed = {
+        host.lower()
+        for host in _smb_hosts_in_scope(
+            shell, candidates, domain=domain, surface=_SHARE_SCOPE_SURFACE, what=what
+        )
+    }
+    kept_hosts = [host for host in (hosts or []) if str(host or "").strip().lower() in allowed]
+    kept_map = share_map
+    if isinstance(share_map, dict):
+        kept_map = {
+            host: shares
+            for host, shares in share_map.items()
+            if str(host or "").strip().lower() in allowed
+        }
+    return kept_hosts, kept_map
 
 
 def _unique_casefold_sorted(values: list[str]) -> list[str]:
@@ -790,26 +923,18 @@ def _smb_config_for_auth(shell: Any, domain: str):
 
 
 def _smb_config_for_guest(shell: Any, domain: str):
-    """Build an SMBConfig for a Guest:<empty> SMB session."""
+    """Build the guest-session SMBConfig against the domain's PDC (RID cycling)."""
     from adscan_internal.models.domain import resolve_dns_server
-    from adscan_internal.services.smb_transport import SMBConfig
 
     domain_data = shell.domains_data.get(domain, {}) or {}
     pdc_ip = str(domain_data.get("pdc") or "").strip()
     pdc_hostname = str(domain_data.get("pdc_hostname") or "").strip() or None
-    guest_username = resolve_smb_guest_username(shell=shell, domain=domain)
-    # Guest / null session: Kerberos requires a principal + ticket.
-    # Force NTLM-anonymous so the posture plan's Kerberos-first policy
-    # doesn't crash with empty credentials (NoneType.native).
     # Split-DC/DNS (issue #15): resolve via the separate AD DNS server when set.
-    return SMBConfig(
+    return build_smb_guest_config(
+        shell,
+        domain=domain,
         target_ip=pdc_ip,
         target_hostname=pdc_hostname,
-        domain=domain,
-        username=guest_username,
-        password="",
-        auth_domain=domain,
-        use_kerberos=False,
         dns_server=resolve_dns_server(domain_data),
         timeout=30,
     )
@@ -908,9 +1033,18 @@ def execute_smb_rid_cycling(
         SMBAccessDeniedError,
         SMBAuthError,
         SMBConnectionError,
+        SMBGuestSessionUnavailableError,
         SMBTransportError,
         smb_machine_with_fallback,
     )
+
+    # RID cycling opens a guest session on the domain controller and reads the
+    # LSA pipe: host work, so a controller the scope excludes (or keeps to
+    # directory reads) gets no guest sign-in.
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="smb_rid_cycling", what="RID cycling over a guest session"
+    ):
+        return
 
     try:
         max_rid = rid_max
@@ -933,6 +1067,16 @@ def execute_smb_rid_cycling(
         try:
             entries, status, error = run_on_new_loop(_drive(max_rid))
         except (SMBAuthError, SMBAccessDeniedError) as exc:
+            from adscan_core.auth_attempt_guard import refusal_in_chain
+
+            if isinstance(exc, SMBGuestSessionUnavailableError) or refusal_in_chain(exc):
+                # The host has no guest access, or the guest sign-in was withheld
+                # before the wire: a second attempt would get the same answer.
+                print_warning(
+                    f"RID cycling with a guest session is not possible on domain "
+                    f"{marked_domain}: {exc}"
+                )
+                return
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
             if not has_local_auth:
@@ -1025,6 +1169,11 @@ def run_null_shares(shell: Any, *, domain: str) -> None:
         "auth",
         "pwned",
     ]:
+        return
+
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="smb_null_share_enumeration", what="Null-session share enumeration"
+    ):
         return
 
     # Use the native aiosmb stack — pass username="" and credential="" so
@@ -1327,6 +1476,13 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
     for token in target_tokens:
         expanded = load_target_entries(token)
         all_hosts.extend(sorted(expanded))
+    all_hosts = _smb_hosts_in_scope(
+        shell,
+        all_hosts,
+        domain=domain,
+        surface="smb_guest_share_enumeration",
+        what="Guest share enumeration",
+    )
 
     if not all_hosts:
         marked_domain = mark_sensitive(domain, "domain")
@@ -1337,11 +1493,24 @@ def run_guest_shares(shell: Any, *, domain: str) -> None:
         return
 
     print_info(
-        f"Guest share enumeration as {mark_sensitive(guest_transport_username, 'user')} "
-        f"against {len(all_hosts)} host(s) [source: {target_source}]."
+        "Guest share enumeration (guest session, transport name "
+        f"{mark_sensitive(guest_transport_username, 'user')}, not a domain account) "
+        f"against {len(all_hosts)} host(s), source: {target_source}."
     )
 
+    # The list passed the engagement scope above, at the start. Each host is
+    # asked about again right before its shares are listed: this loop can run
+    # for a long time and the scope can be narrowed meanwhile.
+    share_gate = host_contact_gate(
+        shell,
+        all_hosts,
+        surface="smb_guest_share_enumeration",
+        what="Guest share enumeration",
+        domain=str(domain or "").strip() or None,
+    )
     for host_ip in all_hosts:
+        if not share_gate.admits(host_ip):
+            continue
         view_set = run_native_shares_view(
             shell,
             domain=domain,
@@ -1472,7 +1641,15 @@ def run_auth_shares(
     if targeting_notice:
         print_info(targeting_notice)
 
-    all_hosts = load_target_entries(targets_file)
+    # Engagement scope before the 445 gate and the per-host enumeration: an
+    # excluded host is neither probed nor enumerated, and is not counted below.
+    all_hosts = _smb_hosts_in_scope(
+        shell,
+        load_target_entries(targets_file),
+        domain=domain,
+        surface="smb_share_enumeration",
+        what="SMB share enumeration",
+    )
     host_count = len(all_hosts)
     print_info(
         f"Checking share access as user {marked_username} in domain {marked_domain}"
@@ -1498,7 +1675,9 @@ def run_auth_shares(
             render_no_reachable_panel,
         )
 
-        share_reach = filter_reachable_hosts_sync(ordered_hosts, port=445)
+        share_reach = filter_reachable_hosts_sync(
+            ordered_hosts, port=445, scope_surface="smb_share_enumeration"
+        )
         print_reachability_summary(share_reach, service_label="SMB")
         if not share_reach.reachable:
             render_no_reachable_panel(
@@ -1559,7 +1738,20 @@ def run_auth_shares(
 
     lockout_guard = SweepLockoutGuard()
     view_sets: list[Any] = []
+    # The list passed the engagement scope at the start of the sweep. Each host
+    # is asked about again right before its shares are listed, so a scope
+    # narrowed while the sweep runs is honoured for the hosts not yet reached
+    # (no sign-in, no listing, and no result recorded for them).
+    share_gate = host_contact_gate(
+        shell,
+        ordered_hosts,
+        surface="smb_share_enumeration",
+        what="SMB share enumeration",
+        domain=str(domain or "").strip() or None,
+    )
     for index, host_ip in enumerate(ordered_hosts, start=1):
+        if not share_gate.admits(host_ip):
+            continue
         # Per-host progress so the operator knows more hosts follow before the
         # consolidated surface renders.
         print_info(
@@ -2147,13 +2339,20 @@ def run_pass_policy(shell: Any, *, domain: str) -> None:
 
 
 async def _probe_smbv1_hosts(
-    hosts: list[str], *, timeout: float | None = None, concurrency: int | None = None
+    hosts: list[str],
+    *,
+    timeout: float | None = None,
+    concurrency: int | None = None,
+    admit: Any = None,
 ) -> list[str]:
     """Return the subset of ``hosts`` that answer a raw SMBv1 negotiate.
 
     Bounded-concurrency native sweep using ``smb_collector.smb1_probe`` — the
     same NT LM 0.12 negotiate NetExec used, with no subprocess. Never raises;
     a host that errors or times out is simply treated as not SMBv1-enabled.
+
+    ``admit`` is the engagement scope's per-host check (``host_contact_gate``),
+    asked right before each host's probe: a host it keeps out is not probed.
     """
     import asyncio
 
@@ -2169,6 +2368,8 @@ async def _probe_smbv1_hosts(
 
     async def _one(host: str) -> str | None:
         async with sem:
+            if admit is not None and not await asyncio.to_thread(admit, host):
+                return None
             await runtime.before_op(host)
             try:
                 return host if await smb1_probe(host, timeout=timeout) else None
@@ -2310,8 +2511,22 @@ def execute_smbv1_audit(shell: Any, *, domain: str, targets_file: str) -> None:
             ]
     except OSError:
         all_hosts = []
+    all_hosts = _smb_hosts_in_scope(
+        shell, all_hosts, domain=domain, surface="smbv1_audit", what="SMBv1 audit"
+    )
 
-    vulnerable_hosts = run_async_sync(_probe_smbv1_hosts(all_hosts))
+    # Asked again per host, right before its probe (the list above is from the
+    # start of the audit). A host kept out was not probed: it is dropped from
+    # the audited set, so it is never recorded as "SMBv1 not enabled".
+    audit_gate = host_contact_gate(
+        shell,
+        all_hosts,
+        surface="smbv1_audit",
+        what="SMBv1 audit",
+        domain=str(domain or "").strip() or None,
+    )
+    vulnerable_hosts = run_async_sync(_probe_smbv1_hosts(all_hosts, admit=audit_gate.admits))
+    all_hosts = _without_held_hosts(all_hosts, audit_gate)
     _record_smbv1_audit(
         shell, domain=domain, all_hosts=all_hosts, vulnerable_hosts=vulnerable_hosts
     )
@@ -2636,6 +2851,8 @@ async def _harvest_gpp_for_domain(
     when NO DC was reachable at all — a data gap, distinct from a reachable DC that
     denied access.
     """
+    import asyncio  # noqa: PLC0415
+
     from adscan_internal.services.gpp_credential_harvester import (
         GPPHarvestResult,
         harvest_gpp_on_connection,
@@ -2654,6 +2871,29 @@ async def _harvest_gpp_for_domain(
 
     # SSOT: PDC-first, one deduped target per DC, each with its OWN FQDN as SPN.
     targets = resolve_dc_connect_targets(shell, domain=target_domain)
+    # Engagement scope: a domain controller the scope excludes is never walked.
+    # What is opened is the SYSVOL share (the walk below judges each root for
+    # the share it is on), so a domain controller the scope keeps to directory
+    # reads is still checked.
+    _resolved_dc_count = len(targets)
+    prepare_targets_for_scope(
+        shell,
+        targets,
+        key=lambda target: target.spn_fqdn or target.connect_ip,
+        address=lambda target: target.connect_ip,
+        domain=target_domain,
+    )
+    targets = partition_targets_in_scope(
+        shell,
+        targets,
+        key=lambda target: target.spn_fqdn or target.connect_ip,
+        address=lambda target: target.connect_ip,
+        contact=Contact("smb", share="SYSVOL"),
+        surface="gpp_sysvol_harvest",
+        what="Group Policy credential check",
+        domain=target_domain,
+    ).allowed
+    _all_dcs_outside_scope = bool(_resolved_dc_count) and not targets
     base_cfg = _smb_config_for_auth(shell, target_domain)
 
     from adscan_internal.models.domain import resolve_dc_ip
@@ -2766,11 +3006,32 @@ async def _harvest_gpp_for_domain(
     aggregate = GPPHarvestResult()
     if not targets:
         aggregate.status = "skipped"
-        aggregate.error = "no DC targets resolved"
+        aggregate.error = (
+            "not checked: every domain controller is excluded from the engagement scope"
+            if _all_dcs_outside_scope
+            else "no DC targets resolved"
+        )
         return aggregate
 
+    # The domain controllers passed the scope above. Each is asked about again
+    # right before its SYSVOL is opened (the next one is only tried when the
+    # one before it did not answer, which can be minutes later).
+    gpp_gate = host_contact_gate(
+        shell,
+        targets,
+        surface="gpp_sysvol_harvest",
+        what="Group Policy credential check",
+        key=lambda target: target.spn_fqdn or target.connect_ip,
+        address=lambda target: target.connect_ip,
+        domain=target_domain,
+        contact=Contact("smb", share="SYSVOL"),
+    )
     any_reachable = False
+    contacted = 0
     for target in targets:
+        if not await asyncio.to_thread(gpp_gate.admits, target):
+            continue
+        contacted += 1
         result, reachable = await _harvest_one(target)
         aggregate.merge(result)
         if reachable:
@@ -2779,6 +3040,14 @@ async def _harvest_gpp_for_domain(
             any_reachable = True
             break
 
+    if not contacted:
+        # The scope kept every domain controller out since the list was built:
+        # nothing was opened, so this is neither "unreachable" nor "denied".
+        aggregate.status = "skipped"
+        aggregate.error = (
+            "not checked: every domain controller is excluded from the engagement scope"
+        )
+        return aggregate
     if not any_reachable:
         # Every DC was unreachable — an honest data gap, not "access denied".
         aggregate.status = "error"
@@ -3318,6 +3587,17 @@ def run_local_cred_reuse(
         load_target_entries(targets_file), is_dc
     )
     announce_skipped_domain_controllers(skipped_dcs, domain=domain)
+    # Engagement scope before the 445 gate and the sweep: an excluded host gets
+    # no probe and no sign-in, and no "not reused" result is recorded for it.
+    coverage = SweepCoverage()
+    all_hosts = _smb_hosts_in_scope(
+        shell,
+        all_hosts,
+        domain=domain,
+        surface="local_cred_reuse_check",
+        what="Local credential reuse check",
+        coverage=coverage,
+    )
     if not all_hosts:
         print_warning(
             f"No member hosts to test for local credential reuse in {mark_sensitive(domain, 'domain')}."
@@ -3332,9 +3612,13 @@ def run_local_cred_reuse(
         from adscan_internal.services.host_reachability_filter import (  # noqa: PLC0415
             filter_reachable_hosts_sync,
             print_reachability_summary,
+            scope_excluded_hosts,
         )
 
-        reach = filter_reachable_hosts_sync(all_hosts, port=445)
+        reach = filter_reachable_hosts_sync(
+            all_hosts, port=445, scope_surface="local_cred_reuse_check"
+        )
+        note_outside_scope(coverage, scope_excluded_hosts(reach))
         print_reachability_summary(reach, service_label="SMB")
         ordered_hosts = list(reach.reachable)
 
@@ -3349,67 +3633,77 @@ def run_local_cred_reuse(
     is_hash = bool(shell.is_hash(credential))
     from adscan_internal.services.async_bridge import run_async_sync  # noqa: PLC0415
 
-    results = run_async_sync(
-        _sweep_local_cred_reuse(
-            ordered_hosts,
-            domain=domain,
-            username=username,
-            credential=credential,
-            is_hash=is_hash,
-            is_domain_controller=is_dc,
+    with sweep_step("local_cred_reuse_check", label="Local credential reuse check") as step:
+        results = run_async_sync(
+            _sweep_local_cred_reuse(
+                ordered_hosts,
+                domain=domain,
+                username=username,
+                credential=credential,
+                is_hash=is_hash,
+                is_domain_controller=is_dc,
+                should_stop=step.should_stop,
+                coverage=coverage,
+                shell=shell,
+            )
         )
-    )
-    synthetic_output = _synthesize_local_cred_reuse_output(results)
+        finish_sweep_step(step, coverage)
+        announce_not_checked(label="Local credential reuse check", coverage=coverage)
+        if stop_ends_operation(step):
+            # A skipped phase or a stopped scan: record what was checked, but do
+            # not open the follow-up dump prompts.
+            prompt_dump_after_reuse = False
+        synthetic_output = _synthesize_local_cred_reuse_output(results)
 
-    # Persist the NetExec-shaped log the downstream renderer reads (the same
-    # relative path the retired ``--log`` wrote). ``execute_local_cred_reuse``
-    # parses THIS file — the synthetic CompletedProcess below carries empty
-    # stdout so outcomes are counted exactly once (from the log, not twice).
-    log_rel = f"domains/{domain}/smb/{username}_cred_reuse.txt"
-    try:
-        os.makedirs(os.path.dirname(log_rel), exist_ok=True)
-        with open(log_rel, "w", encoding="utf-8") as handle:
-            handle.write(synthetic_output)
-    except OSError as exc:
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[local_reuse] failed to persist {log_rel}: {exc}"
-        )
-
-    # Feed the untouched persistence + attack-graph + panel renderer
-    # (``PentestShell.execute_local_cred_reuse``) via a synthetic CompletedProcess,
-    # exactly like the native GPP walker feeds ``execute_netexec_gpp``. This keeps
-    # the LocalAdminPassReuse edge creation and the reuse panels intact while the
-    # data comes from the native aiosmb sweep instead of a netexec subprocess.
-    fake_command = (
-        f"native-smb-local-auth-sweep --domain {domain} --user {username}"
-    )
-    fake_proc = subprocess.CompletedProcess(
-        args=[fake_command],
-        returncode=0,
-        stdout="",
-        stderr="",
-    )
-    original_run_command = getattr(shell, "run_command", None)
-    try:
-        shell.run_command = lambda *_args, **_kwargs: fake_proc
+        # Persist the NetExec-shaped log the downstream renderer reads (the same
+        # relative path the retired ``--log`` wrote). ``execute_local_cred_reuse``
+        # parses THIS file — the synthetic CompletedProcess below carries empty
+        # stdout so outcomes are counted exactly once (from the log, not twice).
+        log_rel = f"domains/{domain}/smb/{username}_cred_reuse.txt"
         try:
-            return shell.execute_local_cred_reuse(
-                fake_command,
-                domain,
-                username,
-                credential,
-                prompt_dump_after_reuse=prompt_dump_after_reuse,
+            os.makedirs(os.path.dirname(log_rel), exist_ok=True)
+            with open(log_rel, "w", encoding="utf-8") as handle:
+                handle.write(synthetic_output)
+        except OSError as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[local_reuse] failed to persist {log_rel}: {exc}"
             )
-        except TypeError:
-            # Backward compatibility for shells that still expose the legacy signature.
-            return shell.execute_local_cred_reuse(
-                fake_command, domain, username, credential
-            )
-    finally:
-        if original_run_command is not None:
-            shell.run_command = original_run_command
+
+        # Feed the untouched persistence + attack-graph + panel renderer
+        # (``PentestShell.execute_local_cred_reuse``) via a synthetic CompletedProcess,
+        # exactly like the native GPP walker feeds ``execute_netexec_gpp``. This keeps
+        # the LocalAdminPassReuse edge creation and the reuse panels intact while the
+        # data comes from the native aiosmb sweep instead of a netexec subprocess.
+        fake_command = (
+            f"native-smb-local-auth-sweep --domain {domain} --user {username}"
+        )
+        fake_proc = subprocess.CompletedProcess(
+            args=[fake_command],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        original_run_command = getattr(shell, "run_command", None)
+        try:
+            shell.run_command = lambda *_args, **_kwargs: fake_proc
+            try:
+                return shell.execute_local_cred_reuse(
+                    fake_command,
+                    domain,
+                    username,
+                    credential,
+                    prompt_dump_after_reuse=prompt_dump_after_reuse,
+                )
+            except TypeError:
+                # Backward compatibility for shells that still expose the legacy signature.
+                return shell.execute_local_cred_reuse(
+                    fake_command, domain, username, credential
+                )
+        finally:
+            if original_run_command is not None:
+                shell.run_command = original_run_command
 
 
 async def _sweep_local_cred_reuse(
@@ -3422,8 +3716,19 @@ async def _sweep_local_cred_reuse(
     timeout: int = 15,
     max_workers: int | None = None,
     is_domain_controller: Any = None,
+    should_stop: Any = None,
+    coverage: Any = None,
+    shell: Any = None,
 ) -> list[Any]:
     """Probe local-account credential reuse across hosts via native aiosmb.
+
+    ``shell`` is the session whose engagement scope applies: the shared batch
+    partitions the hosts before its fan-out, so an excluded host is never
+    contacted even when a caller did not narrow the list first.
+
+    Honours the scan control plane (``should_stop``, default the running
+    step's): after a stop only the checked hosts come back and ``coverage``
+    names the rest, so none of them is read as "not reused".
 
     ``is_domain_controller`` (``local_reuse_targets.domain_controller_matcher``)
     drops any domain controller still in ``hosts`` and is handed to the config
@@ -3467,7 +3772,13 @@ async def _sweep_local_cred_reuse(
         for host in hosts
     ]
     workers = max(1, min(max_workers or get_smb_probe_worker_count(), len(configs)))
-    return await check_smb_privilege_batch(configs, max_concurrency=workers)
+    return await check_smb_privilege_batch(
+        configs,
+        max_concurrency=workers,
+        should_stop=should_stop,
+        coverage=coverage,
+        shell=shell,
+    )
 
 
 def _synthesize_local_cred_reuse_output(results: Any) -> str:
@@ -3642,9 +3953,17 @@ def _collect_unsigned_relay_from_graph(shell: Any, *, domain: str) -> list[str] 
 
 
 async def _probe_unsigned_relay_hosts(
-    hosts: list[str], *, timeout: float | None = None, concurrency: int | None = None
+    hosts: list[str],
+    *,
+    timeout: float | None = None,
+    concurrency: int | None = None,
+    admit: Any = None,
 ) -> list[str]:
     """Return the hosts whose SMB signing is NOT required (relay-able).
+
+    ``admit`` is the engagement scope's per-host check (``host_contact_gate``),
+    asked right before each host's negotiate: a host it keeps out is not
+    contacted and is never listed as a relay target.
 
     Native bounded-concurrency sweep using ``smb_collector.negotiate_only`` (the
     unauthenticated negotiate that reports ``smb_signing_required``) — the same
@@ -3666,6 +3985,8 @@ async def _probe_unsigned_relay_hosts(
 
     async def _one(host: str) -> str | None:
         async with sem:
+            if admit is not None and not await asyncio.to_thread(admit, host):
+                return None
             await runtime.before_op(host)
             try:
                 props = await negotiate_only(host, 445, int(timeout))
@@ -3745,8 +4066,21 @@ def run_smb_relay_targets(shell: Any, *, domain: str) -> None:
     if unsigned is None:
         from adscan_internal.services.async_bridge import run_async_sync
 
-        hosts = list(load_target_entries(targets_file))
-        unsigned = run_async_sync(_probe_unsigned_relay_hosts(hosts))
+        hosts = _smb_hosts_in_scope(
+            shell,
+            load_target_entries(targets_file),
+            domain=domain,
+            surface="smb_signing_probe",
+            what="SMB signing check",
+        )
+        signing_gate = host_contact_gate(
+            shell,
+            hosts,
+            surface="smb_signing_probe",
+            what="SMB signing check",
+            domain=str(domain or "").strip() or None,
+        )
+        unsigned = run_async_sync(_probe_unsigned_relay_hosts(hosts, admit=signing_gate.admits))
     relay_file = os.path.join(shell.domains_dir, domain, "smb", "relay_targets.txt")
     os.makedirs(os.path.dirname(relay_file), exist_ok=True)
     with open(relay_file, "w", encoding="utf-8") as handle:
@@ -3768,6 +4102,12 @@ def run_get_flags(
     Falls back to the :mod:`remote_exec` cascade only when SMB returns
     ACCESS_DENIED for a candidate Desktop file.
     """
+    # Reading files off a host's disk is host work (the ordinary host purpose),
+    # asked before the clock sync or any read.
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="flag_collection", what="Flag collection"
+    ):
+        return
     # Best-effort clock sync — Kerberos byte-reads need it; the call is
     # idempotent and harmless when the clock is already aligned.
     try:
@@ -4089,9 +4429,26 @@ def run_smbclient_upload(
 
     service = ExploitationService()
     poisoning_started = False
+    hosts = _smb_hosts_in_scope(
+        shell,
+        hosts,
+        domain=domain,
+        surface="smb_share_upload",
+        what="SMB share upload",
+    )
 
+    upload_gate = host_contact_gate(
+        shell,
+        hosts,
+        surface="smb_share_upload",
+        what="SMB share upload",
+        domain=str(domain or "").strip() or None,
+    )
     # Iterate over each host
     for host in hosts:
+        # Asked again right before anything is written to this host.
+        if not upload_gate.admits(host):
+            continue
         marked_host = mark_sensitive(host, "hostname")
         print_info(f"Processing host: {marked_host}")
         # Iterate over each share for the current host
@@ -4671,6 +5028,17 @@ def run_ntlmv2_capture_for_writable_shares(
     writable_share_names = [str(n).strip() for n in (writable_share_names or []) if str(n).strip()]
     if not writable_share_names:
         return None
+    # Engagement scope before the listener is resolved or any bait is planted:
+    # nothing is written to a share of an excluded host.
+    prepare_targets_for_scope(shell, [host], domain=str(domain or "").strip() or None)
+    if not require_host_in_scope(
+        shell,
+        host=host,
+        surface="writable_share_capture",
+        what="Writable-share capture",
+        domain=str(domain or "").strip() or None,
+    ):
+        return None
 
     # Same question the 'capture_ntlm_share_drop' command asks, so the offer
     # and the execution can never disagree about whether a listener exists.
@@ -5018,6 +5386,15 @@ def ask_for_smb_shares_read(
     from adscan_internal.rich_output import confirm_operation
 
     if policy_settings.domain_compromise_reached(shell, domain):
+        return
+
+    # Engagement scope at the entry of the whole read flow (mapping, download,
+    # analysis): every later step is built from these two.
+    had_hosts = bool(hosts)
+    hosts, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=hosts, share_map=share_map, what="SMB share hunt"
+    )
+    if had_hosts and not hosts:
         return
 
     original_shares_count = len(shares)
@@ -5389,7 +5766,7 @@ def _build_rclone_copy_command(
         "--retries",
         "1",
         "--low-level-retries",
-        "2",
+        "1",
     ]
     if include_args:
         command_parts.append(include_args)
@@ -5435,12 +5812,55 @@ def _build_rclone_copy_files_from_command(
         "--retries",
         "1",
         "--low-level-retries",
-        "2",
+        "1",
     ]
     if isinstance(max_size_bytes, int) and max_size_bytes > 0:
         max_size_mb = max(1, int(max_size_bytes // (1024 * 1024)))
         command_parts.extend(["--max-size", f"{max_size_mb}M"])
     return " ".join(command_parts)
+
+
+def _share_review_reads_every_file_name(selected_method: str | None) -> bool:
+    """Whether the mapping serves the AI review, which triages every file name.
+
+    The static review reads only its candidate file types, so its mapping keeps
+    those. The AI review exists to catch the oddly named file no type list
+    selects, so its mapping keeps every file name up to a total for the run
+    (the same rule as the file review on a database server).
+    """
+    return str(selected_method or "").strip().lower() in {"ai_rclone", "ai_cifs"}
+
+
+def _run_share_mapping_stage(
+    shell: Any,
+    *,
+    domain: str,
+    total: int,
+    generate: Callable[[Any], dict[str, Any]],
+    merge: Callable[[], dict[str, Any]],
+    aggregate_map_abs: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+    """Run one share mapping and its merge under the share-mapping memory stage.
+
+    Every mapping backend that lists whole share trees (rclone, CIFS) goes
+    through here: past the stage line the mapping stops, keeps what it mapped
+    and declares the shares it did not reach, and a share whose listing was cut
+    short is recorded as a coverage gap. The state of each share's listing
+    lives in the domain's SMB folder, one level above the backend's own folder.
+    """
+    from adscan_internal.services.share_mapping_bounds import (
+        run_share_mapping_bounded,
+    )
+
+    backend_root = os.path.dirname(aggregate_map_abs)
+    return run_share_mapping_bounded(
+        shell,
+        domain,
+        total=total,
+        generate=generate,
+        merge=merge,
+        state_dir=os.path.dirname(backend_root),
+    )
 
 
 def _generate_rclone_mapping(
@@ -5499,6 +5919,8 @@ def _generate_rclone_mapping(
             share_map_pairs += readable_pairs
 
     target_pairs = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -5511,37 +5933,61 @@ def _generate_rclone_mapping(
         f"share_map_pairs={share_map_pairs} fallback_used={fallback_used} "
         f"hosts={len(hosts)} shares={len(shares)}"
     )
-    transport_username, transport_password, transport_domain = (
-        _resolve_rclone_transport_auth(
-            shell,
-            domain=domain,
-            username=username,
-            password=password,
-        )
+    transport_auth, refusal = _rclone_transport_auth_or_refusal(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
     )
+    if transport_auth is None:
+        print_warning(f"Skipping rclone SMB mapping: {refusal}")
+        return {"success": False}
+    transport_username, transport_password, transport_domain = transport_auth
     rclone_service = RcloneShareMappingService()
-    mapping_result = rclone_service.generate_host_metadata_json(
-        run_output_dir=run_output_abs,
-        host_share_targets=target_pairs,
-        username=transport_username,
-        password=transport_password,
-        domain=transport_domain,
-        command_executor=shell.run_command,
-        rclone_path=rclone_path,
-        timeout_seconds=1200,
-    )
     run_id = Path(run_output_abs).name
     share_mapping_service = ShareMappingService()
-    share_mapping_service.merge_spider_plus_run(
+    held_outcomes: dict[str, Any] = {}
+
+    def _generate(stage: Any) -> dict[str, Any]:
+        result = rclone_service.generate_host_metadata_json(
+            run_output_dir=run_output_abs,
+            host_share_targets=target_pairs,
+            username=transport_username,
+            password=transport_password,
+            domain=transport_domain,
+            command_executor=shell.run_command,
+            rclone_path=rclone_path,
+            timeout_seconds=1200,
+            shell=shell,
+            stage=stage,
+        )
+        held_outcomes.update(result.get("share_outcomes") or {})
+        return result
+
+    def _merge() -> dict[str, Any]:
+        return share_mapping_service.merge_spider_plus_run(
+            domain=domain,
+            principal=f"{domain}\\{username}",
+            run_id=run_id,
+            run_output_dir=run_output_abs,
+            aggregate_map_path=aggregate_map_abs,
+            requested_hosts=hosts,
+            requested_shares=shares,
+            host_share_permissions=share_map,
+            share_outcomes=held_outcomes,
+            candidates_only=True,
+        )
+
+    mapping_result, merge_summary, _stopped = _run_share_mapping_stage(
+        shell,
         domain=domain,
-        principal=f"{domain}\\{username}",
-        run_id=run_id,
-        run_output_dir=run_output_abs,
-        aggregate_map_path=aggregate_map_abs,
-        requested_hosts=hosts,
-        requested_shares=shares,
-        host_share_permissions=share_map,
+        total=len(target_pairs),
+        generate=_generate,
+        merge=_merge,
+        aggregate_map_abs=aggregate_map_abs,
     )
+    if mapping_result is None or merge_summary is None:
+        return {"success": False}
     return {
         "success": bool(int(mapping_result.get("host_json_files", 0) or 0) > 0),
         "mapped_shares": int(mapping_result.get("mapped_shares", 0) or 0),
@@ -5597,6 +6043,31 @@ def _run_rclone_copy_loot_download(
         RcloneShareMappingService,
     )
 
+    # rclone is a child process: the pairs handed to it are its only gate.
+    _allowed_hosts = {
+        host.lower()
+        for host in _smb_hosts_in_scope(
+            shell,
+            list(dict.fromkeys(str(host) for host, _share in target_pairs)),
+            domain=domain,
+            surface=_SHARE_SCOPE_SURFACE,
+            what="SMB share download",
+        )
+    }
+    target_pairs = [
+        pair for pair in target_pairs if str(pair[0]).strip().lower() in _allowed_hosts
+    ]
+    # One rclone child per pair, and the downloads can run for a long time: the
+    # partition above is from their start, so each host is asked about again
+    # immediately before its child is started.
+    download_gate = host_contact_gate(
+        shell,
+        list(dict.fromkeys(str(host).strip() for host, _share in target_pairs)),
+        surface=_SHARE_SCOPE_SURFACE,
+        what="SMB share download",
+        domain=str(domain or "").strip() or None,
+    )
+
     rclone_path = _ensure_rclone_available(shell)
     if not rclone_path:
         return {
@@ -5621,14 +6092,20 @@ def _run_rclone_copy_loot_download(
         }
 
     service = RcloneShareMappingService()
-    transport_username, transport_password, transport_domain = (
-        _resolve_rclone_transport_auth(
-            shell,
-            domain=domain,
-            username=username,
-            password=password,
-        )
+    transport_auth, refusal = _rclone_transport_auth_or_refusal(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
     )
+    if transport_auth is None:
+        print_warning(f"Skipping rclone {operation_label}: {refusal}")
+        return {
+            "success": False,
+            "copied_targets": 0,
+            "failed_targets": len(target_pairs),
+        }
+    transport_username, transport_password, transport_domain = transport_auth
     obscured_password = service.obscure_password(
         command_executor=shell.run_command,
         rclone_path=rclone_path,
@@ -5652,6 +6129,7 @@ def _run_rclone_copy_loot_download(
     failed_targets = 0
     partial_targets = 0
     stopped_targets = 0
+    outside_scope_targets = 0
     print_info_debug(
         f"rclone {operation_label} tuning: "
         f"targets={len(target_pairs)} workers={tuning.target_workers} "
@@ -5665,6 +6143,9 @@ def _run_rclone_copy_loot_download(
         # phase / stopped scan) launches no new download; in-flight ones drain.
         if scan_control().should_stop():
             return {"status": "stopped", "host": host, "share": share, "rc": None}
+        # Engagement scope, immediately before the child is handed this host.
+        if not download_gate.admits(str(host).strip()):
+            return {"status": "outside_scope", "host": host, "share": share, "rc": None}
         remote = service.build_smb_remote(
             host=host,
             share=share,
@@ -5743,6 +6224,10 @@ def _run_rclone_copy_loot_download(
                 if status == "stopped":
                     stopped_targets += 1
                     continue
+                if status == "outside_scope":
+                    # Not contacted: neither copied nor failed.
+                    outside_scope_targets += 1
+                    continue
                 completed += 1
                 _report_share_progress(completed, len(target_pairs))
                 if status == "copied":
@@ -5777,6 +6262,7 @@ def _run_rclone_copy_loot_download(
         "partial_targets": partial_targets,
         "failed_targets": failed_targets,
         "stopped_targets": stopped_targets,
+        "outside_scope_targets": outside_scope_targets,
     }
 
 
@@ -5796,6 +6282,34 @@ def _run_rclone_copy_mapped_loot_download(
     """Download exact remote paths with rclone using files-from manifests."""
     from adscan_internal.services.rclone_share_mapping_service import (
         RcloneShareMappingService,
+    )
+
+    # rclone is a child process, and the paths come from a share map that may
+    # have been written under an earlier scope: a host excluded now gets no new
+    # contact, whatever the map holds.
+    _allowed_hosts = {
+        host.lower()
+        for host in _smb_hosts_in_scope(
+            shell,
+            list(dict.fromkeys(str(host) for host, _share in grouped_remote_paths)),
+            domain=domain,
+            surface=_SHARE_SCOPE_SURFACE,
+            what="SMB share download",
+        )
+    }
+    grouped_remote_paths = {
+        key: paths
+        for key, paths in grouped_remote_paths.items()
+        if str(key[0]).strip().lower() in _allowed_hosts
+    }
+    # One rclone child per (host, share): each host is asked about again
+    # immediately before its child is started.
+    download_gate = host_contact_gate(
+        shell,
+        list(dict.fromkeys(str(host).strip() for host, _share in grouped_remote_paths)),
+        surface=_SHARE_SCOPE_SURFACE,
+        what="SMB share download",
+        domain=str(domain or "").strip() or None,
     )
 
     rclone_path = _ensure_rclone_available(shell)
@@ -5822,14 +6336,20 @@ def _run_rclone_copy_mapped_loot_download(
         }
 
     service = RcloneShareMappingService()
-    transport_username, transport_password, transport_domain = (
-        _resolve_rclone_transport_auth(
-            shell,
-            domain=domain,
-            username=username,
-            password=password,
-        )
+    transport_auth, refusal = _rclone_transport_auth_or_refusal(
+        shell,
+        domain=domain,
+        username=username,
+        password=password,
     )
+    if transport_auth is None:
+        print_warning(f"Skipping rclone {operation_label}: {refusal}")
+        return {
+            "success": False,
+            "copied_targets": 0,
+            "failed_targets": len(grouped_remote_paths),
+        }
+    transport_username, transport_password, transport_domain = transport_auth
     obscured_password = service.obscure_password(
         command_executor=shell.run_command,
         rclone_path=rclone_path,
@@ -5852,6 +6372,7 @@ def _run_rclone_copy_mapped_loot_download(
     copied_targets = 0
     failed_targets = 0
     partial_targets = 0
+    outside_scope_targets = 0
     print_info_debug(
         f"rclone {operation_label} tuning: "
         f"targets={len(grouped_remote_paths)} workers={tuning.target_workers} "
@@ -5867,6 +6388,9 @@ def _run_rclone_copy_mapped_loot_download(
             return {"status": "skipped", "host": host, "share": share, "rc": 0}
         if scan_control().should_stop():
             return {"status": "stopped", "host": host, "share": share, "rc": None}
+        # Engagement scope, immediately before the child is handed this host.
+        if not download_gate.admits(str(host).strip()):
+            return {"status": "outside_scope", "host": host, "share": share, "rc": None}
         remote = service.build_smb_remote(
             host=host,
             share=share,
@@ -5933,6 +6457,10 @@ def _run_rclone_copy_mapped_loot_download(
                 host = str(result.get("host", ""))
                 share = str(result.get("share", ""))
                 rc = result.get("rc")
+                if status == "outside_scope":
+                    # Not contacted: neither copied nor failed.
+                    outside_scope_targets += 1
+                    continue
                 if status in {"copied", "skipped", "stopped"}:
                     if status == "copied":
                         copied_targets += 1
@@ -5956,6 +6484,7 @@ def _run_rclone_copy_mapped_loot_download(
         "copied_targets": copied_targets,
         "partial_targets": partial_targets,
         "failed_targets": failed_targets,
+        "outside_scope_targets": outside_scope_targets,
     }
 
 
@@ -6015,9 +6544,162 @@ def _resolve_rclone_transport_auth(
     lowered_username = normalized_username.lower()
     if lowered_username == "null":
         return "null", "", ""
-    if is_guest_alias(lowered_username) and normalized_password == "":
+    if is_guest_sign_in_request(
+        normalized_username, normalized_password, shell=shell, domain=domain
+    ):
         return resolve_smb_guest_username(shell=shell, domain=domain), "", domain
     return normalized_username, normalized_password, domain
+
+
+def _rclone_transport_auth_or_refusal(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> tuple[tuple[str, str, str] | None, str]:
+    """rclone's final ``(user, secret, domain)``, judged by the lockout guard, or why not.
+
+    rclone signs in from its own process, outside ``smb_transport``, so this is
+    the ONE place its sign-in is checked, on the exact values the command is
+    built from. The same decision is what every other sign-in made by another
+    process in the share analysis asks (the CIFS mount helper, and the question
+    "may this share analysis sign in at all" before any backend starts):
+
+    * a null session carries no account and passes;
+    * no domain: refused (the server would check its own local accounts);
+    * a guest sign-in (the guest alias OR the guest transport name, with no
+      secret: ``is_guest_sign_in_request``): the guest identity must be declared
+      (rule 6, which also applies the guest failure bound), and the name sent is
+      the one the guest SSOT authorised;
+    * a password sign-in: the real-principal rules (known-bad secret, budget,
+      live headroom).
+
+    rclone's own verdict is not read back into the ledger, so its command lines
+    carry ``--retries 1 --low-level-retries 1``: one invocation makes at most one
+    sign-in that can fail (a failed authentication ends the listing before any
+    checker or transfer opens another session). After a success rclone may open
+    up to ``checkers + transfers`` pooled sessions, each a successful sign-in.
+    """
+    from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+        AuthAttemptRefused,
+        check_attempt,
+        check_guest_attempt,
+    )
+
+    transport = _resolve_rclone_transport_auth(
+        shell, domain=domain, username=username, password=password
+    )
+    transport_user, transport_password, transport_domain = transport
+    if transport_user == "null":
+        return transport, ""
+    realm = str(transport_domain or "").strip()
+    if not realm:
+        return None, (
+            "no domain was given for the rclone SMB sign-in, so the server would check "
+            "its own local accounts; rclone is not started"
+        )
+    is_guest = is_guest_sign_in_request(username, password, shell=shell, domain=realm)
+    try:
+        if is_guest:
+            identity = authorize_smb_guest_identity(shell, domain=realm)
+            if not identity.declared:
+                return None, identity.reason
+            check_guest_attempt(realm, identity.name)
+            return (identity.name, "", realm), ""
+        check_attempt(realm, transport_user, transport_password)
+    except AuthAttemptRefused as refused:
+        return None, str(refused)
+    return transport, ""
+
+
+def _share_analysis_sign_in_refusal(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> str:
+    """Why the lockout guard withholds this share analysis's sign-in, or ``""``.
+
+    Every backend of one share analysis (rclone, the legacy spider, the CIFS
+    mounts) signs in as the same identity with the same secret, so the guard's
+    answer for that sign-in is the answer for all of them. Asked once before any
+    backend starts: a refusal is a decision about the sign-in, never a backend
+    failure, so no other backend is tried in its place.
+
+    A null session carries no account and is not judged.
+    """
+    if _is_null_session_smb_auth(shell, domain=domain, username=username):
+        return ""
+    transport_auth, refusal = _rclone_transport_auth_or_refusal(
+        shell, domain=domain, username=username, password=password
+    )
+    if transport_auth is not None:
+        return ""
+    return refusal or "the sign-in was withheld to protect the account from lockout"
+
+
+#: Why the legacy spider is never started for a guest session. Its only
+#: credential-less sign-in is as the built-in ``Guest`` account, with an empty
+#: password and no domain: a real account's name, which the guest SSOT never
+#: declares and the lockout guard never lets through with an empty secret.
+_MANSPIDER_GUEST_REFUSAL = (
+    "the legacy share spider can only sign in to a guest session as the built-in "
+    "Guest account, which is a real account; the guest read is done under the "
+    "session's declared guest name instead, so the spider is not started"
+)
+
+
+def manspider_sign_in_refusal(
+    shell: Any,
+    *,
+    domain: str,
+    username: str,
+    password: str,
+) -> str:
+    """Why the legacy share spider must not be started for this session, or ``""``.
+
+    The spider signs in from its own process, so this is the ONE place its
+    sign-in is judged by the lockout guard, before the process starts:
+
+    * a null session carries no account and is not judged;
+    * a guest session is never handed to the spider (``_MANSPIDER_GUEST_REFUSAL``);
+    * any other sign-in is a real principal with a secret: the real-principal
+      rules (empty secret, known-bad secret, budget, live headroom).
+    """
+    if _is_null_session_smb_auth(shell, domain=domain, username=username):
+        return ""
+    if is_guest_sign_in_request(username, password, shell=shell, domain=domain):
+        return _MANSPIDER_GUEST_REFUSAL
+    return _share_analysis_sign_in_refusal(
+        shell, domain=domain, username=username, password=password
+    )
+
+
+def manspider_sign_in_withheld(
+    shell: Any,
+    *,
+    domain: Any,
+    username: Any,
+    password: Any,
+) -> bool:
+    """True (after one operator line) when the legacy spider must not be started.
+
+    What the three spider launchers ask before they build a command. A module
+    function that takes the session, so the real shell and any stand-in driving
+    a launcher get the same decision (:func:`manspider_sign_in_refusal`).
+    """
+    refusal = manspider_sign_in_refusal(
+        shell,
+        domain=str(domain or ""),
+        username=str(username or ""),
+        password=str(password or ""),
+    )
+    if not refusal:
+        return False
+    print_warning(f"Legacy share spider not started: {refusal}")
+    return True
 
 
 def _is_null_session_smb_auth(
@@ -6242,11 +6924,27 @@ def _resolve_cifs_aggregate_map_path(
 
 def _resolve_cifs_host_share_targets(
     *,
+    shell: Any,
+    domain: str | None,
     hosts: list[str],
     shares: list[str],
     share_map: dict[str, dict[str, str]] | None,
 ) -> list[tuple[str, str]]:
-    """Resolve host/share targets for CIFS mount attempts."""
+    """Resolve host/share targets for a share mapping, download or CIFS mount.
+
+    The one place every (host, share) pair handed to rclone or to a CIFS mount
+    is built, so the engagement scope is applied here: both are child processes
+    no in-process check can see, and a pair on an excluded host is never built.
+    ``shell`` and ``domain`` are required so no caller can skip the scope.
+    """
+    mapped_before = isinstance(share_map, dict) and bool(share_map)
+    hosts, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=hosts, share_map=share_map, what="SMB share hunt"
+    )
+    if mapped_before and not share_map:
+        # Every mapped host is outside the scope: nothing to target. Never fall
+        # back to the hosts x shares cross-product below for that reason.
+        return []
     targets: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -6299,8 +6997,36 @@ def _mount_cifs_targets_via_host_helper(
     password: str,
     mount_root: str,
     targets: list[tuple[str, str]],
+    shell: Any = None,
 ) -> list[str]:
-    """Best-effort CIFS share mounts via host-helper; returns mountpoints to cleanup."""
+    """Best-effort CIFS share mounts via host-helper; returns mountpoints to cleanup.
+
+    Engagement scope: the mount is made by the host helper, another process,
+    which nothing in this one can watch. The pairs were built from in-scope
+    hosts (``_resolve_cifs_host_share_targets``); each host is asked about again
+    immediately before its mount is requested, so a host excluded since then is
+    never handed to the helper. ``shell`` is the session whose scope applies
+    (``None``: the registered session).
+    """
+    # The mount signs in from the host helper, another process, so the lockout
+    # guard judges it here, on the exact values the helper is handed. A guest
+    # mount is sent under the declared guest name; a refusal mounts nothing.
+    if not _is_null_session_smb_auth(shell, domain=domain, username=username):
+        transport_auth, refusal = _rclone_transport_auth_or_refusal(
+            shell, domain=domain, username=username, password=password
+        )
+        if transport_auth is None:
+            print_warning(f"Skipping CIFS share mounts: {refusal}")
+            return []
+        username, password, domain = transport_auth
+
+    mount_gate = host_contact_gate(
+        shell,
+        list(dict.fromkeys(str(host).strip() for host, _share in targets)),
+        surface=_SHARE_SCOPE_SURFACE,
+        what="SMB share mount",
+        domain=str(domain or "").strip() or None,
+    )
     helper_sock = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
     if not helper_sock or not os.path.exists(helper_sock):
         marked_sock = mark_sensitive(helper_sock or "<unset>", "path")
@@ -6328,9 +7054,14 @@ def _mount_cifs_targets_via_host_helper(
     remounted_due_to_identity_change_count = 0
     failed_count = 0
 
+    outside_scope_count = 0
     for host, share in targets:
         marked_host = mark_sensitive(host, "hostname")
         marked_share = mark_sensitive(share, "service")
+        # Engagement scope, immediately before the helper is handed this host.
+        if not mount_gate.admits(str(host).strip()):
+            outside_scope_count += 1
+            continue
         try:
             resp = host_helper_client_request(
                 helper_sock,
@@ -6429,7 +7160,7 @@ def _mount_cifs_targets_via_host_helper(
         f"reused_same_identity={reused_same_identity_count} "
         f"reused_existing_mount={reused_existing_mount_count} "
         f"remounted_due_to_identity_change={remounted_due_to_identity_change_count} "
-        f"failed={failed_count}"
+        f"failed={failed_count} outside_scope={outside_scope_count}"
     )
     return mounted_points
 
@@ -6516,6 +7247,9 @@ def run_smb_share_tree_mapping_with_cifs(
 
     shares = _filter_shares_by_global_mapping_exclusions(shares)
     share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+    hosts, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=hosts, share_map=share_map, what="SMB share mapping"
+    )
 
     if not hosts:
         marked_domain = mark_sensitive(domain, "domain")
@@ -6539,6 +7273,8 @@ def run_smb_share_tree_mapping_with_cifs(
     )
     marked_mount_root = mark_sensitive(effective_mount_root, "path")
     mount_targets = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -6551,6 +7287,7 @@ def run_smb_share_tree_mapping_with_cifs(
             password=password,
             mount_root=effective_mount_root,
             targets=mount_targets,
+            shell=shell,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -6594,6 +7331,7 @@ def run_smb_share_tree_mapping_with_cifs(
     )
     marked_aggregate_rel = mark_sensitive(aggregate_map_rel, "path")
 
+    review_all_names = _share_review_reads_every_file_name(selected_method)
     try:
         print_operation_header(
             "SMB Share Tree Mapping (CIFS)",
@@ -6609,25 +7347,51 @@ def run_smb_share_tree_mapping_with_cifs(
             icon="🗺️",
         )
         cifs_service = CIFSShareMappingService()
-        mapping_result = cifs_service.generate_host_metadata_json(
-            mount_root=effective_mount_root,
-            run_output_dir=run_output_abs,
-            hosts=hosts,
-            shares=shares,
-        )
-
         service = ShareMappingService()
         principal_label = f"{domain}\\{username}"
-        summary = service.merge_spider_plus_run(
+        held_outcomes: dict[str, Any] = {}
+
+        def _generate(stage: Any) -> dict[str, Any]:
+            result = cifs_service.generate_host_metadata_json(
+                mount_root=effective_mount_root,
+                run_output_dir=run_output_abs,
+                hosts=hosts,
+                shares=shares,
+                stage=stage,
+                keep_all_file_names=review_all_names,
+            )
+            held_outcomes.update(result.get("share_outcomes") or {})
+            return result
+
+        def _merge() -> dict[str, Any]:
+            return service.merge_spider_plus_run(
+                domain=domain,
+                principal=principal_label,
+                run_id=run_id,
+                run_output_dir=run_output_abs,
+                aggregate_map_path=aggregate_map_abs,
+                requested_hosts=hosts,
+                requested_shares=shares,
+                host_share_permissions=share_map,
+                share_outcomes=held_outcomes,
+                candidates_only=not review_all_names,
+                all_file_names=review_all_names,
+            )
+
+        mapping_result, summary, _stopped = _run_share_mapping_stage(
+            shell,
             domain=domain,
-            principal=principal_label,
-            run_id=run_id,
-            run_output_dir=run_output_abs,
-            aggregate_map_path=aggregate_map_abs,
-            requested_hosts=hosts,
-            requested_shares=shares,
-            host_share_permissions=share_map,
+            total=len(hosts) * len(shares),
+            generate=_generate,
+            merge=_merge,
+            aggregate_map_abs=aggregate_map_abs,
         )
+        if mapping_result is None or summary is None:
+            print_warning(
+                "The CIFS share mapping stopped before its result could be "
+                "consolidated. The report states the shares it did not reach."
+            )
+            return False
 
         host_json_count = int(summary.get("host_json_files", 0))
         merged_files = int(summary.get("merged_file_entries", 0))
@@ -6640,7 +7404,7 @@ def run_smb_share_tree_mapping_with_cifs(
         else:
             print_success(
                 f"CIFS share mapping updated with {host_json_count} host file(s), "
-                f"{mapped_shares} mapped share(s), and {merged_files} file metadata entries."
+                f"{mapped_shares} mapped share(s), and {merged_files} candidate file entries."
             )
         print_info(f"Consolidated SMB share tree map saved to {marked_aggregate_rel}.")
         if run_post_mapping_workflow:
@@ -6716,13 +7480,14 @@ def _resolve_share_tree_walk_credential(
     """Resolve the effective ``(username, credential, is_anonymous)`` for the walk.
 
     Mirrors the auth normalisation the retired ``_build_spider_plus_auth`` did:
-    ``null`` -> anonymous null session; a guest alias with an empty password ->
-    the configured guest transport principal; everything else passes through.
+    ``null`` -> anonymous null session; a guest sign-in (the guest alias or the
+    guest transport name, with an empty password) -> the configured guest
+    transport principal; everything else passes through.
     """
     lowered = username.strip().lower()
     if lowered == "null":
         return "", "", True
-    if is_guest_alias(lowered) and password == "":
+    if is_guest_sign_in_request(username, password, shell=shell, domain=domain):
         return resolve_smb_guest_username(shell=shell, domain=domain), "", True
     return username, password, False
 
@@ -6873,9 +7638,22 @@ async def _native_build_share_tree_host_json(
     walked_hosts = 0
     total_files = 0
 
+    # The hosts passed the engagement scope when the mapping started. A walk
+    # can take minutes per host, so each host is asked about again right before
+    # it is connected to; a host kept out is not walked and gets no map.
+    walk_gate = host_contact_gate(
+        shell,
+        [str(host or "").strip() for host in hosts if str(host or "").strip()],
+        surface=_SHARE_SCOPE_SURFACE,
+        what="SMB share mapping",
+        domain=str(domain or "").strip() or None,
+    )
+
     for host in hosts:
         host_key = str(host or "").strip()
         if not host_key:
+            continue
+        if not await asyncio.to_thread(walk_gate.admits, host_key):
             continue
 
         walk_shares: list[str] = []
@@ -6951,6 +7729,7 @@ async def _native_build_share_tree_host_json(
         "host_json_files": host_json_files,
         "walked_hosts": walked_hosts,
         "total_files": total_files,
+        "outside_scope_hosts": len(walk_gate.held),
         "aborted": False,
     }
 
@@ -6978,6 +7757,9 @@ def run_smb_share_tree_mapping_with_spider_plus(
 
     shares = _filter_shares_by_global_mapping_exclusions(shares)
     share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+    hosts, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=hosts, share_map=share_map, what="SMB share mapping"
+    )
 
     if not hosts:
         marked_domain = mark_sensitive(domain, "domain")
@@ -7148,8 +7930,12 @@ def run_smb_share_tree_mapping_with_rclone(
     from adscan_internal.services.share_mapping_service import ShareMappingService
     from adscan_internal.workspaces import read_json_file
 
+    review_all_names = _share_review_reads_every_file_name(selected_method)
     shares = _filter_shares_by_global_mapping_exclusions(shares)
     share_map = _filter_share_map_by_global_mapping_exclusions(share_map)
+    hosts, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=hosts, share_map=share_map, what="SMB share mapping"
+    )
 
     if not hosts:
         marked_domain = mark_sensitive(domain, "domain")
@@ -7207,6 +7993,8 @@ def run_smb_share_tree_mapping_with_rclone(
     )
 
     target_pairs = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -7232,6 +8020,12 @@ def run_smb_share_tree_mapping_with_rclone(
             ok, reason, _ = _is_smb_rclone_mapping_cache_compatible(
                 cache_payload=data, expected_metadata=expected_cache_metadata,
             )
+            if ok and review_all_names and (
+                isinstance(data, dict) and data.get("retention") == "candidate_files"
+            ):
+                # A map that kept candidate files only cannot serve the AI
+                # review, which triages every file name.
+                ok, reason = False, "map holds candidate files only"
             if not ok:
                 print_info_debug(
                     f"Cached SMB rclone mapping not compatible: reason={reason} "
@@ -7338,37 +8132,66 @@ def run_smb_share_tree_mapping_with_rclone(
 
     try:
         rclone_service = RcloneShareMappingService()
-        transport_username, transport_password, transport_domain = (
-            _resolve_rclone_transport_auth(
-                shell,
-                domain=domain,
-                username=username,
-                password=password,
-            )
+        transport_auth, refusal = _rclone_transport_auth_or_refusal(
+            shell,
+            domain=domain,
+            username=username,
+            password=password,
         )
-        mapping_result = rclone_service.generate_host_metadata_json(
-            run_output_dir=run_output_abs,
-            host_share_targets=target_pairs,
-            username=transport_username,
-            password=transport_password,
-            domain=transport_domain,
-            command_executor=shell.run_command,
-            rclone_path=rclone_path,
-            timeout_seconds=1200,
-        )
-
+        if transport_auth is None:
+            print_warning(f"Skipping rclone SMB mapping: {refusal}")
+            return False
+        transport_username, transport_password, transport_domain = transport_auth
         service = ShareMappingService()
         principal_label = f"{domain}\\{username}"
-        summary = service.merge_spider_plus_run(
+        held_outcomes: dict[str, Any] = {}
+
+        def _generate(stage: Any) -> dict[str, Any]:
+            result = rclone_service.generate_host_metadata_json(
+                run_output_dir=run_output_abs,
+                host_share_targets=target_pairs,
+                username=transport_username,
+                password=transport_password,
+                domain=transport_domain,
+                command_executor=shell.run_command,
+                rclone_path=rclone_path,
+                timeout_seconds=1200,
+                shell=shell,
+                stage=stage,
+                keep_all_file_names=review_all_names,
+            )
+            held_outcomes.update(result.get("share_outcomes") or {})
+            return result
+
+        def _merge() -> dict[str, Any]:
+            return service.merge_spider_plus_run(
+                domain=domain,
+                principal=principal_label,
+                run_id=run_id,
+                run_output_dir=run_output_abs,
+                aggregate_map_path=aggregate_map_abs,
+                requested_hosts=hosts,
+                requested_shares=shares,
+                host_share_permissions=share_map,
+                share_outcomes=held_outcomes,
+                candidates_only=not review_all_names,
+                all_file_names=review_all_names,
+            )
+
+        mapping_result, summary, _stopped = _run_share_mapping_stage(
+            shell,
             domain=domain,
-            principal=principal_label,
-            run_id=run_id,
-            run_output_dir=run_output_abs,
-            aggregate_map_path=aggregate_map_abs,
-            requested_hosts=hosts,
-            requested_shares=shares,
-            host_share_permissions=share_map,
+            total=len(target_pairs),
+            generate=_generate,
+            merge=_merge,
+            aggregate_map_abs=aggregate_map_abs,
         )
+        if mapping_result is None or summary is None:
+            print_warning(
+                "The rclone share mapping stopped before its result could be "
+                "consolidated. The report states the shares it did not reach."
+            )
+            return False
         host_json_count = int(summary.get("host_json_files", 0))
         merged_files = int(summary.get("merged_file_entries", 0))
         mapped_shares = int(mapping_result.get("mapped_shares", 0))
@@ -7383,7 +8206,7 @@ def run_smb_share_tree_mapping_with_rclone(
         else:
             print_success(
                 f"rclone share mapping updated with {host_json_count} host file(s), "
-                f"{mapped_shares} mapped share(s), and {merged_files} file metadata entries."
+                f"{mapped_shares} mapped share(s), and {merged_files} candidate file entries."
             )
         if partial_targets > 0:
             print_warning_debug(
@@ -7512,7 +8335,10 @@ def _run_post_mapping_sensitive_data_workflow(
     ai_attempted = bool(deterministic_result.get("ai_attempted"))
     ai_success = deterministic_result.get("ai_success")
 
-    if selected_method == "deterministic_rclone_direct":
+    if deterministic_result.get("sign_in_refused"):
+        # Nothing ran: the lockout guard withheld the sign-in. Not a completion.
+        outcome = "sign_in_withheld_by_lockout_guard"
+    elif selected_method == "deterministic_rclone_direct":
         outcome = (
             "deterministic_rclone_direct_completed"
             if not fallback_used
@@ -7603,6 +8429,24 @@ def _run_selected_deterministic_share_scan(
     )
     primary_backend = _resolve_deterministic_backend_from_method(selected_method)
     executed_backends: list[str] = []
+
+    # The lockout guard's answer for this sign-in is asked ONCE, before any
+    # backend starts. A refusal is a decision about the sign-in, so it ends the
+    # analysis: no backend is tried in place of the one that was refused.
+    sign_in_refusal = _share_analysis_sign_in_refusal(
+        shell, domain=domain, username=username, password=password
+    )
+    if sign_in_refusal:
+        print_warning(f"Share analysis not run: {sign_in_refusal}")
+        return {
+            "completed": False,
+            "fallback_used": False,
+            "executed_backends": executed_backends,
+            "ai_attempted": False,
+            "ai_success": None,
+            "sign_in_refused": True,
+            "sign_in_refusal": sign_in_refusal,
+        }
 
     if (
         requested_method == "deterministic_rclone_mapped"
@@ -8131,6 +8975,13 @@ def run_smb_share_credential_hunt(
             continue
         share_map.setdefault(normalized_host, {})[share_name] = "READ"
 
+    # Engagement scope on the connectable hosts, before anything is mapped or
+    # downloaded: rclone runs as a child process, so this list is its only gate.
+    _, share_map = _share_targets_in_scope(
+        shell, domain=domain, hosts=None, share_map=share_map, what="SMB share hunt"
+    )
+    share_map = share_map or {}
+
     hosts = sorted(share_map.keys())
     shares = sorted({share_name for host_shares in share_map.values() for share_name in host_shares})
     if not hosts or not shares:
@@ -8655,6 +9506,8 @@ def _run_rclone_credential_phase_download(
             max_size_bytes=max_document_file_size_bytes,
         )
     target_pairs = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -9231,6 +10084,8 @@ def _run_post_mapping_deterministic_rclone_artifact_scan(
         )
     else:
         target_pairs = _resolve_cifs_host_share_targets(
+            shell=shell,
+            domain=domain,
             hosts=hosts,
             shares=shares,
             share_map=share_map,
@@ -9352,6 +10207,8 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
     )
     marked_mount_root = mark_sensitive(effective_mount_root, "path")
     mount_targets = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -9364,6 +10221,7 @@ def _run_post_mapping_deterministic_cifs_credsweeper_scan(
             password=password,
             mount_root=effective_mount_root,
             targets=mount_targets,
+            shell=shell,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -9595,6 +10453,8 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
     )
     marked_mount_root = mark_sensitive(effective_mount_root, "path")
     mount_targets = _resolve_cifs_host_share_targets(
+        shell=shell,
+        domain=domain,
         hosts=hosts,
         shares=shares,
         share_map=share_map,
@@ -9607,6 +10467,7 @@ def _run_post_mapping_deterministic_cifs_artifact_scan(
             password=password,
             mount_root=effective_mount_root,
             targets=mount_targets,
+            shell=shell,
         )
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
@@ -11474,6 +12335,31 @@ def execute_manspider(
     Returns:
         Structured summary with completion state and phase counters.
     """
+    # The spider is a child process and ``command`` already names its targets,
+    # so the engagement scope is asked here, on the hosts the command was built
+    # from. One excluded host (or, with an asset scope, a command whose hosts
+    # are not declared) and the command is not run at all: it cannot be trimmed.
+    _spider_hosts = [str(h).strip() for h in (hosts or []) if str(h or "").strip()]
+    _spider_refused = False
+    if _spider_hosts:
+        # Asked here, by the function that starts the child, right before it does.
+        _spider_refused = bool(
+            subprocess_targets_in_scope(
+                shell,
+                _spider_hosts,
+                surface=_SHARE_SCOPE_SURFACE,
+                what="SMB share spidering",
+                domain=str(domain or "").strip() or None,
+            ).refused
+        )
+    elif asset_scope_recorded(shell):
+        _spider_refused = True
+    if _spider_refused:
+        print_warning(
+            "SMB share spidering not run: its target list could not be confirmed "
+            "inside the engagement scope."
+        )
+        return {"completed": False, "credential_findings": 0, "artifact_hits": 0}
     try:
         if hosts or shares:
             marked_hosts = [mark_sensitive(h, "hostname") for h in (hosts or [])]

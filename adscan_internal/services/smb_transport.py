@@ -71,6 +71,33 @@ class SMBConnectionError(SMBTransportError):
     """Network-level failure: host unreachable, timeout, or TCP RST."""
 
 
+class SMBGuestSessionUnavailableError(SMBAuthError):
+    """A guest sign-in did not produce a guest session on this host.
+
+    ``reason`` is ``"refused"`` (the server rejected the guest sign-in: guest
+    access is disabled there) or ``"not_confirmed"`` (the server granted a
+    session without the guest or null flag, so it was closed unused). Neither
+    is a statement about the domain's NTLM posture or about any account's
+    password.
+    """
+
+    def __init__(self, host: str, reason: str, detail: str = "") -> None:
+        self.host = host
+        self.reason = reason
+        if reason == "not_confirmed":
+            sentence = (
+                f"Guest access is not confirmed on {mark_sensitive(host, 'hostname')}: the server "
+                "granted a session but did not confirm it is a guest session, so it was "
+                "closed without being used"
+            )
+        else:
+            sentence = (
+                f"Guest access is not available on {mark_sensitive(host, 'hostname')}: the server refused the "
+                "guest sign-in"
+            )
+        super().__init__(f"{sentence}{f' ({detail})' if detail else ''}.")
+
+
 # ---------------------------------------------------------------------------
 # Auth-mode helpers
 # ---------------------------------------------------------------------------
@@ -157,6 +184,18 @@ class SMBConfig:
     ``smb_privilege.local_account_logon_domain``) so the target resolves the
     logon against its SAM instead of forwarding it to a DC.
     """
+    guest_session: bool = False
+    """This config asks the server for its GUEST session, not for an account.
+
+    ``username`` is then the session's declared guest transport name (a name no
+    account carries), sent over NTLM with no password. Set ONLY by the guest
+    config builder (``smb_guest_auth_service.build_smb_guest_config``), which
+    establishes the name's absence and declares it to the lockout guard. The
+    transport judges it by rule 6 of ``adscan_core.auth_attempt_guard``
+    (``check_guest_attempt``), never by the empty-secret rule, never upgrades it
+    to Kerberos, never counts its outcome against the name, and confirms from
+    the server's SESSION_SETUP flags that the session really is a guest one.
+    """
     sign: bool = False
     encrypt: bool = False
     disable_self_heal: bool = False
@@ -207,6 +246,16 @@ class SMBConfig:
             promote_credential_fields,
             require_credential_material,
         )
+
+        if self.guest_session:
+            # A guest sign-in carries a name and nothing else: no secret to
+            # send, no ticket to present, and no Kerberos (no principal exists).
+            self.password = ""
+            self.nt_hash = None
+            self.aes_key = None
+            self.ccache_path = None
+            self.use_kerberos = False
+            self.is_local_account = False
 
         self.target_hostname = normalize_kerberos_target_hostname(
             self.target_hostname, self.domain
@@ -545,9 +594,64 @@ def _ntlm_guard_target(config: "SMBConfig") -> "tuple[str, str, str] | None":
 
     secret = config.nt_hash or config.password or ""
     realm = str(config.auth_domain or config.domain or "").strip()
+    if config.guest_session:
+        # A guest sign-in is keyed to the domain it is declared for, never to
+        # the host: with no domain it is refused by rule 6, not re-keyed.
+        return realm, str(config.username), ""
     if config.is_local_account or realm in ("", "."):
         realm = local_realm(config.target_hostname or config.target_ip)
     return realm, str(config.username), str(secret)
+
+
+def _guest_host_label(config: "SMBConfig") -> str:
+    return str(config.target_hostname or config.target_ip or "the host")
+
+
+def _confirm_guest_session(config: "SMBConfig", connection: Any) -> None:
+    """Raise unless the server's SESSION_SETUP flags say this is a guest/null session.
+
+    A session granted WITHOUT the guest or null flag is not used. On the wire it
+    cannot be told apart from a sign-in that authenticated the name as an
+    account with an empty password, and neither moves any counter (both
+    succeeded). The name's absence was established before the first sign-in,
+    so the name is kept (one name per engagement) and this host is reported as
+    "guest not confirmed". A name is recorded as an account only on an answer
+    that names an account state (``_record_guest_outcome``).
+    """
+    if bool(getattr(connection, "session_is_guest", False)) or bool(
+        getattr(connection, "session_is_null", False)
+    ):
+        return
+    raise SMBGuestSessionUnavailableError(_guest_host_label(config), "not_confirmed")
+
+
+def _record_guest_outcome(realm: str, name: str, err: "BaseException | None") -> None:
+    """Apply a refused guest sign-in to the guard's guest ledger (rule 6).
+
+    A reply the domain may have counted (``STATUS_LOGON_FAILURE`` cannot tell
+    "guest disabled" from "an account with a password") counts toward the
+    session's guest failure bound. A reply that names an account state
+    (disabled, locked out, expired) proves the name is an account.
+    """
+    if err is None:
+        return
+    from adscan_core import auth_attempt_guard  # noqa: PLC0415
+    from adscan_core.auth_outcome import AuthOutcome, classify_ntlm_status  # noqa: PLC0415
+    from adscan_core.net_egress_guard import is_egress_refusal  # noqa: PLC0415
+
+    if is_egress_refusal(err):
+        # The engagement scope stopped the connection before any packet left:
+        # no server answered, so there is no sign-in outcome to record.
+        return
+    verdict = classify_ntlm_status(_ntstatus_text(err))
+    if verdict.outcome is AuthOutcome.ACCOUNT_STATE:
+        auth_attempt_guard.record_guest_identity_exists(
+            realm,
+            name,
+            f"a server reported the name as an account ({verdict.reason or 'account state'})",
+        )
+    elif verdict.outcome is AuthOutcome.WRONG_SECRET:
+        auth_attempt_guard.record_guest_failure(realm, name)
 
 
 def _record_ntlm_outcome(target: "tuple[str, str, str]", err: "Exception | None") -> None:
@@ -593,8 +697,21 @@ def _caller_operation_error(exc: BaseException) -> SMBTransportError:
         f"{type(exc).__name__}: {mark_sensitive(str(exc), 'detail')}"
     )
     if isinstance(exc, asyncio.TimeoutError):
-        return SMBConnectionError(f"SMB operation timed out: {type(exc).__name__}")
-    return _translate_aiosmb_exception(exc)  # type: ignore[arg-type]
+        translated: SMBTransportError = SMBConnectionError(
+            f"SMB operation timed out: {type(exc).__name__}"
+        )
+    else:
+        translated = _translate_aiosmb_exception(exc)  # type: ignore[arg-type]
+    # Marked so ``smb_machine_with_fallback`` never reads the caller's own
+    # failure as a sign-in failure: its fallback would open a second session
+    # and yield again from a context manager whose body already ended.
+    translated.raised_by_caller = True  # type: ignore[attr-defined]
+    return translated
+
+
+def _raised_by_caller(exc: BaseException) -> bool:
+    """Whether ``exc`` came from the caller's body, not from the sign-in."""
+    return bool(getattr(exc, "raised_by_caller", False))
 
 
 def _translate_aiosmb_exception(exc: Exception) -> SMBTransportError:
@@ -717,7 +834,13 @@ def _emit_smb_failure_posture(
             signal_code="SMB_SIGNING_REQUIRED",
             message="DC requires SMB signing",
         )
-    if isinstance(translated, SMBAuthError) and not used_kerberos_auth:
+    # A refused GUEST sign-in only says the host does not grant guest access;
+    # it is never evidence that NTLM is disabled.
+    if (
+        isinstance(translated, SMBAuthError)
+        and not used_kerberos_auth
+        and not getattr(config, "guest_session", False)
+    ):
         msg_upper = str(exc).upper()
         if any(marker in msg_upper for marker in _NTLM_BLOCKED_MARKERS):
             _emit_posture_signal(
@@ -1218,14 +1341,22 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
         # disabled or locked, or a principal already at its failure budget is
         # never sent. Refusing here is fail-closed and caller-independent.
         ntlm_target = _ntlm_guard_target(effective_config)
+        guest_session = bool(effective_config.guest_session)
         if ntlm_target is not None:
             from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
                 AuthAttemptRefused,
                 check_attempt,
+                check_guest_attempt,
             )
 
             try:
-                check_attempt(*ntlm_target)
+                if guest_session:
+                    # Rule 6: the session's declared guest name, no password.
+                    check_guest_attempt(
+                        ntlm_target[0], ntlm_target[1], target=_guest_host_label(effective_config)
+                    )
+                else:
+                    check_attempt(*ntlm_target)
             except AuthAttemptRefused as refused:
                 from adscan_core.rich_output import print_warning  # noqa: PLC0415
 
@@ -1244,9 +1375,20 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
 
         try:
             async with connection:
-                _, err = await connection.login()
-                if ntlm_target is not None:
-                    _record_ntlm_outcome(ntlm_target, err)
+                if guest_session and ntlm_target is not None:
+                    from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+                        guest_sign_in,
+                    )
+
+                    with guest_sign_in(ntlm_target[0], ntlm_target[1]):
+                        _, err = await connection.login()
+                    # A guest refusal goes to the guest ledger, never to the
+                    # name's account ledger (rule 6).
+                    _record_guest_outcome(ntlm_target[0], ntlm_target[1], err)
+                else:
+                    _, err = await connection.login()
+                    if ntlm_target is not None:
+                        _record_ntlm_outcome(ntlm_target, err)
                 if err is not None:
                     telemetry.capture_exception(err)
                     _emit_smb_failure_posture(
@@ -1272,7 +1414,18 @@ async def smb_machine_for(config: SMBConfig) -> AsyncIterator[Any]:
                             _self_heal_used.add(key)
                             next_config = recovered
                             raise _SelfHealRetrySentinel()
-                    raise _translate_aiosmb_exception(err) from err
+                    translated = _translate_aiosmb_exception(err)
+                    if guest_session and isinstance(
+                        translated, (SMBAuthError, SMBAccessDeniedError)
+                    ):
+                        raise SMBGuestSessionUnavailableError(
+                            _guest_host_label(effective_config),
+                            "refused",
+                            _ntstatus_text(err),
+                        ) from err
+                    raise translated from err
+                if guest_session:
+                    _confirm_guest_session(effective_config, connection)
                 machine = SMBMachine(connection)
                 async with machine:
                     _emit_smb_success_posture(
@@ -1396,6 +1549,13 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
     """
     from adscan_internal.services.auth_plan import build_smb_plan
 
+    if config.guest_session:
+        # A guest session has no principal to take to a KDC and no secret to
+        # retry: one NTLM guest sign-in, and its answer is the answer.
+        async with smb_machine_for(config) as machine:
+            yield machine
+        return
+
     plan = build_smb_plan(config=config, posture=config.posture_snapshot)
 
     if plan.is_pruned:
@@ -1421,6 +1581,9 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
             TypeError,
             KerberosSpnUnresolvedError,
         ) as exc:
+            if _raised_by_caller(exc):
+                # The session worked; the caller's own operation failed.
+                raise
             # SMBAuthError — auth rejected by the server.
             # AttributeError / TypeError — can occur when Kerberos auth URL
             # construction crashes with empty credentials (username="",
@@ -1482,7 +1645,9 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
                         KerberosSpnUnresolvedError,
                         AttributeError,
                         TypeError,
-                    ):
+                    ) as alt_exc:
+                        if _raised_by_caller(alt_exc):
+                            raise
                         continue  # try the next candidate, then NTLM
 
             reason = (
@@ -1496,10 +1661,17 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
                 f"[smb_transport] Kerberos failed — retrying with NTLM ({reason},"
                 f" {type(exc).__name__})"
             )
-            if effective_config.password is None and not has_nt_hash:
+            from adscan_internal.services.credential_routing import (  # noqa: PLC0415
+                ntlm_secret_available,
+            )
+
+            if not ntlm_secret_available(
+                password=effective_config.password, nt_hash=effective_config.nt_hash
+            ):
                 # NTLM needs a password or an NT hash. A ticket-only or key-only
                 # credential has neither, so the "fallback" would be an NTLM
                 # logon with an empty secret: a failed logon on a real account.
+                # The Kerberos error is the real cause, so it is what is raised.
                 raise exc
             ntlm_config = dataclasses.replace(effective_config, use_kerberos=False)
             async with smb_machine_for(ntlm_config) as machine:
@@ -1511,6 +1683,9 @@ async def smb_machine_with_fallback(config: SMBConfig) -> AsyncIterator[Any]:
         async with smb_machine_for(effective_config) as machine:
             yield machine
     except SMBAuthError as exc:
+        if _raised_by_caller(exc):
+            # The session worked; the caller's own operation failed.
+            raise
         msg = str(exc).upper()
         ntlm_blocked = any(marker in msg for marker in _NTLM_BLOCKED_MARKERS)
         can_retry = bool(config.kdc_ip or config.domain)
@@ -1723,15 +1898,51 @@ async def download_unc_file_to_local(
 
     ``remote_unc_path`` must be a full UNC such as ``\\\\host\\C$\\Windows\\Temp\\foo``.
 
+    The file is streamed: each chunk is written to disk as it arrives, so the
+    memory held is one chunk whatever the size of the remote file. The chunks go
+    to a ``.part`` file beside the destination, renamed over it only once the
+    read finished, so a failed read never leaves a truncated file at
+    ``local_path``.
+
     Raises:
         SMBConnectionError: if the file cannot be opened or a chunk read fails.
     """
     from pathlib import Path as _Path
 
-    data = await read_unc_file_bytes(machine, remote_unc_path)
-    _Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-    _Path(local_path).write_bytes(data)
-    return len(data)
+    from aiosmb.commons.interfaces.file import SMBFile
+
+    smb_file = SMBFile.from_uncpath(remote_unc_path)
+    _, err = await smb_file.open(machine.connection, "r")
+    if err is not None:
+        raise SMBConnectionError(f"Cannot open remote file {remote_unc_path}: {err}")
+
+    destination = _Path(local_path)
+    partial = destination.with_name(destination.name + ".part")
+    written = 0
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with partial.open("wb") as handle:
+            async for chunk, cerr in smb_file.read_chunked():
+                if cerr is not None:
+                    raise SMBConnectionError(
+                        f"Read error on {remote_unc_path}: {cerr}"
+                    )
+                if not chunk:
+                    break
+                handle.write(chunk)
+                written += len(chunk)
+        partial.replace(destination)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    finally:
+        try:
+            await smb_file.close()
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(f"[smb-transport] close failed (ignored): {exc}")
+    return written
 
 
 # ---------------------------------------------------------------------------

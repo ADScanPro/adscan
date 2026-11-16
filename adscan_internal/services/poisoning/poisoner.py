@@ -108,6 +108,22 @@ def _kernel_source_toward(victim_ip: str) -> str | None:
     return kernel_source_ip_toward(victim_ip)
 
 
+def _querying_host_in_scope(victim_ip: str) -> bool:
+    """Whether the engagement scope lets this host be answered.
+
+    Asks the session's asset scope (one attribute read when none is recorded;
+    cached per address otherwise, and invalidated by every scope revision).
+    Silent on purpose: this runs on the job thread for every datagram, and a
+    job thread never prints. An address the engine cannot place is refused.
+    """
+
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        host_scope_verdict,
+    )
+
+    return host_scope_verdict(None, host=victim_ip, connect_address=victim_ip).allowed
+
+
 def _should_respond(
     config: PoisonerConfig,
     *,
@@ -115,9 +131,16 @@ def _should_respond(
     victim_ip: str,
     queried_name: str,
 ) -> bool:
-    """Apply allow/deny filters."""
+    """Apply allow/deny filters, the engagement scope first.
+
+    Called for every datagram, so a scope change made while the job runs
+    applies to the next query. A querying host the engagement scope excludes
+    is never answered.
+    """
 
     if victim_ip in config.ip_denylist:
+        return False
+    if not _querying_host_in_scope(victim_ip):
         return False
     if our_ipv4 and victim_ip == our_ipv4:
         # Don't poison our own probes.

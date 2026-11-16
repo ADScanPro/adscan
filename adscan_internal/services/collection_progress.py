@@ -1,51 +1,38 @@
-"""Centralized host-granular Domain-Collection checkpoint (SSOT for crash-resume).
+"""Host-granular Domain-Collection progress (SSOT for the crash-resume record).
 
 Domain Collection (the per-host SMB enrichment sweep) is the longest scan phase
-and therefore the single most likely Ctrl+C / crash point. Unlike the enumeration
-phases — which the per-phase :mod:`adscan_internal.services.scan_progress`
-checkpoint already covers — collection runs OUTSIDE ``run_enumeration`` and
-persists its graph only ONCE at the end, so an interruption mid-sweep loses every
-host enriched so far and re-runs the whole sweep on reload.
+and the single most likely Ctrl+C / crash point. Since the inventory-first
+graph store, every swept host is committed to the domain's store as its own
+unit the moment it is merged (``collector.store_writer.HostUnitCommitter``):
+the unit carries the host's facts AND its done-mark in one transaction, so the
+resume skip-set is the store's committed hosts (:func:`resumed_done_ids`) and
+nothing has to be ordered by hand.
 
-This module is the durable HOST cursor for that sweep. It records which host
-object_ids were enriched so a reload can skip them and continue with the
-remaining hosts, merging into the partial graph. It is modeled 1:1 on
-``scan_progress`` — same status vocabulary, same list-not-set rule, same
-fail-open reads, same ``_best_effort_save`` — but keyed at HOST granularity
-(a set of done host ids) rather than PHASE granularity (a list of phase ids).
-The two never overlap: ``collection_progress`` is only ever ``running`` before
-the first enumeration phase starts, at which point the phase-level checkpoint
-takes over.
-
-The record::
+This module keeps the sweep's RECORD in ``domains_data`` (status, totals), which
+the start-of-run resume notice and the platform's resume state read::
 
     domains_data[<domain>]["collection_progress"] = {
         "status": "running" | "complete",     # running left behind == interrupted
         "hosts_total": 1847,                   # dispatch set size at sweep start
-        "hosts_done": ["S-1-5-21-…-1104", …],  # OBJECT_IDs enriched (a JSON LIST)
+        "hosts_done_count": 312,               # hosts committed (a count, never the list)
         "host_cap": 0,                         # cap in force (0 = full)
         "scan_type": "audit",                  # engagement type at launch
         "updated_at": "2026-07-13T14:05:00Z",  # ISO-8601 UTC
     }
 
-The host key is the graph node's ``object_id`` (the SID): it is the stable,
-alias-independent node key ``CollectionResult.add_node`` writes against
-(``self.nodes[object_id.upper()]``) and survives IP/DNS churn between runs — do
-NOT key by IP or hostname (both drift).
+A 14.0.x record carried the done SET as ``hosts_done`` (a list of SIDs); it is
+dropped on the next sweep start and never read: those hosts' edges live in the
+14.0.x graph file, not in the store, so they are swept again.
 
-Hard invariants (both enforced by tests):
+Hard invariant (enforced by tests): **no ``_`` prefix.**
+``collect_workspace_variables_from_shell`` drops every ``domains_data`` key
+starting with ``_`` before writing ``variables.json``, and the record must
+survive a crash, so its key is bare.
 
-* **No ``_`` prefix.** ``collect_workspace_variables_from_shell`` drops every
-  ``domains_data`` key starting with ``_`` before writing ``variables.json``
-  (runtime-only convention). ``collection_progress`` must survive a crash, so its
-  key is bare.
-* **``hosts_done`` is a JSON list, never a ``set``.** A ``set`` in
-  ``domains_data`` breaks ``save_workspace_data`` (JSON serialization).
-
-The module is dependency-light — it never imports the engine, the collector, or
-the native stack — so it is safe for any consumer. All helpers are fail-open: a
-malformed record or a shell without ``domains_data`` degrades to "not started"
-(a fresh full sweep), never an exception that breaks the scan.
+All helpers are fail-open: a malformed record, a shell without ``domains_data``
+or an unreadable store degrades to "not started" (a fresh full sweep), never an
+exception that breaks the scan. The store is reached lazily through
+``graph_runtime``; nothing else of the engine is imported.
 """
 
 from __future__ import annotations
@@ -144,10 +131,9 @@ def mark_collection_running(
 ) -> None:
     """Mark the collection sweep as running; initialize the record on first entry.
 
-    Idempotent and resume-safe: a pre-existing ``hosts_done`` list is PRESERVED
-    (never wiped), so re-entering an interrupted sweep keeps the host cursor
-    intact while ``hosts_total`` / ``host_cap`` / ``scan_type`` are refreshed for
-    the current run. Persists immediately so the resumable ``running`` marker is
+    Idempotent: re-entering an interrupted sweep refreshes ``hosts_total`` /
+    ``host_cap`` / ``scan_type`` for the current run (the host cursor itself is
+    the graph store's, untouched here). Persists immediately so the resumable ``running`` marker is
     durable the moment the sweep starts, independent of the 5 s auto-save.
     """
     entry = _domain_data(shell, domain)
@@ -157,8 +143,9 @@ def mark_collection_running(
     if not isinstance(record, dict):
         record = {}
     record["status"] = STATUS_RUNNING
-    if not isinstance(record.get("hosts_done"), list):
-        record["hosts_done"] = []
+    # The done SET lives in the graph store (``resumed_done_ids``); a list left
+    # by a 14.0.x run would only mislead a reader.
+    record.pop("hosts_done", None)
     record["hosts_total"] = int(hosts_total or 0)
     record["host_cap"] = int(host_cap or 0)
     if scan_type is not None:
@@ -167,49 +154,15 @@ def mark_collection_running(
     entry[COLLECTION_PROGRESS_KEY] = record
     _debug(
         f"mark_collection_running domain={domain} hosts_total={record['hosts_total']} "
-        f"host_cap={record['host_cap']} done={len(record['hosts_done'])} -> persisting"
+        f"host_cap={record['host_cap']} -> persisting"
     )
     _best_effort_save(shell)
 
 
-def mark_host_done(shell: Any, domain: str, object_id: str) -> None:
-    """Record ``object_id`` as an enriched host (idempotent; cadence-buffered save).
-
-    Appends the host's graph ``object_id`` (upper-cased for alias-independent
-    comparison) to the in-memory ``hosts_done`` list. Deliberately does NOT
-    persist per host — at 1-2k hosts a per-host ``workspace_save`` would be pure
-    write amplification. The flush is buffered and performed on a cadence by
-    :func:`checkpoint_collection_progress` (AFTER the partial graph is persisted,
-    so a done-id never reaches disk ahead of the host's edges). Fail-open.
-    """
-    if not object_id:
-        return
-    entry = _domain_data(shell, domain)
-    if entry is None:
-        return
-    record = entry.get(COLLECTION_PROGRESS_KEY)
-    if not isinstance(record, dict):
-        # A host-done without a prior mark_collection_running still records
-        # progress rather than dropping it.
-        record = {"status": STATUS_RUNNING, "hosts_done": []}
-    done = record.get("hosts_done")
-    if not isinstance(done, list):
-        done = []
-    oid = str(object_id).upper()
-    if oid not in done:  # idempotent
-        done.append(oid)
-    record["hosts_done"] = done
-    record["updated_at"] = _now_iso()
-    entry[COLLECTION_PROGRESS_KEY] = record
-
-
 def checkpoint_collection_progress(shell: Any, domain: str) -> None:
-    """Flush the buffered ``collection_progress`` record to disk (the cadence flush).
+    """Flush the ``collection_progress`` record to disk now.
 
-    Call ONLY after the partial graph has been persisted — the ordering is
-    load-bearing: a ``hosts_done`` id must never reach disk ahead of the host's
-    edges, or a resume would skip a host whose enrichment was never persisted and
-    silently drop it. No-op when no record exists. Never raises.
+    No-op when no record exists. Never raises.
     """
     entry = _domain_data(shell, domain)
     if entry is None:
@@ -221,7 +174,7 @@ def checkpoint_collection_progress(shell: Any, domain: str) -> None:
     entry[COLLECTION_PROGRESS_KEY] = record
     _debug(
         f"checkpoint_collection_progress domain={domain} "
-        f"done={len(record.get('hosts_done') or [])} -> flushing"
+        f"done_count={record.get('hosts_done_count', 0)} -> flushing"
     )
     _best_effort_save(shell)
 
@@ -229,19 +182,17 @@ def checkpoint_collection_progress(shell: Any, domain: str) -> None:
 def mark_collection_complete(shell: Any, domain: str) -> None:
     """Mark the sweep cleanly finished so the reload resume offer stops.
 
-    Retains ``hosts_done`` (history), only flips ``status`` to ``complete``. Once
-    complete the record is never resumed (``resumed_done_ids`` returns empty for a
-    non-``running`` record), so the next collection is a fresh full sweep.
+    Only flips ``status`` to ``complete``. The resume skip-set follows the
+    store's own stage state (a sweep whose stages ended ``complete`` is never
+    resumed), so the next collection is a full sweep.
     """
     entry = _domain_data(shell, domain)
     if entry is None:
         return
     record = entry.get(COLLECTION_PROGRESS_KEY)
     if not isinstance(record, dict):
-        record = {"hosts_done": []}
+        record = {}
     record["status"] = STATUS_COMPLETE
-    if not isinstance(record.get("hosts_done"), list):
-        record["hosts_done"] = []
     record["updated_at"] = _now_iso()
     entry[COLLECTION_PROGRESS_KEY] = record
     _best_effort_save(shell)
@@ -255,31 +206,77 @@ def reset_collection_progress(shell: Any, domain: str) -> None:
     entry.pop(COLLECTION_PROGRESS_KEY, None)
 
 
-def resumed_done_ids(shell: Any, domain: str) -> frozenset[str]:
-    """Return the upper-cased done-set to skip on resume, or an empty set.
+#: Store stages whose committed units are a swept host's done-mark (the
+#: ``graph_store.records`` names, spelled here so this module stays
+#: dependency-light).
+_HOST_SWEEP_STAGES: tuple[str, ...] = ("smb_hosts",)
 
-    Only a ``running`` (interrupted) record yields skip entries — an absent or
-    ``complete`` record returns an empty set, so a fresh / finished scan sweeps
-    every host. The set is the O(1) skip filter the fan-out applies over its
-    dispatch list.
 
-    Honours the :data:`COLLECTOR_FRESH_ENV` escape hatch: when the operator asks
-    for a fresh full sweep, the resumable record is discarded and an empty set is
-    returned, so this run re-scans every host from scratch (the explicit opt-out
-    the start-of-run resume notice names).
+def resumed_done_ids(
+    shell: Any, domain: str, *, stages: Iterable[str] | None = None
+) -> frozenset[str]:
+    """Return the upper-cased host ids to skip on resume, or an empty set.
+
+    The done-set is the domain's graph store: a host is done when its unit of
+    EVERY sweep stage in ``stages`` (default: the SAMR stage, ``smb_hosts``)
+    committed, which is the same transaction as its facts, so a done host is
+    never ahead of its sessions, local groups or shares. Nothing is read from
+    ``variables.json``: a 14.0.x workspace whose interrupted sweep kept its
+    done-set there is swept again in full, because the hosts it lists have
+    their edges in the 14.0.x graph file, not in the store.
+
+    Only a sweep that did not finish yields skip entries: when every stage of
+    ``stages`` last ended ``complete``, the set is empty and the next sweep
+    re-collects every host (each host's unit is replaced as it is collected).
+
+    Honours the :data:`COLLECTOR_FRESH_ENV` escape hatch: an empty set, and the
+    resumable record is discarded (the orchestrator also begins the sweep's
+    stages ``fresh``, which drops their units).
     """
-    record = read_collection_progress(shell, domain)
-    if record.get("status") != STATUS_RUNNING:
-        return frozenset()
     if collector_fresh_requested():
-        # Explicit re-scan-all: drop the cursor so the sweep starts clean and no
-        # later reload inherits a half-applied skip-set.
         reset_collection_progress(shell, domain)
         return frozenset()
-    done = record.get("hosts_done")
-    if not isinstance(done, list):
+    wanted = tuple(stages) if stages is not None else _HOST_SWEEP_STAGES
+    if not wanted:
         return frozenset()
-    return frozenset(str(x).upper() for x in done)
+    try:
+        from adscan_internal.services.graph_runtime import graph_store_for  # noqa: PLC0415
+
+        store = graph_store_for(shell, domain, create=False)
+        if store is None:
+            return frozenset()
+        runs = {run.stage: run for run in store.stage_runs()}
+        if all(getattr(runs.get(stage), "status", "") == "complete" for stage in wanted):
+            return frozenset()
+        if not all(stage in runs for stage in wanted):
+            return frozenset()
+        done: frozenset[str] | None = None
+        for stage in wanted:
+            units = frozenset(str(unit).upper() for unit in store.done_units(stage))
+            done = units if done is None else done & units
+        return done or frozenset()
+    except Exception as exc:  # noqa: BLE001 — a read must never break the scan
+        _debug(f"resumed_done_ids: store unreadable ({type(exc).__name__}); full sweep")
+        return frozenset()
+
+
+def record_hosts_done_count(shell: Any, domain: str, count: int) -> None:
+    """Record how many hosts the sweep has committed (a count, never the list).
+
+    The ``collection_progress`` record keeps the sweep's status and totals for
+    the resume notice and the platform's resume state; the done SET lives in
+    the graph store. Not persisted here (the caller's next save carries it).
+    """
+    entry = _domain_data(shell, domain)
+    if entry is None:
+        return
+    record = entry.get(COLLECTION_PROGRESS_KEY)
+    if not isinstance(record, dict):
+        return
+    record["hosts_done_count"] = int(count or 0)
+    record.pop("hosts_done", None)
+    record["updated_at"] = _now_iso()
+    entry[COLLECTION_PROGRESS_KEY] = record
 
 
 def resume_notice_counts(shell: Any, domain: str) -> tuple[int, int, int] | None:

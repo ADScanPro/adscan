@@ -41,18 +41,30 @@ def _path_is_proven(path: Mapping[str, Any]) -> bool:
     return str(path.get("status", "")).strip().lower() in _PROVEN_STATUSES
 
 
-def _account_key(name: str) -> str:
+def affected_user_key(name: str) -> str:
     """Case-folded, realm-stripped comparison key (``user@realm`` -> ``user``).
 
-    Matches the exposure KPI's own user key, so an exclusion persisted as a
-    bare sAMAccountName also removes the UPN form of the same account.
+    The ONE key an affected account is compared and counted by. A path's
+    ``meta.affected_users`` names an account either bare (``adscan``, when a
+    broad group was resolved to its members) or as the graph label
+    (``ADSCAN@CORP.EXAMPLE``, when the route starts from that principal), while
+    ``meta.affected_users_tier_map`` is keyed bare. Compared without this key the
+    two forms never met: a route starting from an ordinary user counted no
+    ordinary user, and its fix then read "no ordinary user account runs through
+    this technique". Matches the exposure KPI's own user key, so an exclusion
+    persisted as a bare sAMAccountName also removes the UPN form.
     """
     key = name.strip().lower()
+    if key.startswith("name:"):
+        key = key[len("name:") :]
     if "@" in key:
         local = key.split("@", 1)[0]
         if local:
             key = local
     return key
+
+
+_account_key = affected_user_key
 
 
 def population_exclusions(domain_entries: Any) -> frozenset[str]:
@@ -126,7 +138,7 @@ def _build_domain_tier2_set(paths: Iterable[Mapping[str, Any]]) -> set[str] | No
                 and user.strip()
                 and str(tier).strip().lower() == "tier2"
             ):
-                result.add(user.strip().lower())
+                result.add(affected_user_key(user))
     return result if saw_tier_data else None
 
 
@@ -134,8 +146,13 @@ def _affected_users(
     path: Mapping[str, Any],
     tier2_set: set[str] | None = None,
     excluded: frozenset[str] = frozenset(),
-) -> set[str]:
-    """Extract the lowercased ordinary **Tier-2** affected users from ``meta``.
+) -> dict[str, str]:
+    """Extract the ordinary **Tier-2** affected users from ``meta``, by account key.
+
+    Returns ``{account key: name as the record wrote it, lower-cased}``. An
+    account is COUNTED by its key (:func:`affected_user_key`), so the bare form
+    and the graph-label form of one account are one person; it is SHOWN by the
+    name the record carries.
 
     Reads ``meta.affected_users`` and FILTERS it to ``tier2_set`` — the DOMAIN-level
     ordinary Tier-2 population the caller built once (:func:`_build_domain_tier2_set`)
@@ -152,15 +169,21 @@ def _affected_users(
     """
     meta = path.get("meta")
     if not isinstance(meta, Mapping):
-        return set()
+        return {}
     raw = meta.get("affected_users")
     if not isinstance(raw, (list, tuple, set)):
-        return set()
-    names = {e.strip().lower() for e in raw if isinstance(e, str) and e.strip()}
-    if excluded:
-        names = {n for n in names if _account_key(n) not in excluded}
-    if tier2_set is not None:
-        return names & tier2_set
+        return {}
+    names: dict[str, str] = {}
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        key = affected_user_key(entry)
+        if key in excluded or (tier2_set is not None and key not in tier2_set):
+            continue
+        shown = entry.strip().lower()
+        # The realm-qualified form says more than the bare one; keep it.
+        if key not in names or ("@" in shown and "@" not in names[key]):
+            names[key] = shown
     return names
 
 
@@ -227,6 +250,8 @@ def build_user_exposure_ranking(
     # to a given user.
     reachable: dict[str, int] = {}
     proven: dict[str, int] = {}
+    # Counted by account key, shown by the name the records carry.
+    shown: dict[str, str] = {}
 
     # The DOMAIN-level ordinary Tier-2 population, resolved ONCE so every path's
     # affected users filter to the SAME set the exposure-KPI headline counts (only
@@ -245,7 +270,9 @@ def build_user_exposure_ranking(
         if not users:
             continue
         is_proven = _path_is_proven(path)
-        for user in users:
+        for user, name in users.items():
+            if user not in shown or ("@" in name and "@" not in shown[user]):
+                shown[user] = name
             reachable[user] = reachable.get(user, 0) + 1
             if is_proven:
                 proven[user] = proven.get(user, 0) + 1
@@ -253,7 +280,7 @@ def build_user_exposure_ranking(
     # Rank: reachable desc, proven desc, name asc.
     ranked = sorted(
         reachable.keys(),
-        key=lambda name: (-reachable[name], -proven.get(name, 0), name),
+        key=lambda name: (-reachable[name], -proven.get(name, 0), shown[name]),
     )
 
     total_exposed_users = len(ranked)
@@ -261,7 +288,7 @@ def build_user_exposure_ranking(
 
     top_users = [
         {
-            "name": _clean_display_name(name),
+            "name": _clean_display_name(shown[name]),
             "reachable_paths": reachable[name],
             "proven_paths": proven.get(name, 0),
         }
@@ -276,9 +303,10 @@ def build_user_exposure_ranking(
 
     buckets: list[dict[str, Any]] = []
     for route_count in sorted(grouped.keys(), reverse=True):
-        names = sorted(grouped[route_count])
+        keys = grouped[route_count]
+        names = sorted(shown[key] for key in keys)
         user_count = len(names)
-        has_proven = any(proven.get(name, 0) > 0 for name in names)
+        has_proven = any(proven.get(key, 0) > 0 for key in keys)
         buckets.append(
             {
                 "route_count": route_count,

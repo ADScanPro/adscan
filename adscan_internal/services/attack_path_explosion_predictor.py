@@ -63,25 +63,57 @@ def _control_fanout_by_source_relation(
     return per_source_rel
 
 
+#: A fan-out over this share of ALL the graph's nodes is a mega-hub whatever its
+#: absolute size: on a small directory a hub that controls half of every object
+#: meshes the graph exactly as a 500-edge hub does on a large one.
+RELATIVE_HUB_FRACTION = 0.5
+
+#: The size-relative floor never goes under this, so a lab-sized graph with a
+#: handful of fan-outs (an HTB box, a GOAD domain) is never routed by it.
+RELATIVE_HUB_MIN_OUT_DEGREE = 100
+
+
+def effective_mega_hub_floor(node_count: int, min_out_degree: int = 500) -> int:
+    """The fan-out a ``(source, relation)`` must exceed to be a mega-hub.
+
+    The lower of the absolute floor (``min_out_degree``) and a size-relative one
+    (:data:`RELATIVE_HUB_FRACTION` of the graph's nodes, never under
+    :data:`RELATIVE_HUB_MIN_OUT_DEGREE`). Taking the lower of the two keeps every
+    hub the absolute floor found, so no graph routed before stops being routed;
+    the relative floor only adds a small graph whose fan-outs cover most of it.
+    Measured (2026-11-13): the dense ``tiny`` preset (643 nodes) has two
+    reachable non-Tier-0 control fan-outs of 400 and 381, under the absolute 500,
+    and its full search grows past 5 GB without finishing; among 226 local
+    graphs (labs, HTB boxes, synthetic batteries and real engagements) the
+    relative floor routes none that the absolute floor did not already route.
+    """
+    relative = max(RELATIVE_HUB_MIN_OUT_DEGREE, int(RELATIVE_HUB_FRACTION * max(node_count, 0)))
+    return min(int(min_out_degree), relative)
+
+
 def _control_mega_hub_ids(graph: dict[str, Any], *, min_out_degree: int = 500) -> set[str]:
     """Return the set of node ids that are control mega-hubs.
 
-    A control mega-hub is a source node with more than ``min_out_degree``
-    same-relation CONTROL edges. This is the SINGLE definition of the mega-hub
-    criterion — both :func:`count_control_mega_hubs` (the raw count) and
-    :func:`predicts_explosion_reachable` (the reachability-filtered count) consume
-    it, so the two can never drift on what counts as a hub.
+    A control mega-hub is a source node with more than
+    :func:`effective_mega_hub_floor` same-relation CONTROL edges (``min_out_degree``,
+    lowered on a small graph to half its nodes). This is the SINGLE definition of
+    the mega-hub criterion — both :func:`count_control_mega_hubs` (the raw count)
+    and :func:`predicts_explosion_reachable` (the reachability-filtered count)
+    consume it, so the two can never drift on what counts as a hub.
 
     Args:
         graph: The attack graph dict.
-        min_out_degree: The strict fan-out floor a ``(source, relation)`` must
+        min_out_degree: The absolute fan-out floor a ``(source, relation)`` must
             exceed to make its source a mega-hub.
 
     Returns:
         The set of mega-hub source-node ids.
     """
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    node_count = len(nodes) if isinstance(nodes, (dict, list)) else 0
+    floor = effective_mega_hub_floor(node_count, min_out_degree)
     per_source_rel = _control_fanout_by_source_relation(graph)
-    return {src for (src, _rel), n in per_source_rel.items() if n > min_out_degree}
+    return {src for (src, _rel), n in per_source_rel.items() if n > floor}
 
 
 def count_control_mega_hubs(graph: dict[str, Any], *, min_out_degree: int = 500) -> int:

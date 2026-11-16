@@ -32,6 +32,16 @@ reads those resources again and decides each recorded edge:
   not returned, the CA security descriptor or registry needs rights this
   account lacks, the web endpoint timed out). That is never "fixed".
 
+**A family is decided only when everything it is graded from was read.** The
+detectors emit nothing for a value they were not given, so "the detector found
+nothing" proves absence only when the read behind it happened. Whether the scan
+recorded a step or not, a family answers "not re-checked" while a CA's registry
+values, its security descriptor, its web endpoint or an access control list the
+family depends on was not obtained (:func:`family_basis_unread`). For the two
+registry-fed families that is the scan's own rule,
+``ca_registry_checks.assess_registry_checks``, so a scan and a re-check give
+the same answer on the same CA.
+
 Most AD CS steps name the same ledger object (the impersonated Domain Admins
 group), so a present step is reported by its ledger item id, not its object:
 one group losing enroll closes its own step while another group's stays open.
@@ -82,6 +92,11 @@ _PKI_KINDS = frozenset({"ntauthstore", "rootca", "aiaca", "enterpriseca"})
 #: ``not re-checked`` reasons (``ReadOutcome.reason``).
 REASON_PKI_UNREADABLE = "pki_directory_unreadable"
 REASON_PKI_INCOMPLETE = "pki_directory_read_incomplete"
+REASON_CA_REGISTRY_NOT_READ = "ca_registry_not_read"
+REASON_CA_SECURITY_NOT_READ = "ca_security_not_read"
+REASON_WEB_NOT_VERIFIED = "web_enrollment_not_verified"
+REASON_ACL_NOT_READ = "access_control_list_not_read"
+REASON_OID_LINKS_NOT_READ = "issuance_policy_links_not_read"
 
 
 @dataclass(frozen=True)
@@ -358,6 +373,101 @@ def _resource_unknown(
     return True
 
 
+def _templates_of(pki: PkiState, ca: Any) -> list[Any]:
+    """The templates one CA publishes (the collector's own publication rule)."""
+    from adscan_internal.services.collector.adcs_collector import (  # noqa: PLC0415
+        _published_template_ids,
+    )
+
+    templates = [n for n in pki.nodes.values() if n.kind == "CertTemplate"]
+    published = _published_template_ids(ca, templates)
+    return [t for t in templates if t.object_id in published]
+
+
+def _registry_assessed(check: AdcsCheck, probe: Any) -> bool:
+    """Whether the scan's own rule calls this CA's registry-fed check decided."""
+    from adscan_internal.services.adcs.ca_registry_checks import (  # noqa: PLC0415
+        assess_registry_checks,
+    )
+
+    assessments = assess_registry_checks(
+        getattr(probe, "registry", None),
+        skip_reason=str(getattr(probe, "registry_skip_reason", "") or REASON_CA_REGISTRY_NOT_READ),
+    )
+    assessment = assessments.get(check.check_id)
+    return bool(assessment is not None and assessment.assessed)
+
+
+def family_basis_unread(
+    check: AdcsCheck,
+    pki: PkiState,
+    ca_hosts: Optional[CaHostState],
+    fresh: Mapping[str, set[str]],
+) -> str:
+    """The read this family is graded from that was NOT obtained (``""``: all read).
+
+    Independent of what the scan recorded: a detector emits nothing for a value
+    it was not given, so an empty detection is evidence of absence only when
+    every object the family can live on was read. A CA on which the condition
+    was re-observed needs no further proof and is skipped.
+    """
+    from adscan_internal.services.collector.adcs_collector import template_is_published  # noqa: PLC0415
+
+    cas = [n for n in pki.nodes.values() if n.kind == "EnterpriseCA"]
+    templates = [
+        n
+        for n in pki.nodes.values()
+        if n.kind == "CertTemplate"
+        and (check.relation == "ADCSESC4" or template_is_published(n, pki.published_labels))
+    ]
+
+    def acl_unread(nodes: Iterable[Any]) -> bool:
+        return any(str(n.object_id).upper() in pki.unread_acl for n in nodes)
+
+    if check.basis in {BASIS_TEMPLATE, BASIS_TEMPLATE_WRITER}:
+        if check.relation == "ADCSESC13" and templates and not pki.oid_links_resolved:
+            return REASON_OID_LINKS_NOT_READ
+        return REASON_ACL_NOT_READ if acl_unread(templates) else ""
+    if check.basis == BASIS_PKI_OBJECT:
+        pki_objects = [n for n in pki.nodes.values() if str(n.kind).lower() in _PKI_KINDS]
+        return REASON_ACL_NOT_READ if acl_unread(pki_objects) else ""
+    if check.basis in {BASIS_CA_SAN_FLAG, BASIS_CA_INTERFACE_FLAG}:
+        for ca in cas:
+            oid = str(ca.object_id).upper()
+            if check.basis == BASIS_CA_INTERFACE_FLAG and oid in fresh:
+                continue
+            if _registry_assessed(check, _probe_for(ca_hosts, oid)):
+                continue
+            if check.basis == BASIS_CA_SAN_FLAG and not any(
+                _template_still_qualifies_for_esc6(pki, template, "") for template in _templates_of(pki, ca)
+            ):
+                # No template this CA publishes could carry the condition even
+                # with the flag set: the unread flag decides nothing here.
+                continue
+            return REASON_CA_REGISTRY_NOT_READ
+        if check.basis == BASIS_CA_SAN_FLAG and cas and acl_unread(templates):
+            return REASON_ACL_NOT_READ
+        return ""
+    if check.basis == BASIS_CA_SECURITY:
+        for ca in cas:
+            oid = str(ca.object_id).upper()
+            if oid in fresh:
+                continue
+            if oid in pki.unread_acl or not _security_descriptor_read(ca):
+                return REASON_CA_SECURITY_NOT_READ
+        return ""
+    if check.basis == BASIS_CA_WEB:
+        for ca in cas:
+            oid = str(ca.object_id).upper()
+            if oid in fresh:
+                continue
+            web = getattr(_probe_for(ca_hosts, oid), "web", None)
+            if web is None or not web.esc8_absence_certain:
+                return REASON_WEB_NOT_VERIFIED
+        return ""
+    return REASON_ACL_NOT_READ
+
+
 def _fresh_index(edges: Iterable[Any], relation: str) -> dict[str, set[str]]:
     index: dict[str, set[str]] = {}
     for edge in edges:
@@ -463,25 +573,34 @@ def grade_adcs_check(
     unknown_objects = {rec.object_id for rec, s in decisions if s == STATE_UNKNOWN}
     decided = frozenset(rec.object_id for rec, _s in decisions) - unknown_objects
 
+    # The family as a whole: whatever the scan recorded, an empty detection
+    # closes nothing while a read the detector depends on was not obtained.
+    basis_reason = family_basis_unread(check, pki, ca_hosts, fresh)
+
     present: dict[str, frozenset[str]] = {relation.lower(): present_items}
     if finding_present:
         present[check.finding_key] = frozenset({domain_id})
-    if not unknown_objects and not finding_unknown:
+    if not unknown_objects and not finding_unknown and not basis_reason:
         outcome = ReadOutcome(check.check_id, domain_id, CheckStatus.RAN, None, present)
     else:
         outcome = ReadOutcome(
-            check.check_id, domain_id, CheckStatus.PARTIAL, decided, present, _unknown_reason(check)
+            check.check_id,
+            domain_id,
+            CheckStatus.PARTIAL,
+            decided,
+            present,
+            basis_reason or _unknown_reason(check),
         )
     return AdcsGrade(outcome=outcome, resolved=sorted(resolved.items()))
 
 
 def _unknown_reason(check: AdcsCheck) -> str:
     return {
-        BASIS_CA_SAN_FLAG: "ca_registry_not_read",
-        BASIS_CA_INTERFACE_FLAG: "ca_registry_not_read",
-        BASIS_CA_SECURITY: "ca_security_not_read",
-        BASIS_CA_WEB: "web_enrollment_not_verified",
-    }.get(check.basis, "access_control_list_not_read")
+        BASIS_CA_SAN_FLAG: REASON_CA_REGISTRY_NOT_READ,
+        BASIS_CA_INTERFACE_FLAG: REASON_CA_REGISTRY_NOT_READ,
+        BASIS_CA_SECURITY: REASON_CA_SECURITY_NOT_READ,
+        BASIS_CA_WEB: REASON_WEB_NOT_VERIFIED,
+    }.get(check.basis, REASON_ACL_NOT_READ)
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +719,13 @@ ADCS_SCAN_GRADERS: Mapping[str, tuple[str, ...]] = {
     check_id: (
         "adscan_internal.services.collector.adcs_collector:ADCSCollector",
         "adscan_internal.services.collector.adcs_collector:detect_collected_escalations",
+        *(
+            ("adscan_internal.services.adcs.ca_registry_checks:assess_registry_checks",)
+            if check.basis in {BASIS_CA_SAN_FLAG, BASIS_CA_INTERFACE_FLAG}
+            else ()
+        ),
     )
-    for check_id in ADCS_CHECKS
+    for check_id, check in ADCS_CHECKS.items()
 }
 
 
@@ -617,6 +741,7 @@ __all__ = (
     "build_ca_host_state",
     "build_pki_state",
     "decide_recorded_edge",
+    "family_basis_unread",
     "grade_adcs_check",
     "observe_adcs_check",
     "principal_classifier",

@@ -60,7 +60,7 @@ The schema (all keys optional)::
       domain: corp.example    # optional; absent = every domain the run touches
       secret_env: ADSCAN_CLEANUP_SECRET  # the ADSCAN_* variable holding the secret (never inline)
     checks:                   # scan policy: which checks may run (absent = every check)
-      base: safe_for_production            # full_validation (default) | detection_only | safe_for_production
+      base: production_sensitive            # lab_ctf | audit | production_sensitive (legacy ids full_validation, detection_only, safe_for_production still load)
       disabled: [step:kerberoasting, family:delegation_trusts]
       enabled: [step:readgmsapassword]
       new_checks: disabled                 # follow_base (default) | disabled
@@ -75,6 +75,13 @@ The schema (all keys optional)::
       name: "Corp example"    # report states whether this run's digest matches it
       revision: 3
       digest: "sha256:<64 hex>"
+    asset_scope:              # the asset-level engagement scope (absent = keep the
+                              # workspace's recorded scope; present, even empty, REPLACES it)
+      allow: [198.51.100.0/24]             # entries (same grammar as --scope-allow)
+      deny: [fs01.corp.example, "CORP\\svc_backup"]   # deny always wins
+      dc_access: directory                 # directory (default) | full
+      decided_by: web_user                 # scan_configuration (default) | web_user
+      decided_by_label: "Jane Example"     # who, for the record (free text)
 
 The ``checks`` section is validated for shape and selector syntax by
 :func:`adscan_core.scan_policy.policy.parse_policy_definition`; registry-aware
@@ -204,9 +211,17 @@ _TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "pacing",
         "cleanup_credential",
         "agreed_policy",
+        "asset_scope",
     }
 )
 _AGREED_POLICY_KEYS: frozenset[str] = frozenset({"name", "revision", "digest"})
+# The asset-scope section (the web platform writes it; mirrored by the web
+# schema ``ScanAssetScopeInput``, locked by the CLI<->web contract test).
+ASSET_SCOPE_KEYS: frozenset[str] = frozenset(
+    {"allow", "deny", "dc_access", "decided_by", "decided_by_label"}
+)
+ASSET_SCOPE_DC_ACCESS_VALUES: frozenset[str] = frozenset({"directory", "directory_only", "full"})
+ASSET_SCOPE_DECIDED_BY_VALUES: frozenset[str] = frozenset({"scan_configuration", "web_user"})
 _PHASES_KEYS: frozenset[str] = frozenset({"disabled", "steps"})
 _TRUST_KEYS: frozenset[str] = frozenset({"policy", "domains"})
 _ATTACK_PATH_KEYS: frozenset[str] = frozenset({"policy", "selected"})
@@ -485,6 +500,29 @@ class ChecksConfig:
 
 
 @dataclass(frozen=True)
+class AssetScopeSection:
+    """The ``asset_scope`` section: allow and deny entries, validated.
+
+    Present (even with both lists empty) means the run REPLACES the workspace's
+    recorded asset scope; absent means the recorded one stays.
+
+    Attributes:
+        allow: Allow entries as given (each validated by the shared grammar).
+        deny: Deny entries as given.
+        dc_access: ``directory``/``directory_only``/``full``, or ``None``
+            (directory reads only).
+        decided_by: ``scan_configuration`` (default) or ``web_user``.
+        decided_by_label: Free text recorded with the decision (a user name).
+    """
+
+    allow: tuple[str, ...] = ()
+    deny: tuple[str, ...] = ()
+    dc_access: Optional[str] = None
+    decided_by: str = "scan_configuration"
+    decided_by_label: str = ""
+
+
+@dataclass(frozen=True)
 class ScanConfig:
     """A fully-resolved scan configuration.
 
@@ -536,6 +574,9 @@ class ScanConfig:
     # (``{name, revision, digest}``), so the report can state whether this run
     # used it. Disclosure only: it never changes which checks run.
     agreed_policy: Optional[dict[str, Any]] = None
+    # The asset-level engagement scope (allow/deny lists). ``None`` = keep the
+    # workspace's recorded scope.
+    asset_scope: Optional[AssetScopeSection] = None
 
     # -- convenience predicates used by the gated decision points -----------
 
@@ -560,6 +601,7 @@ class ScanConfig:
             and self.durable_changes.machine_account_policy is None
             and self.cleanup_credential is None
             and self.agreed_policy is None
+            and self.asset_scope is None
             and self.checks.is_default
             and self.pacing.is_default
         )
@@ -834,6 +876,56 @@ def _parse_agreed_policy(raw: Any) -> Optional[dict[str, Any]]:
     return normalized
 
 
+def _parse_asset_scope(raw: Any) -> Optional[AssetScopeSection]:
+    """Parse the ``asset_scope`` section through the shared scope grammar.
+
+    Every entry is validated here, so a syntax error stops the run (exit 2)
+    before anything is sent, and names the list and the entry.
+    """
+    if raw is None:
+        return None
+    from adscan_core.engagement_scope_model import (  # noqa: PLC0415
+        ScopeSyntaxError,
+        parse_scope_values,
+    )
+
+    mapping = _require_mapping(raw, where="asset_scope")
+    _reject_unknown_keys(mapping, ASSET_SCOPE_KEYS, where="asset_scope")
+    lists: dict[str, tuple[str, ...]] = {}
+    for name in ("allow", "deny"):
+        values = _coerce_str_list(mapping.get(name), where=f"asset_scope.{name}")
+        # An empty list is meaningful here (the section replaces the recorded
+        # scope, so empty lists clear it); only entries that exist are parsed.
+        try:
+            if values:
+                parse_scope_values(values, origin=f"asset_scope.{name}")
+        except ScopeSyntaxError as exc:
+            raise ScanConfigError(f"Invalid engagement scope entry: {exc}") from exc
+        lists[name] = values
+    dc_access = mapping.get("dc_access")
+    if dc_access is not None and str(dc_access).strip().lower() not in ASSET_SCOPE_DC_ACCESS_VALUES:
+        raise ScanConfigError(
+            f"'asset_scope.dc_access' must be one of {sorted(ASSET_SCOPE_DC_ACCESS_VALUES)}, "
+            f"got {dc_access!r}."
+        )
+    decided_by = str(mapping.get("decided_by") or "scan_configuration").strip()
+    if decided_by not in ASSET_SCOPE_DECIDED_BY_VALUES:
+        raise ScanConfigError(
+            f"'asset_scope.decided_by' must be one of {sorted(ASSET_SCOPE_DECIDED_BY_VALUES)}, "
+            f"got {decided_by!r}."
+        )
+    label = mapping.get("decided_by_label")
+    if label is not None and not isinstance(label, str):
+        raise ScanConfigError("'asset_scope.decided_by_label' must be a string.")
+    return AssetScopeSection(
+        allow=lists["allow"],
+        deny=lists["deny"],
+        dc_access=str(dc_access).strip().lower() if dc_access is not None else None,
+        decided_by=decided_by,
+        decided_by_label=str(label or "")[:200],
+    )
+
+
 def _parse_checks(raw: Any) -> ChecksConfig:
     """Parse the ``checks`` section through the scan-policy SSOT validator."""
     if raw is None:
@@ -935,6 +1027,7 @@ def parse_scan_config(data: Any) -> ScanConfig:
         pacing=_parse_pacing(mapping.get("pacing")),
         cleanup_credential=_parse_cleanup_credential(mapping.get("cleanup_credential")),
         agreed_policy=_parse_agreed_policy(mapping.get("agreed_policy")),
+        asset_scope=_parse_asset_scope(mapping.get("asset_scope")),
     )
 
 

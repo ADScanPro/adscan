@@ -105,6 +105,9 @@ REASON_ACCESS_DENIED = "registry_access_denied"
 REASON_REMOTE_REGISTRY_UNAVAILABLE = "remote_registry_unavailable"
 REASON_AUTH_FAILED = "authentication_failed"
 REASON_READ_FAILED = "registry_read_failed"
+#: The Kerberos reply behind the session could not be read (malformed or cut
+#: short): a protocol fault, neither a refusal by the host nor a wrong credential.
+REASON_KERBEROS_REPLY_UNREADABLE = "kerberos_reply_unreadable"
 
 _ERROR_FILE_NOT_FOUND = 0x2
 _ERROR_ACCESS_DENIED = 0x5
@@ -216,6 +219,14 @@ def classify_esc12_reading(reading: Esc12RegistryReading) -> tuple[str, str]:
 
 def classify_registry_error(exc: BaseException) -> str:
     """Map a transport / RPC failure to a ``not_checked`` reason code."""
+    from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+        is_malformed_kdc_reply,
+    )
+
+    if is_malformed_kdc_reply(exc):
+        # Named before the generic buckets: its text would otherwise fall
+        # through to "read failed" and hide what actually happened.
+        return REASON_KERBEROS_REPLY_UNREADABLE
     errno = getattr(exc, "errno", None)
     if errno == _ERROR_ACCESS_DENIED:
         return REASON_ACCESS_DENIED

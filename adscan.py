@@ -2,7 +2,14 @@
 # pylint: disable=unexpected-keyword-arg
 from adscan_core.async_bridge import run_on_new_loop
 from adscan_core.domain_auth_state import is_authenticated_state
-from adscan_core.scan_control import ScanAbortRequested
+from adscan_core.ci_exit_codes import exit_code_for_signal
+from adscan_core.scan_control import ScanAbortRequested, scan_control
+
+# Bound at import time on purpose: a signal handler runs in the main thread
+# between bytecodes, and an import inside it can land on a module that is still
+# half-initialized (the progress dashboard first imports this module as
+# collection starts), raising ImportError into whatever code was running.
+from adscan_core.scan_control.interrupts import handle_sigint
 from adscan_internal.rich_output import (
     mark_passthrough,
     mark_sensitive,
@@ -8776,17 +8783,20 @@ def _print_install_summary():
     telemetry_enabled = telemetry._is_telemetry_enabled()
     if telemetry_enabled:
         tele_status = Text("  ON", style="bold green")
-        tele_status.append(" — anonymous, sanitized usage analytics", style="dim")
+        from adscan_core.telemetry_disclosure import (
+            TELEMETRY_DETAIL_ROWS,
+            TELEMETRY_ON_SUMMARY,
+        )
+
+        tele_status.append(f" — {TELEMETRY_ON_SUMMARY}", style="dim")
         renderables.append(tele_status)
         renderables.append(Text(""))
 
         tele_detail = Table.grid(padding=(0, 1))
         tele_detail.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
         tele_detail.add_column(justify="left", style="dim")
-        tele_detail.add_row("What", "Commands run, feature usage, errors")
-        tele_detail.add_row("Not sent", "IPs, domains, credentials, paths")
-        tele_detail.add_row("Session off", "export ADSCAN_TELEMETRY=0")
-        tele_detail.add_row("Permanent", "telemetry off  (inside ADscan)")
+        for _label, _value in TELEMETRY_DETAIL_ROWS:
+            tele_detail.add_row(_label, _value)
         tele_detail.add_row("Details", cta_markup("telemetry_notice"))
         renderables.append(tele_detail)
     else:
@@ -8957,6 +8967,7 @@ def handle_start(args: argparse.Namespace | None = None) -> None:
             requested_pro=False,
             verbose_mode=VERBOSE_MODE,
             debug_mode=DEBUG_MODE,
+            startup_args=args,
         ),
         deps=StartSessionDeps(
             is_frozen=is_frozen,
@@ -9150,7 +9161,7 @@ def _resolve_streamer_metadata_snapshot(shell: Any) -> dict[str, Any]:
 
     The streamer fires a metadata-bearing chunk on every tick so a session that
     hangs or crashes — and therefore never reaches ``capture_session_end`` — still
-    carries its identity (lab/partner), progressive compromise state, and AD scale
+    carries its identity (lab, licence), progressive compromise state, and AD scale
     on the LAST chunk that did arrive. Previously only ``workspace_type`` rode the
     live path; everything else was bound only at finalize, so a hung session was
     untriageable.
@@ -9175,7 +9186,7 @@ def _resolve_streamer_metadata_snapshot(shell: Any) -> dict[str, Any]:
     """
     fields: dict[str, Any] = {}
 
-    # 1. Lab + partner (Class A — identity). Translate the canonical lab fields
+    # 1. Lab + licence (Class A — identity). Translate the canonical lab fields
     #    to the ``target_*`` wire keys the legacy finalize payload uses, so the
     #    live and finalize paths populate the SAME sessions-row columns.
     try:
@@ -9199,14 +9210,17 @@ def _resolve_streamer_metadata_snapshot(shell: Any) -> dict[str, Any]:
             fields["target_slug"] = str(lab_slug).lower()
         if lab_name_whitelisted is not None:
             fields["target_whitelisted"] = bool(lab_name_whitelisted)
-        # Partner attribution — re-resolve so a tag persisted by the start gate
-        # after process start is picked up (mirrors the finalize pattern).
+        # Licence identity (grant id, installation id and the licence's own
+        # partner tag), read per chunk from the signed licence so a licence
+        # activated mid-session is picked up. Empty without a licence.
         try:
-            from adscan_core import telemetry as _partner_tel  # noqa: PLC0415
+            from adscan_core import telemetry as _licence_tel  # noqa: PLC0415
 
-            partner_tag = _partner_tel.refresh_partner_tag()
-            if partner_tag:
-                fields["partner_tag"] = partner_tag
+            fields.update(_licence_tel.licence_identity_fields())
+            # Installation identity (installation id, the 14.0.x legacy id
+            # when this installation migrated, virtualization) so the reviewer
+            # can filter sessions by installation.
+            fields.update(_licence_tel.installation_identity_session_fields())
         except Exception:  # noqa: BLE001
             pass
     except Exception:  # noqa: BLE001
@@ -11002,6 +11016,19 @@ class PentestShell:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
 
+        # Engagement-scope egress guard: while this session has an asset scope,
+        # a connection this process attempts to an excluded address is refused
+        # before a packet leaves, even where a call site missed its own check.
+        try:
+            from adscan_internal.services.engagement_scope import (
+                install_asset_scope_egress_guard,
+            )
+
+            install_asset_scope_egress_guard(self)
+        except Exception as exc:  # noqa: BLE001 — must not break startup
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
         # Attack-graph notes hold credential-store REFERENCES, never recovered
         # values. Bind the resolver to this session so the operator's own views
         # (attack-path detail) still show the cleartext they are entitled to.
@@ -12058,8 +12085,6 @@ class PentestShell:
         exits on Ctrl+C. Unattended (``adscan ci``): the first SIGINT stops the
         scan cleanly, a second one runs the graceful shutdown below.
         """
-        from adscan_core.scan_control.interrupts import handle_sigint
-
         handle_sigint(signum, frame, fallback=self.signal_handler)
 
     def signal_handler(self, _signum, _frame):
@@ -12151,9 +12176,8 @@ class PentestShell:
             # Exit with the signal's status (130 Ctrl+C, 143 SIGTERM, 129
             # SIGHUP), never 0: the run was interrupted, and a 0 here made the
             # web worker record a scan stopped from outside as completed and
-            # dispatch a deliverable kit for it.
-            from adscan_core.ci_exit_codes import exit_code_for_signal
-
+            # dispatch a deliverable kit for it. (exit_code_for_signal is bound at
+            # import time: nothing is imported inside a signal handler.)
             sys.exit(exit_code_for_signal(_signum))
 
     def auto_save(self):
@@ -14824,11 +14848,29 @@ class PentestShell:
                             command_method=cmd_method,
                         ):
                             continue
-                        # `system` needs the raw string to preserve pipes/quotes.
-                        if command_name == "system":
-                            cmd_method(raw_arg_string)
-                        else:
-                            cmd_method(arg_string)  # Call the original do_* method
+                        # A verb that names a domain or a host passes the
+                        # engagement scope first (one shared gate, also used by
+                        # `adscan execute`); refused, the verb does not run.
+                        from adscan_internal.cli.asset_scope_cmd import (
+                            gate_command_targets,
+                        )
+
+                        if command_name != "scope" and not gate_command_targets(
+                            self, command_name, arg_string
+                        ):
+                            continue
+                        # Every command runs inside a scan-control command scope,
+                        # so Ctrl+C opens the operator menu (stop this command,
+                        # keep going, and the step/phase choices of a scan or
+                        # long step running inside it) instead of cancelling the
+                        # command at an arbitrary point. The CLI never exits on
+                        # Ctrl+C; a stop unwinds as ScanAbortRequested below.
+                        with scan_control().command(command_name, label=command_name):
+                            # `system` needs the raw string to preserve pipes/quotes.
+                            if command_name == "system":
+                                cmd_method(raw_arg_string)
+                            else:
+                                cmd_method(arg_string)  # Call the original do_* method
                     except Exception as e:
                         telemetry.capture_exception(e)
                         print_error(f"Error executing command '{command_name}'.")
@@ -14956,6 +14998,12 @@ class PentestShell:
             f"  [dim]{version_tag}[/dim]"
             f"  [{badge_style}]{license_mode}[/{badge_style}]"
         )
+        # PRO: one line on the licence (contract end, or no end date).
+        from adscan_core.pro_license.status_view import banner_text
+
+        licence_line = banner_text(license_mode)
+        if licence_line is not None:
+            self.console.print(licence_line)
 
         # Tagline (shared with Textual TUI)
         self.console.print(
@@ -15003,7 +15051,7 @@ class PentestShell:
           'set myip <ip>' is a permanent alias.
         - iface: network interface to use. Automatically adds the interface's IP to the myip variable
         - auto: enable or disable automatic mode. It will run the scan without prompting (automatic) or by prompting the user (semi-automatic)
-        - telemetry: turn anonymous usage telemetry on or off. The change applies to every
+        - telemetry: turn sanitized usage telemetry on or off. The change applies to every
           workspace and future session; add 'workspace' to scope it to the current one.
         - pacing: how hard ADscan works the network: fragile, polite, normal (default) or
           fast. Saved in the workspace; a scan policy may cap it ('show pacing').
@@ -15018,8 +15066,8 @@ class PentestShell:
         set hosts 192.168.1.0/24, set hosts 192.168.1.10-23
         set iface eth0
         set auto True
-        set telemetry off
-        set telemetry off workspace
+        set telemetry off            (this workspace only)
+        set telemetry off global     (every workspace)
         set pacing polite
         set pacing.max_parallel_hosts 4
         """
@@ -15513,6 +15561,28 @@ class PentestShell:
         )
 
         handle_cleanup_credential_command(self, args)
+
+    def do_scope(self, args):
+        """Show or change the engagement scope: the hosts and accounts ADscan may touch.
+
+        Usage: scope [show]
+            scope allow <entry>[,<entry>...]   Add allow entries (only these may be touched).
+            scope deny <entry>[,<entry>...]    Add deny entries (never touched; deny wins).
+            scope allow-file <path> | deny-file <path>
+            scope remove <id|value>[,...]      Remove entries (a1, d2, or the value).
+            scope clear [allow|deny|all]
+            scope dc-access directory|full     Domain controllers: directory reads only unless allowed, or all assessed as hosts.
+            scope check <host or account>      The verdict and the entry that decided it.
+            scope verify                       What every entry resolves to, before anything is contacted.
+
+        Entries: IP, CIDR, range, FQDN, *.suffix, short host name, SID, DN,
+        DOMAIN\\name or UPN. A change applies from the next action. Widening
+        the scope asks for confirmation (default No) and every change is recorded
+        in the workspace with who and when.
+        """
+        from adscan_internal.cli.asset_scope_cmd import handle_scope_command
+
+        handle_scope_command(self, args)
 
     def do_benchmark(self, args):
         """Measure (or re-measure) the local hashcat hardware benchmark used
@@ -18367,9 +18437,20 @@ class PentestShell:
         workspace_dir = Path(workspace_dir_raw)
 
         # ── Hygiene findings ────────────────────────────────────────────
+        from adscan_internal.services.attack_graph_service import load_attack_graph
+        from adscan_core.reporting.audit_summary_view import (
+            STATE_NONE,
+            build_hygiene_view,
+            collector_state,
+        )
+
+        # The report writes findings as a LIST under domains.<domain>.findings.
+        # Three states stay distinct (findings / collector finished and found
+        # none / no reading at all): see audit_summary_view.
         hygiene_rows: list[tuple[str, str, str, int]] = []
         # rows: (severity_badge, label, value_text, severity_order)
         report_path = workspace_dir / "technical_report.json"
+        report: Any = None
         if report_path.is_file():
             try:
                 with report_path.open("r", encoding="utf-8") as fh:
@@ -18378,38 +18459,23 @@ class PentestShell:
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 report = None
-            if isinstance(report, dict):
-                findings_root = (
-                    report.get("findings")
-                    if isinstance(report.get("findings"), dict)
-                    else report
-                )
-                for key, label, unit_singular, unit_plural in self._AUDIT_HYGIENE_ROWS:
-                    entry = findings_root.get(key) if isinstance(findings_root, dict) else None
-                    if not isinstance(entry, dict):
-                        continue
-                    details = entry.get("details") if isinstance(entry.get("details"), dict) else entry
-                    count = details.get("count") if isinstance(details, dict) else None
-                    if not isinstance(count, int) or count <= 0:
-                        continue
-                    severity_raw = ""
-                    if isinstance(details, dict):
-                        severity_raw = str(details.get("severity_summary") or "").lower().strip()
-                    badge, style = self._AUDIT_SEVERITY_STYLE.get(
-                        severity_raw, self._AUDIT_SEVERITY_STYLE["info"]
-                    )
-                    order = self._AUDIT_SEVERITY_ORDER.get(severity_raw, 99)
-                    if unit_singular == unit_plural:
-                        # Policy-level finding (MAQ, etc.) — the count is
-                        # always 1 by construction and reads as noise.
-                        # Show just the descriptive scope.
-                        value_text = unit_singular
-                    else:
-                        units = unit_singular if count == 1 else unit_plural
-                        value_text = f"{count} {units}"
-                    hygiene_rows.append(
-                        (f"[{style}]{badge}[/{style}]", label, value_text, order)
-                    )
+        try:
+            collector = collector_state(load_attack_graph(self, domain))
+        except Exception as exc:  # noqa: BLE001 - a graph read must not hide the panel
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            collector = "absent"
+        hygiene_view = build_hygiene_view(
+            report, domain, self._AUDIT_HYGIENE_ROWS, collector=collector
+        )
+        for severity_raw, label, value_text in hygiene_view["rows"]:
+            badge, style = self._AUDIT_SEVERITY_STYLE.get(
+                severity_raw, self._AUDIT_SEVERITY_STYLE["info"]
+            )
+            order = self._AUDIT_SEVERITY_ORDER.get(severity_raw, 99)
+            hygiene_rows.append(
+                (f"[{style}]{badge}[/{style}]", label, value_text, order)
+            )
         hygiene_rows.sort(key=lambda r: (r[3], r[1]))
 
         # ── CVE probe results ───────────────────────────────────────────
@@ -18496,12 +18562,20 @@ class PentestShell:
             for badge, label, value, _ in hygiene_rows:
                 hyg_table.add_row(badge, label, value)
             body_parts.append(hyg_table)
+        elif hygiene_view["state"] == STATE_NONE:
+            body_parts.append(
+                Text(
+                    "  The collector finished and recorded none of these "
+                    "hygiene findings.",
+                    style="dim",
+                )
+            )
         else:
             body_parts.append(
                 Text(
-                    "  No passive findings recorded — clean posture or "
-                    "collector did not run in this scan.",
-                    style="dim",
+                    "  No reading for these hygiene checks: "
+                    f"{hygiene_view['reason']}. This is not a clean result.",
+                    style="yellow",
                 )
             )
 
@@ -19107,6 +19181,27 @@ class PentestShell:
             marked_target_domain = mark_sensitive(target_domain, "domain")
             print_error(
                 f"No host targets are available for domain {marked_target_domain}."
+            )
+            return
+        # The script is a child process that reads its hosts from this file,
+        # which was written earlier and may predate the current engagement
+        # scope. Its entries are judged here, immediately before the script
+        # starts, and the script is handed a file of in-scope hosts only.
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_target_file_in_scope,
+        )
+
+        target_file_path = subprocess_target_file_in_scope(
+            self,
+            target_file_path,
+            surface="drop_the_mic_scan",
+            what="Drop-The-Mic check",
+            domain=target_domain,
+        )
+        if not target_file_path:
+            print_info(
+                "Drop-The-Mic check contacted no host: no target of "
+                f"{mark_sensitive(target_domain, 'domain')} is inside the engagement scope."
             )
             return
         target_file = shlex.quote(target_file_path)
@@ -20767,11 +20862,38 @@ class PentestShell:
         )
 
     def zerologon_disruptive(self, _arg):
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_host_in_scope,
+        )
+
+        # The script is a child process pointed at the domain controller.
+        if not subprocess_host_in_scope(
+            self,
+            self.pdc_hostname or self.pdc,
+            address=self.pdc,
+            surface="exploit_script",
+            what="Zerologon",
+            domain=getattr(self, "domain", None),
+        ):
+            return
         command = f"zerologon-exploit.py {self.pdc_hostname} {self.pdc}"
         print_warning("Exploiting Zerologon (⚠️DISRUPTIVE)")
         self.execute_zerologon_disruptive(command)
 
     def zerologon_restore(self, _arg):
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_host_in_scope,
+        )
+
+        if not subprocess_host_in_scope(
+            self,
+            self.pdc_hostname or self.pdc,
+            address=self.pdc,
+            surface="exploit_script",
+            what="Zerologon restore",
+            domain=getattr(self, "domain", None),
+        ):
+            return
         command = f"reinstall_original_pw.py {self.pdc_hostname} {self.pdc} {self.hash}"
         print_info("Restoring the DC to its previous hash")
         self.execute_zerologon_restore(command)
@@ -20817,6 +20939,16 @@ class PentestShell:
         run_nopac(self, domain=domain)
 
     def printnightmare(self, target_domain):
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_dc_in_scope,
+        )
+
+        # The script is a child process pointed at the domain controller: asked
+        # of the engagement scope before the share is opened or anything starts.
+        if not subprocess_dc_in_scope(
+            self, target_domain, surface="exploit_script", what="PrintNightmare"
+        ):
+            return
         self.do_open_smb(target_domain)
         pdc = self.domains_data[target_domain]['pdc']
         target = (
@@ -21415,6 +21547,12 @@ class PentestShell:
                 f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
             )
             return
+        from adscan_internal.cli.smb import manspider_sign_in_withheld
+
+        if manspider_sign_in_withheld(
+            self, domain=target_domain, username=username, password=password
+        ):
+            return {"completed": False, "sign_in_refused": True}
         workspace_path = os.path.abspath(self.current_workspace_dir)
         spider_output_dir = os.path.join(workspace_path, "smb", "spidering")
         spider_output_arg = shlex.quote(spider_output_dir)
@@ -21490,6 +21628,12 @@ class PentestShell:
                 f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
             )
             return
+        from adscan_internal.cli.smb import manspider_sign_in_withheld
+
+        if manspider_sign_in_withheld(
+            self, domain=target_domain, username=username, password=password
+        ):
+            return {"completed": False, "sign_in_refused": True}
         workspace_path = os.path.abspath(self.current_workspace_dir)
         output_subdir = "artifacts"
         if phase == SMB_SENSITIVE_SCAN_PHASE_HEAVY_ARTIFACTS:
@@ -21603,6 +21747,12 @@ class PentestShell:
                 f"Domain '{marked_target_domain}' is not configured. Please add or select a valid domain."
             )
             return
+        from adscan_internal.cli.smb import manspider_sign_in_withheld
+
+        if manspider_sign_in_withheld(
+            self, domain=target_domain, username=username, password=password
+        ):
+            return {"completed": False, "sign_in_refused": True}
         workspace_path = os.path.abspath(self.current_workspace_dir)
         output_subdir = "passw"
         if phase == SMB_SENSITIVE_SCAN_PHASE_DOCUMENT_CREDENTIALS:
@@ -26874,6 +27024,20 @@ class PentestShell:
         """
         Executes the PTC command and processes its results.
         """
+        from adscan_internal.services.engagement_scope import Contact
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_dc_in_scope,
+        )
+
+        # The tool is a child process that talks Kerberos to the domain's KDC.
+        if not subprocess_dc_in_scope(
+            self,
+            domain,
+            surface="pkinit_tool",
+            what="Pass the certificate",
+            contact=Contact("kerberos"),
+        ):
+            return
         print_info("Performing a Pass The Certificate")
         try:
             proc = self.run_command(command, timeout=300)
@@ -26919,6 +27083,20 @@ class PentestShell:
     def unpac_the_hash(self, domain, target_user, as_rep_key):
         """Obtains NT hash using getnthash.py."""
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.engagement_scope import Contact
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_dc_in_scope,
+        )
+
+        # The tool is a child process that talks Kerberos to the domain's KDC.
+        if not subprocess_dc_in_scope(
+            self,
+            domain,
+            surface="pkinit_tool",
+            what="NT hash recovery",
+            contact=Contact("kerberos"),
+        ):
+            return
 
         try:
             # Use Python from isolated venv if available, fallback to system python
@@ -28334,6 +28512,20 @@ class PentestShell:
         If this function is still needed, it should be refactored to use the service layer.
         """
         from adscan_internal.rich_output import mark_sensitive
+        from adscan_internal.services.engagement_scope import Contact
+        from adscan_internal.services.engagement_scope_targets import (
+            subprocess_dc_in_scope,
+        )
+
+        # The enumerator is a child process that talks Kerberos to the domain's KDC.
+        if not subprocess_dc_in_scope(
+            self,
+            domain,
+            surface="kerberos_user_enumeration",
+            what="Kerberos user enumeration",
+            contact=Contact("kerberos"),
+        ):
+            return
 
         try:
             if not self.do_sync_clock_with_pdc(domain, verbose=True):
@@ -30105,7 +30297,20 @@ class PentestShell:
         Args:
             domain_forwarders: Mapping of domain -> list of upstream DNS server IPs.
             root_forwarders: Upstream DNS servers used for all other lookups (zone ".").
+
+        The local forwarder is its own process: it sends the queries itself, so
+        no in-process check sees them. An upstream the engagement scope excludes
+        is therefore never written into its configuration.
         """
+        from adscan_internal.services.dns_forwarder_scope import (
+            forwarders_in_engagement_scope,
+        )
+
+        domain_forwarders, root_forwarders = forwarders_in_engagement_scope(
+            self,
+            domain_forwarders=domain_forwarders,
+            root_forwarders=root_forwarders,
+        )
         return self._get_dns_resolver_service().write_unbound_config(
             domain_forwarders=domain_forwarders,
             root_forwarders=root_forwarders,
@@ -31445,24 +31650,56 @@ class PentestShell:
 
     def do_clear_all(self, arg):
         """
-        Clears the current workspace by deleting all files and folders,
-        except for workspace metadata and logging directories.
+        Clears the current workspace's scan data: every file and folder except
+        the session's own files and what the engagement accumulates across scans.
         Resets the authentication values for each domain and clears the domains list.
         """
+        from adscan_core.workspace_retention import (  # noqa: PLC0415
+            accumulates_across_scans,
+        )
+
+        # The session's own files: its configuration, the report the next run
+        # diffs against, and the log directories the open log handlers write to.
+        # Everything the engagement accumulates across scans (the engagement
+        # ledger, the run folders, the delivered documents, the scope record, the
+        # secret-purge record, the fingerprint key, the command history) is kept
+        # through the shared definition in ``adscan_core.workspace_retention``,
+        # which the platform's promotion obeys too: ``ci`` runs this clear on
+        # every non-resume start, and a re-scan must never erase the history.
         protected_files = [
             "variables.json",
             "technical_report.json",
-            ".adscan_history",
             "logs",
             "log",
         ]
 
         # Obtain a list of all files and folders in the current directory
         current_dir = os.getcwd()
+        # Close the graph stores under it BEFORE their directories go. A store a
+        # reader opened earlier in this session (any read of attack_graph.json
+        # does) stays cached; deleting its directory under it leaves the handle
+        # writing into an unlinked database, so the run's collection lands
+        # nowhere on disk and the workspace ends without a graph_store (F30).
+        # Closed without an export: the workspace is being discarded, and the
+        # next collection opens a fresh store.
+        from adscan_internal.services.graph_runtime import (  # noqa: PLC0415
+            close_graph_stores_under,
+        )
+
+        close_graph_stores_under(current_dir)
         items = os.listdir(current_dir)
 
-        # Filter the files and folders to delete
-        items_to_delete = [item for item in items if item not in protected_files]
+        # Filter the files and folders to delete. The scope record is more than
+        # one file: its lock (deleting it under a writer that holds it gives
+        # the next writer a second lock), the block a platform run was started
+        # from (the promotion compares the workspace's record with it) and any
+        # copy set aside as unreadable (evidence of the client's decision); the
+        # shared definition names all of them.
+        items_to_delete = [
+            item
+            for item in items
+            if item not in protected_files and not accumulates_across_scans(item)
+        ]
 
         # Delete files and folders. A partial failure — typically root-owned
         # workspace artifacts left behind by a container run (PermissionError /
@@ -31695,6 +31932,18 @@ class PentestShell:
             if background_jobs is not None:
                 background_jobs.finalize()
         except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+        # Every domain's graph store: export what the session changed since the
+        # last export (attack_graph.json, the sidecars, the technical findings)
+        # and close the stores, so the workspace on disk is complete and can be
+        # copied or promoted. Before the ledger attaches to technical_report.json
+        # below, since the export refreshes that file.
+        try:
+            from adscan_internal.services.graph_runtime import close_graph_stores
+
+            close_graph_stores(self)
+        except Exception as exc:  # noqa: BLE001 - best-effort shutdown
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
         # Use telemetry console for session recording export. This console
@@ -32901,6 +33150,17 @@ def _should_use_docker_mode() -> bool:
     return not is_docker_env() and not is_windows()
 
 
+def _close_all_graph_stores() -> None:
+    """Export and close every graph store the run opened (unattended ``finally``)."""
+    try:
+        from adscan_internal.services.graph_runtime import close_all_graph_stores
+
+        close_all_graph_stores()
+    except Exception as exc:  # noqa: BLE001 - best-effort shutdown
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def handle_ci(args):
     """
     Handle non-interactive CI scan for automated testing.
@@ -33220,6 +33480,11 @@ def add_ci_subparser(subparsers):
     from adscan_core.report_options import add_ci_report_arguments
 
     add_ci_report_arguments(ci_parser)
+    # The asset-level engagement scope (allow and deny lists), the same five
+    # flags `start` and the launcher declare (adscan_core.engagement_scope_cli).
+    from adscan_core.engagement_scope_cli import add_scope_arguments
+
+    add_scope_arguments(ci_parser)
     return ci_parser
 
 
@@ -33410,6 +33675,11 @@ if __name__ == "__main__":
             "Hidden by default to keep the panel focused on choke points."
         ),
     )
+    # Asset-level engagement scope for the workspace opened at startup (applied
+    # after a confirmation summary; the REPL `scope` command changes it later).
+    from adscan_core.engagement_scope_cli import add_scope_arguments as _add_scope_args
+
+    _add_scope_args(start_parser)
     # Non-interactive CI scan for automated testing. The subparser is built by
     # the module-level ``add_ci_subparser`` so the flag surface is importable
     # (locked against the launcher pass-through SSOT by a contract test).
@@ -33845,6 +34115,18 @@ if __name__ == "__main__":
 
     _guard_host_direct_core_launch(args.command)
 
+    # The last-resort memory sentinel, for the engine's own run (never the host
+    # launcher's docker path, never the web backend): at 95% of the memory
+    # ceiling it records where the run stopped and exits with status 3.
+    if args.command in ("start", "ci", "execute", "recheck") and not (
+        args.command in ("start", "ci") and _should_use_docker_mode()
+    ):
+        from adscan_internal.services.memory_sentinel_wiring import (
+            start_engine_memory_sentinel,
+        )
+
+        start_engine_memory_sentinel(args.command)
+
     if args.command == "install":
         install_success = False
         installation_mode = "unknown"
@@ -33890,6 +34172,19 @@ if __name__ == "__main__":
         sys.exit(0 if install_success else 1)
     elif args.command == "start":
         use_docker_mode = _should_use_docker_mode()
+        from adscan_core.engagement_scope_cli import scope_flag_values as _scope_values
+
+        if use_docker_mode and _scope_values(args).any_given:
+            # This host path does not mount the scope files into the runtime.
+            print_error(
+                "The --scope flags need the adscan launcher, which validates them and "
+                "mounts the scope files: run `adscan start ...`."
+            )
+            sys.exit(2)
+        if not use_docker_mode:
+            from adscan_internal.cli.asset_scope_cmd import validate_scope_flags_or_exit
+
+            validate_scope_flags_or_exit(args, exit_fn=sys.exit)
         if use_docker_mode:
             exit_code = _handle_start_docker_mode(
                 verbose=bool(getattr(args, "verbose", False)),
@@ -33982,6 +34277,15 @@ if __name__ == "__main__":
                 "mounts the --output folder: run `adscan ci ...`, or drop --ephemeral."
             )
             sys.exit(2)
+        from adscan_core.engagement_scope_cli import scope_flag_values as _ci_scope_values
+
+        if use_docker_mode and _ci_scope_values(args).any_given:
+            # This host path does not mount the scope files into the runtime.
+            print_error(
+                "The --scope flags need the adscan launcher, which validates them and "
+                "mounts the scope files: run `adscan ci ...`."
+            )
+            sys.exit(2)
         if use_docker_mode:
             from adscan_core.report_options import (
                 forward_report_options as _forward_report_options,
@@ -34016,6 +34320,7 @@ if __name__ == "__main__":
         try:
             exit_code = handle_ci(args)
         finally:
+            _close_all_graph_stores()
             _capture_command_session(
                 "ci",
                 success=(exit_code == 0),
@@ -34056,6 +34361,7 @@ if __name__ == "__main__":
                 on_command_resolved=_on_run_command_resolved,
             )
         finally:
+            _close_all_graph_stores()
             if _run_session["command"]:
                 _capture_command_session(
                     _run_session["command"],
@@ -34071,6 +34377,7 @@ if __name__ == "__main__":
         try:
             exit_code = handle_execute(args)
         finally:
+            _close_all_graph_stores()
             _capture_command_session(
                 "execute",
                 success=(exit_code == 0),

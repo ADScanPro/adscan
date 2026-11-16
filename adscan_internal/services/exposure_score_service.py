@@ -62,9 +62,13 @@ from adscan_core.reporting.compromise_verdict import (
     OPERATOR_AWAITING_WAIT_KEY,
     OPERATOR_DECISION_ROUTES_KEY,
     OUTSIDE_SCOPE_DOMAINS_KEY,
+    OUTSIDE_SCOPE_OBJECTS_KEY,
+    OUTSIDE_SCOPE_UNCONFIRMED_KEY,
     operator_awaiting_wait_seconds,
     operator_decision_route_counts,
     outside_scope_domains_of,
+    outside_scope_objects_of,
+    unconfirmed_scope_objects_of,
 )
 from adscan_core.reporting.engagement_scope import (
     BEYOND_SCOPE_KPI_KEY,
@@ -1250,6 +1254,16 @@ def compute_exposure_kpis(
     crossed_domains = outside_scope_domains_of(records)
     if crossed_domains:
         block[OUTSIDE_SCOPE_DOMAINS_KEY] = crossed_domains
+    # The hosts and accounts the ASSET scope excluded on those routes: the
+    # verdict names the object, never the client's own domain.
+    crossed_objects = outside_scope_objects_of(records)
+    if crossed_objects:
+        block[OUTSIDE_SCOPE_OBJECTS_KEY] = crossed_objects
+    # The objects on those routes the engine could not confirm as within the
+    # scope: stated apart from the client's exclusions.
+    unconfirmed_objects = unconfirmed_scope_objects_of(records)
+    if unconfirmed_objects:
+        block[OUTSIDE_SCOPE_UNCONFIRMED_KEY] = unconfirmed_objects
     # Reach beyond the scope: the continuations the domain listing split off its
     # routes at the scope boundary. Stated in its own block, never counted in
     # this domain's figures or denominators above.
@@ -1407,6 +1421,29 @@ def stamp_exposure_kpis_for_domain(
             passes it here to avoid a second graph reload. When ``None`` the
             reachable-terminal summary is computed over the base graph.
     """
+    # The domain's graph is not available this run (its build or its directory
+    # read stopped at the memory ceiling): there is no listing to derive a KPI
+    # from, and the block an empty listing produces reads as "no user exposed".
+    # No block is stamped and any earlier one is removed; attack-path discovery
+    # carries the not-evaluated declaration instead. One check for every caller
+    # (scan end, PRO report, LITE report).
+    try:
+        from adscan_internal.services.graph_availability import (  # noqa: PLC0415
+            clear_route_derived_figures,
+            domain_graph_unavailable_stage,
+        )
+
+        if domain_graph_unavailable_stage(shell, domain):
+            domain_data.pop("exposure_kpis", None)
+            clear_route_derived_figures(shell, domain)
+            return
+    except Exception as exc:  # noqa: BLE001 - the check never breaks the stamp
+        from adscan_core import telemetry as _telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception as _print_exception  # noqa: PLC0415
+
+        _telemetry.capture_exception(exc)
+        _print_exception(exception=exc)
+
     # Idempotency guard: a valid block means a prior seam (PRO or an earlier LITE
     # pass) already stamped it. Do not recompute/overwrite — UNLESS no_cache asks
     # for a hard refresh (a stale cross-run block the guard cannot distinguish

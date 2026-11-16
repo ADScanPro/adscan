@@ -33,12 +33,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from adscan_core.rich_output import print_info_debug
+from adscan_core.rich_output import print_info_debug, print_warning
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.adcs.esc12_detection import (
     REASON_ACCESS_DENIED,
     REASON_CA_CONFIG_NOT_FOUND,
+    REASON_KERBEROS_REPLY_UNREADABLE,
     REASON_READ_FAILED,
     classify_registry_error,
 )
@@ -150,12 +151,21 @@ class ADCSCARegistryProbe:
                 f"ca={mark_sensitive(ca_name, 'host')} "
                 f"error={type(exc).__name__}: {exc}"
             )
+            error_reason = classify_registry_error(exc)
+            if error_reason == REASON_KERBEROS_REPLY_UNREADABLE:
+                # Not a refusal and not a missing right: say what happened, once,
+                # where the operator sees it. The checks stay "not assessed".
+                print_warning(
+                    f"CA registry settings not read on {mark_sensitive(ca_name, 'service')}: "
+                    "the domain controller's Kerberos reply arrived malformed or truncated. "
+                    "The checks that depend on them are recorded as not assessed."
+                )
             return CARegistryProbeResult(
                 target_host=str(target_host),
                 ca_name=ca_name,
                 success=False,
                 error_message=f"{type(exc).__name__}: {exc}",
-                error_reason=classify_registry_error(exc),
+                error_reason=error_reason,
             )
 
         build_number, ubr, major, minor = os_version

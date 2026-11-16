@@ -45,6 +45,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.environment_change_ledger import (
     CHANGE_CLASS_AUTO_REVERT,
 )
+from adscan_core.memory_guard import check_enclosing_stage
 from adscan_core.output import confirm_ask
 from adscan_internal.services.exploitation import ExploitationService
 from adscan_internal.services.exploitation.remote_windows_execution import (
@@ -79,11 +80,21 @@ from adscan_internal.services.smb_sensitive_file_policy import (
     get_sensitive_phase_definition,
     get_sensitive_phase_extensions,
 )
+from adscan_internal.services.mssql_review_coverage import (
+    record_listing_state,
+    run_post_auth_bounded,
+)
 from adscan_internal.services.windows_file_mapping_service import (
+    BULK_SYSTEM_DIRECTORY_NAMES,
     WindowsFileMapEntry,
+    WindowsFileMapLimits,
     WindowsFileMappingError,
     WindowsFileMappingService,
     WindowsPowerShellExecutionResult,
+)
+from adscan_internal.services.winrm_exclusion_policy import (
+    get_winrm_excluded_directory_names,
+    get_winrm_excluded_path_prefixes,
 )
 from adscan_internal.services.windows_sensitive_scan_policy_service import (
     WindowsSensitiveScanPolicyService,
@@ -599,7 +610,7 @@ def _fetch_mssql_phase_files(
         file_targets=file_targets,
         download_dir=loot_dir,
         environment=policy_settings.policy_environment(shell),
-        file_fetcher=lambda remote_path, save_path: _download_mssql_target(
+        file_fetcher=lambda remote_path, save_path: _download_mssql_target_bounded(
             remote_executor=remote_executor,
             auth=auth,
             remote_path=remote_path,
@@ -704,6 +715,12 @@ def _run_mssql_ai_sensitive_data_scan(
     )
 
 
+def _download_mssql_target_bounded(**kwargs: Any) -> Any:
+    """Fetch one file, after asking the enclosing memory stage whether to go on."""
+    check_enclosing_stage()
+    return _download_mssql_target(**kwargs)
+
+
 def _download_mssql_target(
     *,
     remote_executor: RemoteWindowsExecutionService,
@@ -722,6 +739,26 @@ def _download_mssql_target(
     if not result.success:
         raise RuntimeError(result.error_message or "MSSQL file download failed.")
     return str(result.local_path or local_path)
+
+
+#: Bounds of the file listing read through ``xp_cmdshell`` (see
+#: :class:`WindowsFileMapLimits` for why each value is what it is).
+MSSQL_FILE_MAP_LIMITS = WindowsFileMapLimits()
+
+
+def _mssql_file_review_extensions(mode: str) -> tuple[str, ...]:
+    """The extensions the file listing keeps on the server, for one review mode.
+
+    The deterministic review reads only the extensions of its phases and the
+    virtual-machine disk and memory images, so the listing asks the server for
+    those alone (a file matches on any of its dot-separated suffixes, so a
+    ``.xml.bak`` is kept). The AI review triages every file name: no filter.
+    """
+    from adscan_internal.services.windows_file_review_scope import (  # noqa: PLC0415
+        review_listing_extensions,
+    )
+
+    return review_listing_extensions(mode)
 
 
 def _run_mssql_filesystem_mapping(
@@ -776,10 +813,21 @@ def _run_mssql_filesystem_mapping(
         try_use_mapping_cache,
     )
 
+    review_extensions = _mssql_file_review_extensions(mode)
+
     def _mssql_loader() -> "tuple[int, dict] | None":
         data = mapping_service.load_file_map(input_path=output_path)
         entries = list(data.get("entries") or [])
         if not entries:
+            return None
+        # A map listed with an extension filter serves only a review that reads
+        # no extension outside it (the AI review reads every file).
+        cached_extensions = set(
+            (data.get("listing") or {}).get("included_extensions") or ()
+        )
+        if cached_extensions and (
+            not review_extensions or not set(review_extensions) <= cached_extensions
+        ):
             return None
         return len(entries), data
 
@@ -814,15 +862,29 @@ def _run_mssql_filesystem_mapping(
 
         started_at = time.perf_counter()
         try:
-            mapping_result = mapping_service.generate_file_map(
+            # Every reply of this transport is held in memory whole, so the
+            # listing is read in bounded replies. The whole tree is still
+            # walked: only the WinRM noise folders are left out, never a path
+            # allowlist. Volume is cut by what a file IS (an extension filter
+            # applied on the server), with a cap per reply and a total. Past
+            # the total it stops and the gap is declared below.
+            mapping_result = mapping_service.generate_bounded_file_map(
                 command_executor=_executor,
                 output_path=output_path,
+                limits=MSSQL_FILE_MAP_LIMITS,
+                excluded_path_prefixes=get_winrm_excluded_path_prefixes(),
+                excluded_directory_names=get_winrm_excluded_directory_names(),
+                included_extensions=review_extensions,
+                # Order only: every directory is walked, the operating system's
+                # and vendors' last, so a custom location is read first.
+                deferred_directory_names=BULK_SYSTEM_DIRECTORY_NAMES,
                 metadata={
                     "transport": "mssql",
                     "execution_mode": execution_path.mode,
                     "linked_server": execution_path.linked_server,
                     "identity": execution_path.identity,
                 },
+                on_query=check_enclosing_stage,
             )
         except WindowsFileMappingError as exc:
             telemetry.capture_exception(exc)
@@ -838,6 +900,13 @@ def _run_mssql_filesystem_mapping(
             f"in {duration:.2f}s."
         )
 
+    listing_complete = record_listing_state(
+        shell,
+        domain=domain,
+        host=host,
+        manifest_path=output_path,
+        listing=(mapping_result or {}).get("listing"),
+    )
     entries: list[object] = list((mapping_result or {}).get("entries") or [])
     run_root_abs = os.path.join(os.path.dirname(output_path), "phases")
     os.makedirs(run_root_abs, exist_ok=True)
@@ -865,6 +934,7 @@ def _run_mssql_filesystem_mapping(
             "completed": True,
             "output_path": output_path,
             "entry_count": len(entries),
+            "listing_complete": listing_complete,
             "phases_run": [],
         }
 
@@ -989,6 +1059,7 @@ def _run_mssql_filesystem_mapping(
         "completed": True,
         "output_path": output_path,
         "entry_count": len(entries),
+        "listing_complete": listing_complete,
         "phases_run": results,
     }
 
@@ -2598,7 +2669,8 @@ def _ensure_xp_cmdshell_enabled_local(
 
     # Capture the pre-enable advanced-options state so a later revert can restore
     # it exactly (a box that already had advanced options on must be left that
-    # way). Best-effort: an unreadable state defaults to off.
+    # way). Best-effort: an unreadable state reverts to off in this session and
+    # is recorded as unknown in the ledger.
     try:
         _, original_advanced_on = backend._read_xp_cmdshell_state(
             domain=domain,
@@ -2606,10 +2678,13 @@ def _ensure_xp_cmdshell_enabled_local(
             secret=secret,
             timeout=30,
         )
+        advanced_recorded = True
     except Exception as exc:  # noqa: BLE001 - state read is best-effort
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         original_advanced_on = False
+        # The ledger records "unknown", never an assumed value.
+        advanced_recorded = False
 
     # We only reach here when the PRE-state is disabled, so enabling is an ACTUAL
     # change: gate it behind operator consent and register it in the cleanup
@@ -2640,7 +2715,13 @@ def _ensure_xp_cmdshell_enabled_local(
                     "host": host,
                     "linked_server": None,
                     "original_xp_cmdshell": False,
-                    "original_advanced_options": bool(original_advanced_on),
+                    "original_advanced_options": (
+                        bool(original_advanced_on) if advanced_recorded else None
+                    ),
+                    # The login that enabled it, so a later run of this
+                    # workspace can undo the change from this record alone.
+                    "executor_username": str(username or ""),
+                    "executor_domain": str(domain or ""),
                 },
                 method="sp_configure",
                 change_class=CHANGE_CLASS_AUTO_REVERT,
@@ -2774,6 +2855,8 @@ def _ensure_xp_cmdshell_enabled_linked(
                     "original_xp_cmdshell": None,
                     "original_advanced_options": None,
                     "enabled_via_linked_from": host,
+                    "executor_username": str(username or ""),
+                    "executor_domain": str(domain or ""),
                 },
                 method="sp_configure_at_link",
                 change_class=CHANGE_CLASS_AUTO_REVERT,
@@ -2900,9 +2983,15 @@ def _revert_xp_cmdshell_enable(
     linked_server: str | None,
     change_id: str | None,
     original_advanced_on: bool,
+    exclude: tuple[str, ...] = (),
 ) -> bool:
     """Disable the ``xp_cmdshell`` WE enabled and drive its ledger record to a
     confirmed / manual-required terminal state. Returns True when confirmed.
+
+    ``password`` may be empty when the caller holds only the ledger record (a
+    change inherited from a session that ended): the enabling login's secret is
+    then looked up in the credential store. ``exclude`` names principals
+    already tried for this change.
 
     THE revert path for every ``xp_cmdshell`` ADscan enabled (the ad-hoc
     post-auth workflow, its linked-server enables and the reusable attack-step
@@ -2933,6 +3022,20 @@ def _revert_xp_cmdshell_enable(
         secret=password,
         kind={"ccache": KIND_CCACHE, "nt_hash": KIND_NT_HASH}.get(secret_kind, KIND_PASSWORD),
     )
+    held_in_memory = bool(str(password or "").strip())
+    get_change = getattr(ledger, "get_change", None)
+    recorded = get_change(change_id) if callable(get_change) and change_id else None
+    stored_detail = recorded.get("detail") if isinstance(recorded, dict) else None
+    recorded_detail = dict(stored_detail) if isinstance(stored_detail, dict) and stored_detail else {
+        "host": host,
+        "linked_server": linked_server,
+        "original_xp_cmdshell": None if linked_server else False,
+        "original_advanced_options": None if linked_server else bool(original_advanced_on),
+    }
+    from adscan_core.reporting.cleanup_commands import (  # noqa: PLC0415
+        mssql_xp_cmdshell_instruction,
+    )
+
     result = run_revert_with_precedence(
         shell,
         ledger=ledger if change_id else None,
@@ -2948,9 +3051,16 @@ def _revert_xp_cmdshell_enable(
         verification_method=(
             "xp_cmdshell_state_reread_on_link" if linked_server else "xp_cmdshell_state_reread"
         ),
-        manual_instructions="EXEC sp_configure 'xp_cmdshell', 0; RECONFIGURE;",
+        manual_instructions=mssql_xp_cmdshell_instruction(
+            linked_server or host, recorded_detail
+        ),
         object_dn=f"{linked_server} (linked server via {host})" if linked_server else host,
-        extra_before_creator=[creator],
+        extra_before_creator=[creator] if held_in_memory else [],
+        # Without the secret in memory the precedence resolves it from the
+        # credential store (an inherited change, undone from its ledger record).
+        creator_username="" if held_in_memory else username,
+        creator_domain="" if held_in_memory else domain,
+        exclude=exclude,
         supported_kinds=(KIND_PASSWORD, KIND_NT_HASH, KIND_CCACHE),
         description="xp_cmdshell disable",
     )
@@ -3553,6 +3663,72 @@ def revert_deferred_xp_cmdshell(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_warning(f"Deferred xp_cmdshell revert raised: {exc}.")
+
+
+def revert_ledger_xp_cmdshell_entry(
+    shell: MssqlShell,
+    *,
+    ledger: Any,
+    entry: dict[str, Any],
+    exclude: tuple[str, ...] = (),
+) -> bool:
+    """Undo an ``xp_cmdshell`` enable from its LEDGER RECORD alone.
+
+    The dispatcher the final revert pass uses for ``mssql_xp_cmdshell_enabled``.
+    A run that ended (killed, crashed) loses the in-memory handle
+    :func:`revert_deferred_xp_cmdshell` needs, and the record it left behind is
+    all the next run of the workspace holds. Everything the revert needs is on
+    that record: the instance, the linked server, the values both settings had
+    before the change and the login that made it. The undo goes through the
+    same revert precedence as a change of this run (cleanup account first), and
+    only a re-read showing the option off settles ``reverted_confirmed``.
+
+    A record whose ``original_xp_cmdshell`` is true was already on before the
+    assessment: it is not ADscan's change, so nothing is disabled.
+
+    Returns:
+        True when the revert was confirmed by a re-read.
+    """
+    detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+    detail = dict(detail or {})
+    change_id = str(entry.get("change_id") or "").strip() or None
+    linked_server = str(detail.get("linked_server") or "").strip() or None
+    host = str(detail.get("host") or "").strip()
+    if not host and not linked_server:
+        host = str(entry.get("target") or "").strip()
+    domain = str(entry.get("domain") or detail.get("executor_domain") or "").strip()
+    if not host or not change_id or detail.get("original_xp_cmdshell") is True:
+        return False
+
+    from adscan_internal.models.domain import resolve_dc_ip  # noqa: PLC0415
+    from adscan_internal.services.host_address_resolver import (  # noqa: PLC0415
+        resolve_connect_and_spn,
+    )
+
+    kdc_host = resolve_dc_ip((getattr(shell, "domains_data", None) or {}).get(domain) or {})
+    connect_host, spn_host = resolve_connect_and_spn(
+        shell, host=host, domain=domain, resolver_ip=kdc_host, service="mssql", probe_port=1433
+    )
+    backend = ImpacketMSSQLBackend(
+        host=connect_host,
+        domain=domain,
+        kerberos_target_hostname=spn_host,
+        kdc_host=kdc_host,
+    )
+    return _revert_xp_cmdshell_enable(
+        shell,
+        backend,
+        domain=str(detail.get("executor_domain") or domain),
+        username=str(detail.get("executor_username") or "").strip(),
+        password="",
+        host=host,
+        linked_server=linked_server,
+        change_id=change_id,
+        # Unknown restores the product default, as the in-session revert does;
+        # the manual instruction never assumes it.
+        original_advanced_on=bool(detail.get("original_advanced_options")),
+        exclude=tuple(exclude),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4654,6 +4830,53 @@ def run_mssql_postauth_workflow(
     workflow_intent: str = "default",
     escalation_chain: set[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
+    """Run the MSSQL post-auth workflow under its memory boundary.
+
+    The workflow (:func:`_run_mssql_postauth_workflow`) reads replies of a size
+    the server decides. It runs as the ``mssql_post_auth`` stage: past the stage
+    line it stops with a declared coverage gap instead of growing until the
+    process is killed.
+    """
+    try:
+        state_dir: str | None = os.path.join(
+            _get_workspace_dir(shell), shell.domains_dir, domain, "mssql"
+        )
+    except Exception:  # noqa: BLE001 - no workspace: the stop is still declared
+        state_dir = None
+    stopped, result = run_post_auth_bounded(
+        shell,
+        domain,
+        host,
+        lambda: _run_mssql_postauth_workflow(
+            shell,
+            domain=domain,
+            host=host,
+            username=username,
+            password=password,
+            workflow_intent=workflow_intent,
+            escalation_chain=escalation_chain,
+        ),
+        state_dir=state_dir,
+    )
+    if stopped:
+        return {
+            "completed": False,
+            "stopped_for_memory": True,
+            "error": "The MSSQL review stopped within the available memory.",
+        }
+    return result
+
+
+def _run_mssql_postauth_workflow(
+    shell: MssqlShell,
+    *,
+    domain: str,
+    host: str,
+    username: str,
+    password: str,
+    workflow_intent: str = "default",
+    escalation_chain: set[tuple[str, str]] | None = None,
+) -> dict[str, object]:
     """Run the premium MSSQL post-auth workflow for low-priv and linked-server paths.
 
     This is the native-stack implementation: a single privilege sweep
@@ -5048,14 +5271,20 @@ def run_mssql_postauth_workflow(
             "No SYSTEM escalation from this surface; running the MSSQL filesystem "
             "sensitive-data search as a fallback."
         )
-        mapping_result = _run_mssql_filesystem_mapping(
-            shell,
-            domain=domain,
-            host=host,
-            username=username,
-            password=password,
-            execution_path=execution_path,
-        )
+        try:
+            mapping_result = _run_mssql_filesystem_mapping(
+                shell,
+                domain=domain,
+                host=host,
+                username=username,
+                password=password,
+                execution_path=execution_path,
+            )
+        finally:
+            # The file review is where the memory stage is asked whether to go
+            # on. A stop there leaves through here, so xp_cmdshell is still put
+            # back (the call below is then a no-op).
+            _revert_xp_cmdshell_if_we_enabled()
     # Engagement done with the local xp_cmdshell path: restore the config if we
     # enabled it (success path included) — ADscan always leaves the system as
     # it was found.
@@ -5967,6 +6196,21 @@ def run_mssql_steal_ntlmv2(
     marked_username = mark_sensitive(username, "user")
     marked_password = mark_sensitive(password, "password")
     marked_host = mark_sensitive(host, "hostname")
+    # The module below is a child process pointed at the SQL host: the host is
+    # asked of the engagement scope here, before a callback address is worked
+    # out for it or the child is started.
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        subprocess_host_in_scope,
+    )
+
+    if not subprocess_host_in_scope(
+        shell,
+        host,
+        surface="mssql_ntlm_capture",
+        what="SQL Server NTLM capture",
+        domain=str(domain or "").strip() or None,
+    ):
+        return
     # The SQL host connects back to us: advertise the address that reaches it
     # (declared > egress > route > interface guess), not a startup-interface IP.
     from adscan_internal.services.listener_ip import (  # noqa: PLC0415

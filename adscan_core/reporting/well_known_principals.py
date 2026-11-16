@@ -104,6 +104,27 @@ def _sid_is_structural_well_known(sid: str) -> bool:
     return False
 
 
+def is_public_well_known_sid(sid: str) -> bool:
+    """Whether a SID is a Windows constant that names no client (no domain part).
+
+    Narrower than :func:`_sid_is_structural_well_known`: a domain SID
+    (``S-1-5-21-<d1>-<d2>-<d3>[-RID]``), even a reserved RID, carries the client's
+    domain identifier and is NOT public. Public: the enumerated non-NT-authority
+    well-knowns (Everyone ``S-1-1-0``, ...), every ``BUILTIN`` alias
+    (``S-1-5-32-*``) and the single-subauthority NT-authority SIDs
+    (Authenticated Users ``S-1-5-11``, SYSTEM ``S-1-5-18``, ...).
+    """
+    s = str(sid or "").strip().upper()
+    if not s.startswith("S-1-"):
+        return False
+    if s in _EXACT_WELL_KNOWN_SIDS:
+        return True
+    parts = s.split("-")
+    if len(parts) == 5 and parts[2] == "5" and parts[3] == "32" and parts[4].isdigit():
+        return True
+    return len(parts) == 4 and parts[1] == "1" and parts[2] == "5" and parts[3].isdigit()
+
+
 def _name_token(name: object) -> str:
     """Return a name lower-cased and stripped of a trailing ``@domain`` suffix."""
     token = str(name or "").strip().lower()

@@ -77,6 +77,7 @@ from adscan_core.reporting.execution_failure_explanations import (
     resolve_step_failure_reason,
 )
 from adscan_core.path_offer import display_label
+from adscan_core.reporting.principal_display import declares_node_identities
 from adscan_core.sensitive import strip_sensitive_markers
 from adscan_core.theme import (
     ADSCAN_PRIMARY,
@@ -185,6 +186,7 @@ def _step_kind(relation: str) -> str:
     return KIND_EXECUTABLE
 
 
+@declares_node_identities(records="summary")
 def build_execution_plan(summary: dict[str, Any], domain: str | None = None) -> list[PlanStep]:
     """Build the operator-facing plan of a path from its summary.
 
@@ -782,6 +784,12 @@ class AttackPathExecutionRun:
                 "detail": "",
                 "next_step": "",
             }
+        elif _outside_engagement_scope(notes, state.reasons):
+            # The engagement scope kept the step from running: mapped, not run,
+            # and never an unexplained stop. The explanation says which of the
+            # two it was (excluded, or not confirmed as within the scope).
+            outcome = OUTCOME_SKIPPED
+            explanation = _engagement_scope_explanation(notes)
         elif _excluded_by_scan_policy(notes, state.reasons):
             # The scan policy kept the step off: a choice, not a failure.
             outcome = OUTCOME_SKIPPED
@@ -1211,6 +1219,48 @@ def _declined_before_acting(state: "_StepState") -> bool:
         OUTCOME_SUCCESS,
         OUTCOME_ATTEMPTED,
     )
+
+
+def _outside_engagement_scope(notes: dict[str, Any], reasons: list[str]) -> bool:
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        NOT_EXECUTED_OUTSIDE_SCOPE,
+        is_outside_scope_note,
+    )
+
+    if is_outside_scope_note(notes):
+        return True
+    return any(str(r).strip() == NOT_EXECUTED_OUTSIDE_SCOPE for r in reasons)
+
+
+#: Explanation key saying which scope outcome kept a step from running.
+SCOPE_OUTCOME_EXPLANATION_KEY = "scope_outcome"
+
+
+def _engagement_scope_explanation(notes: dict[str, Any]) -> dict[str, str]:
+    """The explanation of a step the engagement scope kept from running.
+
+    Worded by the scope's own vocabulary (``outside_scope_step_label``): an
+    excluded object and one that could not be confirmed as within the scope
+    never share a sentence.
+    """
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        NOT_EXECUTED_OUTSIDE_SCOPE,
+        SCOPE_OUTCOME_EXCLUDED,
+        SCOPE_OUTCOME_UNCONFIRMED,
+        is_unconfirmed_scope_note,
+        outside_scope_step_label,
+    )
+
+    return {
+        "code": "",
+        "reason_code": NOT_EXECUTED_OUTSIDE_SCOPE,
+        "headline": outside_scope_step_label(notes),
+        "detail": "",
+        "next_step": "",
+        SCOPE_OUTCOME_EXPLANATION_KEY: (
+            SCOPE_OUTCOME_UNCONFIRMED if is_unconfirmed_scope_note(notes) else SCOPE_OUTCOME_EXCLUDED
+        ),
+    }
 
 
 def _excluded_by_scan_policy(notes: dict[str, Any], reasons: list[str]) -> bool:

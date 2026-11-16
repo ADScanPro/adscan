@@ -67,29 +67,35 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
+#: Public name of the coercer so streaming writers (the graph export) serialise
+#: stray non-JSON values exactly as :func:`write_json_file` does.
+json_default = _json_default
+
+
 def write_json_file(path: str, data: dict[str, Any]) -> None:
     """Write a JSON dict to disk atomically, with stable formatting.
 
     Two invariants a naive ``open(path, "w") + json.dump`` violates:
 
-    * **Atomic.** The payload is serialized to a string FIRST, then written to a
-      temp file in the same directory and ``os.replace``d over the destination
-      (atomic on POSIX). A serialization error therefore never truncates or
-      corrupts the existing good file — the previous content survives
-      byte-for-byte and the temp fragment is cleaned up.
+    * **Atomic.** The payload is streamed into a temp file in the same
+      directory and ``os.replace``d over the destination only once it is
+      complete (atomic on POSIX). A serialization error mid-stream therefore
+      never truncates or corrupts the existing good file: the previous content
+      survives byte-for-byte and the temp fragment is removed.
     * **Serialization-safe.** A ``default`` coercer (:func:`_json_default`)
       degrades non-JSON values instead of raising, so a stray ``set``/``bytes``
       in ``domains_data`` cannot poison the write and drop the whole layer.
-    """
-    # Serialize BEFORE touching the destination: if this raises, the existing
-    # file on disk is untouched.
-    payload = json.dumps(data, indent=4, sort_keys=True, default=_json_default)
 
+    The document is streamed, never built as one string: an attack graph of a
+    dense directory serializes to several GB, and holding that string (plus
+    the encoder's chunk list) doubled the process's peak memory. The bytes
+    written are identical to ``json.dumps`` with the same options.
+    """
     directory = os.path.dirname(os.path.abspath(path))
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".variables-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
+        with os.fdopen(fd, "w", encoding="utf-8", buffering=_WRITE_BUFFER_BYTES) as handle:
+            json.dump(data, handle, indent=4, sort_keys=True, default=_json_default)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
@@ -101,7 +107,14 @@ def write_json_file(path: str, data: dict[str, Any]) -> None:
         raise
 
 
+#: Write buffer for :func:`write_json_file`: the pure-Python encoder yields many
+#: small chunks, so a large buffer keeps the streamed write as fast as one
+#: big ``write``.
+_WRITE_BUFFER_BYTES = 1 << 20
+
+
 __all__ = [
+    "json_default",
     "read_json_file",
     "write_json_file",
 ]

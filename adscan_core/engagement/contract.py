@@ -338,6 +338,28 @@ def _validate_one_of(value: Any, options: list[Mapping[str, Any]], root: Mapping
     raise ContractError("one_of", path, f"{matches} branches matched")
 
 
+def validate_against(schema: Mapping[str, Any], doc: Any) -> None:
+    """Validate ``doc`` against a schema the caller loaded itself.
+
+    For a contract that lives outside this package (the web backend's webhook
+    event schema) but follows the same conventions and the same validator.
+    The schema's keywords are checked first, so it can never carry a
+    constraint this validator ignores.
+
+    Raises:
+        ContractError: On the first violation found.
+    """
+    _check_keywords(schema, "#")
+    _validate_node(doc, schema, schema, "")
+
+
+def undeclared_fields_against(schema: Mapping[str, Any], doc: Any) -> list[str]:
+    """:func:`undeclared_fields` for a schema the caller loaded itself."""
+    out: list[str] = []
+    _collect_undeclared(doc, schema, schema, "", out)
+    return out
+
+
 def undeclared_fields(schema_name: str, doc: Any) -> list[str]:
     """Return JSON Pointers to every key ``doc`` carries that ``schema_name`` does not declare.
 
@@ -391,5 +413,7 @@ __all__ = (
     "schema_major",
     "schema_tag",
     "undeclared_fields",
+    "undeclared_fields_against",
     "validate",
+    "validate_against",
 )

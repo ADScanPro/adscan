@@ -815,6 +815,14 @@ def _segment_by_tier(block: Mapping[str, Any], tier: str) -> Mapping[str, Any] |
     return None
 
 
+#: The population the password-recovery figures count, as the client reads it:
+#: every account whose password hash was extracted and put through recovery,
+#: krbtgt and the account the assessment ran as included. Worded apart from the
+#: rotation action's population (``post_compromise_obligations``), which counts
+#: the accounts a usable credential is held for.
+HASHES_TESTED_POPULATION = "whose password hashes were extracted and tested"
+
+
 def _headline(block: Mapping[str, Any]) -> str:
     """One client-safe line stating the measured outcome, never the method."""
     try:
@@ -830,9 +838,15 @@ def _headline(block: Mapping[str, Any]) -> str:
     # assessment report's recovered-password finding counts enabled accounts
     # only. Unlabelled, "9 of 18, 2 administrative" sat next to "8 accounts, 1
     # administrative" in one kit with nothing to reconcile them.
+    #
+    # It also names WHAT was extracted: password hashes that were then tested.
+    # The rotation action of the same kit counts something else (the accounts
+    # a usable credential is held for, krbtgt handled apart), and while both
+    # said "credential material" a reader took "18 accounts" and "16 accounts"
+    # for one figure reported twice. See ``HASHES_TESTED_POPULATION``.
     lead = (
         f"Password recovery resolved the password of {recovered:,} of the "
-        f"{extracted:,} {accounts_noun} whose credential material was extracted, "
+        f"{extracted:,} {accounts_noun} {HASHES_TESTED_POPULATION}, "
         "enabled and disabled alike."
     )
     # The boundary leads the sentence, then the directness split, because a
@@ -925,8 +939,8 @@ def recovered_password_population_note(details: Any) -> str:
             f"accounts{named}"
         )
     return (
-        f"{note}{tail}; the AD Password Hygiene Report counts every account whose "
-        "credential material was extracted, enabled or disabled, so its totals "
+        f"{note}{tail}; the AD Password Hygiene Report counts every account "
+        f"{HASHES_TESTED_POPULATION}, enabled or disabled, so its totals "
         f"include {'it' if extra == 1 else 'them'}."
     )
 

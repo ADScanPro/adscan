@@ -79,10 +79,118 @@ NOTICE_BAD_SIGNATURE = "bad_signature"
 NOTICE_UNKNOWN_INSTALLATION = "unknown_installation"
 NOTICE_DEACTIVATED = "deactivated"
 NOTICE_MALFORMED = "malformed"
+#: Answer to a launch check-in when the installation already holds the
+#: current document: nothing to install, the check-in itself is the news
+#: (the grant is neither revoked nor changed).
+NOTICE_LICENCE_CURRENT = "licence_current"
 #: Notices that end the installation's right to start assessments.
 TERMINAL_NOTICES = frozenset({NOTICE_REVOKED, NOTICE_DEACTIVATED})
 
 MAX_REQUEST_BYTES = 64 * 1024
+
+# ── Sequence accounting (spec § 5.6) ─────────────────────────────────────────
+#
+# Every request consumes one number of the installation's sequence. Some are
+# legitimately never delivered: a renewal replaced by the next launch's, an
+# activation retried, a band report replaced by a newer band. So a gap in the
+# numbers the server receives proves nothing on its own. Each request therefore
+# states, at the moment it is signed, which earlier numbers this installation
+# still HOLDS queued and which it WITHDREW without sending. A number that is
+# neither delivered, held nor withdrawn was created and then lost: that is the
+# gap the server reports. Both fields are lists of inclusive ``[first, last]``
+# ranges. A request without them (an engine from before 15.0.0) is never used
+# to open or confirm a gap.
+
+#: Numbers this installation signed earlier and still holds, unsent or unanswered.
+PENDING_SEQUENCES_FIELD = "pending_sequences"
+#: Numbers this installation signed earlier and dropped without sending (replaced).
+WITHDRAWN_SEQUENCES_FIELD = "withdrawn_sequences"
+#: Most ranges either field may carry; a longer list is truncated to its newest ranges.
+MAX_SEQUENCE_RANGES = 256
+
+#: Request kinds that record usage (a domain brought in, a new engagement). The
+#: engine never withdraws one: it stays queued until the server answers it.
+USAGE_KINDS = frozenset({KIND_REGISTRATION, KIND_ENGAGEMENT_REPORT})
+#: Which of the held numbers are usage requests, each with the first
+#: :data:`USAGE_DIGEST_LENGTH` hex of its request digest: ``[[sequence, digest], ...]``.
+#: Once a delivered request declared a number here, the server closes it only
+#: when that same request arrives: a later withdrawal claim, or another request
+#: taking the number, is reported instead (``license_server.sequence_gaps``).
+#: A server from before this field ignores it; a request without it is handled
+#: as before.
+PENDING_USAGE_FIELD = "pending_usage"
+USAGE_DIGEST_LENGTH = 16
+
+
+def pending_usage(items: Any) -> list[list[Any]]:
+    """The :data:`PENDING_USAGE_FIELD` value for queued ``items`` (the store's pending entries)."""
+    declared: dict[int, str] = {}
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("kind") not in USAGE_KINDS:
+            continue
+        payload = item.get("document", {}).get("payload", {}) if isinstance(item.get("document"), Mapping) else {}
+        sequence, digest = payload.get("sequence"), item.get("digest")
+        if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0 and isinstance(digest, str):
+            declared[sequence] = digest[:USAGE_DIGEST_LENGTH]
+    return [[n, declared[n]] for n in sorted(declared)][-MAX_SEQUENCE_RANGES:]
+
+
+def parse_pending_usage(value: Any) -> list[tuple[int, str]] | None:
+    """Validated ``(sequence, digest prefix)`` pairs from a request; None when absent or malformed."""
+    if not isinstance(value, list) or len(value) > MAX_SEQUENCE_RANGES:
+        return None
+    parsed: list[tuple[int, str]] = []
+    for item in value:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        sequence, digest = item
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+            return None
+        if (
+            not isinstance(digest, str)
+            or len(digest) != USAGE_DIGEST_LENGTH
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            return None
+        parsed.append((sequence, digest))
+    return parsed
+
+
+def sequence_ranges(numbers: Any) -> list[list[int]]:
+    """Inclusive ``[first, last]`` ranges covering ``numbers`` (positive ints only), newest last.
+
+    Capped to :data:`MAX_SEQUENCE_RANGES`, keeping the newest ranges.
+    """
+    values = sorted({n for n in numbers if isinstance(n, int) and not isinstance(n, bool) and n > 0})
+    ranges: list[list[int]] = []
+    for value in values:
+        if ranges and value == ranges[-1][1] + 1:
+            ranges[-1][1] = value
+        else:
+            ranges.append([value, value])
+    return ranges[-MAX_SEQUENCE_RANGES:]
+
+
+def parse_sequence_ranges(value: Any) -> list[tuple[int, int]] | None:
+    """Validated ranges from a request field; None when the field is absent or malformed."""
+    if not isinstance(value, list) or len(value) > MAX_SEQUENCE_RANGES:
+        return None
+    parsed: list[tuple[int, int]] = []
+    for item in value:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in item)
+            or item[0] > item[1]
+        ):
+            return None
+        parsed.append((item[0], item[1]))
+    return parsed
+
+
+def in_sequence_ranges(number: int, ranges: list[tuple[int, int]] | None) -> bool:
+    """True when ``number`` falls inside one of ``ranges``."""
+    return any(first <= number <= last for first, last in ranges or ())
 
 
 def utc_now() -> datetime:
@@ -208,6 +316,7 @@ __all__ = [
     "KIND_RENEWAL",
     "PROTOCOL_VERSION",
     "REQUEST_KINDS",
+    "NOTICE_LICENCE_CURRENT",
     "TERMINAL_NOTICES",
     "build_request",
     "format_instant",

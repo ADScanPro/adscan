@@ -23,10 +23,9 @@ verbose warning so unclassified vectors surface during development.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from typing import Final
-
-from adscan_core.rich_output import print_warning
 
 
 class EdgeKind(str, Enum):
@@ -434,10 +433,19 @@ def classify_edge_kind(relation: str | None) -> EdgeKind:
 
     if lower not in _WARNED_UNCLASSIFIED:
         _WARNED_UNCLASSIFIED.add(lower)
-        print_warning(
+        message = (
             f"[edge_kind] Unclassified edge relation '{canonical}' — "
             "add it to adscan_internal/services/edge_kind.py"
         )
+        # The console layer is imported here, and is optional: the web platform and
+        # its host worker load this module to classify edges in environments that
+        # carry no console output packages.
+        try:
+            from adscan_core.rich_output import print_warning  # noqa: PLC0415
+        except ImportError:
+            logging.getLogger(__name__).warning(message)
+        else:
+            print_warning(message)
     return EdgeKind.UNKNOWN
 
 

@@ -8,10 +8,16 @@ format produced by ``spider_plus``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import os
 
+from adscan_core.reporting.resource_coverage import REASON_MEMORY
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.share_mapping_bounds import (
+    MEMORY_CHECK_EVERY_ENTRIES,
+    ReviewNameBudget,
+    ShareListingCollector,
+)
 from adscan_internal.services.smb_exclusion_policy import (
     is_globally_excluded_smb_relative_path,
     prune_excluded_walk_dirs,
@@ -29,17 +35,31 @@ class CIFSShareMappingService(BaseService):
         run_output_dir: str,
         hosts: list[str],
         shares: list[str],
+        stage: Any | None = None,
+        keep_all_file_names: bool = False,
     ) -> dict[str, Any]:
         """Generate host JSON metadata files from CIFS mount paths.
+
+        Memory: only candidate files are kept
+        (:mod:`adscan_internal.services.share_mapping_bounds`), within a bound
+        per share, and each host's result is written as soon as that host is
+        done. The whole tree of every share is still walked.
 
         Args:
             mount_root: Root directory containing CIFS-mounted content.
             run_output_dir: Output directory where host JSON files are written.
             hosts: Hostnames/IPs to include in the mapping run.
             shares: Share names to enumerate for each host.
+            keep_all_file_names: The AI review: keep every file name, not only
+                the candidate types, up to one total for the run
+                (``MAX_AI_REVIEW_FILE_NAMES_PER_RUN``); past it candidate files
+                are still kept and the share is a declared gap.
+            stage: The enclosing memory-bounded stage, when there is one; past
+                its line no further share is walked (``memory_stopped``).
 
         Returns:
-            Summary with host/share/file counters.
+            Summary with host/share/file counters, and ``share_outcomes``
+            (``{host: {share: outcome}}``): how each share's walk ended.
         """
         mount_root_path = Path(mount_root).expanduser().resolve(strict=False)
         run_output_path = Path(run_output_dir).expanduser().resolve(strict=False)
@@ -52,10 +72,26 @@ class CIFSShareMappingService(BaseService):
         host_json_files = 0
         mapped_shares = 0
         mapped_files = 0
+        capped_targets = 0
+        shares_done = 0
+        memory_stopped = False
+        share_outcomes: dict[str, dict[str, dict[str, Any]]] = {}
+        name_budget = ReviewNameBudget() if keep_all_file_names else None
+
+        def _memory_crossed() -> bool:
+            return stage is not None and bool(stage.over_line())
 
         for host in unique_hosts:
+            if memory_stopped:
+                break
+            # One host's result is written and released before the next starts.
             host_payload: dict[str, dict[str, dict[str, str]]] = {}
             for share in unique_shares:
+                # Memory checkpoint: past the stage line no further share is
+                # walked; the caller's stage boundary declares the rest.
+                if _memory_crossed():
+                    memory_stopped = True
+                    break
                 share_root = self.resolve_share_mount_path(
                     mount_root=mount_root_path,
                     host=host,
@@ -64,12 +100,27 @@ class CIFSShareMappingService(BaseService):
                 )
                 if share_root is None:
                     continue
-                files_map = self._collect_share_files(share_root=share_root)
-                if not files_map:
-                    continue
-                host_payload[share] = files_map
-                mapped_shares += 1
-                mapped_files += len(files_map)
+                collector = ShareListingCollector(name_budget=name_budget)
+                stream_stopped = self._collect_share_files(
+                    share_root=share_root,
+                    collector=collector,
+                    memory_crossed=_memory_crossed,
+                )
+                shares_done += 1
+                if stage is not None:
+                    stage.progress(shares_done)
+                share_outcomes.setdefault(host, {})[share] = collector.outcome(
+                    interrupted_reason=REASON_MEMORY if stream_stopped else None
+                )
+                if collector.capped:
+                    capped_targets += 1
+                if collector.files:
+                    host_payload[share] = collector.files
+                    mapped_shares += 1
+                    mapped_files += len(collector.files)
+                if stream_stopped:
+                    memory_stopped = True
+                    break
 
             if not host_payload:
                 continue
@@ -84,6 +135,11 @@ class CIFSShareMappingService(BaseService):
             "host_json_files": host_json_files,
             "mapped_shares": mapped_shares,
             "mapped_file_entries": mapped_files,
+            "capped_targets": capped_targets,
+            "targets_total": len(unique_hosts) * len(unique_shares),
+            "shares_done": shares_done,
+            "memory_stopped": memory_stopped,
+            "share_outcomes": share_outcomes,
         }
 
     def resolve_candidate_local_path(
@@ -270,37 +326,50 @@ class CIFSShareMappingService(BaseService):
         self,
         *,
         share_root: Path,
-    ) -> dict[str, dict[str, str]]:
-        """Collect spider_plus-like file metadata for one mounted share path."""
-        files_map: dict[str, dict[str, str]] = {}
+        collector: ShareListingCollector,
+        memory_crossed: Callable[[], bool],
+    ) -> bool:
+        """Walk one mounted share, keeping its candidate files in ``collector``.
+
+        The whole tree is walked: no depth limit. Only a candidate file is
+        ``stat``-ed and kept, within the collector's bound, so memory does not
+        grow with the size of the share. Returns True when the walk stopped
+        because memory crossed the stage line.
+        """
         for dirpath, dirnames, filenames in os.walk(share_root):
             prune_excluded_walk_dirs(dirnames)
-            base_dir = Path(dirpath)
+            # Plain string paths: ``pathlib`` interns every part it parses, and
+            # this runs once per file of the share.
+            relative_dir = os.path.relpath(dirpath, share_root).replace(os.sep, "/")
+            prefix = "" if relative_dir == "." else f"{relative_dir}/"
             for filename in filenames:
-                file_path = base_dir / filename
+                file_path = os.path.join(dirpath, filename)
+                relative_path = f"{prefix}{filename}"
+                if is_globally_excluded_smb_relative_path(relative_path):
+                    continue
+                admitted = collector.admit(relative_path)
+                if (
+                    collector.entries_listed % MEMORY_CHECK_EVERY_ENTRIES == 0
+                    and memory_crossed()
+                ):
+                    return True
+                if not admitted:
+                    continue
                 try:
-                    stat_result = file_path.stat()
+                    stat_result = os.stat(file_path)
                 except OSError:
                     self.logger.exception(
                         "Failed stat() on CIFS file during mapping: %s",
                         file_path,
                     )
                     continue
-
-                try:
-                    relative_path = file_path.relative_to(share_root).as_posix()
-                except ValueError:
-                    continue
-                if is_globally_excluded_smb_relative_path(relative_path):
-                    continue
-
-                files_map[relative_path] = {
+                collector.files[relative_path] = {
                     "size": self._format_size_human(int(stat_result.st_size)),
                     "ctime_epoch": str(int(stat_result.st_ctime)),
                     "mtime_epoch": str(int(stat_result.st_mtime)),
                     "atime_epoch": str(int(stat_result.st_atime)),
                 }
-        return files_map
+        return False
 
     @staticmethod
     def _unique_non_empty(values: list[str]) -> list[str]:

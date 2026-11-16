@@ -25,13 +25,16 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from adscan_internal import telemetry
+from adscan_core.scan_control.fanout import SweepCoverage, run_stoppable_fanout
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_runtime import Outcome, active_runtime
 from adscan_internal.rich_output import print_info_debug
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
 from adscan_internal.services.posture_sink import PostureSink
+from adscan_internal.services.sweep_stop import note_outside_scope
 from adscan_internal.services.smb_transport import (
     SMBAuthError,
     SMBConfig,
@@ -284,10 +287,23 @@ async def check_smb_privilege_batch(
     *,
     max_concurrency: int | None = None,
     per_host_budget: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    coverage: SweepCoverage | None = None,
+    shell: Any | None = None,
 ) -> list[SMBPrivilegeResult]:
     """Run multiple SMB privilege checks concurrently with bounded parallelism.
 
-    Returns results in the same order as configs.
+    Engagement scope: the configs are partitioned once, before the fan-out, so a
+    host the scope excludes never reaches a worker (no connection, no result).
+    ``shell`` is the session whose scope applies; excluded hosts are recorded on
+    ``coverage.outside_scope`` and the scope SSOT tells the operator once.
+
+    Returns results in the same order as configs. The sweep honours the scan
+    control plane (``should_stop``, default: the running step's stop): after a
+    stop, hosts still queued are never contacted and hosts in flight get a short
+    grace. Only the hosts that were checked come back; ``coverage`` (when given)
+    records how many were checked and which were not, so a caller never reports
+    an unchecked host as "no access".
     max_concurrency controls simultaneous SMB connections (default from the scan
     pacing, ``sweep.smb_privilege``: 10 at the default level).
 
@@ -299,6 +315,27 @@ async def check_smb_privilege_batch(
     indefinitely (the >10min stall this fixes). ``None`` derives it per-config
     from the connection timeout.
     """
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        fanout_scope_gate,
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(
+        shell,
+        configs,
+        key=lambda cfg: cfg.target_hostname or cfg.target_ip,
+        address=lambda cfg: cfg.target_ip,
+    )
+    scope = partition_targets_in_scope(
+        shell,
+        configs,
+        key=lambda cfg: cfg.target_hostname or cfg.target_ip,
+        address=lambda cfg: cfg.target_ip,
+        surface="smb_admin_check",
+        what="SMB access check",
+    )
+    note_outside_scope(coverage, scope.refused_items, key=lambda cfg: cfg.target_ip)
+    configs = scope.allowed
     if max_concurrency is None:
         max_concurrency = int(component_pacing(active_pacing(), "sweep.smb_privilege")["max_concurrency"])
     runtime = active_runtime()
@@ -363,7 +400,31 @@ async def check_smb_privilege_batch(
         return result
 
     sweep_started = time.monotonic()
-    results = list(await asyncio.gather(*(_bounded(c) for c in configs)))
+    config_list = list(configs)
+    outcome = await run_stoppable_fanout(
+        config_list,
+        _bounded,
+        concurrency=max(1, int(max_concurrency)),
+        should_stop=should_stop,
+        # A long sweep: each chunk is prepared and each host judged again right
+        # before its contact (the partition above is from the sweep's start).
+        before_item=fanout_scope_gate(
+            shell,
+            config_list,
+            surface="smb_admin_check",
+            key=lambda cfg: cfg.target_hostname or cfg.target_ip,
+            address=lambda cfg: cfg.target_ip,
+        ),
+    )
+    results = outcome.completed_results()
+    if coverage is not None:
+        coverage.absorb(outcome, [c.target_ip for c in configs])
+    if outcome.stopped:
+        print_info_debug(
+            f"[smb_privilege] sweep stopped: {outcome.completed} of {len(configs)} hosts "
+            f"checked ({outcome.not_started} never started, "
+            f"{outcome.cancelled_in_flight} cancelled in flight)"
+        )
     sweep_elapsed = time.monotonic() - sweep_started
 
     if timings:

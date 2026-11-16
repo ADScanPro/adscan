@@ -132,6 +132,28 @@ def mark_sensitive(value: str, data_type: str) -> str:
     return _mark(value, data_type)
 
 
+def markup_object_label(label: str) -> str:
+    """An object label ready to interpolate into a Rich MARKUP string.
+
+    Marked for telemetry (``mark_sensitive(label, "node")``: cleartext on screen,
+    scrubbed in the recording) and escaped for Rich, so a label carrying square
+    brackets (a GPO named "[tier0] Workstations") prints whole instead of being
+    read as a style tag, which drops it or raises ``MarkupError`` for ``[/...]``.
+
+    Use it only where the string is parsed as markup (``print_*`` f-strings, a
+    panel body given as ``str``). A ``Text`` / ``Text.append`` surface does not
+    parse markup, so it keeps ``mark_sensitive(label, "node")``: the escape
+    would print as a backslash there.
+    """
+    from rich.markup import escape  # noqa: PLC0415
+
+    from adscan_core.sensitive import mark_sensitive as _mark  # noqa: PLC0415
+
+    if not label or not isinstance(label, str):
+        return label
+    return escape(_mark(label, "node"))
+
+
 def mark_dict_values(
     data: Dict[str, str],
     type_mapping: Dict[str, str],
@@ -1250,6 +1272,7 @@ __all__ = [
     "strip_sensitive_markers",
     "mark_passthrough",
     "mark_sensitive",
+    "markup_object_label",
     "mark_dict_values",
     # deferred live-log capture
     "push_deferred_live_buffer",

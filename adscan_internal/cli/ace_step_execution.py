@@ -21,6 +21,7 @@ from adscan_internal import print_info, print_warning, telemetry
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
+    markup_object_label,
     print_info_debug,
     print_panel,
     print_info_verbose,
@@ -817,30 +818,95 @@ def resolve_execution_candidates(
     )
 
     usable, dropped = partition_usable_principals(shell, domain, candidates)
-    if not dropped:
-        return candidates, source_tag
-    from adscan_internal.services._annotation_log_dedup import (  # noqa: PLC0415
-        annotation_log_seen,
-    )
-
-    if not annotation_log_seen(
-        ("exec-user-unusable", str(from_label or ""), ",".join(sorted(dropped)))
-    ):
-        print_info_debug(
-            "[exec-user] Dropped candidate(s) that cannot sign in: "
-            + ", ".join(
-                f"{mark_sensitive(user, 'user')} ({reason})" for user, reason in dropped.items()
-            )
+    if dropped:
+        from adscan_internal.services._annotation_log_dedup import (  # noqa: PLC0415
+            annotation_log_seen,
         )
-    if usable:
-        return usable, source_tag
-    _UNUSABLE_CANDIDATES_BY_SOURCE[_exec_user_memo_key(domain, from_label)] = dict(dropped)
-    return [], UNUSABLE_PRINCIPALS_ONLY_TAG
+
+        if not annotation_log_seen(
+            ("exec-user-unusable", str(from_label or ""), ",".join(sorted(dropped)))
+        ):
+            print_info_debug(
+                "[exec-user] Dropped candidate(s) that cannot sign in: "
+                + ", ".join(
+                    f"{mark_sensitive(user, 'user')} ({reason})"
+                    for user, reason in dropped.items()
+                )
+            )
+        if not usable:
+            _UNUSABLE_CANDIDATES_BY_SOURCE[_exec_user_memo_key(domain, from_label)] = dict(dropped)
+            return [], UNUSABLE_PRINCIPALS_ONLY_TAG
+        candidates = usable
+    in_scope, scoped_tag = _drop_candidates_outside_engagement_scope(
+        shell, domain=domain, candidates=candidates, source_tag=source_tag, from_label=from_label
+    )
+    if (
+        scoped_tag == SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG
+        and source_tag == "context_username"
+        and context_username
+    ):
+        # The credential the route carried belongs to an account the scope
+        # excludes. It is treated as not held: the step is resolved again from
+        # its own source, so another account that controls it may still run it.
+        return resolve_execution_candidates(
+            shell,
+            domain=domain,
+            context_username=None,
+            summary=summary,
+            from_label=from_label,
+            from_node_kind=from_node_kind,
+            host=host,
+            strict_source=strict_source,
+            relation=relation,
+        )
+    return in_scope, scoped_tag
 
 
 #: The unusable candidates behind the last empty resolution, per step source,
 #: so the executor can name them when it reports that the step has no actor.
 _UNUSABLE_CANDIDATES_BY_SOURCE: dict[tuple[str, str], dict[str, str]] = {}
+
+#: Source tag returned when the engagement scope excludes every candidate that
+#: could run the step: the step has no actor, and that is a scope refusal.
+SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG = "scope_excluded_principals_only"
+
+
+def _drop_candidates_outside_engagement_scope(
+    shell: Any,
+    *,
+    domain: str,
+    candidates: list[str],
+    source_tag: str,
+    from_label: str | None,
+) -> tuple[list[str], str]:
+    """Remove the candidates the engagement scope excludes (the scope SSOT decides).
+
+    An account the client excluded is never the identity a step runs as. This is
+    the one list every actor selection reads (the gate, the readiness column,
+    the executor and its picker), so an excluded account is neither chosen nor
+    offered. The order of the remaining candidates is kept. When the scope
+    removes all of them the tag is :data:`SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG`.
+    Without an asset scope ``candidates`` comes back as it is.
+    """
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        actor_scope_refusal,
+        prepare_accounts_for_scope,
+    )
+
+    kept: list[str] = []
+    excluded: list[str] = []
+    # The candidates are told to the session once; each is then judged (a read).
+    prepare_accounts_for_scope(shell, candidates, domain=domain)
+    for candidate in candidates:
+        if actor_scope_refusal(shell, domain=domain, username=candidate, rung="candidate") is None:
+            kept.append(candidate)
+        else:
+            excluded.append(candidate)
+    if not excluded:
+        return candidates, source_tag
+    if kept:
+        return kept, source_tag
+    return [], SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG
 
 
 def _resolve_execution_candidates_unfiltered(
@@ -980,13 +1046,13 @@ def _resolve_execution_candidates_unfiltered(
         if keep_context:
             print_info_debug(
                 f"[exec-user] Using context username: {mark_sensitive(exec_username, 'user')} "
-                f"(bucket={bucket}, source={mark_sensitive(from_label or '?', 'node')})"
+                f"(bucket={bucket}, source={markup_object_label(from_label or '?')})"
             )
             return [exec_username], "context_username"
         print_info_debug(
             "[exec-user] Ignoring stale context username "
             f"{mark_sensitive(exec_username, 'user')}: the step source "
-            f"{mark_sensitive(from_label or '?', 'node')} is a control/ACL/delegation "
+            f"{markup_object_label(from_label or '?')} is a control/ACL/delegation "
             "principal the context does not control; resolving the actor from the "
             "source instead."
         )
@@ -1047,7 +1113,7 @@ def _resolve_execution_candidates_unfiltered(
                 print_info_debug(
                     "[exec-user] Group-membership resolution: selected "
                     f"{len(candidate_users)} candidate(s) for "
-                    f"from_label={mark_sensitive(str(from_label or ''), 'node')}: "
+                    f"from_label={markup_object_label(str(from_label or ''))}: "
                     f"{_preview_users(candidate_users)}"
                 )
         elif member_sams_raw is None:
@@ -1059,7 +1125,7 @@ def _resolve_execution_candidates_unfiltered(
             # difference.
             print_info_debug(
                 "[exec-user] Group-membership resolution: membership of "
-                f"group={mark_sensitive(str(from_label or ''), 'node')} is "
+                f"group={markup_object_label(str(from_label or ''))} is "
                 "INDETERMINATE (no membership snapshot for this domain); "
                 "treating the source group as not controlled rather than "
                 "assuming any stored credential is a member."
@@ -1068,7 +1134,7 @@ def _resolve_execution_candidates_unfiltered(
             print_info_debug(
                 "[exec-user] Group-membership resolution: no stored "
                 "credential matches any actual member of "
-                f"group={mark_sensitive(str(from_label or ''), 'node')} "
+                f"group={markup_object_label(str(from_label or ''))} "
                 f"(members={len(member_sams)}); the source group is not controlled."
             )
 
@@ -1089,7 +1155,7 @@ def _resolve_execution_candidates_unfiltered(
         source_tag = "broad_source"
         print_info_debug(
             "[exec-user] Broad source "
-            f"{mark_sensitive(str(from_label or ''), 'node')}: any owned principal is a "
+            f"{markup_object_label(str(from_label or ''))}: any owned principal is a "
             f"member ({len(candidate_users)} candidate(s))."
         )
 
@@ -1133,7 +1199,7 @@ def _resolve_execution_candidates_unfiltered(
         # do not control. Leave the actor unresolved so the gate locks the step.
         print_info_debug(
             "[exec-user] Strict source resolution: no source-faithful actor for "
-            f"from_label={mark_sensitive(str(from_label or '?'), 'node')}; "
+            f"from_label={markup_object_label(str(from_label or '?'))}; "
             "not falling back to any stored credential."
         )
     elif (
@@ -1252,9 +1318,15 @@ def select_execution_user(
             )
             print_warning(
                 "No account can run this step: every account that controls "
-                f"{mark_sensitive(from_label or '?', 'node')} is unable to sign in"
+                f"{markup_object_label(from_label or '?')} is unable to sign in"
                 + (f": {names}." if names else ".")
                 + " The step is not attempted, so no account is sent a sign-in it would refuse."
+            )
+        elif source_tag == SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG:
+            print_info(
+                "No account can run this step: every account that controls "
+                f"{markup_object_label(from_label or '?')} is excluded from the "
+                "engagement scope. The step is not executed."
             )
         return None, source_tag
 
@@ -1270,7 +1342,7 @@ def select_execution_user(
     if memoized and memoized in normalized_candidates:
         print_info_debug(
             "[exec-user] Reusing memoized execution-user selection for source "
-            f"{mark_sensitive(from_label or '?', 'node')}: "
+            f"{markup_object_label(from_label or '?')}: "
             f"{mark_sensitive(memoized, 'user')} (not re-prompting)."
         )
         return memoized, "memoized_selection"
@@ -1331,6 +1403,21 @@ def select_execution_user(
                     f"[exec-user] Manual username not in credentials: {marked_user}"
                 )
                 return None, "manual_missing_credential"
+            # A typed name passes the same scope check as a listed one: the
+            # picker never lets an excluded account become the acting identity.
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                asset_refusal_line,
+            )
+            from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+                actor_scope_refusal,
+            )
+
+            typed_refusal = actor_scope_refusal(
+                shell, domain=domain, username=stored, rung="typed account"
+            )
+            if typed_refusal is not None:
+                print_warning(asset_refusal_line("This step", str(stored), typed_refusal))
+                return None, SCOPE_EXCLUDED_PRINCIPALS_ONLY_TAG
             print_info_debug(
                 f"[exec-user] Manual username matched credentials: {mark_sensitive(stored, 'user')}"
             )
@@ -1672,8 +1759,8 @@ def build_ace_step_context(
     )
     if actor is None or not actor.username or not actor.secret:
         marked_domain = mark_sensitive(domain, "domain")
-        marked_from = mark_sensitive(from_label, "node")
-        marked_to = mark_sensitive(to_label, "node")
+        marked_from = markup_object_label(from_label)
+        marked_to = markup_object_label(to_label)
         print_info_debug(
             "[ace-context] No usable execution actor: "
             f"relation={mark_sensitive(relation, 'detail')} domain={marked_domain} "
@@ -1711,8 +1798,8 @@ def build_ace_step_context(
         str(_target_props.get("last_known_rdn") or "").strip() or None
     )
     marked_domain = mark_sensitive(domain, "domain")
-    marked_from = mark_sensitive(from_label, "node")
-    marked_to = mark_sensitive(to_label, "node")
+    marked_from = markup_object_label(from_label)
+    marked_to = markup_object_label(to_label)
     marked_user = mark_sensitive(exec_username, "user")
     print_info_debug(
         "[ace-context] Built execution context: "
@@ -1889,7 +1976,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
     if relation not in ACL_ACE_RELATIONS:
         return None
 
-    marked_to = mark_sensitive(context.to_label, "node")
+    marked_to = markup_object_label(context.to_label)
 
     target_kind = context.target_kind.strip().lower()
 
@@ -2004,7 +2091,7 @@ def execute_ace_step(shell: Any, *, context: AceStepContext) -> bool | None:
         ):
             print_warning(
                 f"[dim]Pre-execution check:[/dim] the ReadGMSAPassword source "
-                f"({mark_sensitive(context.from_label, 'node')}) is in [bold]{from_domain}[/bold] "
+                f"({markup_object_label(context.from_label)}) is in [bold]{from_domain}[/bold] "
                 f"but the gMSA is in [bold]{context.target_domain}[/bold]. "
                 "If the source group is Domain Local, this edge is structurally not effective - "
                 "the SID appears in msDS-GroupMSAMembership but Domain Local scope does not "

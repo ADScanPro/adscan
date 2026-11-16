@@ -280,7 +280,16 @@ def read_scbe_across_dcs(
     from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
         collection_host_verdict,
         note_collection_host_skipped,
+        note_host_addresses,
+        prepare_scope_targets,
     )
+
+    # The verdict only reads what the session was told: report the address each
+    # domain controller was recorded with, and look up the ones known by name.
+    for fqdn, ip in targets:
+        if fqdn and ip:
+            note_host_addresses(shell, host=fqdn, addresses=[ip])
+    prepare_scope_targets(shell, [fqdn for fqdn, ip in targets if fqdn and not ip], domain=domain)
 
     service = CertificateMappingService()
     readings: list[Esc14DcReading] = []

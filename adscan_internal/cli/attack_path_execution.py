@@ -17,7 +17,7 @@ from adscan_core.scan_policy import settings as policy_settings
 from adscan_internal.services.ledger_guard import ledger_or_warn
 
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import asyncio
@@ -64,6 +64,7 @@ from adscan_internal.passwords import (
 from adscan_internal.rich_output import (
     BRAND_COLORS,
     mark_sensitive,
+    markup_object_label,
     order_attack_paths_for_display,
     print_panel,
     print_system_change_warning,
@@ -103,7 +104,9 @@ from adscan_internal.services.execution_credential_scope import (
     local_service_for_relation,
     relation_authenticates_to_source_host,
     relation_is_host_execution_read,
+    relation_runs_in_source_host_session,
     scope_carried_credential_to_step,
+    step_authentication_host,
 )
 from adscan_internal.services.post_exploitation.access_followups import (
     step_is_engine_manufactured_followup,
@@ -179,7 +182,6 @@ from adscan_internal.services.attack_step_catalog import (
     access_session_grant_for_relation,
     build_step_knowledge,
     is_probabilistic_step,
-    relation_counts_for_execution_readiness,
     relation_requires_execution_context,
     required_context_for_relation,
 )
@@ -1113,6 +1115,13 @@ def rematerialize_attack_path_snapshot(
             return None
     except Exception:  # noqa: BLE001
         pass
+    # The domain's graph is not available (its build or its directory read
+    # stopped at the memory ceiling): no listing is computed, none is persisted
+    # and no headline figure is stamped. Discovery is declared not evaluated and
+    # the figures an earlier run left are removed, so neither "0 routes" nor a
+    # previous run's score stands next to the stop.
+    if _declare_unavailable_graph(shell, domain):
+        return None
     try:
         # ``no_cache=True`` forces a read of the reconciled on-disk graph even if a
         # pre-reconciliation compute is still cached this process — freshness is the
@@ -1149,6 +1158,32 @@ def rematerialize_attack_path_snapshot(
     )
     _stamp_headline_blocks_from_canonical_listing(shell, domain, summaries)
     return summaries
+
+
+def _declare_unavailable_graph(shell: Any, domain: str) -> bool:
+    """Declare ``domain``'s discovery not evaluated when its graph is not available.
+
+    Returns whether it was (the caller then computes nothing). Best-effort.
+    """
+    try:
+        from adscan_internal.services import attack_graph_service
+        from adscan_internal.services.graph_availability import (
+            clear_route_derived_figures,
+            declare_attack_paths_not_evaluated,
+            domain_graph_unavailable_stage,
+        )
+
+        graph = attack_graph_service.load_attack_graph(shell, domain)
+        stage = domain_graph_unavailable_stage(shell, domain, graph=graph)
+        if not stage:
+            return False
+        declare_attack_paths_not_evaluated(shell, domain, stage, scope="domain")
+        clear_route_derived_figures(shell, domain)
+        return True
+    except Exception as exc:  # noqa: BLE001 - never affects the scan flow
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
 
 
 def _stamp_headline_blocks_from_canonical_listing(
@@ -1268,6 +1303,16 @@ def rematerialize_attack_path_snapshots_at_scan_end(shell: Any) -> None:
     )
 
     stamp_host_reach_coverage_for_all_domains(shell)
+
+    # Asset-scope coverage: the hosts and accounts the client excluded from this
+    # assessment, and what that left unassessed. Stamped here so a run that
+    # generates no report still declares the gap; re-stamped below with the
+    # canonical listings so it can count the routes the exclusions stopped.
+    from adscan_internal.services.asset_scope_coverage_stamp import (
+        stamp_asset_scope_coverage,
+    )
+
+    stamp_asset_scope_coverage(shell, listings=listings)
 
     # The workspace-wide "Start here" the SAR prints, ranked once over every
     # domain's canonical listing, so the web CTEM serves the deliverable's own
@@ -1497,10 +1542,33 @@ def _get_stored_credential_map(shell: Any, domain: str) -> dict[str, str]:
     return normalized
 
 
+def _relation_starts_execution(action: str) -> bool:
+    """True when ``action`` is a step ADscan itself runs (a supported technique).
+
+    Structural glue (``MemberOf`` and the other context relations), safety
+    abstentions and relations with no implementation are never the step a route
+    starts from. Every SUPPORTED technique is, whether or not its own branch
+    asks the actor SSOT for a credential: a route starts at the first step the
+    executor will run, never at a later one.
+    """
+    key = str(action or "").strip().lower()
+    return bool(key) and classify_relation_support(key).kind == "supported"
+
+
 def _first_execution_readiness_step(
     summary: dict[str, Any],
 ) -> tuple[str, dict[str, Any]] | None:
-    """Return the first path step that gates whether execution can start."""
+    """Return the FIRST step the executor would run: the one readiness is judged on.
+
+    The start question is "can the first step that runs get its actor now", and
+    it is asked of that step only. A later step is never the judge: its source
+    is usually a principal the route controls only AFTER the earlier steps
+    succeed (``BackupOperatorEscalation -> DC$ -> MemberOf -> Domain Controllers
+    -> DCSync``: the DCSync source is a group nobody controls yet), and each
+    later step resolves its own actor when it runs. Picking the judge from a
+    hand list of relations skipped every supported technique outside the list
+    and blamed the route on such a later step.
+    """
     steps = summary.get("steps")
     if not isinstance(steps, list):
         return None
@@ -1508,10 +1576,16 @@ def _first_execution_readiness_step(
         if not isinstance(step, dict):
             continue
         action = str(step.get("action") or "").strip().lower()
-        if relation_counts_for_execution_readiness(action):
-            details = step.get("details")
-            if isinstance(details, dict):
-                return action, details
+        if not _relation_starts_execution(action):
+            continue
+        details = step.get("details")
+        if not isinstance(details, dict):
+            # The first step that runs names no source or target, so there is
+            # nothing to resolve an actor from: readiness has no answer and
+            # the start-step selector decides when the path is executed. A
+            # later step is still not consulted in its place.
+            return None
+        return action, details
     return None
 
 
@@ -1704,7 +1778,7 @@ def _execution_readiness_meta(
                     print_info_debug(
                         "[target-access] "
                         f"relation={mark_sensitive(action, 'detail')} "
-                        f"target={mark_sensitive(to_label, 'node')} "
+                        f"target={markup_object_label(to_label)} "
                         f"target_kind={mark_sensitive(target_kind, 'detail')} "
                         f"mode={mark_sensitive(target_access_mode, 'detail')} "
                         f"legacy_requirement={mark_sensitive(target_access_requirement, 'detail')} "
@@ -1973,6 +2047,11 @@ def _annotate_execution_readiness(
     )
 
     annotated: list[dict[str, Any]] = []
+    # The engagement scope judges the next step of every route from what the
+    # session knows: it is told about all of them once, before the loop.
+    _prepare_engagement_scope_for_steps(
+        shell, domain=domain, steps=[_next_pending_step(summary) for summary in summaries]
+    )
     with annotation_log_dedup_scope() as _dedup:
         for summary in summaries:
             annotated.append(
@@ -2026,7 +2105,14 @@ def annotate_summary_execution_readiness(
     if readiness:
         meta.update(readiness)
     _apply_scan_policy_readiness(shell, current, meta)
-    _apply_engagement_scope_readiness(shell, domain=domain, summary=current, meta=meta)
+    _apply_engagement_scope_readiness(
+        shell,
+        domain=domain,
+        summary=current,
+        meta=meta,
+        context_username=context_username,
+        context_password=context_password,
+    )
     return current
 
 
@@ -2241,25 +2327,331 @@ def _refuse_step_for_scan_policy(
 
 
 def _step_engagement_scope(
-    shell: Any, *, domain: str, step: dict[str, Any]
+    shell: Any,
+    *,
+    domain: str,
+    step: dict[str, Any],
+    steps: list[Any] | None = None,
+    step_index: int | None = None,
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> Any:
-    """The engagement-scope verdict of one step (both axes, the scope SSOT)."""
+    """The engagement-scope verdict of one step.
+
+    The scope SSOT judges the step's acting object and its target (their
+    domains, and the objects themselves under an asset scope). Two more
+    questions only the executor can ask, because it alone knows them, are put to
+    the same SSOT here and folded into the one verdict the readiness overlay and
+    the per-step seam both read (:func:`_step_execution_scope`): the HOST the
+    step signs in to or runs on, and whether an account inside the scope is left
+    to run it. Without an asset scope the SSOT's verdict is returned as it is.
+    """
     from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
         step_scope_verdict,
     )
 
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
-    return step_scope_verdict(
+    verdict = step_scope_verdict(
         shell,
         path_domain=domain,
         from_label=str(details.get("from") or ""),
         to_label=str(details.get("to") or ""),
         details=details,
     )
+    if not verdict.allowed:
+        return verdict
+    return _step_execution_scope(
+        shell,
+        domain=domain,
+        step=step,
+        verdict=verdict,
+        steps=steps,
+        step_index=step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
+
+
+def _undetermined_asset_verdict(kind: str) -> Any:
+    """A fail-closed verdict for an axis whose scope answer could not be computed."""
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        ASSET_REASON_UNDETERMINED,
+        AssetScopeVerdict,
+        ScopeOutcome,
+    )
+
+    return AssetScopeVerdict(ScopeOutcome.UNDETERMINED, ASSET_REASON_UNDETERMINED, kind)
+
+
+def _next_pending_step(summary: Any) -> dict[str, Any] | None:
+    """The first executable step of a route that has not run yet (``None`` when none)."""
+    steps = summary.get("steps") if isinstance(summary, dict) else None
+    for step in steps if isinstance(steps, list) else ():
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip()
+        if not action or not _relation_is_executable_step(action):
+            continue
+        if scan_policy_enforcement.step_already_processed(step):
+            continue
+        return step
+    return None
+
+
+def _prepare_engagement_scope_for_steps(
+    shell: Any, *, domain: str, steps: Iterable[dict[str, Any] | None]
+) -> None:
+    """Tell the scope SSOT what it needs to judge a BATCH of steps, in one pass.
+
+    A scope verdict is a read of what the session knows. Before a list of steps
+    is judged (the readiness overlay over every route, or one step about to
+    run), the objects each step names and the hosts it would contact are handed
+    to the SSOT's own triggers, grouped by the domain they belong to: one
+    indexed directory read per object, one lookup per host name, each done once
+    however many steps name it. Never raises: what the session was not told
+    reads "not confirmed", so the step is left alone.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            asset_scope_recorded,
+            object_domain,
+            prepare_scope_principals,
+        )
+        from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+            prepare_targets_for_scope,
+        )
+
+        if not asset_scope_recorded(shell):
+            return
+        labels: dict[str, dict[str, None]] = {}
+        hosts: dict[str, dict[str, None]] = {}
+        for step in steps or ():
+            if not isinstance(step, dict):
+                continue
+            details = step.get("details") if isinstance(step.get("details"), dict) else {}
+            from_label = str(details.get("from") or "")
+            to_label = str(details.get("to") or "")
+            owners = {
+                "source": object_domain(
+                    shell,
+                    label=from_label,
+                    path_domain=domain,
+                    dn=details.get("source_dn"),
+                    dnshostname=details.get("source_dnshostname"),
+                )
+                or domain,
+                "target": object_domain(
+                    shell,
+                    label=to_label,
+                    path_domain=domain,
+                    dn=details.get("target_dn"),
+                    dnshostname=details.get("target_dnshostname"),
+                )
+                or domain,
+            }
+            if from_label:
+                labels.setdefault(owners["source"], {})[from_label] = None
+            if to_label:
+                labels.setdefault(owners["target"], {})[to_label] = None
+            for host, owner in _step_contact_hosts(
+                shell,
+                domain=domain,
+                relation=str(step.get("action") or "").strip().lower(),
+                from_label=from_label,
+                to_label=to_label,
+                details=details,
+                source_domain=owners["source"],
+                target_domain=owners["target"],
+            ):
+                hosts.setdefault(owner or "", {})[host] = None
+        for owner, names in labels.items():
+            prepare_scope_principals(shell, list(names), domain=owner or None)
+        for owner, names in hosts.items():
+            prepare_targets_for_scope(shell, list(names), domain=owner or None)
+    except Exception as exc:  # noqa: BLE001 - unprepared steps stay "not confirmed"
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def _step_contact_hosts(
+    shell: Any,
+    *,
+    domain: str,
+    relation: str,
+    from_label: str,
+    to_label: str,
+    details: dict[str, Any],
+    source_domain: str,
+    target_domain: str,
+) -> list[tuple[str, str]]:
+    """The hosts a step sends packets to, as ``(host, owning domain)``.
+
+    * the SOURCE host of a step that runs inside a session on it (the dump
+      family, ``HasSession``, a credential read off its file system);
+    * the TARGET host of an access step (``AdminTo``, ``CanRDP``,
+      ``CanPSRemote``, ``ExecuteDCOM``, the SQL access edges), and of any step
+      whose target is a computer by DIRECTORY data: an excluded host is one
+      identity, so a step on its computer object is judged like a step on it;
+    * the domain controller a ``DCSync`` replicates from.
+
+    Each relation set is read from its own SSOT
+    (``execution_credential_scope``), the target's kind from the principal-kind
+    SSOT (``_resolve_from_node_kind``), never from the shape of a name.
+    """
+    key = str(relation or "").strip().lower()
+    hosts: list[tuple[str, str]] = []
+
+    def _add(label: str, dnshostname: Any, owner: str) -> None:
+        host = str(dnshostname or "").strip()
+        if not host and label:
+            resolved = resolve_netexec_target_for_node_label(shell, domain, node_label=label)
+            host = resolved.strip() if isinstance(resolved, str) else ""
+        if host and (host, owner) not in hosts:
+            hosts.append((host, owner))
+
+    if key == "dcsync":
+        dc_host = _resolve_step_execution_host(
+            shell, domain=domain, relation=key, from_label=from_label, to_label=to_label
+        )
+        if dc_host:
+            hosts.append((dc_host, target_domain))
+        return hosts
+    if relation_runs_in_source_host_session(key):
+        _add(from_label, details.get("source_dnshostname"), source_domain)
+    target_is_host = bool(step_authentication_host(key, from_label=None, to_label=to_label))
+    if not target_is_host and to_label:
+        target_is_host = (
+            str(_resolve_from_node_kind(shell, target_domain or domain, to_label) or "").lower()
+            == "computer"
+        )
+    if target_is_host:
+        _add(to_label, details.get("target_dnshostname"), target_domain)
+    return hosts
+
+
+def _step_execution_scope(
+    shell: Any,
+    *,
+    domain: str,
+    step: dict[str, Any],
+    verdict: Any,
+    steps: list[Any] | None,
+    step_index: int | None,
+    context_username: str | None,
+    context_password: str | None,
+) -> Any:
+    """Fold the host axis and the actor axis into a step verdict the SSOT allowed.
+
+    Host axis: a step that signs in to a host, or runs on one, needs that host
+    inside the scope for a HOST contact (``host_scope_verdict``): the address
+    entries, the names a deny entry resolved to, and the rule that keeps a
+    domain controller to directory reads all apply there, and none of them is
+    visible to the per-object check. A host verdict that cannot be computed
+    refuses the step (fail closed).
+
+    Actor axis: the step's actor is resolved through the ONE actor SSOT
+    (:func:`resolve_step_execution_actor`, read-only). When it finds nobody and
+    the scope removed at least one account that could have run the step, the
+    step has no actor BECAUSE of the scope, and is refused with that reason
+    instead of a generic "no credential".
+
+    The refusing verdict rides the SSOT's own shape (``target_asset`` for the
+    host, ``source_asset`` for the actor), so every consumer of
+    ``asset_refusal`` words and records it the same way.
+    """
+    from dataclasses import replace  # noqa: PLC0415
+
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+        host_scope_verdict,
+    )
+
+    if not asset_scope_recorded(shell):
+        return verdict
+    details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    key = str(step.get("action") or "").strip().lower()
+    from_label = str(details.get("from") or "")
+    to_label = str(details.get("to") or "")
+    try:
+        hosts = _step_contact_hosts(
+            shell,
+            domain=domain,
+            relation=key,
+            from_label=from_label,
+            to_label=to_label,
+            details=details,
+            source_domain=str(getattr(verdict.source, "domain", "") or domain),
+            target_domain=str(getattr(verdict.target, "domain", "") or domain),
+        )
+        for host, owner in hosts:
+            # Signing in to a host, or running on it, is an ordinary host
+            # contact: nothing narrower is stated.
+            host_verdict = host_scope_verdict(shell, host=host, domain=owner or None)
+            if not host_verdict.allowed:
+                return replace(verdict, allowed=False, target_asset=host_verdict)
+    except Exception as exc:  # noqa: BLE001 - an unreadable host verdict is not a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return replace(verdict, allowed=False, target_asset=_undetermined_asset_verdict("computer"))
+
+    if key in {"asreproasting", "asreproast"} or not (
+        key in ACL_ACE_RELATIONS or relation_requires_execution_context(key)
+    ):
+        return verdict
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        recording_actor_scope_drops,
+    )
+
+    chain = [s for s in (steps or ()) if isinstance(s, dict)] or None
+    chain_summary: dict[str, Any] = {"steps": chain} if chain else {}
+    with recording_actor_scope_drops() as drops:
+        try:
+            # Read-only, exactly as the start-step gate asks it: strict, so the
+            # one rung that can prompt (the generic host credential) never runs.
+            actor = resolve_step_execution_actor(
+                shell,
+                domain=domain,
+                relation=key,
+                from_label=from_label,
+                to_label=to_label,
+                summary=chain_summary,
+                context_username=context_username,
+                context_password=context_password,
+                steps=chain,
+                step_index=step_index,
+                strict_source=True,
+                interactive=False,
+            )
+            if actor is None and drops and relation_is_host_execution_read(key):
+                # A host read may also run as a generic host credential (the
+                # rung the strict probe leaves out). Any account left for it
+                # means the step still has somebody to run as.
+                generic, _tag = resolve_execution_candidates(
+                    shell,
+                    domain=domain,
+                    context_username=context_username,
+                    summary=chain_summary,
+                    from_label=from_label,
+                    strict_source=False,
+                )
+                if generic:
+                    return verdict
+        except Exception as exc:  # noqa: BLE001 - the actor seams below still gate
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            return verdict
+    if actor is None and drops:
+        return replace(verdict, allowed=False, source_asset=drops[0][1])
+    return verdict
 
 
 def _first_pending_step_outside_scope(
-    shell: Any, *, domain: str, steps: list[Any]
+    shell: Any,
+    *,
+    domain: str,
+    steps: list[Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> tuple[int, dict[str, Any], Any] | None:
     """The first pending executable step, when the engagement scope keeps it out."""
     for idx, step in enumerate(steps or (), start=1):
@@ -2270,13 +2662,27 @@ def _first_pending_step_outside_scope(
             continue
         if scan_policy_enforcement.step_already_processed(step):
             continue
-        verdict = _step_engagement_scope(shell, domain=domain, step=step)
+        verdict = _step_engagement_scope(
+            shell,
+            domain=domain,
+            step=step,
+            steps=steps,
+            step_index=idx,
+            context_username=context_username,
+            context_password=context_password,
+        )
         return (idx, step, verdict) if not verdict.allowed else None
     return None
 
 
 def _apply_engagement_scope_readiness(
-    shell: Any, *, domain: str, summary: dict[str, Any], meta: dict[str, Any]
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    meta: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> None:
     """Mark a route whose next step leaves the engagement scope as not startable.
 
@@ -2287,11 +2693,21 @@ def _apply_engagement_scope_readiness(
     from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
         EXECUTION_STATUS_OUTSIDE_SCOPE,
         OUTSIDE_SCOPE_STEP_LABEL,
+        outside_scope_step_label,
     )
 
     steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    # A no-op after the list pre-pass; a route annotated on its own tells the
+    # session about its next step here.
+    _prepare_engagement_scope_for_steps(shell, domain=domain, steps=[_next_pending_step(summary)])
     try:
-        hit = _first_pending_step_outside_scope(shell, domain=domain, steps=steps)
+        hit = _first_pending_step_outside_scope(
+            shell,
+            domain=domain,
+            steps=steps,
+            context_username=context_username,
+            context_password=context_password,
+        )
     except Exception as exc:  # noqa: BLE001 - an unreadable step is not startable
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -2299,9 +2715,23 @@ def _apply_engagement_scope_readiness(
     if hit is None:
         return
     _idx, step, verdict = hit
+    step_details = step.get("details") if isinstance(step.get("details"), dict) else {}
+    asset_note = _asset_scope_verdict_step_note(
+        shell,
+        verdict,
+        from_label=str(step_details.get("from") or ""),
+        to_label=str(step_details.get("to") or ""),
+    )
     meta["execution_support_status"] = EXECUTION_STATUS_OUTSIDE_SCOPE
-    meta["execution_support_reason"] = OUTSIDE_SCOPE_STEP_LABEL
+    # The route is not startable in either state. The label says which one
+    # (excluded, or left alone because it could not be confirmed as in scope),
+    # through the one shared wording function.
+    meta["execution_support_reason"] = (
+        outside_scope_step_label(asset_note) if asset_note else OUTSIDE_SCOPE_STEP_LABEL
+    )
     meta["execution_not_executed_reason"] = EXECUTION_STATUS_OUTSIDE_SCOPE
+    if asset_note:
+        meta["execution_scope_note"] = dict(asset_note)
     meta["execution_out_of_scope_domain"] = verdict.out_of_scope_domain
     meta["execution_context_action"] = str(step.get("action") or "").strip().lower()
 
@@ -2321,11 +2751,26 @@ def _path_outside_engagement_scope(summary: dict[str, Any]) -> bool:
 
 
 def _refuse_path_outside_engagement_scope(
-    shell: Any, *, domain: str, summary: dict[str, Any]
+    shell: Any,
+    *,
+    domain: str,
+    summary: dict[str, Any],
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> None:
-    """Refuse a whole route whose first pending step leaves the engagement scope."""
+    """Refuse a whole route whose first pending step leaves the engagement scope.
+
+    Takes the same carried context the readiness overlay judged the route with,
+    so the step it refuses is the one the overlay marked.
+    """
     steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
-    hit = _first_pending_step_outside_scope(shell, domain=domain, steps=steps)
+    hit = _first_pending_step_outside_scope(
+        shell,
+        domain=domain,
+        steps=steps,
+        context_username=context_username,
+        context_password=context_password,
+    )
     if hit is None:
         return
     step_index, step, verdict = hit
@@ -2354,6 +2799,8 @@ def _refuse_outside_scope_step(
 ) -> None:
     from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
         NOT_EXECUTED_OUTSIDE_SCOPE,
+        OUTSIDE_SCOPE_STEP_LABEL,
+        outside_scope_step_label,
     )
     from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
         refuse_outside_scope,
@@ -2363,6 +2810,16 @@ def _refuse_outside_scope_step(
     details = step.get("details") if isinstance(step.get("details"), dict) else {}
     from_label = str(details.get("from") or "")
     to_label = str(details.get("to") or "")
+    # An asset verdict has two outcomes, and the step record says which: the
+    # object is excluded, or it could not be confirmed as inside the scope and
+    # the step was left alone. One reason token for both (the step is mapped
+    # and was not run because of the scope); the note the scope SSOT builds
+    # carries the outcome and its cause, and the label is worded from it.
+    asset_note = _asset_scope_verdict_step_note(
+        shell, verdict, from_label=from_label, to_label=to_label
+    )
+    step_reason = NOT_EXECUTED_OUTSIDE_SCOPE
+    step_label = outside_scope_step_label(asset_note) if asset_note else OUTSIDE_SCOPE_STEP_LABEL
 
     def _record(message: str, _details: dict[str, Any]) -> None:
         _record_attack_path_execution_event(
@@ -2378,27 +2835,24 @@ def _refuse_outside_scope_step(
             from_label=from_label,
             to_label=to_label,
             step_status="not_executed",
-            reason=NOT_EXECUTED_OUTSIDE_SCOPE,
+            reason=step_reason,
         )
 
     run = get_active_execution_run(shell) if event_stage == "path_blocked" else None
     if run is not None:
         try:
-            from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
-                OUTSIDE_SCOPE_STEP_LABEL,
-            )
             from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
-                outside_scope_line,
+                step_scope_refusal_line,
             )
 
             run.refuse(
-                f"{action} not executed: outside the engagement scope",
+                f"{action} {step_label[0].lower()}{step_label[1:].rstrip('.')}",
                 explanation={
                     "code": "",
-                    "reason_code": NOT_EXECUTED_OUTSIDE_SCOPE,
-                    "headline": OUTSIDE_SCOPE_STEP_LABEL,
-                    "detail": outside_scope_line(
-                        action, to_label, verdict.out_of_scope_domain, marked=False
+                    "reason_code": step_reason,
+                    "headline": step_label,
+                    "detail": step_scope_refusal_line(
+                        verdict, action, to_label, marked=False
                     ),
                     "next_step": "",
                 },
@@ -2417,7 +2871,35 @@ def _refuse_outside_scope_step(
         source_domain=verdict.source.domain,
         step_status=str(step.get("status") or "theoretical"),
         event_recorder=_record,
+        asset_verdict=getattr(verdict, "asset_refusal", None),
     )
+
+
+def _asset_scope_verdict_step_note(
+    shell: Any, verdict: Any, *, from_label: str, to_label: str
+) -> dict[str, str] | None:
+    """The step note of the asset verdict that keeps a step out, or ``None``.
+
+    ``None`` when a DOMAIN keeps the step out (that note names the domain and is
+    unchanged). Otherwise the note is THE one the scope SSOT builds from a
+    verdict (``engagement_scope.asset_verdict_note``): the object, the outcome
+    (excluded, or not confirmed with its cause) and how the deciding entry was
+    written. The object named is the acting identity when the refusing verdict
+    is the step's source side, the step's target otherwise. The edge itself is
+    stamped by the SSOT (``refuse_outside_scope``); this is the same note, for
+    the surfaces the executor writes (the readiness overlay, the run view).
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_verdict_note,
+    )
+
+    asset = getattr(verdict, "asset_refusal", None)
+    if asset is None:
+        return None
+    acting = asset is getattr(verdict, "source_asset", None) and asset is not getattr(
+        verdict, "target_asset", None
+    )
+    return asset_verdict_note(shell, asset, from_label if acting else to_label)
 
 
 def _refuse_step_outside_engagement_scope(
@@ -2429,15 +2911,30 @@ def _refuse_step_outside_engagement_scope(
     step_index: int,
     total_steps: int | None,
     last_executable_idx: int | None,
+    context_username: str | None = None,
+    context_password: str | None = None,
 ) -> bool:
     """THE per-step engagement-scope seam of the executor loop.
 
-    Returns True (and records the refusal) when the step's acting object or
-    target belongs to a domain outside the engagement scope, so the caller stops
-    the route there. Every attack step passes through it before it runs; a
-    structural test keeps it in the loop.
+    Returns True (and records the refusal) when the engagement scope keeps the
+    step from running, so the caller stops the route there: its acting object or
+    its target belongs to a domain outside the scope, or, under an asset scope,
+    is itself excluded; the host it signs in to is excluded; or every account
+    that could run it is excluded (``context_username`` is the credential the
+    route carries into this step). Every attack step passes through it before it
+    runs and before any prompt offers it; a structural test keeps it in the loop.
     """
-    verdict = _step_engagement_scope(shell, domain=domain, step=step)
+    # One step about to run: the session is told about it, then judges it.
+    _prepare_engagement_scope_for_steps(shell, domain=domain, steps=[step])
+    verdict = _step_engagement_scope(
+        shell,
+        domain=domain,
+        step=step,
+        steps=summary.get("steps") if isinstance(summary.get("steps"), list) else None,
+        step_index=step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
     if verdict.allowed:
         return False
     _refuse_outside_scope_step(
@@ -2739,9 +3236,9 @@ def _didactic_steps_for_path(summary: dict[str, Any]) -> list[dict[str, Any]]:
 
     A path narrative can be long (MemberOf / context hops between the real
     techniques). For the didactic card we want the steps that ACTUALLY get
-    executed — the ones that count for execution readiness — so the learner sees
+    executed (supported techniques, not glue) so the learner sees
     the attack(s) about to run, not the graph plumbing. Falls back to every step
-    with a known relation if none are execution-readiness steps (so a
+    with a known relation if none is a supported technique (so a
     fully-structural path still gets explained).
     """
     steps = summary.get("steps")
@@ -2756,7 +3253,7 @@ def _didactic_steps_for_path(summary: dict[str, Any]) -> list[dict[str, Any]]:
         if not action:
             continue
         named.append(step)
-        if relation_counts_for_execution_readiness(action):
+        if _relation_starts_execution(action):
             executable.append(step)
     return executable or named
 
@@ -2853,7 +3350,13 @@ def offer_attack_path_execution(
         _refuse_path_for_scan_policy(shell, domain=domain, summary=annotated)
         return False
     if support_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
-        _refuse_path_outside_engagement_scope(shell, domain=domain, summary=annotated)
+        _refuse_path_outside_engagement_scope(
+            shell,
+            domain=domain,
+            summary=annotated,
+            context_username=context_username,
+            context_password=context_password,
+        )
         return False
     if support_status in {"unsupported", "blocked"}:
         reason = str(meta.get("execution_support_reason") or "").strip()
@@ -3481,7 +3984,23 @@ def attack_path_step_source_is_actionable(
     (``get_attack_path_source_domains``). The FIRST domain whose credential store
     controls the source wins; the last per-domain reason is returned when none
     do, so single-domain behaviour is byte-identical.
+
+    Under an asset scope, a step the engagement scope keeps from running is not
+    actionable either (:func:`_step_asset_scope_refusal_reason`): this predicate
+    is what the start-step selector and the ``[ready]`` marker read, so no
+    prompt offers a step the per-step seam would refuse.
     """
+    scope_reason = _step_asset_scope_refusal_reason(
+        shell,
+        domain=domain,
+        step=step,
+        steps=steps,
+        step_index=step_index,
+        context_username=context_username,
+        context_password=context_password,
+    )
+    if scope_reason:
+        return False, scope_reason
     actionable, reason = _attack_path_step_source_is_actionable_in_domain(
         shell,
         domain=domain,
@@ -3510,6 +4029,52 @@ def attack_path_step_source_is_actionable(
         if alt_actionable:
             return True, alt_reason
     return actionable, reason
+
+
+def _step_asset_scope_refusal_reason(
+    shell: Any,
+    *,
+    domain: str,
+    step: Any,
+    steps: list[dict[str, Any]] | None,
+    step_index: int | None,
+    context_username: str | None,
+    context_password: str | None,
+) -> str:
+    """The shared "outside the engagement scope" label when the scope refuses ``step``.
+
+    ``""`` when the session has no asset scope (the actionability predicate then
+    answers exactly as before) or when the step may run. The verdict is the one
+    the per-step seam reads (:func:`_step_engagement_scope`), so the selector
+    and the seam cannot disagree. A verdict that cannot be computed makes the
+    step not actionable (fail closed).
+    """
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        OUTSIDE_SCOPE_STEP_LABEL,
+    )
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+    )
+
+    if not isinstance(step, dict) or not asset_scope_recorded(shell):
+        return ""
+    # One step the selector is asked about: told to the session, then judged.
+    _prepare_engagement_scope_for_steps(shell, domain=domain, steps=[step])
+    try:
+        verdict = _step_engagement_scope(
+            shell,
+            domain=domain,
+            step=step,
+            steps=steps,
+            step_index=step_index,
+            context_username=context_username,
+            context_password=context_password,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable verdict is not a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return OUTSIDE_SCOPE_STEP_LABEL
+    return "" if verdict.allowed else OUTSIDE_SCOPE_STEP_LABEL
 
 
 def _alternate_source_domains(shell: Any, domain: str) -> list[str]:
@@ -4245,7 +4810,7 @@ def _render_no_actionable_start_panel(
     """
     entry = _attack_path_entry_principal_label(summary, steps)
     entry_line = (
-        f"Compromise {mark_sensitive(entry, 'node')} to unlock this path."
+        f"Compromise {markup_object_label(entry)} to unlock this path."
         if entry
         else "Compromise the path's entry principal to unlock this path."
     )
@@ -4267,7 +4832,7 @@ def _render_no_actionable_start_panel(
     print_info_debug(
         "[attack_paths] no actionable start step; rendered not-reachable panel: "
         f"domain={mark_sensitive(domain, 'domain')} "
-        f"entry={mark_sensitive(entry or '?', 'node')}"
+        f"entry={markup_object_label(entry or '?')}"
     )
 
 
@@ -5453,8 +6018,8 @@ def _print_allowedtoact_blocked_panel(
     from adscan_internal.rich_output import print_panel  # noqa: PLC0415
 
     lines = [
-        f"Target (RBCD):  {mark_sensitive(target_label or '?', 'node')}",
-        f"Trustee:        {mark_sensitive(trustee_label or '?', 'node')}",
+        f"Target (RBCD):  {markup_object_label(target_label or '?')}",
+        f"Trustee:        {markup_object_label(trustee_label or '?')}",
         "",
         f"Why it cannot run now:  {reason}",
         "",
@@ -8178,7 +8743,7 @@ def _resolve_users_from_principal_label(
     if kind != "group":
         print_info_debug(
             "[exec-user] No actor from principal "
-            f"{mark_sensitive(str(principal_label or '?'), 'node')}: neither the "
+            f"{markup_object_label(str(principal_label or '?'))}: neither the "
             "attack graph nor the membership snapshot records what kind of "
             "principal it is."
         )
@@ -8754,7 +9319,7 @@ def _execute_unauthenticated_entry_step(
     No secret is fabricated — a missing derived credential is an honest stop.
     """
     owner = _normalize_account(to_label)
-    marked_owner = mark_sensitive(to_label or "?", "node")
+    marked_owner = markup_object_label(to_label or "?")
     session_label = "guest" if bind_kind == BIND_KIND_GUEST else "null"
 
     _record_attack_path_execution_event(
@@ -8877,6 +9442,21 @@ def _actor_cannot_sign_in(shell: Any, domain: str, username: str, *, rung: str) 
     return bool(reason)
 
 
+def _actor_outside_engagement_scope(shell: Any, domain: str, username: str, *, rung: str) -> bool:
+    """True when the engagement scope keeps ``username`` from being an acting identity.
+
+    The scope SSOT decides (``engagement_scope.principal_scope_verdict``, through
+    the shared actor seam). Applied to the ladder rungs that pick a single
+    principal; the source-owned candidates are filtered by the same seam inside
+    :func:`resolve_execution_candidates`, so the gate and the executor agree.
+    """
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        actor_scope_refusal,
+    )
+
+    return actor_scope_refusal(shell, domain=domain, username=username, rung=rung) is not None
+
+
 def resolve_step_execution_actor(
     shell: Any,
     *,
@@ -8922,6 +9502,12 @@ def resolve_step_execution_actor(
     several owned candidates; ``False`` (the read-only gate) takes the ranked head
     without ever prompting.
 
+    Every rung leaves out an account the engagement scope excludes (the scope
+    SSOT's verdict, asked through ``_actor_outside_engagement_scope`` and inside
+    :func:`resolve_execution_candidates`): an excluded account is never the
+    identity a step runs as. When that leaves no actor, the step seam reports
+    the step as outside the engagement scope.
+
     Returns a :class:`StepExecutionActor`, or ``None`` when no material exists.
     """
     key = str(relation or "").strip().lower()
@@ -8959,6 +9545,12 @@ def resolve_step_execution_actor(
         scoped = resolve_execution_credential(
             shell, domain=domain, host=resolved_host, relation=key
         )
+        if scoped is not None and _actor_outside_engagement_scope(
+            shell, domain, scoped[0], rung="scoped-ticket principal"
+        ):
+            # The ticket acts AS this principal on the host: an excluded account
+            # is never the acting identity, however the ticket was obtained.
+            scoped = None
         if scoped is not None:
             ticket_user, ccache_path = scoped
             print_info_debug(
@@ -8987,6 +9579,10 @@ def resolve_step_execution_actor(
     )
     if carried_actor and _actor_cannot_sign_in(shell, domain, carried_actor, rung="carried foothold"):
         carried_actor = None
+    if carried_actor and _actor_outside_engagement_scope(
+        shell, domain, carried_actor, rung="carried foothold"
+    ):
+        carried_actor = None
     if carried_actor:
         secret, islocal = _resolve_actor_secret(
             shell,
@@ -9012,6 +9608,10 @@ def resolve_step_execution_actor(
             shell, domain=domain, host=resolved_host
         )
         if machine_account and _actor_cannot_sign_in(
+            shell, domain, machine_account, rung="owned machine account"
+        ):
+            machine_account = None
+        if machine_account and _actor_outside_engagement_scope(
             shell, domain, machine_account, rung="owned machine account"
         ):
             machine_account = None
@@ -11350,7 +11950,13 @@ def _execute_selected_attack_path_impl(
         _refuse_path_for_scan_policy(shell, domain=domain, summary=summary)
         return False
     if _gate_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
-        _refuse_path_outside_engagement_scope(shell, domain=domain, summary=summary)
+        _refuse_path_outside_engagement_scope(
+            shell,
+            domain=domain,
+            summary=summary,
+            context_username=context_username,
+            context_password=context_password,
+        )
         return False
     if _gate_status in {"unsupported", "blocked"}:
         _gate_reason = str(_gate_meta.get("execution_support_reason") or "").strip()
@@ -11482,7 +12088,7 @@ def _execute_selected_attack_path_impl(
             if announce:
                 print_warning(
                     f"Step {rich_markup_escape(action)} on "
-                    f"{mark_sensitive(to_label or 'the target', 'node')} was not run, "
+                    f"{markup_object_label(to_label or 'the target')} was not run, "
                     f"so the path stopped: {rich_markup_escape(reason)}"
                 )
             if not from_label or not to_label:
@@ -11534,7 +12140,7 @@ def _execute_selected_attack_path_impl(
             call sites instead of being inferred from persisted edge status.
             """
             marked_action = action
-            marked_target = mark_sensitive(to_label or "", "node")
+            marked_target = markup_object_label(to_label or "")
             # The cause is UNTRUSTED (exploit/LDAP text): escape it so a
             # bracket-shaped token can never break Rich markup (see the Rich
             # square-bracket rule), and keep it to one clause on the halt line.
@@ -12652,8 +13258,8 @@ def _execute_selected_attack_path_impl(
                 "[attack_paths] existing-step rerun decision: "
                 f"index={step_index} status={mark_sensitive(status, 'detail')} "
                 f"action={mark_sensitive(action or 'N/A', 'detail')} "
-                f"from={mark_sensitive(from_label or 'N/A', 'node')} "
-                f"to={mark_sensitive(to_label or 'N/A', 'node')} "
+                f"from={markup_object_label(from_label or 'N/A')} "
+                f"to={markup_object_label(to_label or 'N/A')} "
                 f"bypassable={bypassable!r} "
                 f"rerun={rerun!r}"
             )
@@ -12779,6 +13385,8 @@ def _execute_selected_attack_path_impl(
                 step_index=idx,
                 total_steps=total_executable_steps,
                 last_executable_idx=last_executable_idx,
+                context_username=context_username,
+                context_password=context_password,
             ):
                 return execution_started
             # A directory write in a prefix the policy will not let complete
@@ -12891,8 +13499,8 @@ def _execute_selected_attack_path_impl(
                     "[attack_paths] skipping previously processed step: "
                     f"index={idx} status={mark_sensitive(str(step.get('status') or ''), 'detail')} "
                     f"action={mark_sensitive(action, 'detail')} "
-                    f"from={mark_sensitive(from_label or 'N/A', 'node')} "
-                    f"to={mark_sensitive(to_label or 'N/A', 'node')}"
+                    f"from={markup_object_label(from_label or 'N/A')} "
+                    f"to={markup_object_label(to_label or 'N/A')}"
                 )
                 continue
             if existing_step_decision == "cancel":
@@ -12943,7 +13551,7 @@ def _execute_selected_attack_path_impl(
                 print_info_debug(
                     "[attack_paths] ownership gate skipped for engine-manufactured "
                     f"follow-up: index={idx} action={mark_sensitive(action, 'detail')} "
-                    f"from={mark_sensitive(from_label or 'N/A', 'node')}"
+                    f"from={markup_object_label(from_label or 'N/A')}"
                 )
             _source_actionable, _source_reason = (
                 (True, "")
@@ -12978,7 +13586,7 @@ def _execute_selected_attack_path_impl(
                     step_status="blocked",
                     reason="source_principal_not_controlled",
                 )
-                marked_source = mark_sensitive(from_label or "?", "node")
+                marked_source = markup_object_label(from_label or "?")
                 print_warning(
                     f"This step starts from {marked_source}, which is not yet "
                     "compromised. Obtain control of it first via the preceding "
@@ -14409,7 +15017,7 @@ def _execute_selected_attack_path_impl(
                             if rbcd_member_to_add:
                                 print_info_debug(
                                     "[rbcd-coord] next step is AllowedToAct on group "
-                                    f"{mark_sensitive(to_label, 'node')}; AddMember will add "
+                                    f"{markup_object_label(to_label)}; AddMember will add "
                                     f"the SPN-bearing account "
                                     f"{mark_sensitive(rbcd_member_to_add, 'user')}"
                                 )
@@ -14428,8 +15036,8 @@ def _execute_selected_attack_path_impl(
                     step_index=idx,
                 )
                 if not exec_context:
-                    marked_from = mark_sensitive(from_label, "node")
-                    marked_to = mark_sensitive(to_label, "node")
+                    marked_from = markup_object_label(from_label)
+                    marked_to = markup_object_label(to_label)
                     _record_attack_path_execution_event(
                         shell,
                         domain=domain,
@@ -14538,7 +15146,7 @@ def _execute_selected_attack_path_impl(
                         "target object type in this path.\n",
                         style="red",
                     )
-                    marked_to = mark_sensitive(to_label, "node")
+                    marked_to = markup_object_label(to_label)
                     message.append(
                         f"\nUnsupported step: {action} -> {marked_to}\n",
                         style="dim",
@@ -22058,7 +22666,13 @@ def _offer_attack_paths_for_execution_summaries_impl(
             _record_attempt(selected_idx)
             continue
         if execution_support_status == _EXECUTION_STATUS_OUTSIDE_SCOPE:
-            _refuse_path_outside_engagement_scope(shell, domain=domain, summary=selected)
+            _refuse_path_outside_engagement_scope(
+                shell,
+                domain=domain,
+                summary=selected,
+                context_username=context_username,
+                context_password=context_password,
+            )
             if single_pass:
                 return executed
             _record_attempt(selected_idx)

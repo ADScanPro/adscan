@@ -58,7 +58,7 @@ from adscan_core.scan_policy.policy import (
 )
 from adscan_core.scan_policy.registry import load_registry
 from adscan_core.scan_policy.resolve import ResolvedScanPolicy
-from adscan_core.scan_policy.summary import build_policy_safety_summary
+from adscan_core.scan_policy.summary import build_policy_safety_summary, policy_counts
 from adscan_internal.cli.scan_policy_library import INTERACTIVE_SCOPE_NOTE
 
 USAGE = (
@@ -112,12 +112,8 @@ def use_choices(workspace_dir: str | None = None) -> list[str]:
 
 
 def _counts_line(resolved: ResolvedScanPolicy) -> str:
-    summary = build_policy_safety_summary(resolved)
-    return (
-        f"{summary['attack_steps_enabled']} of {summary['attack_steps_total']} attack steps, "
-        f"{summary['vulnerability_checks_enabled']} of {summary['vulnerability_checks_total']} "
-        "vulnerability checks"
-    )
+    """The policy's figure, from the SSOT the editor and ``policy show`` use too."""
+    return policy_counts(resolved).line
 
 
 def pacing_label(pacing: Any) -> str:

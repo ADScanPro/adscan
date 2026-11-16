@@ -24,6 +24,7 @@ beyond delegated calls into the exploitation service.
 from __future__ import annotations
 
 from adscan_core.async_bridge import run_on_new_loop
+from adscan_core.output._state import markup_object_label
 from adscan_internal.services.ledger_guard import ledger_or_warn
 
 from pathlib import Path
@@ -543,7 +544,7 @@ def run_exploit_gpo_immediate_task_for_step(
 
         print_info(
             "GPO Immediate Scheduled Task: planting (and immediately reverting) "
-            f"on {mark_sensitive(chosen.display_name or chosen.gpo_object_id, 'text')} "
+            f"on {markup_object_label(chosen.display_name or chosen.gpo_object_id)} "
             f"as {mark_sensitive(exec_username, 'user')}."
         )
 
@@ -597,7 +598,7 @@ def run_exploit_gpo_immediate_task_for_step(
         print_success(
             "GPO Immediate Scheduled Task "
             f"{rollback_note} on "
-            f"{mark_sensitive(chosen.display_name or chosen.gpo_object_id, 'text')} "
+            f"{markup_object_label(chosen.display_name or chosen.gpo_object_id)} "
             f"({len(result.change_ids)} ledger entries)."
         )
         return True

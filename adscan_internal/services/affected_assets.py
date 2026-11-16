@@ -165,9 +165,18 @@ def _is_non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip()) and value != "NS"
 
 
-def _extend_unique(target: list[str], values: Iterable[str]) -> None:
-    """Append string values preserving order and uniqueness."""
-    seen = set(target)
+def _extend_unique(
+    target: list[str], values: Iterable[str], seen: set[str] | None = None
+) -> None:
+    """Append string values preserving order and uniqueness.
+
+    ``seen`` is the set of the strings ``target`` holds, for a caller that
+    appends to one list in a loop: rebuilding it on every call made such a loop
+    quadratic (hundreds of thousands of edges on a large directory). A caller
+    passes it only when every append to ``target`` goes through here.
+    """
+    if seen is None:
+        seen = set(target)
     for value in values:
         normalized = value.strip()
         if not normalized or normalized in seen:
@@ -180,15 +189,11 @@ def _extract_strings(value: Any) -> list[str]:
     """Extract string leaves from a nested list-like value."""
     if _is_non_empty_string(value):
         return [str(value).strip()]
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         results: list[str] = []
+        seen: set[str] = set()
         for item in value:
-            _extend_unique(results, _extract_strings(item))
-        return results
-    if isinstance(value, tuple):
-        results = []
-        for item in value:
-            _extend_unique(results, _extract_strings(item))
+            _extend_unique(results, _extract_strings(item), seen)
         return results
     return []
 
@@ -240,23 +245,24 @@ def extract_share_locations(details: Any) -> list[str]:
         return []
 
     locations: list[str] = []
+    seen: set[str] = set()
     raw_locations = view.get(SECRET_LOCATION_KEY)
     if isinstance(raw_locations, list):
         for entry in raw_locations:
             if not isinstance(entry, dict):
-                _extend_unique(locations, _extract_strings(entry))
+                _extend_unique(locations, _extract_strings(entry), seen)
                 continue
             for key in ("unc", "path", "share"):
                 value = entry.get(key)
                 if _is_non_empty_string(value):
-                    _extend_unique(locations, [str(value).strip()])
+                    _extend_unique(locations, [str(value).strip()], seen)
                     break
     if locations:
         return locations
 
     for key in _SHARE_NAME_KEYS:
         for value in _extract_strings(view.get(key)):
-            _extend_unique(locations, _split_joined_display_tokens(value))
+            _extend_unique(locations, _split_joined_display_tokens(value), seen)
     return locations
 
 
@@ -444,8 +450,9 @@ def _extract_account_assets(
 ) -> list[str]:
     """Return the display labels for the principals a finding carries itself."""
     assets: list[str] = []
+    seen: set[str] = set()
     for name, _sid, qualifier in iter_account_records(details, rule=rule):
-        _extend_unique(assets, [format_account_display(name, qualifier)])
+        _extend_unique(assets, [format_account_display(name, qualifier)], seen)
     return assets
 
 
@@ -852,6 +859,7 @@ def _extract_assets_from_attack_graph_edges(
 
     relation_aliases = _relation_aliases_for_vulnerability(vuln_name)
     matches: list[str] = []
+    seen: set[str] = set()
     for edge in attack_graph_edges:
         if not isinstance(edge, dict):
             continue
@@ -860,10 +868,10 @@ def _extract_assets_from_attack_graph_edges(
             continue
         notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
         if is_adcs_relation(relation):
-            _extend_unique(matches, _extract_strings(edge.get("source")))
-            _extend_unique(matches, _extract_strings(edge.get("from")))
+            _extend_unique(matches, _extract_strings(edge.get("source")), seen)
+            _extend_unique(matches, _extract_strings(edge.get("from")), seen)
             adcs_assets = _adcs_template_and_ca_assets(notes)
-            _extend_unique(matches, adcs_assets)
+            _extend_unique(matches, adcs_assets, seen)
             if adcs_assets:
                 continue
             # ADCS edge with no template parsed: fall through to target/to, but
@@ -871,10 +879,10 @@ def _extract_assets_from_attack_graph_edges(
             # The bare domain object is preserved by the filter.
             edge_terminals = _extract_strings(edge.get("target"))
             _extend_unique(edge_terminals, _extract_strings(edge.get("to")))
-            _extend_unique(matches, _drop_direct_domain_breaker_assets(edge_terminals))
+            _extend_unique(matches, _drop_direct_domain_breaker_assets(edge_terminals), seen)
             continue
-        _extend_unique(matches, _extract_strings(edge.get("target")))
-        _extend_unique(matches, _extract_strings(edge.get("to")))
+        _extend_unique(matches, _extract_strings(edge.get("target")), seen)
+        _extend_unique(matches, _extract_strings(edge.get("to")), seen)
 
     _extend_unique(target, matches)
 
@@ -1100,6 +1108,7 @@ def _extract_assets_from_attack_paths(
         return
 
     matches: list[str] = []
+    seen: set[str] = set()
     for path in attack_paths:
         if not isinstance(path, dict) or not _path_matches_vulnerability(
             path, vuln_name
@@ -1120,7 +1129,7 @@ def _extract_assets_from_attack_paths(
                 )
 
         if matched_step_assets:
-            _extend_unique(matches, matched_step_assets)
+            _extend_unique(matches, matched_step_assets, seen)
             continue
 
         # The path-level target fallback is the terminal; drop it when it is a
@@ -1128,6 +1137,7 @@ def _extract_assets_from_attack_paths(
         _extend_unique(
             matches,
             _drop_direct_domain_breaker_assets(_extract_strings(path.get("target"))),
+            seen,
         )
 
     _extend_unique(target, matches)
@@ -1255,12 +1265,13 @@ def _read_set_assets(details: Mapping[str, Any]) -> list[str]:
     if not isinstance(raw, list):
         return []
     out: list[str] = []
+    seen: set[str] = set()
     for entry in raw:
         if not isinstance(entry, Mapping):
             continue
         label = str(entry.get("label") or entry.get("sid") or "").strip()
         if label:
-            _extend_unique(out, [label])
+            _extend_unique(out, [label], seen)
     return out
 
 
@@ -1306,6 +1317,7 @@ def _flat_assets_from_structured_entities(vuln_data: Any) -> list[str]:
         "artifact": "Artifact: ",
     }
     out: list[str] = []
+    seen: set[str] = set()
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -1318,11 +1330,11 @@ def _flat_assets_from_structured_entities(vuln_data: Any) -> list[str]:
             # Re-prefix using the stable identifier (the bare template/CA name),
             # not the host-style display, so classification stays correct.
             name = str(entry.get("identifier") or display).strip()
-            _extend_unique(out, [f"{prefix}{name}"])
+            _extend_unique(out, [f"{prefix}{name}"], seen)
         elif asset_type == "credential":
-            _extend_unique(out, [f"Password: {client_secret_display()}"])
+            _extend_unique(out, [f"Password: {client_secret_display()}"], seen)
         else:
-            _extend_unique(out, [display])
+            _extend_unique(out, [display], seen)
     return out
 
 
@@ -2579,9 +2591,10 @@ def _wordlists_from_attempts(details: Mapping[str, Any]) -> tuple[str, list[str]
 
     Roasting steps record every cracking pass under
     ``details.attempts = [{"wordlist": ..., "status": ..., "at": ...}, ...]``.
-    The cracked wordlist is the one on the last successful attempt; if none
-    succeeded, fall back to the last attempt's wordlist so the report still
-    shows what was tried.
+    The cracked wordlist is the one on the last SUCCESSFUL attempt, and it is
+    empty when none succeeded: what was merely tried is ``wordlists_tried``.
+    It once fell back to the last attempt's wordlist, so a finding whose
+    cracking recovered nothing still read "recovered offline using <wordlist>".
     """
     attempts = details.get("attempts")
     if not isinstance(attempts, list) or not attempts:
@@ -2589,21 +2602,28 @@ def _wordlists_from_attempts(details: Mapping[str, Any]) -> tuple[str, list[str]
 
     tried: list[str] = []
     cracked = ""
-    last_with_wordlist = ""
     for attempt in attempts:
         if not isinstance(attempt, dict):
             continue
         wordlist = str(attempt.get("wordlist") or "").strip()
-        status = str(attempt.get("status") or "").strip().lower()
         if wordlist:
             if wordlist not in tried:
                 tried.append(wordlist)
-            last_with_wordlist = wordlist
-            if status in {"success", "cracked", "ok", "found"}:
+            if attempt_recovered_a_secret(attempt):
                 cracked = wordlist
-    if not cracked:
-        cracked = last_with_wordlist
     return cracked, tried
+
+
+#: Attempt statuses that mean a cracking pass recovered the secret.
+_RECOVERED_ATTEMPT_STATUSES = frozenset({"success", "cracked", "ok", "found"})
+
+
+def attempt_recovered_a_secret(attempt: Any) -> bool:
+    """Whether one recorded cracking attempt recovered the secret."""
+    return (
+        isinstance(attempt, Mapping)
+        and str(attempt.get("status") or "").strip().lower() in _RECOVERED_ATTEMPT_STATUSES
+    )
 
 
 def extract_affected_notes(finding_key: str, details: Any) -> dict[str, Any]:

@@ -25,18 +25,28 @@ from urllib.parse import urlparse
 import site
 import sys
 import traceback
-import uuid
 
 import certifi
 import requests
-import sentry_sdk
+
+try:  # optional observability dependency: absent in the worker/backend venvs
+    import sentry_sdk
+except ImportError:  # pragma: no cover - exercised by a hidden-module test
+    sentry_sdk = None  # type: ignore[assignment]
 
 from .ssl_certificates import configure_ssl_certificates_for_requests
 from adscan_core.offline import offline_mode_enabled, telemetry_disabled_by_environment
-from adscan_core.partner_tag_format import (
-    PARTNER_TAG_FORMAT_HINT as _PARTNER_TAG_FORMAT_HINT,
-    PARTNER_TAG_PATTERN as _PARTNER_TAG_FORMAT_PATTERN,
-    validate_partner_tag as _validate_partner_tag_format,
+from adscan_core.licence_telemetry import (
+    licence_group as _licence_group,
+    licence_telemetry_fields as _licence_telemetry_fields,
+)
+from adscan_core.telemetry_identity import (
+    ROTATION_EVENT as _IDENTITY_ROTATION_EVENT,
+    ROTATION_REASONS as _IDENTITY_ROTATION_REASONS,
+    current_installation_identity as _current_installation_identity,
+    is_valid_installation_id as _is_valid_installation_id,
+    is_valid_legacy_id as _is_valid_legacy_id,
+    mark_rotation_announced as _mark_rotation_announced,
 )
 from adscan_core.outbound_links import ADSCAN_SITE_HOST
 from adscan_core.lab_context import (
@@ -59,6 +69,7 @@ from adscan_core.sensitive import (
     MARKER_CHARS,
     PASSTHROUGH_MARKERS,
     SENSITIVE_MARKERS,
+    WELL_KNOWN_PRINCIPAL_NAMES,
     strip_sensitive_markers,
 )
 from adscan_core.path_utils import (
@@ -181,91 +192,8 @@ _PASSTHROUGH_MARKERS = PASSTHROUGH_MARKERS["passthrough"]
 # - We avoid preserving any value that contains a domain prefix/suffix (DOMAIN\\user, user@domain)
 #   because that would leak org identifiers. In those contexts, the domain/user parts are
 #   typically sanitized independently by dedicated patterns.
-_WELL_KNOWN_PRINCIPALS_PASSTHROUGH: frozenset[str] = frozenset(
-    {
-        # Built-in users (commonly referenced across tool outputs)
-        "administrator",
-        "guest",
-        "krbtgt",
-        # Spanish built-in user names
-        "administrador",
-        "invitado",
-        # Common well-known groups
-        "domain admins",
-        "enterprise admins",
-        "schema admins",
-        "administrators",
-        "remote management users",
-        "remote desktop users",
-        "account operators",
-        "backup operators",
-        "server operators",
-        "print operators",
-        "dnsadmins",
-        "cert publishers",
-        "protected users",
-        "authenticated users",
-        "everyone",
-        # NT AUTHORITY well-known security principals (public SIDs, not org-specific).
-        # Both the bare label and the "NT AUTHORITY\<name>" qualified form resolve
-        # via _is_well_known_principal (whole-string) and _preserve_well_known_qualified
-        # (split on \\). S-1-5-18 / -19 / -20 / -11 / -9 / -2 / -7.
-        "system",
-        "nt authority\\system",
-        "local service",
-        "nt authority\\local service",
-        "network service",
-        "nt authority\\network service",
-        "authenticated users",
-        "nt authority\\authenticated users",
-        "enterprise domain controllers",
-        "nt authority\\enterprise domain controllers",
-        "anonymous logon",
-        "nt authority\\anonymous logon",
-        # Additional public BUILTIN groups
-        "users",
-        "guests",
-        "replicator",
-        "performance log users",
-        "performance monitor users",
-        "distributed com users",
-        "network configuration operators",
-        "iis_iusrs",
-        "event log readers",
-        "access control assistance operators",
-        "rds remote access servers",
-        "rds endpoint servers",
-        "rds management servers",
-        "hyper-v administrators",
-        "key admins",
-        "enterprise key admins",
-        "cloneable domain controllers",
-        "dnsupdateproxy",
-        "group policy creator owners",
-        "read-only domain controllers",
-        "enterprise read-only domain controllers",
-        "domain controllers",
-        "domain computers",
-        "domain users",
-        "domain guests",
-        # Spanish group name equivalents (best-effort; environments may differ)
-        "administradores del dominio",
-        "usuarios del dominio",
-        "invitados del dominio",
-        "administradores de empresa",
-        "administradores de esquema",
-        "administradores",
-        "usuarios de administracion remota",
-        "usuarios de administracion",
-        "usuarios de escritorio remoto",
-        "operadores de cuenta",
-        "operadores de copia de seguridad",
-        "operadores de servidor",
-        "operadores de impresion",
-        "usuarios autenticados",
-        "todos",
-    }
-)
+# The set lives in adscan_core.sensitive (the marker SSOT routes a label by it).
+_WELL_KNOWN_PRINCIPALS_PASSTHROUGH: frozenset[str] = WELL_KNOWN_PRINCIPAL_NAMES
 
 
 def _preserve_well_known_principals_enabled() -> bool:
@@ -655,6 +583,9 @@ def init_sentry():
     Sentry project, following Sentry's official best practice recommendations.
     """
     # Get single Sentry proxy URL (Sentry recommends single project + environment tags)
+    if sentry_sdk is None:
+        print_info_debug("sentry_sdk not installed; error tracking disabled")
+        return
     n8n_sentry_proxy = get_sentry_proxy_url()
     if not n8n_sentry_proxy:
         print_error_debug("Sentry proxy URL not configured")
@@ -878,6 +809,7 @@ def _send_telemetry_state_event(
         if value is None or value == "":
             continue
         props["$set"][key] = value
+    props.update(installation_identity_fields())
 
     payload = {"event": event, "distinct_id": TELEMETRY_ID, "properties": props}
     try:
@@ -1392,197 +1324,111 @@ def collect_system_context() -> dict[str, Any]:
     return context
 
 
-# Determine distinct id (hashed for anonymity, persisted)
-_telemetry_id_override = os.getenv("ADSCAN_TELEMETRY_ID", "").strip()
-if _telemetry_id_override:
-    # Container-mode wrappers can pass a stable host-derived id to avoid using
-    # the container's /etc/machine-id or a non-persistent in-container ADSCAN_HOME.
-    TELEMETRY_ID = _telemetry_id_override
-else:
-    id_dir = get_adscan_home()
-    id_file = id_dir / "id"
-    if id_file.exists():
-        TELEMETRY_ID = id_file.read_text(encoding="utf-8").strip()
-    else:
-        machine_id_file = Path("/etc/machine-id")
-        if machine_id_file.exists():
-            raw_id = machine_id_file.read_text(encoding="utf-8").strip()
-        else:
-            raw_id = uuid.uuid4().hex[:12]
-        TELEMETRY_ID = hashlib.sha256(raw_id.encode()).hexdigest()[:12]
-        id_dir.mkdir(parents=True, exist_ok=True)
-        id_file.write_text(TELEMETRY_ID, encoding="utf-8")
+# Determine distinct id: a random installation id, minted once and persisted
+# under the state dir, with clone detection. The model, the migration from the
+# 14.0.x machine-id hash and why the client never aliases live in
+# ``adscan_core.telemetry_identity``. In the container the launcher forwards the
+# host's identity (``ADSCAN_TELEMETRY_ID`` and friends) and nothing is written.
+_INSTALLATION_IDENTITY = _current_installation_identity()
+TELEMETRY_ID = _INSTALLATION_IDENTITY.installation_id
+_identity_announce_lock = threading.Lock()
 
-# Partner tag — identifies which partner/beta tester this install belongs to
-# (e.g. "acme-mssp"). Used as a telemetry dimension and as the PRO entitlement
-# marker for the shared registry image.
+
+def installation_identity_fields() -> dict[str, Any]:
+    """Installation-level properties attached to every event, AFTER sanitization.
+
+    ``installation_id`` (also the ``distinct_id``), the keyed ``machine_hash``
+    (how many installations share one machine image) and ``virtualization``.
+    Never the raw machine id, a MAC or a host name. Values we minted or
+    computed, in validated shapes, so a pseudonymizing pass must not touch them.
+    """
+
+    identity = _INSTALLATION_IDENTITY
+    fields: dict[str, Any] = {"installation_id": identity.installation_id}
+    if identity.machine_hash:
+        fields["machine_hash"] = identity.machine_hash
+    if identity.virtualization:
+        fields["virtualization"] = identity.virtualization
+    if not identity.persisted:
+        fields["installation_id_ephemeral"] = True
+    return fields
+
+
+def installation_identity_session_fields() -> dict[str, Any]:
+    """Identity fields for a session recording (the reviewer DB, not PostHog)."""
+
+    identity = _INSTALLATION_IDENTITY
+    fields: dict[str, Any] = {"installation_id": identity.installation_id}
+    if identity.legacy_telemetry_id:
+        fields["legacy_telemetry_id"] = identity.legacy_telemetry_id
+    if identity.virtualization:
+        fields["virtualization"] = identity.virtualization
+    return fields
+
+
+def _maybe_announce_identity_rotation() -> None:
+    """Send the pending ``installation_identity_rotated`` event once.
+
+    Called from :func:`capture` once telemetry is known to be flowing, so an
+    opted-out installation never announces anything and the event rides the
+    same gates as every other. The persisted pending flag is cleared once the
+    event is queued (the dispatcher persists and retries it).
+    """
+
+    global _INSTALLATION_IDENTITY
+    with _identity_announce_lock:
+        identity = _INSTALLATION_IDENTITY
+        pending = identity.pending
+        if pending is None:
+            return
+        _INSTALLATION_IDENTITY = _mark_rotation_announced(identity)
+    trusted: dict[str, Any] = {
+        "previous_installation_id": pending.previous_installation_id,
+        "rotation_reason": pending.reason,
+    }
+    if pending.legacy_telemetry_id:
+        trusted["legacy_telemetry_id"] = pending.legacy_telemetry_id
+    capture(_IDENTITY_ROTATION_EVENT, None, _trusted_identity_props=trusted)
+
+
+def _trusted_identity_props_valid(trusted: dict[str, Any]) -> bool:
+    """Shape-check the post-sanitization identity props (fail closed)."""
+
+    previous = trusted.get("previous_installation_id")
+    if not (_is_valid_installation_id(previous) or _is_valid_legacy_id(previous)):
+        return False
+    if trusted.get("rotation_reason") not in _IDENTITY_ROTATION_REASONS:
+        return False
+    legacy = trusted.get("legacy_telemetry_id")
+    return legacy is None or _is_valid_legacy_id(legacy)
+
+
+# Telemetry identity of a PRO install = its licence (founder decision
+# 2026-11-12). The user never provides an identity any more: the first-run
+# partner-tag prompt, the requirement in `adscan ci`, the `--partner-tag` flag,
+# the `ADSCAN_PARTNER_TAG` variable and the `<state>/partner.json` file are
+# retired. When a verified PRO licence is installed, every event and session
+# recording carries `licence_grant_id`, `licence_installation_id` and the
+# licence's own `partner_tag` (our label for that licence), all read from the
+# signed document by `adscan_core.licence_telemetry`; never a name or email.
+# Without a licence (LITE, legacy PRO) none of them is sent and the installation
+# id (TELEMETRY_ID) is the only identity. Licensed or not, every event also
+# carries installation_id, machine_hash and virtualization.
 #
-# Resolution order (single source of truth — `resolve_partner_tag`):
-#   1. env var ADSCAN_PARTNER_TAG (forwarded into the container by the host
-#      launcher; also the override for CI / power-users / legacy baked images
-#      that still carry `ENV ADSCAN_PARTNER_TAG`)
-#   2. persisted file in the STATE dir (`get_adscan_state_dir()/partner.json`,
-#      field "partner_tag") — written once at runtime by the PRO start gate and
-#      surviving across `docker run --rm` because the state dir is bind-mounted
-#   3. "" when neither is present
-#
-# This mirrors the TELEMETRY_ID pattern above (env override → volume file → fall
-# back). The file MUST live under the STATE dir (`~/.adscan/state` ↔
-# `/opt/adscan/state`), which the launcher bind-mounts — NOT the home root
-# (`/opt/adscan`), which is only mounted via specific subdirs. Writing it to the
-# unmounted home root meant `docker run --rm` discarded it on every launch and
-# re-prompted the operator for the partner tag on every `adscan start`. A
-# read-side migration heals already-activated installs whose legacy file still
-# sits in the home root on a persistent (non-`--rm`) home.
-_PARTNER_TAG_FILENAME = "partner.json"
-_PARTNER_TAG_FIELD = "partner_tag"
-
-# Format contract for a partner tag: starts with a lowercase letter or digit,
-# then 1-40 more of lowercase letters, digits, or hyphens (2-41 chars total).
-# Deliberately strict: no uppercase, no spaces, no underscores, no leading
-# hyphen — this is a URL/telemetry-safe slug like "acme-mssp".
-#
-# It lives HERE (adscan_core) rather than in the container-side start gate
-# because both sides validate against it: the host launcher's `--partner-tag`
-# flag and the in-container PRO gate. One pattern means a tag the launcher
-# accepts is never rejected by the gate that consumes it.
-# The pattern and the hint are defined once in adscan_core.partner_tag_format
-# (dependency-free, so the PRO licence model and the licence server share it).
-_PARTNER_TAG_PATTERN = _PARTNER_TAG_FORMAT_PATTERN
-
-#: Human-readable description of the format, for prompts and error messages.
-PARTNER_TAG_FORMAT_HINT = _PARTNER_TAG_FORMAT_HINT
-
-#: The refusal message shown when ADscan PRO is started without a resolvable
-#: partner tag. It lives HERE (adscan_core) so the host launcher's fast
-#: pre-container gate and the in-container start gate print the SAME wording —
-#: the recovery it names (``--partner-tag`` and ``ADSCAN_PARTNER_TAG``) must
-#: only ever be a route that actually works from the host.
-PARTNER_TAG_REQUIRED_MESSAGE = (
-    "ADscan PRO requires a partner tag. Re-run with --partner-tag and "
-    "the tag from your onboarding email, for example: "
-    "adscan ci --partner-tag acme-mssp. ADscan saves it on this "
-    "machine, so you only pass it once. Exporting ADSCAN_PARTNER_TAG "
-    "before the run works too."
-)
+# The retired inputs are ignored quietly, so an old script, environment or
+# appliance `.env` keeps working; nothing reads them.
+RETIRED_PARTNER_TAG_ENV = "ADSCAN_PARTNER_TAG"
 
 
-def validate_partner_tag(tag: object) -> bool:
-    """Return True when ``tag`` matches the partner-tag format contract.
+def licence_identity_fields() -> dict[str, str]:
+    """Opaque licence ids for telemetry, or ``{}`` without a verified licence.
 
-    Accepts e.g. ``acme-mssp``; rejects empty strings, uppercase, whitespace,
-    odd characters, and tags longer than 41 characters. Pure function — safe to
-    call from the host launcher and from the container runtime.
-
-    Args:
-        tag: Candidate partner tag (any type; non-strings are rejected).
-
-    Returns:
-        True if the tag is well-formed, False otherwise.
+    One ``stat`` per call (the parsed licence is cached by size and mtime), so
+    every sender can call it per payload and pick up a licence activated
+    mid-process.
     """
-    return _validate_partner_tag_format(tag)
+    return _licence_telemetry_fields()
 
-
-def _extract_partner_tag(partner_file: Path) -> str:
-    """Read and parse a single ``partner.json`` file, or "" on any failure."""
-    try:
-        if not partner_file.exists():
-            return ""
-        data = json.loads(partner_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    return str(data.get(_PARTNER_TAG_FIELD, "") or "").strip()
-
-
-def _read_persisted_partner_tag() -> str:
-    """Return the partner tag persisted in the state dir, or "" when absent.
-
-    Reads ``get_adscan_state_dir()/partner.json`` and extracts the
-    ``partner_tag`` field. Any read/parse failure is swallowed and treated as
-    "no persisted tag" — resolution then falls through to the empty default.
-
-    Migration: if the state-dir file is absent but a legacy
-    ``get_adscan_home()/partner.json`` exists (an install activated before the
-    file moved out of the unmounted home root), read the legacy value and
-    re-persist it under the state dir so the install self-heals. Best-effort —
-    a failed migration write never raises.
-    """
-    state_tag = _extract_partner_tag(get_adscan_state_dir() / _PARTNER_TAG_FILENAME)
-    if state_tag:
-        return state_tag
-    legacy_tag = _extract_partner_tag(get_adscan_home() / _PARTNER_TAG_FILENAME)
-    if legacy_tag:
-        try:
-            persist_partner_tag(legacy_tag)
-        except OSError:
-            pass
-        return legacy_tag
-    return ""
-
-
-def resolve_partner_tag() -> str:
-    """Resolve the partner tag: signed PRO licence → env override → volume file → "".
-
-    A PRO licence that verifies carries the partner tag inside its signed
-    payload, so it is identity rather than a typed claim and wins over the
-    other two (``adscan_core.pro_license.identity``; one ``stat`` per call).
-
-    Returns:
-        The resolved partner tag, or an empty string when no licence carries
-        one and neither the ``ADSCAN_PARTNER_TAG`` env var nor a persisted
-        volume file is present.
-    """
-    try:
-        from adscan_core.pro_license.identity import installed_licence_identity
-
-        licensed = installed_licence_identity()
-    except Exception:  # noqa: BLE001 - identity lookup never breaks telemetry
-        licensed = None
-    if licensed is not None and licensed.partner_tag:
-        return licensed.partner_tag
-    env_tag = os.getenv("ADSCAN_PARTNER_TAG", "").strip()
-    if env_tag:
-        return env_tag
-    return _read_persisted_partner_tag()
-
-
-def persist_partner_tag(partner_tag: str) -> None:
-    """Persist the partner tag to the state dir so it survives across containers.
-
-    Writes ``get_adscan_state_dir()/partner.json`` with the ``partner_tag``
-    field. The state dir is bind-mounted by the launcher, so the file survives
-    ``docker run --rm`` (the home root is not mounted directly). The caller is
-    responsible for validating the tag format before calling this.
-
-    Args:
-        partner_tag: The partner tag to persist (already validated).
-    """
-    partner_dir = get_adscan_state_dir()
-    partner_dir.mkdir(parents=True, exist_ok=True)
-    partner_file = partner_dir / _PARTNER_TAG_FILENAME
-    partner_file.write_text(
-        json.dumps({_PARTNER_TAG_FIELD: partner_tag.strip()}),
-        encoding="utf-8",
-    )
-
-
-# Resolved at import for the telemetry dimension. The PRO start gate may persist
-# a tag and then refresh this via `refresh_partner_tag()` within the same
-# process so the first session after onboarding is attributed correctly.
-PARTNER_TAG: str = resolve_partner_tag()
-
-
-def refresh_partner_tag() -> str:
-    """Re-resolve PARTNER_TAG (e.g. after the start gate persists it).
-
-    Returns:
-        The freshly resolved partner tag.
-    """
-    global PARTNER_TAG  # noqa: PLW0603 — module-level telemetry dimension
-    PARTNER_TAG = resolve_partner_tag()
-    return PARTNER_TAG
 
 _SANITIZATION_KEY: Optional[bytes] = None
 _SANITIZED_VALUES: set[str] = set()
@@ -2690,6 +2536,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "asyncio_cross_loop_escape",
         "asreproast_started",
         "asreproast_users_found",
+        "asset_scope_backstop_hit",
         "attack_path_compute_performance",
         "attack_path_discovery_started",
         "attack_step_unexplained_failure",
@@ -2754,6 +2601,8 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "first_cred_found",
         "first_install",
         "forcechangepassword_computer_hard_blocked",
+        # graph_live_reader.py: a live graph held for another workspace dir.
+        "graph_reader_workspace_mismatch",
         "hash_cracked",
         "hash_not_cracked",
         "help_requested",
@@ -2762,6 +2611,7 @@ _ALLOWED_EVENT_NAMES: frozenset[str] = frozenset(
         "install_after_fail",
         "install_blocked_low_disk",
         "install_started",
+        "installation_identity_rotated",
         "installation_mode_selected",
         "kerberoast_no_users_found",
         "kerberoast_started",
@@ -2881,7 +2731,12 @@ def _coerce_event_name(event: str) -> str:
     return event if event in _ALLOWED_EVENT_NAMES else _TELEMETRY_UNLISTED_EVENT_BUCKET
 
 
-def capture(event: str, properties: Optional[dict[str, Any]] = None):
+def capture(
+    event: str,
+    properties: Optional[dict[str, Any]] = None,
+    *,
+    _trusted_identity_props: Optional[dict[str, Any]] = None,
+):
     """Capture a telemetry event via n8n proxy if enabled.
 
     Automatically routes events to appropriate PostHog project based on environment:
@@ -2890,12 +2745,19 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
     - "prod": Production project
 
     Also adds environment property to all events for additional filtering.
+    ``_trusted_identity_props`` is private to the identity rotation event: ids
+    this module minted, shape-checked and attached after sanitization.
     """
     if _telemetry_client and (
         _is_telemetry_enabled()
         or (event.startswith("telemetry_") and not offline_mode_enabled())
     ):
         try:
+            if event != _IDENTITY_ROTATION_EVENT and _is_telemetry_enabled():
+                try:
+                    _maybe_announce_identity_rotation()
+                except Exception:  # noqa: BLE001 - never block the real event
+                    pass
             # Get appropriate proxy URL for current environment
             proxy_url = _get_posthog_proxy_url()
             if not proxy_url:
@@ -2928,8 +2790,7 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
                     continue
                 props[key] = value
             props["environment"] = current_environment
-            if PARTNER_TAG:
-                props["partner_tag"] = PARTNER_TAG
+            licence_fields = licence_identity_fields()
 
             # Add environment to person properties (for user-level filtering).
             # Use a single, consistent key name `downloaded_source` so dashboards
@@ -2942,8 +2803,6 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
                 "downloaded_source": DOWNLOAD_SOURCE,
                 "environment": current_environment,
             }
-            if PARTNER_TAG:
-                default_set["partner_tag"] = PARTNER_TAG
             for key, value in version_fields.items():
                 if key == "adscan_version":
                     continue
@@ -2964,6 +2823,29 @@ def capture(event: str, properties: Optional[dict[str, Any]] = None):
                 pass
             merged_set = _sanitize_telemetry_properties({**default_set, **user_set})
             props = _sanitize_telemetry_properties(props)
+            # Licence identity (event AND person property) plus the licence
+            # group. Attached AFTER sanitization on purpose: these are values
+            # we issued and signed (validated shapes, no client data), and the
+            # group key must match the licence server's lifecycle events byte
+            # for byte, which a pseudonymizing pass could break.
+            if licence_fields:
+                props.update(licence_fields)
+                merged_set.update(licence_fields)
+                props["$groups"] = _licence_group(licence_fields)
+            # Installation identity, attached after sanitization for the same
+            # reason: values we minted or keyed-hashed, in validated shapes.
+            identity_fields = installation_identity_fields()
+            props.update(identity_fields)
+            merged_set.update(identity_fields)
+            if _trusted_identity_props and event == _IDENTITY_ROTATION_EVENT:
+                if not _trusted_identity_props_valid(_trusted_identity_props):
+                    return
+                props.update(_trusted_identity_props)
+                legacy_id = _trusted_identity_props.get("legacy_telemetry_id")
+                if legacy_id:
+                    # Set once on the new person: a later rotation must never
+                    # overwrite which 14.0.x id this installation came from.
+                    props["$set_once"] = {"legacy_telemetry_id": legacy_id}
             props["$set"] = merged_set
 
             # Fail-closed event-NAME guard: the name is the only payload field
@@ -8258,8 +8140,8 @@ def _send_session_to_vercel(
             "user_id_hash": TELEMETRY_ID,
             "html": html_content,
         }
-        if PARTNER_TAG:
-            payload["partner_tag"] = PARTNER_TAG
+        payload.update(licence_identity_fields())
+        payload.update(installation_identity_session_fields())
         payload.update(_vercel_version_field())
         # _vercel_metadata_fields() already applies the privacy policy for
         # lab/session context. Do not re-sanitize here or we will destroy the
@@ -9008,6 +8890,7 @@ def identify_user(properties: dict):
             continue
         properties.setdefault(key, value)
     properties = _sanitize_telemetry_properties(properties)
+    properties.update(installation_identity_fields())
 
     if _telemetry_client:
         try:
@@ -9101,7 +8984,7 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
     except Exception:  # noqa: BLE001 - never break error reporting
         pass
     # Send exception to Sentry (via n8n proxy using custom transport)
-    if _is_telemetry_enabled():
+    if sentry_sdk is not None and _is_telemetry_enabled():
         try:
             sentry_sdk.capture_exception(e)
         except (ValueError, TypeError, OSError) as exc:
@@ -9162,6 +9045,7 @@ def capture_exception(e: Exception, properties: Optional[dict[str, Any]] = None)
             if properties:
                 capture_props.update(properties)
             capture_props = _sanitize_telemetry_properties(capture_props)
+            capture_props.update(installation_identity_fields())
 
             # Send exception as a special event to PostHog via n8n. The
             # payload above is fully sanitized on THIS thread; hand it to the

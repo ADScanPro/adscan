@@ -39,23 +39,23 @@ Design notes:
       that lights up at Contoso scale.
 
 Complexity:
-    The computation is driven per SOURCE, which is what keeps it cheap on a
-    directory graph: the number of leaf originators is tiny (single/low digits
-    even at Contoso scale, where ~34k nodes / ~276k edges yield only ~11 sources
-    and a ~4.8k-node terminal-reachable set). For each source we forward-flood
-    the reachable subgraph once (``O(E_r)`` over the ``E_r`` reachable edges) to
-    learn the small set of edges it can reach, then test each such edge's
-    criticality with a scoped forward BFS that skips it (a terminal is
-    unreachable afterwards iff the edge was on ALL of that source's paths to
-    ``S``). This is ``O(sources * reachable_edges * E_r)`` worst case but in
-    practice low-seconds at Contoso, versus ~100s for the naive "remove each of
-    ~50k whole-graph candidate edges and re-flood" approach. It is exact:
-    validated against the brute-force reflood oracle over thousands of random
-    cyclic graphs.
+    Both choke views and the exposure-source anchor read ONE dominator tree
+    (Lengauer-Tarjan, ``O(E log V)``) of the reachable subgraph, reversed,
+    rooted at a virtual node joined to every terminal, with each candidate edge
+    split into its own node. An object (node or edge) lies on every route from a
+    source to ``S`` exactly when it dominates that source, so a cardinality is a
+    subtree count. The earlier edge view re-flooded the graph once per source and
+    per reachable edge (``O(sources * reachable_edges * E_r)``); a dense directory
+    has tens of thousands of sources, and at a partner-sized directory (58k
+    objects, 900k relationships) it ran for over two hours. That implementation is
+    the test-only oracle (``tests/unit/services/_chokepoint_reference.py``) and
+    this one returns the identical result.
 """
 
 from __future__ import annotations
 
+from array import array
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,6 +82,14 @@ _PRINCIPAL_KINDS: frozenset[str] = frozenset({"User", "Computer", "Group"})
 #: work with, and its two booleans say honestly whether each sub-block came out
 #: non-empty.
 PATH_DERIVED_BLOCKS_KEY = _PATH_DERIVED_BLOCKS_KEY
+
+#: Set (``True``) on a stamped block whose choke-point analysis was stopped, by
+#: the memory guard or by the operator, before it finished. Such a block carries
+#: no cardinality, no ranking and no KPI card (a partial count is never shown as
+#: complete), and its gap is declared in the domain's ``resource_coverage`` or
+#: ``operator_stop_coverage`` block. Absent on a completed block, which keeps a
+#: completed block byte-identical to what it always was.
+CARDINALITY_STOPPED_KEY = "cardinality_stopped"
 
 
 def chokepoint_block_is_derived(block: Any) -> bool:
@@ -377,8 +385,17 @@ def _node_is_standard_user(node: dict[str, Any]) -> bool:
     named after the trusted domain (``SEVENKINGDOMS$`` made "11 of 11" sit next
     to a population of 10), and a managed service account, whose password is
     machine-managed and not exposed by anything this ratio measures.
+
+    And it drops a DELETED account, as that SSOT does (``is_active``). A scan
+    that reaches Domain Admin reads the directory's Deleted Objects container,
+    and a deleted account keeps its ``userAccountControl``, so it reads as
+    enabled. Counted here, a client whose recycle bin holds a thousand deleted
+    users would be told a thousand more ordinary accounts hold a path, beside a
+    population that never included them ("11 of 11" over a population of 9).
     """
     if str(node.get("kind") or "").strip() != "User":
+        return False
+    if is_tombstoned(node):
         return False
     if _node_is_disabled(node):
         return False
@@ -516,90 +533,390 @@ def edge_key(from_id: str, relation: str, to_id: str) -> str:
     return f"{from_id}|{relation}|{to_id}"
 
 
-def _build_forward_adjacency(
-    graph: dict[str, Any],
-    *,
-    nodes_map: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, set[str]]:
-    """Build the forward adjacency ``from -> {to, ...}`` from the graph edges.
+#: Units of work (flow-graph nodes or edges visited) between two calls of the
+#: ``checkpoint`` a caller passes to the choke computation. The seam uses it to
+#: tick the memory guard and to honour an operator stop; one call costs a few
+#: microseconds, a unit well under one, so this keeps the overhead negligible
+#: while a stop still lands within a fraction of a second.
+CHECKPOINT_EVERY = 65_536
 
-    Only TRAVERSABLE compromise edges enter the adjacency — the SAME gate the DFS
-    uses (:func:`attack_graph_core.is_traversable_attack_edge`), so the forward
-    flood never crosses the non-compromise share-access edges that inflate reach.
+#: Index of the virtual root of the dominator flow graph (joined to every terminal).
+_ROOT = 0
 
-    Args:
-        graph: The attack graph dict.
-        nodes_map: The ``id -> node`` map for the class-aware ``WriteSPN``
-            exclusion. When ``None`` it is built from ``graph``.
 
-    Returns:
-        A mapping from a node id to the set of node ids it has an edge INTO.
+class _ChokeIndex:
+    """The reachable subgraph both choke views and the source count share.
+
+    Built ONCE per summary from a single pass over the edges through the shared
+    admission gate, instead of once per view: the edge choke, the node choke and
+    :func:`exposure_source_count` all read the same reverse adjacency and the same
+    ``Reach^-1(S)``.
+
+    Attributes:
+        nodes: ``id -> node`` map.
+        terminals: The value-terminal ids.
+        reverse: Reverse adjacency ``to -> {from, ...}`` over traversable edges.
+        reach: ``Reach^-1(S)`` (terminals included).
     """
-    forward: dict[str, set[str]] = {}
-    edges = graph.get("edges")
-    if not isinstance(edges, list):
-        return forward
-    resolved_nodes = nodes_map if isinstance(nodes_map, dict) else _iter_nodes(graph)
+
+    __slots__ = ("nodes", "terminals", "reverse", "reach", "graph")
+
+    def __init__(self, graph: dict[str, Any], terminals: set[str]) -> None:
+        self.graph = graph
+        self.terminals = terminals
+        self.nodes = _iter_nodes(graph)
+        self.reverse = _build_reverse_adjacency(graph, nodes_map=self.nodes)
+        self.reach = _reverse_reach(self.reverse, terminals)
+
+    def principal_sources(self) -> set[str]:
+        """Enabled principals that reach ``S`` (terminals excluded)."""
+        nodes = self.nodes
+        terminals = self.terminals
+        return {
+            node_id
+            for node_id in self.reach
+            if node_id not in terminals
+            and isinstance(nodes.get(node_id), dict)
+            and _node_is_enabled_principal(nodes[node_id])
+        }
+
+    def leaf_sources(self) -> set[str]:
+        """Leaf originators: reachable non-terminals with no inbound reach edge."""
+        reach = self.reach
+        reverse = self.reverse
+        terminals = self.terminals
+        return {
+            node_id
+            for node_id in reach
+            if node_id not in terminals and not (reverse.get(node_id, set()) & reach)
+        }
+
+
+def _first_traversable_relations(
+    index: _ChokeIndex, pairs: set[tuple[str, str]]
+) -> dict[tuple[str, str], str]:
+    """The first-seen traversable relation of each ``(from, to)`` pair asked for.
+
+    The stable edge key carries the relation of the FIRST traversable edge of a
+    parallel-edge pair, in edge-list order. Only the pairs that turned out to be
+    choke edges need a key, so the edge list is scanned once and the admission
+    gate is evaluated only for an edge whose pair is one of them.
+    """
+    edges = index.graph.get("edges")
+    found: dict[tuple[str, str], str] = {}
+    if not pairs or not isinstance(edges, list):
+        return found
+    nodes = index.nodes
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        if not is_traversable_attack_edge(edge, resolved_nodes):
-            continue
         from_id = str(edge.get("from") or "").strip()
         to_id = str(edge.get("to") or "").strip()
-        if not from_id or not to_id:
+        pair = (from_id, to_id)
+        if pair not in pairs or pair in found:
             continue
-        forward.setdefault(from_id, set()).add(to_id)
-    return forward
+        if not is_traversable_attack_edge(edge, nodes):
+            continue
+        found[pair] = str(edge.get("relation") or "").strip()
+        if len(found) == len(pairs):
+            break
+    return found
 
 
-def _source_still_reaches_terminals(
-    source: str,
-    forward: dict[str, set[str]],
-    reach: set[str],
-    terminals: set[str],
-    *,
-    excluded_edge: tuple[str, str] | None,
-) -> bool:
-    """Return ``True`` if ``source`` still reaches any terminal with ``e`` cut.
+def _csr(
+    n: int, src: "array[int]", dst: "array[int]"
+) -> tuple["array[int]", "array[int]"]:
+    """Compressed adjacency (``offsets``, ``targets``) of ``n`` nodes from edge arrays."""
+    offsets = array("l", bytes(8 * (n + 1)))
+    for s in src:
+        offsets[s + 1] += 1
+    running = 0
+    for i in range(n + 1):
+        running += offsets[i]
+        offsets[i] = running
+    targets = array("l", bytes(8 * len(src)))
+    cursor = array("l", offsets)
+    for s, d in zip(src, dst):
+        pos = cursor[s]
+        targets[pos] = d
+        cursor[s] = pos + 1
+    return offsets, targets
 
-    A forward BFS from ``source`` restricted to the reachable subgraph
-    (``reach``), skipping the single ``excluded_edge`` if given. Restricting the
-    walk to ``reach`` keeps each BFS cheap because it never wanders into nodes
-    that cannot lead to a terminal anyway.
+
+def _dominator_tree(
+    n: int,
+    succ_off: "array[int]",
+    succ_idx: "array[int]",
+    pred_off: "array[int]",
+    pred_idx: "array[int]",
+    checkpoint: Callable[[int], None] | None,
+) -> tuple["array[int]", "array[int]", "array[int]"]:
+    """Immediate dominators of a flowgraph rooted at :data:`_ROOT` (Lengauer-Tarjan).
+
+    The iterative Lengauer-Tarjan algorithm with path compression (the "simple"
+    variant, ``O(m log n)``), in pure Python over compact integer arrays. The
+    immediate dominator of a node is unique, so the result is the same whatever
+    algorithm computes it; this one is chosen because its bound does not depend
+    on the graph's loop structure (an iterative data-flow formulation can take
+    many passes over a directory graph full of membership cycles).
 
     Args:
-        source: The source node id to flood forward from.
-        forward: The forward adjacency ``from -> {to, ...}``.
-        reach: The set of nodes that can reach the terminal set.
-        terminals: The value-terminal node ids.
-        excluded_edge: An optional ``(u, v)`` edge to treat as removed.
+        n: Number of flow-graph nodes (``0`` is the root).
+        succ_off, succ_idx: Flow-forward adjacency in CSR form.
+        pred_off, pred_idx: Its transpose.
+        checkpoint: Called with a unit count every :data:`CHECKPOINT_EVERY` units.
 
     Returns:
-        ``True`` if a terminal is still reachable from ``source``.
+        ``(vertex, idom, dfn)`` in DFS-preorder numbering: ``vertex[i]`` is the
+        node with preorder number ``i`` (only nodes reachable from the root are
+        numbered), ``idom[i]`` the preorder number of its immediate dominator
+        (``idom[0]`` is ``0``) and ``dfn[node]`` the preorder number of a node
+        (``-1`` when unreachable). An immediate dominator always precedes its
+        node in preorder.
     """
-    if source in terminals:
-        return True
-    seen: set[str] = {source}
-    pending = [source]
-    while pending:
-        current = pending.pop()
-        for nxt in forward.get(current, ()):
-            if excluded_edge is not None and (current, nxt) == excluded_edge:
+    dfn = array("l", [-1]) * n
+    vertex = array("l")
+    parent = array("l")
+
+    # Iterative depth-first search assigning preorder numbers.
+    dfn[_ROOT] = 0
+    vertex.append(_ROOT)
+    parent.append(-1)
+    stack_node = [_ROOT]
+    stack_pos = [succ_off[_ROOT]]
+    visited = 0
+    while stack_node:
+        v = stack_node[-1]
+        p = stack_pos[-1]
+        end = succ_off[v + 1]
+        descended = False
+        while p < end:
+            w = succ_idx[p]
+            p += 1
+            if dfn[w] < 0:
+                dfn[w] = len(vertex)
+                vertex.append(w)
+                parent.append(dfn[v])
+                stack_pos[-1] = p
+                stack_node.append(w)
+                stack_pos.append(succ_off[w])
+                descended = True
+                break
+        if not descended:
+            stack_node.pop()
+            stack_pos.pop()
+        visited += 1
+        if checkpoint is not None and not visited % CHECKPOINT_EVERY:
+            checkpoint(CHECKPOINT_EVERY)
+
+    m = len(vertex)
+    semi = array("l", range(m))
+    label = array("l", range(m))
+    ancestor = array("l", [-1]) * m
+    idom = array("l", bytes(8 * m))
+    bucket_head = array("l", [-1]) * m
+    bucket_next = array("l", [-1]) * m
+    compress_stack: list[int] = []
+
+    def _eval(v: int) -> int:
+        # Lowest-semi label on the forest path above ``v`` (path compression).
+        if ancestor[v] < 0:
+            return v
+        x = v
+        while ancestor[ancestor[x]] >= 0:
+            compress_stack.append(x)
+            x = ancestor[x]
+        while compress_stack:
+            y = compress_stack.pop()
+            a = ancestor[y]
+            if semi[label[a]] < semi[label[y]]:
+                label[y] = label[a]
+            ancestor[y] = ancestor[a]
+        return label[v]
+
+    for w in range(m - 1, 0, -1):
+        node = vertex[w]
+        sw = semi[w]
+        for pos in range(pred_off[node], pred_off[node + 1]):
+            vd = dfn[pred_idx[pos]]
+            if vd < 0:
                 continue
-            if nxt not in reach or nxt in seen:
+            u = _eval(vd)
+            su = semi[u]
+            if su < sw:
+                sw = su
+        semi[w] = sw
+        bucket_next[w] = bucket_head[sw]
+        bucket_head[sw] = w
+        pw = parent[w]
+        ancestor[w] = pw
+        v = bucket_head[pw]
+        bucket_head[pw] = -1
+        while v >= 0:
+            nxt = bucket_next[v]
+            u = _eval(v)
+            idom[v] = u if semi[u] < semi[v] else pw
+            v = nxt
+        if checkpoint is not None and not w % CHECKPOINT_EVERY:
+            checkpoint(CHECKPOINT_EVERY)
+
+    for w in range(1, m):
+        if idom[w] != semi[w]:
+            idom[w] = idom[idom[w]]
+    return vertex, idom, dfn
+
+
+def _subtree_counts(
+    vertex: "array[int]", idom: "array[int]", members: "bytearray"
+) -> "array[int]":
+    """Members in each dominator subtree, indexed by preorder number.
+
+    ``members[node]`` flags the flow-graph nodes to count. An immediate dominator
+    precedes its node in preorder, so one pass from the last preorder number to
+    the first folds every subtree into its parent.
+    """
+    m = len(vertex)
+    counts = array("l", (members[vertex[i]] for i in range(m)))
+    for i in range(m - 1, 0, -1):
+        c = counts[i]
+        if c:
+            counts[idom[i]] += c
+    return counts
+
+
+def _choke_cardinalities(
+    index: _ChokeIndex,
+    *,
+    want_edges: bool,
+    want_nodes: bool,
+    checkpoint: Callable[[int], None] | None = None,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Both choke views from ONE dominator tree of the edge-split reachable graph.
+
+    The flow graph is the reachable subgraph reversed and rooted at a virtual root
+    joined to every terminal, with every candidate edge ``(u, v)`` split into its
+    own node (``v -> e -> u`` in flow direction). In it, a node or an edge-node
+    ``d`` dominates a node ``s`` exactly when every path from ``s`` to the
+    terminal set passes through ``d``. So:
+
+    * an edge's cardinality is the number of leaf originators in its edge-node's
+      dominator subtree (the original per-source, per-edge reflood counted the
+      same set: the edges whose removal leaves the source unable to reach ``S``);
+    * a node's cardinality is the number of enabled source principals strictly
+      inside its subtree (the original idom-chain walk counted the same set).
+
+    Two edge classes are left out of the split graph because they can never be on
+    every route and leaving them in changes no dominance: a self-loop, and an edge
+    leaving a terminal (any route through it already reached a terminal before
+    it). A node's dominators are the same with or without them, so the node view
+    reads the same tree. Parallel edges were already one ``(u, v)`` pair in the set
+    adjacency, exactly as the original reflood removed the whole pair.
+
+    Returns:
+        ``(edge_cardinality, node_cardinality)``; a view not asked for is ``{}``.
+    """
+    terminals = index.terminals
+    reach = index.reach
+    reverse = index.reverse
+
+    edge_sources = index.leaf_sources() if want_edges else set()
+    node_sources = index.principal_sources() if want_nodes else set()
+    if not edge_sources and not node_sources:
+        return {}, {}
+
+    # Node numbering: 0 = root, then the reachable nodes.
+    order = sorted(reach)
+    node_index = {node_id: i + 1 for i, node_id in enumerate(order)}
+    r = len(order)
+
+    # Candidate edges, grouped by their head so a head's edge-nodes are contiguous.
+    pair_from = array("l")
+    pair_to = array("l")
+    for v_id in order:
+        froms = reverse.get(v_id)
+        if not froms:
+            continue
+        v_ix = node_index[v_id]
+        for u_id in froms:
+            if u_id == v_id or u_id in terminals:
                 continue
-            if nxt in terminals:
-                return True
-            seen.add(nxt)
-            pending.append(nxt)
-    return False
+            u_ix = node_index.get(u_id)
+            if u_ix is None:
+                continue
+            pair_from.append(u_ix)
+            pair_to.append(v_ix)
+    p = len(pair_from)
+    n = 1 + r + p
+    edge_base = 1 + r
+
+    # Flow edges: root -> terminal, head -> edge-node, edge-node -> tail.
+    src = array("l")
+    dst = array("l")
+    for t_id in sorted(terminals):
+        src.append(_ROOT)
+        dst.append(node_index[t_id])
+    for k in range(p):
+        e = edge_base + k
+        src.append(pair_to[k])
+        dst.append(e)
+        src.append(e)
+        dst.append(pair_from[k])
+    if checkpoint is not None:
+        checkpoint(len(src))
+    succ_off, succ_idx = _csr(n, src, dst)
+    pred_off, pred_idx = _csr(n, dst, src)
+    del src, dst
+
+    vertex, idom, dfn = _dominator_tree(
+        n, succ_off, succ_idx, pred_off, pred_idx, checkpoint
+    )
+    del succ_off, succ_idx, pred_off, pred_idx
+
+    edge_result: dict[str, int] = {}
+    if edge_sources:
+        members = bytearray(n)
+        for node_id in edge_sources:
+            members[node_index[node_id]] = 1
+        counts = _subtree_counts(vertex, idom, members)
+        critical: dict[tuple[str, str], int] = {}
+        for k in range(p):
+            i = dfn[edge_base + k]
+            if i < 0:
+                continue
+            c = counts[i]
+            if c > 0:
+                critical[(order[pair_from[k] - 1], order[pair_to[k] - 1])] = c
+        relations = _first_traversable_relations(index, set(critical))
+        for (u_id, v_id), c in critical.items():
+            key = edge_key(u_id, relations.get((u_id, v_id), ""), v_id)
+            edge_result[key] = edge_result.get(key, 0) + c
+
+    node_result: dict[str, int] = {}
+    if node_sources:
+        members = bytearray(n)
+        for node_id in node_sources:
+            members[node_index[node_id]] = 1
+        counts = _subtree_counts(vertex, idom, members)
+        for node_id in order:
+            if node_id in terminals:
+                continue
+            ix = node_index[node_id]
+            i = dfn[ix]
+            if i < 0:
+                continue
+            c = counts[i] - members[ix]
+            if c > 0:
+                node_result[node_id] = c
+    return edge_result, node_result
 
 
 def compute_chokepoint_cardinality(
-    graph: dict[str, Any], *, value_terminals: set[str]
+    graph: dict[str, Any],
+    *,
+    value_terminals: set[str],
+    checkpoint: Callable[[int], None] | None = None,
 ) -> dict[str, int]:
-    """Return per-edge choke-point cardinality via per-source set algebra.
+    """Return per-edge choke-point cardinality (one dominator tree, near-linear).
 
     The cardinality of edge ``e = (u, v)`` (oriented toward the value-terminal set
     ``S``) is the number of *sources* — leaf originators, i.e. reachable nodes
@@ -607,17 +924,13 @@ def compute_chokepoint_cardinality(
     cutting that single edge severs all of them. This is the set reading of
     ``|Reach^-1(S)| - |Reach^-1(S) with e removed|`` restricted to source nodes.
 
-    It is computed source-by-source, which is what makes it cheap on a directory
-    graph: the number of leaf originators is tiny (single/low digits even at
-    Contoso scale ~34k nodes / ~276k edges, where there are ~11 sources), while
-    the terminal-reachable set is only a few thousand nodes. For each source we
-    forward-flood the reachable subgraph once to learn the small set of edges it
-    can reach, then test each such edge's criticality with a scoped forward BFS
-    that skips it — a terminal is unreachable afterwards iff the edge was on ALL
-    of that source's paths to ``S``. Each critical edge accrues +1 per source it
-    severs. This is exact (validated against the brute-force reflood oracle over
-    thousands of random cyclic graphs) and avoids the ``O(all_candidate_edges *
-    E)`` cost of the naive whole-graph reflood, which was ~100s at Contoso.
+    Computed with ONE dominator tree of the edge-split reachable graph (see
+    :func:`_choke_cardinalities`): the edges a source cannot avoid are exactly the
+    edge-nodes among its dominators, so an edge's cardinality is the number of
+    sources in its subtree. ``O(E log V)`` for all sources at once. The previous
+    implementation re-flooded the graph once per source and per reachable edge,
+    which did not finish in two hours at a partner-sized directory; it is kept as
+    the test oracle and this function returns the identical dict.
 
     Counting SOURCES (not every reachable node) is what the bridge test expects:
     three low-priv sources funnelling through one bridge edge returns a
@@ -627,6 +940,9 @@ def compute_chokepoint_cardinality(
     Args:
         graph: The attack graph dict (``nodes`` dict-or-list, ``edges`` list).
         value_terminals: The value-terminal (crown-jewel) node ids.
+        checkpoint: Optional; called with a unit count every
+            :data:`CHECKPOINT_EVERY` units of work (memory guard, operator stop).
+            Whatever it raises propagates and no partial result is returned.
 
     Returns:
         A mapping from a stable edge key (``"{from}|{relation}|{to}"``) to its
@@ -634,142 +950,20 @@ def compute_chokepoint_cardinality(
         empty dict when there are no terminals, edges, or sources.
     """
     terminals = {str(t) for t in value_terminals if str(t)}
-    edges = graph.get("edges")
-    if not terminals or not isinstance(edges, list):
+    if not terminals or not isinstance(graph.get("edges"), list):
         return {}
-
-    nodes = _iter_nodes(graph)
-    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
-    reach = _reverse_reach(reverse, terminals)
-
-    # Sources = leaf originators: reachable nodes with no inbound reach edge.
-    sources = {
-        node_id
-        for node_id in reach
-        if node_id not in terminals and not (reverse.get(node_id, set()) & reach)
-    }
-    if not sources:
-        return {}
-
-    forward = _build_forward_adjacency(graph, nodes_map=nodes)
-
-    # Relation lookup so the omitted-cardinality edges never cost a graph scan.
-    # Only traversable edges are keyed — the SAME gate the adjacency uses — so a
-    # pair that carries both a share-access edge (non-traversable) and a real
-    # compromise edge never picks up the share relation for its stable key.
-    relation_by_pair: dict[tuple[str, str], str] = {}
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        if not is_traversable_attack_edge(edge, nodes):
-            continue
-        from_id = str(edge.get("from") or "").strip()
-        to_id = str(edge.get("to") or "").strip()
-        if not from_id or not to_id:
-            continue
-        # Keep the first-seen relation for a parallel-edge pair (stable key).
-        relation_by_pair.setdefault(
-            (from_id, to_id), str(edge.get("relation") or "").strip()
-        )
-
-    result: dict[str, int] = {}
-    for source in sources:
-        # The edges this source could ever traverse toward S: its forward-reach
-        # within the terminal-reachable subgraph. Only these can be critical.
-        forward_reach: set[str] = {source}
-        pending = [source]
-        while pending:
-            current = pending.pop()
-            for nxt in forward.get(current, ()):
-                if nxt in reach and nxt not in forward_reach:
-                    forward_reach.add(nxt)
-                    pending.append(nxt)
-
-        for u in forward_reach:
-            for v in forward.get(u, ()):
-                if v not in reach:
-                    continue
-                if _source_still_reaches_terminals(
-                    source, forward, reach, terminals, excluded_edge=(u, v)
-                ):
-                    continue
-                relation = relation_by_pair.get((u, v), "")
-                key = edge_key(u, relation, v)
-                result[key] = result.get(key, 0) + 1
-    return result
-
-
-_DOM_ROOT = "__chokepoint_dom_root__"
-
-
-def _compute_immediate_dominators(
-    succ: dict[str, set[str]],
-    pred: dict[str, set[str]],
-    root: str,
-) -> dict[str, str]:
-    """Compute the immediate-dominator map of a flowgraph rooted at ``root``.
-
-    Iterative Cooper-Harvey-Kennedy ("A Simple, Fast Dominance Algorithm"). The
-    graph is oriented in flow direction (``succ`` = flow-forward adjacency,
-    ``pred`` its transpose). Every node must be reachable from ``root`` — the
-    caller guarantees this by joining a virtual root to every terminal and
-    building ``succ``/``pred`` over the reachable subgraph only.
-
-    Args:
-        succ: Flow-forward adjacency ``node -> {successor, ...}``.
-        pred: Flow-backward adjacency ``node -> {predecessor, ...}`` (transpose).
-        root: The single entry node all others are reachable from.
-
-    Returns:
-        ``idom`` mapping ``node -> immediate dominator``. ``root`` is omitted.
-    """
-    order: list[str] = []
-    visited: set[str] = {root}
-    stack: list[tuple[str, bool]] = [(root, False)]
-    while stack:
-        node, processed = stack.pop()
-        if processed:
-            order.append(node)
-            continue
-        stack.append((node, True))
-        for nxt in succ.get(node, ()):
-            if nxt not in visited:
-                visited.add(nxt)
-                stack.append((nxt, False))
-    order.reverse()  # reverse postorder
-    rpo_index = {node: i for i, node in enumerate(order)}
-
-    idom: dict[str, str] = {root: root}
-
-    def _intersect(a: str, b: str) -> str:
-        while a != b:
-            while rpo_index[a] > rpo_index[b]:
-                a = idom[a]
-            while rpo_index[b] > rpo_index[a]:
-                b = idom[b]
-        return a
-
-    changed = True
-    while changed:
-        changed = False
-        for node in order:
-            if node == root:
-                continue
-            new_idom: str | None = None
-            for p in pred.get(node, ()):
-                if p not in rpo_index or p not in idom:
-                    continue
-                new_idom = p if new_idom is None else _intersect(p, new_idom)
-            if new_idom is not None and idom.get(node) != new_idom:
-                idom[node] = new_idom
-                changed = True
-
-    idom.pop(root, None)
-    return idom
+    index = _ChokeIndex(graph, terminals)
+    edge_result, _ = _choke_cardinalities(
+        index, want_edges=True, want_nodes=False, checkpoint=checkpoint
+    )
+    return edge_result
 
 
 def compute_node_chokepoint_cardinality(
-    graph: dict[str, Any], *, value_terminals: set[str]
+    graph: dict[str, Any],
+    *,
+    value_terminals: set[str],
+    checkpoint: Callable[[int], None] | None = None,
 ) -> dict[str, int]:
     """Return per-NODE choke-point cardinality via a dominator tree (set algebra).
 
@@ -784,16 +978,15 @@ def compute_node_chokepoint_cardinality(
     large cardinalities at scale.
 
     Computed WITHOUT re-flooding per node: one dominator tree over the reachable
-    subgraph (rooted at a virtual root joined to every terminal). A node ``d``
-    *dominates* node ``m`` when every path from ``m`` to ``S`` passes through
-    ``d``; the number of source principals in ``n``'s dominator subtree is exactly
-    how many are severed by removing ``n``. Near-linear in practice. Exact:
-    validated against the brute-force node-removal oracle over thousands of random
-    cyclic graphs.
+    subgraph (rooted at a virtual root joined to every terminal, the same tree the
+    edge view reads). A node ``d`` *dominates* node ``m`` when every path from
+    ``m`` to ``S`` passes through ``d``; the number of source principals in
+    ``n``'s dominator subtree is exactly how many are severed by removing ``n``.
 
     Args:
         graph: The attack graph dict (``nodes`` dict-or-list, ``edges`` list).
         value_terminals: The value-terminal (crown-jewel) node ids.
+        checkpoint: As in :func:`compute_chokepoint_cardinality`.
 
     Returns:
         A mapping from a node id to its choke-point cardinality (>= 1). Nodes that
@@ -801,55 +994,13 @@ def compute_node_chokepoint_cardinality(
         terminals, edges, or source principals.
     """
     terminals = {str(t) for t in value_terminals if str(t)}
-    edges = graph.get("edges")
-    if not terminals or not isinstance(edges, list):
+    if not terminals or not isinstance(graph.get("edges"), list):
         return {}
-
-    nodes = _iter_nodes(graph)
-    reverse = _build_reverse_adjacency(graph, nodes_map=nodes)
-    reach = _reverse_reach(reverse, terminals)
-
-    sources = {
-        node_id
-        for node_id in reach
-        if node_id not in terminals
-        and isinstance(nodes.get(node_id), dict)
-        and _node_is_enabled_principal(nodes[node_id])
-    }
-    if not sources:
-        return {}
-
-    # Dominator flow graph rooted at S: flow runs FROM the virtual root (joined
-    # to every terminal) BACKWARD along the graph edges toward the sources, so a
-    # node's dominator subtree is exactly the set of nodes whose every path to S
-    # passes through it. ``succ`` is the reverse adjacency, ``pred`` its transpose.
-    succ: dict[str, set[str]] = {_DOM_ROOT: set(terminals)}
-    pred: dict[str, set[str]] = {}
-    for terminal in terminals:
-        pred.setdefault(terminal, set()).add(_DOM_ROOT)
-    for to_id, froms in reverse.items():
-        if to_id not in reach:
-            continue
-        for from_id in froms:
-            if from_id not in reach:
-                continue
-            succ.setdefault(to_id, set()).add(from_id)
-            pred.setdefault(from_id, set()).add(to_id)
-
-    idom = _compute_immediate_dominators(succ, pred, _DOM_ROOT)
-
-    # For each source, every strict dominator on its idom chain (excluding the
-    # source itself and the terminals) severs it when removed.
-    result: dict[str, int] = {}
-    for source in sources:
-        node = source
-        seen: set[str] = set()
-        while node in idom and node not in seen:
-            seen.add(node)
-            node = idom[node]
-            if node in reach and node not in terminals:
-                result[node] = result.get(node, 0) + 1
-    return {node_id: count for node_id, count in result.items() if count > 0}
+    index = _ChokeIndex(graph, terminals)
+    _, node_result = _choke_cardinalities(
+        index, want_edges=False, want_nodes=True, checkpoint=checkpoint
+    )
+    return node_result
 
 
 def build_chokepoint_summary(
@@ -857,6 +1008,7 @@ def build_chokepoint_summary(
     *,
     value_terminals: set[str],
     top_k: int = 20,
+    checkpoint: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     """Build the compact, JSON-safe choke-point summary for persistence.
 
@@ -874,6 +1026,8 @@ def build_chokepoint_summary(
         graph: The attack graph dict.
         value_terminals: The value-terminal node ids.
         top_k: How many top choke points of each kind to keep.
+        checkpoint: As in :func:`compute_chokepoint_cardinality`; whatever it
+            raises propagates and no partial summary is returned.
 
     Returns:
         A JSON-safe dict with ``schema_version``, ``exposure_source_count``,
@@ -885,16 +1039,26 @@ def build_chokepoint_summary(
     terminals = {str(t) for t in value_terminals if str(t)}
     keep = max(0, int(top_k))
 
-    edge_cardinality = compute_chokepoint_cardinality(graph, value_terminals=terminals)
+    # One reachable-subgraph index and ONE dominator tree for all three figures
+    # (the edge choke, the node choke and the exposure-source anchor).
+    edge_cardinality: dict[str, int] = {}
+    node_cardinality: dict[str, int] = {}
+    source_count = 0
+    if terminals:
+        index = _ChokeIndex(graph, terminals)
+        source_count = len(index.principal_sources())
+        if isinstance(graph.get("edges"), list):
+            edge_cardinality, node_cardinality = _choke_cardinalities(
+                index, want_edges=True, want_nodes=True, checkpoint=checkpoint
+            )
+        del index
+
     edge_ranked = sorted(edge_cardinality.items(), key=lambda kv: (-kv[1], kv[0]))
     top_edges = [
         {"edge_key": key, "cardinality": int(count)}
         for key, count in edge_ranked[:keep]
     ]
 
-    node_cardinality = compute_node_chokepoint_cardinality(
-        graph, value_terminals=terminals
-    )
     node_ranked = sorted(node_cardinality.items(), key=lambda kv: (-kv[1], kv[0]))
     top_nodes = [
         {"node_id": node_id, "cardinality": int(count)}
@@ -903,9 +1067,7 @@ def build_chokepoint_summary(
 
     return {
         "schema_version": 1,
-        "exposure_source_count": exposure_source_count(
-            graph, value_terminals=terminals
-        ),
+        "exposure_source_count": source_count,
         "value_terminal_count": len(terminals),
         "edge_candidate_count": len(edge_cardinality),
         "node_candidate_count": len(node_cardinality),
@@ -1033,7 +1195,11 @@ def record_chokepoint_cardinality(
         domain: The domain the summary belongs to.
         summary: The output of :func:`build_chokepoint_summary`.
     """
-    if not domain or not isinstance(summary, dict) or "top_chokepoints" not in summary:
+    if not domain or not isinstance(summary, dict):
+        return
+    # A computed block, or one whose analysis was stopped (persisted so the
+    # platform reads the same honest absence the report renders).
+    if "top_chokepoints" not in summary and not summary.get(CARDINALITY_STOPPED_KEY):
         return
     try:
         from adscan_core.reporting.technical_report import (
@@ -1209,6 +1375,129 @@ def _ranking_population_exclusions(
         return []
 
 
+#: Scan-control step id of the choke-point analysis.
+CHOKEPOINT_STEP_ID = "chokepoint_analysis"
+
+#: What the analysis counts for its progress and its memory declaration: the
+#: nodes and edges of the dominator flow graph it walks.
+CHOKEPOINT_UNIT = "graph elements"
+
+
+class _OperatorStoppedChokepoints(Exception):
+    """The operator stopped the choke-point step; no partial summary survives."""
+
+
+def _summary_or_stop(
+    graph: dict[str, Any],
+    value_terminals: set[str],
+    stage: Any,
+    step: Any,
+) -> dict[str, Any] | None:
+    """The memory-bounded body: the whole summary, or ``None`` on an operator stop.
+
+    One function call, as :func:`adscan_core.memory_guard.memory_bounded`
+    requires, so everything the computation built is released before the
+    boundary declares a memory stop.
+    """
+    done = 0
+
+    def _checkpoint(units: int) -> None:
+        nonlocal done
+        done += int(units)
+        stage.tick(int(units))
+        step.progress(done=done)
+        if step.should_stop():
+            raise _OperatorStoppedChokepoints()
+
+    try:
+        return build_chokepoint_summary(
+            graph, value_terminals=value_terminals, top_k=20, checkpoint=_checkpoint
+        )
+    except _OperatorStoppedChokepoints:
+        return None
+
+
+def _clear_previous_chokepoint_stop(shell: Any, domain: str) -> None:
+    """Forget an earlier stop of this analysis: it has just completed. Never raises."""
+    try:
+        from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+            STAGE_CHOKEPOINT_ANALYSIS,
+        )
+        from adscan_core.reporting.technical_report import (  # noqa: PLC0415
+            read_resource_coverage,
+        )
+        from adscan_internal.services.resource_coverage_recorder import (  # noqa: PLC0415
+            record_stage_coverage,
+        )
+
+        block = read_resource_coverage(shell, domain) or {}
+        if any(
+            isinstance(item, dict) and item.get("stage") == STAGE_CHOKEPOINT_ANALYSIS
+            for item in block.get("stages") or ()
+        ):
+            record_stage_coverage(
+                shell,
+                domain,
+                {"complete": True, "stages": []},
+                replace_stage=STAGE_CHOKEPOINT_ANALYSIS,
+            )
+    except Exception as exc:  # noqa: BLE001 - clearing a stop never raises
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
+def build_chokepoint_summary_bounded(
+    *,
+    shell: Any,
+    domain: str,
+    graph: dict[str, Any],
+    value_terminals: set[str],
+) -> dict[str, Any] | None:
+    """:func:`build_chokepoint_summary` under the memory guard and the scan control.
+
+    The computation is a long step the operator can stop and a memory-bounded
+    stage (``chokepoint_analysis``). Either stop discards everything it computed:
+    a partial cardinality is never returned as if it were complete. A memory stop
+    is declared in the domain's ``resource_coverage`` block (the analysis maps to
+    no scan phase: the paths and their figures are whole without it); an operator
+    stop is declared by the scan control as a stopped step.
+
+    Returns:
+        The summary, or ``None`` when the analysis was stopped.
+    """
+    from adscan_core.memory_guard import OUTCOME_COMPLETE, memory_bounded  # noqa: PLC0415
+    from adscan_core.reporting.resource_coverage import (  # noqa: PLC0415
+        STAGE_CHOKEPOINT_ANALYSIS,
+    )
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+    from adscan_internal.services.resource_coverage_recorder import (  # noqa: PLC0415
+        record_stage_coverage,
+    )
+
+    def _record(block: dict[str, Any]) -> None:
+        record_stage_coverage(shell, domain, block)
+
+    summary: dict[str, Any] | None = None
+    with scan_control().step(
+        CHOKEPOINT_STEP_ID,
+        label="Choke-point analysis",
+        long=True,
+        unit=CHOKEPOINT_UNIT,
+        domain=domain,
+    ) as step:
+        with memory_bounded(
+            STAGE_CHOKEPOINT_ANALYSIS, unit=CHOKEPOINT_UNIT, record=_record
+        ) as stage:
+            summary = _summary_or_stop(graph, value_terminals, stage, step)
+    if stage.outcome != OUTCOME_COMPLETE or summary is None:
+        return None
+    _clear_previous_chokepoint_stop(shell, domain)
+    return summary
+
+
 def stamp_chokepoint_cardinality_for_domain(
     *,
     shell: Any,
@@ -1279,6 +1568,21 @@ def stamp_chokepoint_cardinality_for_domain(
         no_cache: Recompute and overwrite even when a derived block exists (see
             the idempotency note above).
     """
+    # A graph a build stopped on is not this domain's graph: nothing may be ranked
+    # or persisted from it (the readers declare "not evaluated" instead).
+    try:
+        from adscan_internal.services.graph_availability import (  # noqa: PLC0415
+            domain_graph_unavailable_stage,
+        )
+
+        if domain_graph_unavailable_stage(shell, domain, graph=norm_graph):
+            return None
+    except Exception as exc:  # noqa: BLE001 -- availability is best-effort here
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     # Idempotency guard (cost only): a block that is ranked AND carries the
     # path-derivation marker was already derived from the attack paths, so there
     # is nothing left to add WITHIN one generation. ``no_cache`` bypasses it for
@@ -1297,69 +1601,87 @@ def stamp_chokepoint_cardinality_for_domain(
         print_exception = None  # type: ignore[assignment]
 
     try:
-        summary = build_chokepoint_summary(
-            norm_graph,
+        summary = build_chokepoint_summary_bounded(
+            shell=shell,
+            domain=domain,
+            graph=norm_graph,
             value_terminals=value_terminals,
-            top_k=20,
         )
+        cardinality_complete = summary is not None
+        if summary is None:
+            # Stopped (memory or operator) and already declared. No cardinality,
+            # no ranking and no KPI card are written: a partial count must never
+            # read as complete, so the badge and the choke summary are simply
+            # absent. The path-derived sub-blocks below do not depend on the
+            # cardinality and are still derived. Without ``ranked_chokepoints``
+            # the block is not "derived" (``chokepoint_block_is_derived``), so the
+            # next stamp retries the analysis.
+            summary = {
+                "schema_version": 1,
+                "value_terminal_count": len(
+                    {str(t) for t in value_terminals if str(t)}
+                ),
+                CARDINALITY_STOPPED_KEY: True,
+            }
         summary["bounded"] = bool(bounded)
-        # Rank + severity-enrich HERE, at the one seam that HAS the graph, so
-        # every downstream render (PRO PDF, LITE, web) inherits the two-axis
-        # order (severity leads cardinality) with real labels, WITHOUT re-loading
-        # the ~194MB graph in each renderer. The persisted rows are kept JSON-safe:
-        # the severity SSOT returns a ``Severity`` enum, coerced to its string
-        # value; the shared ``ranked_edges`` back-reference each row carries is
-        # dropped (identical on every row, not needed by the render). Best-effort —
-        # a ranking failure must never break the summary.
-        try:
-            from adscan_internal.services.chokepoint_scoring import (  # noqa: PLC0415
-                rank_chokepoints,
-            )
+        if cardinality_complete:
+            # Rank + severity-enrich HERE, at the one seam that HAS the graph, so
+            # every downstream render (PRO PDF, LITE, web) inherits the two-axis
+            # order (severity leads cardinality) with real labels, WITHOUT re-loading
+            # the ~194MB graph in each renderer. The persisted rows are kept JSON-safe:
+            # the severity SSOT returns a ``Severity`` enum, coerced to its string
+            # value; the shared ``ranked_edges`` back-reference each row carries is
+            # dropped (identical on every row, not needed by the render). Best-effort —
+            # a ranking failure must never break the summary.
+            try:
+                from adscan_internal.services.chokepoint_scoring import (  # noqa: PLC0415
+                    rank_chokepoints,
+                )
 
-            _choke_nodes = (
-                norm_graph.get("nodes") if isinstance(norm_graph, dict) else None
-            )
-            _nodes_map: dict[str, Any] = {}
-            if isinstance(_choke_nodes, dict):
-                for _nid, _node in _choke_nodes.items():
-                    if isinstance(_node, dict):
-                        _nodes_map[str(_node.get("id") or _nid)] = _node
-            elif isinstance(_choke_nodes, list):
-                for _node in _choke_nodes:
-                    if isinstance(_node, dict) and _node.get("id"):
-                        _nodes_map[str(_node["id"])] = _node
+                _choke_nodes = (
+                    norm_graph.get("nodes") if isinstance(norm_graph, dict) else None
+                )
+                _nodes_map: dict[str, Any] = {}
+                if isinstance(_choke_nodes, dict):
+                    for _nid, _node in _choke_nodes.items():
+                        if isinstance(_node, dict):
+                            _nodes_map[str(_node.get("id") or _nid)] = _node
+                elif isinstance(_choke_nodes, list):
+                    for _node in _choke_nodes:
+                        if isinstance(_node, dict) and _node.get("id"):
+                            _nodes_map[str(_node["id"])] = _node
 
-            _ranked = rank_chokepoints(summary, nodes_map=_nodes_map, graph=norm_graph)
-            summary["ranked_chokepoints"] = [
-                {
-                    "node_id": str(_r.get("node_id") or ""),
-                    "node_label": str(_r.get("node_label") or _r.get("node_id") or ""),
-                    "cardinality": int(_r.get("cardinality") or 0),
-                    # Severity is a ``str, Enum`` — store its plain string value.
-                    "severity": str(getattr(_r.get("severity"), "value", "") or ""),
-                    "severity_rank": int(_r.get("severity_rank") or 0),
-                    "protected_terminal_label": str(
-                        _r.get("protected_terminal_label") or ""
-                    ),
-                }
-                for _r in _ranked
-            ]
-        except Exception as _rank_exc:  # noqa: BLE001 - ranking is best-effort
-            if print_exception is not None:
-                print_exception(exception=_rank_exc)
+                _ranked = rank_chokepoints(summary, nodes_map=_nodes_map, graph=norm_graph)
+                summary["ranked_chokepoints"] = [
+                    {
+                        "node_id": str(_r.get("node_id") or ""),
+                        "node_label": str(_r.get("node_label") or _r.get("node_id") or ""),
+                        "cardinality": int(_r.get("cardinality") or 0),
+                        # Severity is a ``str, Enum`` — store its plain string value.
+                        "severity": str(getattr(_r.get("severity"), "value", "") or ""),
+                        "severity_rank": int(_r.get("severity_rank") or 0),
+                        "protected_terminal_label": str(
+                            _r.get("protected_terminal_label") or ""
+                        ),
+                    }
+                    for _r in _ranked
+                ]
+            except Exception as _rank_exc:  # noqa: BLE001 - ranking is best-effort
+                if print_exception is not None:
+                    print_exception(exception=_rank_exc)
 
-        # Derive + persist the KPI headline card HERE, at the stamp seam, so every
-        # downstream render (PRO PDF, LITE, web T6) reads the SAME card without
-        # recomputing. It is derived from the ranked rows + exposure_source_count
-        # already on the summary; JSON-safe; best-effort (a failure just omits the
-        # card, older scans render unchanged).
-        try:
-            _kpi = derive_chokepoint_kpi(summary)
-            if _kpi is not None:
-                summary["chokepoint_kpi"] = _kpi
-        except Exception as _kpi_exc:  # noqa: BLE001 - card is best-effort
-            if print_exception is not None:
-                print_exception(exception=_kpi_exc)
+            # Derive + persist the KPI headline card HERE, at the stamp seam, so every
+            # downstream render (PRO PDF, LITE, web T6) reads the SAME card without
+            # recomputing. It is derived from the ranked rows + exposure_source_count
+            # already on the summary; JSON-safe; best-effort (a failure just omits the
+            # card, older scans render unchanged).
+            try:
+                _kpi = derive_chokepoint_kpi(summary)
+                if _kpi is not None:
+                    summary["chokepoint_kpi"] = _kpi
+            except Exception as _kpi_exc:  # noqa: BLE001 - card is best-effort
+                if print_exception is not None:
+                    print_exception(exception=_kpi_exc)
 
         # Derive + persist the "Start here" remediation LEAD (E4) HERE, at the one
         # seam that already has the domain's attack paths + the choke cardinality,

@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from adscan_core.pal.process import peak_rss_bytes
+from adscan_core.pal.process import current_rss_bytes, peak_rss_bytes
 
 # cgroup v2 unified-hierarchy mount root + the limit/usage file names within a
 # cgroup directory. The process's OWN cgroup is resolved from ``/proc/self/cgroup``
@@ -53,6 +53,7 @@ from adscan_core.pal.process import peak_rss_bytes
 _CGROUP_V2_ROOT = "/sys/fs/cgroup"
 _CGROUP_V2_MAX_NAME = "memory.max"
 _CGROUP_V2_CURRENT_NAME = "memory.current"
+_CGROUP_V2_STAT_NAME = "memory.stat"
 _PROC_SELF_CGROUP = "/proc/self/cgroup"
 # Legacy fixed paths — the container-root fallback when the per-process directory
 # cannot be resolved.
@@ -61,6 +62,7 @@ _CGROUP_V2_CURRENT = "/sys/fs/cgroup/memory.current"
 # cgroup v1 memory-controller limit + usage files.
 _CGROUP_V1_LIMIT = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 _CGROUP_V1_USAGE = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
+_CGROUP_V1_STAT = "/sys/fs/cgroup/memory/memory.stat"
 # Host-wide available memory.
 _PROC_MEMINFO = "/proc/meminfo"
 # Per-process status (VmRSS).
@@ -106,12 +108,24 @@ class MemorySituation:
         source: One of the ``SOURCE_*`` tags identifying where
             ``available_bytes``/``limit_bytes`` came from — so a later reader
             knows whether the figure is a container ceiling or a host number.
+        cgroup_usage_bytes: For a cgroup source, the memory charged to the
+            cgroup that the kernel cannot reclaim before it kills: everything
+            the cgroup holds (child processes, tmpfs and shared memory included)
+            minus the reclaimable file cache. ``None`` for a host source.
+        host_available_bytes: Host ``MemAvailable`` (or psutil ``available``),
+            read alongside a cgroup figure too, because a cgroup limit set above
+            what the host has free does not make that memory exist.
+        host_total_bytes: Host physical memory (``MemTotal`` / psutil
+            ``total``), or ``None``.
     """
 
     available_bytes: Optional[int]
     limit_bytes: Optional[int]
     rss_bytes: Optional[int]
     source: str
+    cgroup_usage_bytes: Optional[int] = None
+    host_available_bytes: Optional[int] = None
+    host_total_bytes: Optional[int] = None
 
 
 def _read_text(path: str) -> Optional[str]:
@@ -228,12 +242,69 @@ def _parse_meminfo_kb(raw: str, key: str) -> Optional[int]:
     return None
 
 
-def _read_mem_available() -> Optional[int]:
-    """Read host ``MemAvailable`` from ``/proc/meminfo`` in bytes, or ``None``."""
+def _parse_stat(raw: Optional[str]) -> dict[str, int]:
+    """Parse a cgroup ``memory.stat`` (``key value`` per line) into a dict."""
+    values: dict[str, int] = {}
+    if not raw:
+        return values
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            values[parts[0]] = int(parts[1])
+    return values
+
+
+def _cgroup_v2_unreclaimable(directory: Optional[str], current: Optional[int]) -> Optional[int]:
+    """Non-reclaimable usage of a cgroup v2: ``current - (file - shmem)``.
+
+    ``file`` counts the page cache INCLUDING tmpfs and shared memory, which the
+    kernel cannot drop, so shmem is added back. Falls back to ``current`` when
+    ``memory.stat`` is unreadable (over-counting is the safe direction).
+    """
+    if not isinstance(current, int):
+        return None
+    stat_path = (
+        directory.rstrip("/") + "/" + _CGROUP_V2_STAT_NAME
+        if directory is not None
+        else _CGROUP_V2_ROOT + "/" + _CGROUP_V2_STAT_NAME
+    )
+    stat = _parse_stat(_read_text(stat_path))
+    if "file" not in stat:
+        return current
+    reclaimable = max(stat["file"] - stat.get("shmem", 0), 0)
+    return max(current - reclaimable, 0)
+
+
+def _cgroup_v1_unreclaimable(usage: Optional[int]) -> Optional[int]:
+    """Non-reclaimable usage of a cgroup v1: ``usage - file LRU``.
+
+    The file LRU (``total_inactive_file + total_active_file``) is the cache the
+    kernel can drop. Shared memory and tmpfs pages are swap-backed and live on
+    the ANON LRU in v1, so they are not in the file LRU and are already counted;
+    adding ``shmem`` back would count it twice. Falls back to ``usage`` when
+    ``memory.stat`` is unreadable.
+    """
+    if not isinstance(usage, int):
+        return None
+    stat = _parse_stat(_read_text(_CGROUP_V1_STAT))
+    inactive = stat.get("total_inactive_file", stat.get("inactive_file"))
+    active = stat.get("total_active_file", stat.get("active_file"))
+    if inactive is None and active is None:
+        return usage
+    return max(usage - (inactive or 0) - (active or 0), 0)
+
+
+def _read_host_meminfo() -> tuple[Optional[int], Optional[int]]:
+    """Return host ``(MemAvailable, MemTotal)`` in bytes from ``/proc/meminfo``."""
     raw = _read_text(_PROC_MEMINFO)
     if raw is None:
-        return None
-    return _parse_meminfo_kb(raw, "MemAvailable:")
+        return None, None
+    return _parse_meminfo_kb(raw, "MemAvailable:"), _parse_meminfo_kb(raw, "MemTotal:")
+
+
+def _read_mem_available() -> Optional[int]:
+    """Read host ``MemAvailable`` from ``/proc/meminfo`` in bytes, or ``None``."""
+    return _read_host_meminfo()[0]
 
 
 def _read_psutil_host_situation() -> Optional[tuple[int, int]]:
@@ -269,16 +340,22 @@ def _read_psutil_host_situation() -> Optional[tuple[int, int]]:
 def read_process_rss_bytes() -> Optional[int]:
     """Return current process RSS in bytes, best-effort.
 
-    Prefers ``/proc/self/status`` (``VmRSS``, live RSS). Falls back to the PAL
-    peak-RSS reader (``resource.getrusage(RUSAGE_SELF).ru_maxrss`` on POSIX, a
-    high-water mark; ``psutil`` on Windows) when the status file is unavailable.
-    Returns ``None`` when neither is readable.
+    Prefers ``/proc/self/status`` (``VmRSS``, live RSS). Without it (native
+    Windows, macOS) reads the PAL live-RSS reader (``psutil``), and only then the
+    PAL peak-RSS reader (``ru_maxrss`` on POSIX, ``peak_wset`` on Windows), a
+    high-water mark that never comes down. The live reading comes first because
+    the memory guard compares RSS against a ceiling: a peak would make every stage
+    after a large one stop on memory that was already released. Returns ``None``
+    when none is readable.
     """
     raw = _read_text(_PROC_SELF_STATUS)
     if raw is not None:
         vmrss = _parse_meminfo_kb(raw, "VmRSS:")
         if vmrss is not None:
             return vmrss
+    live = current_rss_bytes()
+    if isinstance(live, int) and live > 0:
+        return live
     # High-water mark (peak RSS in bytes) via the PAL process seam — POSIX reads
     # ``resource.getrusage``, Windows falls back to ``psutil`` / ``None``.
     peak = peak_rss_bytes()
@@ -314,31 +391,41 @@ def read_memory_situation() -> MemorySituation:
                 else _CGROUP_V2_CURRENT
             )
             available = max(v2_limit - usage, 0) if isinstance(usage, int) else None
+            host_available, host_total = _read_host_meminfo()
             return MemorySituation(
                 available_bytes=available,
                 limit_bytes=v2_limit,
                 rss_bytes=rss,
                 source=SOURCE_CGROUP_V2,
+                cgroup_usage_bytes=_cgroup_v2_unreclaimable(v2_dir, usage),
+                host_available_bytes=host_available,
+                host_total_bytes=host_total,
             )
 
         v1_limit = _read_cgroup_v1_limit()
         if v1_limit is not None:
             usage = _read_int_file(_CGROUP_V1_USAGE)
             available = max(v1_limit - usage, 0) if isinstance(usage, int) else None
+            host_available, host_total = _read_host_meminfo()
             return MemorySituation(
                 available_bytes=available,
                 limit_bytes=v1_limit,
                 rss_bytes=rss,
                 source=SOURCE_CGROUP_V1,
+                cgroup_usage_bytes=_cgroup_v1_unreclaimable(usage),
+                host_available_bytes=host_available,
+                host_total_bytes=host_total,
             )
 
-        mem_available = _read_mem_available()
+        mem_available, mem_total = _read_host_meminfo()
         if mem_available is not None:
             return MemorySituation(
                 available_bytes=mem_available,
                 limit_bytes=None,
                 rss_bytes=rss,
                 source=SOURCE_PROC_MEMINFO,
+                host_available_bytes=mem_available,
+                host_total_bytes=mem_total,
             )
 
         # Final fallback — psutil host figures. This is the ONLY source on native
@@ -352,6 +439,8 @@ def read_memory_situation() -> MemorySituation:
                 limit_bytes=total,
                 rss_bytes=rss,
                 source=SOURCE_PSUTIL_HOST,
+                host_available_bytes=available,
+                host_total_bytes=total,
             )
     except Exception:  # noqa: BLE001 — a memory beacon must never crash the caller.
         pass

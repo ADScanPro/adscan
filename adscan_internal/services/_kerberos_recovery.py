@@ -995,7 +995,9 @@ def _install_auth_attempt_guard() -> None:
 # layer only CHECKS: the verdict arrives in the transport's reply, which the
 # transport seams (SMB session setup, LDAP bind, RDP CredSSP) classify and record.
 # A host-local logon (no domain, or ".") is left to the seam that knows the host,
-# and the deliberate guest probe (``Guest`` with no password) is not judged.
+# and the deliberate guest probe (``Guest`` with no password) is not judged. A
+# guest sign-in marked by its transport (``guest_sign_in``) is judged by rule 6
+# (``check_guest_attempt``); nothing else with an empty secret is.
 
 
 def _ntlm_guard_target(credential: Any) -> "tuple[str, str, str] | None":
@@ -1025,8 +1027,15 @@ def _make_guarded_ntlm_authenticate(original: Callable[..., Any]) -> Callable[..
         if getattr(self, "iteration_cnt", 0) >= 1 and authData is not None:
             target = _ntlm_guard_target(getattr(self, "credential", None))
             if target is not None:
+                realm, principal, secret = target
                 try:
-                    auth_attempt_guard.check_attempt(*target)
+                    if not secret and auth_attempt_guard.guest_sign_in_active(realm, principal):
+                        # Rule 6: only the guest sign-in a guest transport marked
+                        # for exactly this principal; a declared name with an
+                        # empty secret anywhere else stays under rule 4.
+                        auth_attempt_guard.check_guest_attempt(realm, principal)
+                    else:
+                        auth_attempt_guard.check_attempt(*target)
                 except auth_attempt_guard.AuthAttemptRefused as refused:
                     return None, None, refused
         return await original(self, authData, *args, **kwargs)

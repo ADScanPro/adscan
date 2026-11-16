@@ -12,12 +12,21 @@ Payload (spec § 3.2)::
      "registration": {"policy": "deferred|blocking|credits|offline", "grace_days": 14},
      "domain_code_key": "<b64 32 bytes>", "band_edges": [500, 2000],
      "retest_window_days": 90,
+     "contract_ends_on": "YYYY-MM-DD" | null,
      "renew_after": "YYYY-MM-DD", "entitlements": {}}
 
 ``retest_window_days`` is optional (default 90, read through
 :func:`adscan_core.pro_license.billable_engagements.resolve_retest_window_days`):
 how long a full scan of an already-assessed domain counts as a retest of the
 same billable engagement rather than a new one.
+
+Two dates, never confused. ``valid_until`` is the DOCUMENT: how long this
+machine may work without reaching the licence server (the grant's maximum
+offline days), refreshed automatically at every online launch.
+``contract_ends_on`` is the CONTRACT: the grant's last day, which ADscan may
+extend, or ``null`` for a grant with no end date. The document never outlives
+the contract. Documents issued before the field existed carry no key; their
+contract end is then inferred (:func:`_contract_term`).
 
 The Enterprise verifier refuses every edition here, and this verifier refuses
 the Enterprise ones, so neither product can be unlocked with the other's file.
@@ -66,10 +75,17 @@ POLICY_BLOCKING = "blocking"
 POLICY_CREDITS = "credits"
 POLICY_OFFLINE = "offline"
 
+#: How a licence states its contract end (:attr:`ProLicense.contract_term`).
+CONTRACT_FIXED = "fixed"
+CONTRACT_OPEN_ENDED = "open_ended"
+CONTRACT_UNKNOWN = "unknown"
+
 #: Which registration policies each edition may carry. A trial never blocks
 #: (founder decision 2026-11-10), so a server bug cannot issue a blocking trial.
 ALLOWED_POLICIES: dict[str, frozenset[str]] = {
-    EDITION_TRIAL: frozenset({POLICY_DEFERRED}),
+    # A trial registers (blocking, 7-day grace) since 2026-11-13; a trial
+    # document issued before still carries ``deferred`` until it refreshes.
+    EDITION_TRIAL: frozenset({POLICY_DEFERRED, POLICY_BLOCKING}),
     EDITION_PARTNER: frozenset({POLICY_BLOCKING}),
     EDITION_PAID: frozenset({POLICY_CREDITS, POLICY_BLOCKING}),
     EDITION_ENGAGEMENT: frozenset({POLICY_OFFLINE}),
@@ -118,6 +134,10 @@ class ProLicense:
     renew_after: date | None = None
     entitlements: Mapping[str, Any] = field(default_factory=dict)
     key_id: str = ""
+    #: Last day of the CONTRACT (None: no end date, or not stated by an older
+    #: document; :attr:`contract_term` says which).
+    contract_ends_on: date | None = None
+    contract_term: str = CONTRACT_UNKNOWN
 
     @property
     def label(self) -> str:
@@ -140,6 +160,22 @@ class ProLicense:
         return self.ends_at + timedelta(days=self.grace_days)
 
     @property
+    def contract_ends_at(self) -> datetime | None:
+        """First instant (UTC) after the contract's last day; None without an end date."""
+        if self.contract_ends_on is None:
+            return None
+        return datetime.combine(self.contract_ends_on + timedelta(days=1), time.min, tzinfo=timezone.utc)
+
+    @property
+    def contract_outlasts_document(self) -> bool:
+        """True when the contract continues after this document ends (a refresh is expected)."""
+        if self.contract_term == CONTRACT_OPEN_ENDED:
+            return True
+        if self.contract_term == CONTRACT_FIXED:
+            return self.contract_ends_on is not None and self.contract_ends_on > self.valid_until
+        return self.renew_after is not None
+
+    @property
     def bound(self) -> bool:
         """True when the licence names the installation it belongs to."""
         return bool(self.installation_id)
@@ -148,6 +184,15 @@ class ProLicense:
     def needs_server(self) -> bool:
         """True when domains are registered with the licence server."""
         return self.registration_policy != POLICY_OFFLINE
+
+    @property
+    def reports_run_sizes(self) -> bool:
+        """True when each run's size counts reach the licence server (partner licences only).
+
+        Every other edition keeps the counts in its local register and sends a
+        size band only. The licence server enforces the same rule on its side.
+        """
+        return self.edition == EDITION_PARTNER and self.needs_server
 
     def bound_to(self, installation_id: str, installation_key: str) -> bool:
         """True when this licence may be used by that installation."""
@@ -219,6 +264,27 @@ def _instant(text: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _contract_term(
+    payload: Mapping[str, Any], edition: str, valid_until: date, renew_after: date | None
+) -> tuple[date | None, str]:
+    """The contract end a payload states, or the one an older document implies."""
+    if edition == EDITION_ENGAGEMENT:
+        return valid_until, CONTRACT_FIXED
+    if "contract_ends_on" in payload:
+        if payload.get("contract_ends_on") is None:
+            return None, CONTRACT_OPEN_ENDED
+        end = _date(payload, "contract_ends_on")
+        assert end is not None
+        if end < valid_until:
+            raise LicenseError("malformed", "The licence document outlives its contract.")
+        return end, CONTRACT_FIXED
+    # Issued before the field existed: a document without renew_after ran to
+    # the contract's last day; one with it says only that the contract is longer.
+    if renew_after is None:
+        return valid_until, CONTRACT_FIXED
+    return None, CONTRACT_UNKNOWN
+
+
 def validate_pro_license_payload(payload: Mapping[str, Any], *, key_id: str = "") -> ProLicense:
     """Apply the rules shared by the licence server (issuing) and the engine.
 
@@ -254,7 +320,9 @@ def validate_pro_license_payload(payload: Mapping[str, Any], *, key_id: str = ""
     registration_grace = _int(registration, "grace_days", 0, MAX_REGISTRATION_GRACE_DAYS)
 
     partner_tag = _str(payload, "partner_tag", required=False).lower()
-    if (edition == EDITION_PARTNER or partner_tag) and not validate_partner_tag(partner_tag):
+    # The partner tag is ADscan's label for the grant (optional, never typed by
+    # the operator); when present it must be well formed.
+    if partner_tag and not validate_partner_tag(partner_tag):
         raise LicenseError("malformed", "The licence carries an invalid partner tag.")
 
     installation_id = _str(payload, "installation_id", required=edition != EDITION_ENGAGEMENT)
@@ -295,6 +363,9 @@ def validate_pro_license_payload(payload: Mapping[str, Any], *, key_id: str = ""
     except EntitlementError as exc:
         raise LicenseError("malformed", str(exc)) from exc
 
+    renew_after = _date(payload, "renew_after", required=False)
+    contract_ends_on, contract_term = _contract_term(payload, edition, valid_until, renew_after)
+
     return ProLicense(
         license_id=_str(payload, "license_id"),
         customer=_str(payload, "customer"),
@@ -315,9 +386,11 @@ def validate_pro_license_payload(payload: Mapping[str, Any], *, key_id: str = ""
         request_digest=_str(payload, "request_digest", required=False),
         band_edges=tuple(edges),
         retest_window_days=retest_window_days,
-        renew_after=_date(payload, "renew_after", required=False),
+        renew_after=renew_after,
         entitlements=dict(entitlements),
         key_id=key_id,
+        contract_ends_on=contract_ends_on,
+        contract_term=contract_term,
     )
 
 
@@ -361,6 +434,9 @@ def parse_pro_license(
 
 __all__ = [
     "ALLOWED_POLICIES",
+    "CONTRACT_FIXED",
+    "CONTRACT_OPEN_ENDED",
+    "CONTRACT_UNKNOWN",
     "EDITION_ENGAGEMENT",
     "EDITION_LABELS",
     "EDITION_PAID",

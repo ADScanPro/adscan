@@ -516,14 +516,7 @@ async def discover_writable_gpos(
             # does not currently emit gPCFileSysPath into the graph, but the
             # path is deterministic given (domain, GPO name/CN with braces).
             domain_fqdn = str(props.get("domain") or "").strip().lower()
-            cn_name = str(props.get("name") or "").strip()
-            if not cn_name:
-                # Derive {GUID} from the DN if name is missing.
-                dn = _node_dn(target_node)
-                if dn.startswith("CN={"):
-                    end = dn.find("}")
-                    if end > 0:
-                        cn_name = dn[3:end + 1]
+            cn_name = _gpo_cn(target_node, props)
             if domain_fqdn and cn_name:
                 gpc_path = (
                     f"\\\\{domain_fqdn}\\SysVol\\{domain_fqdn}\\Policies\\{cn_name}"
@@ -546,6 +539,28 @@ async def discover_writable_gpos(
 
     results.sort(key=lambda c: (not c.touches_tier0, c.display_name.lower()))
     return results
+
+
+def _gpo_cn(node: dict[str, Any], props: dict[str, Any]) -> str:
+    """The GPO's ``{GUID}`` CN, its SYSVOL folder name. ``""`` when unknown.
+
+    Never the label: since the collector reads ``displayName`` a GPO is labelled
+    ``Default Domain Policy (31B2F340)``, which is not a folder. Order: the
+    ``gpo_guid`` the collector stamps, the DN's first RDN, then a legacy
+    ``name`` that is itself a ``{GUID}`` (graphs collected before ``displayName``).
+    """
+    guid = str(props.get("gpo_guid") or "").strip().strip("{}")
+    if guid:
+        return f"{{{guid.upper()}}}"
+    dn = _node_dn(node)
+    if dn.startswith("CN={"):
+        end = dn.find("}")
+        if end > 0:
+            return dn[3:end + 1]
+    legacy = str(props.get("name") or "").strip()
+    if legacy.startswith("{") and legacy.endswith("}"):
+        return legacy
+    return ""
 
 
 def _canonical_relation(relation_lower: str) -> str:

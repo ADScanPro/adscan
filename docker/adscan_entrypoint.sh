@@ -16,20 +16,48 @@ ENTRYPOINT_LOG="/opt/adscan/state/entrypoint.log"
 mkdir -p "$(dirname "${ENTRYPOINT_LOG}")" >/dev/null 2>&1 || true
 : > "${ENTRYPOINT_LOG}" 2>/dev/null || true
 
-_ep_log() {
-  # Log entrypoint diagnostics both to stderr (for docker logs) and to a
-  # structured log file that the Python runtime can later ingest and forward
-  # through the Rich + telemetry pipeline.
-  local msg="$*"
-  echo "[entrypoint] ${msg}" >&2
+# Routine diagnostics stay off the operator's terminal at INFO: they go to the
+# log file, which the Python runtime ingests into the workspace debug log
+# (emit_entrypoint_logs_from_state). They reach stderr too only under --debug
+# (or ADSCAN_DEBUG_MODE=1 / ADSCAN_ENTRYPOINT_VERBOSE=1). Lines the operator
+# must act on use _ep_warn, which always reaches stderr.
+_ep_verbose=0
+if [[ "${ADSCAN_DEBUG_MODE:-}" == "1" || "${ADSCAN_ENTRYPOINT_VERBOSE:-}" == "1" ]]; then
+  _ep_verbose=1
+fi
+for _ep_arg in "$@"; do
+  if [[ "${_ep_arg}" == "--debug" ]]; then
+    _ep_verbose=1
+  fi
+done
+unset _ep_arg
+
+_ep_write() {
   # Best-effort only: failures here must never break container startup.
   {
-    printf '%s\n' "${msg}" >>"${ENTRYPOINT_LOG}"
+    printf '%s\n' "$*" >>"${ENTRYPOINT_LOG}"
   } 2>/dev/null || true
 }
 
+_ep_log() {
+  # Routine diagnostic: log file always, stderr only when verbose.
+  local msg="$*"
+  if [[ "${_ep_verbose}" == "1" ]]; then
+    echo "[entrypoint] ${msg}" >&2
+  fi
+  _ep_write "${msg}"
+}
+
+_ep_warn() {
+  # A problem the operator must see (startup failure, degraded mode): always
+  # stderr, and the log file.
+  local msg="$*"
+  echo "[entrypoint] ${msg}" >&2
+  _ep_write "${msg}"
+}
+
 if ! command -v gosu >/dev/null 2>&1; then
-  _ep_log "gosu not found; image build is incomplete"
+  _ep_warn "gosu not found; image build is incomplete"
   exit 1
 fi
 
@@ -59,11 +87,11 @@ _check_launcher_runtime_contract() {
     return 0
   fi
 
-  _ep_log "launcher runtime contract incomplete: ${issues[*]}"
-  _ep_log "FULL runtime should be started via the official host launcher (pipx/pip install adscan)"
-  _ep_log "manual in-container launches will be blocked by the Python runtime guard"
+  _ep_warn "launcher runtime contract incomplete: ${issues[*]}"
+  _ep_warn "FULL runtime should be started via the official host launcher (pipx/pip install adscan)"
+  _ep_warn "manual in-container launches will be blocked by the Python runtime guard"
   if [[ -n "${ADSCAN_HOST_HELPER_SOCK:-}" ]]; then
-    _ep_log "host helper socket path: ${ADSCAN_HOST_HELPER_SOCK}"
+    _ep_warn "host helper socket path: ${ADSCAN_HOST_HELPER_SOCK}"
   fi
 }
 
@@ -243,7 +271,7 @@ _public_dns_mode() {
       echo "disabled"
       ;;
     *)
-      _ep_log "unknown ADSCAN_PUBLIC_DNS_MODE='${ADSCAN_PUBLIC_DNS_MODE:-}'; using inherit"
+      _ep_warn "unknown ADSCAN_PUBLIC_DNS_MODE='${ADSCAN_PUBLIC_DNS_MODE:-}'; using inherit"
       echo "inherit"
       ;;
   esac
@@ -613,39 +641,39 @@ else
     # The launcher reserved this IP via flock but Unbound could not bind to it.
     # This is a hard failure in multi-instance mode: falling back to a different
     # IP would violate the reservation contract and collide with another launcher.
-    _ep_log "ERROR: Unbound failed to start on launcher-reserved IP ${ADSCAN_LOCAL_RESOLVER_IP}"
-    _ep_log "       Unbound binds two ports on this IP:"
-    _ep_log "         - :53   (DNS resolver)"
-    _ep_log "         - :8953 (remote-control, used by ADscan to reload configs)"
-    _ep_log "       Either can be the source of conflict — typically :8953 when an"
-    _ep_log "       older adscan container (running an image without the per-IP"
-    _ep_log "       control fix) is still up and bound the full loopback pool."
-    _ep_log ""
+    _ep_warn "ERROR: Unbound failed to start on launcher-reserved IP ${ADSCAN_LOCAL_RESOLVER_IP}"
+    _ep_warn "       Unbound binds two ports on this IP:"
+    _ep_warn "         - :53   (DNS resolver)"
+    _ep_warn "         - :8953 (remote-control, used by ADscan to reload configs)"
+    _ep_warn "       Either can be the source of conflict — typically :8953 when an"
+    _ep_warn "       older adscan container (running an image without the per-IP"
+    _ep_warn "       control fix) is still up and bound the full loopback pool."
+    _ep_warn ""
 
     # Best-effort diagnostic: show what is currently bound on those ports.
     if command -v ss >/dev/null 2>&1; then
-      _ep_log "[diag] listeners around ${ADSCAN_LOCAL_RESOLVER_IP}:"
+      _ep_warn "[diag] listeners around ${ADSCAN_LOCAL_RESOLVER_IP}:"
       ss -Hn -tulnp 2>/dev/null \
         | awk -v ip="${ADSCAN_LOCAL_RESOLVER_IP}" '$0 ~ ip ":(53|8953) "' \
         | while IFS= read -r line; do
-            _ep_log "[diag] ${line}"
+            _ep_warn "[diag] ${line}"
           done || true
     fi
 
     if [[ -s "${unbound_log:-/dev/null}" ]]; then
-      _ep_log ""
-      _ep_log "[diag] last 5 lines from ${unbound_log}:"
+      _ep_warn ""
+      _ep_warn "[diag] last 5 lines from ${unbound_log}:"
       tail -n 5 "${unbound_log}" 2>/dev/null \
         | while IFS= read -r line; do
-            _ep_log "[diag]   ${line}"
+            _ep_warn "[diag]   ${line}"
           done || true
     fi
-    _ep_log ""
-    _ep_log "       Stop the older adscan session (or whichever process holds these"
-    _ep_log "       ports) and retry. After every running adscan container is on"
-    _ep_log "       the new image the conflict cannot recur."
+    _ep_warn ""
+    _ep_warn "       Stop the older adscan session (or whichever process holds these"
+    _ep_warn "       ports) and retry. After every running adscan container is on"
+    _ep_warn "       the new image the conflict cannot recur."
   else
-    _ep_log "unbound did not respond on any loopback candidate (127.0.0.x:53); leaving /etc/resolv.conf unchanged"
+    _ep_warn "unbound did not respond on any loopback candidate (127.0.0.x:53); leaving /etc/resolv.conf unchanged"
   fi
   # Either way, unset so ADscan does not assume a working local resolver.
   unset ADSCAN_LOCAL_RESOLVER_IP || true
@@ -672,7 +700,7 @@ trap cleanup EXIT INT TERM
 # (uid_map "0 0 …") and keep their caps untouched. We run as container-root here
 # (before the gosu drop), which holds CAP_SETFCAP over the image files.
 if ! grep -qE '^[[:space:]]*0[[:space:]]+0[[:space:]]' /proc/self/uid_map 2>/dev/null; then
-  _ep_log "rootless/user-namespaced runtime detected — stripping file-capabilities so ADscan can start (reduced network mode: no ICMP discovery / TUN pivoting)"
+  _ep_warn "rootless/user-namespaced runtime detected — stripping file-capabilities so ADscan can start (reduced network mode: no ICMP discovery / TUN pivoting)"
   if command -v setcap >/dev/null 2>&1; then
     _venv_python="$(readlink -f /opt/adscan/venv/bin/python 2>/dev/null || true)"
     for _capbin in "${_venv_python}" /opt/adscan/tools/ligolo-ng/proxy/linux-amd64/proxy; do

@@ -984,6 +984,32 @@ class TierBasis(str, Enum):
     SERVER_ROLE_INFERRED = "server_role_inferred"
 
 
+#: Tier bases that place a computer by a RIGHT someone holds rather than by its
+#: membership, role or own attributes: a control/admin/delegation right over a
+#: Tier 0 object (``TIER0_CONTROL``) and a broad interactive-logon right
+#: (``RDS_DOWNGRADE``, which also fires on a Citrix session-host SPN and is
+#: counted here conservatively). Every other basis (Tier 0 group or DC role,
+#: server OS, application or server-role SPN) is membership, role or attribute.
+#: A NEW basis that reads a right must be added here.
+RIGHT_BASED_TIER_BASES: frozenset[str] = frozenset(
+    {TierBasis.TIER0_CONTROL.value, TierBasis.RDS_DOWNGRADE.value}
+)
+
+
+def node_stamped_tier_basis(node: Mapping[str, Any] | None) -> str | None:
+    """Return the ``privilege_tier_basis`` stamped on a graph node, or ``None``."""
+    if not isinstance(node, Mapping):
+        return None
+    props = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+    raw = (props or {}).get("privilege_tier_basis") or node.get("privilege_tier_basis")
+    return str(raw).strip().lower() if isinstance(raw, str) and raw.strip() else None
+
+
+def tier_basis_is_right_based(basis: str | None) -> bool:
+    """Return whether a stamped basis placed the object by a right (:data:`RIGHT_BASED_TIER_BASES`)."""
+    return bool(basis) and str(basis).strip().lower() in RIGHT_BASED_TIER_BASES
+
+
 # Application-class SPN service classes: publishing one is a positive signal that
 # a member server runs a real line-of-business application (Tier 1), beyond the
 # generic SPNs EVERY domain-joined server carries. Matched case-insensitively
@@ -1143,6 +1169,37 @@ def is_client_os(os_str: str | None) -> bool:
     if not text or "server" in text:
         return False
     return any(marker in text for marker in _CLIENT_OS_MARKERS)
+
+
+def is_server_os(os_str: str | None) -> bool:
+    """Return whether an OS string names a server SKU ("server" anywhere in it).
+
+    The rule the computer tier applies to grade a member server
+    (:func:`privilege_tier_for_computer` ``is_server``): AD exposes the role only
+    through ``operatingSystem``, and Microsoft names every server SKU "Server".
+    """
+    return "server" in str(os_str or "").lower()
+
+
+#: :func:`computer_os_kind` values.
+OS_KIND_SERVER = "server"
+OS_KIND_WORKSTATION = "workstation"
+OS_KIND_UNKNOWN = "unknown"
+
+
+def computer_os_kind(os_str: str | None) -> str:
+    """Server, workstation or unknown, from a computer's ``operatingSystem``.
+
+    Server by :func:`is_server_os`, workstation by :func:`is_client_os` (a known
+    Windows client edition), unknown for everything else (no OS string, a
+    non-Windows or unrecognised system): never guessed. A domain controller
+    runs a server SKU, so it is a server here.
+    """
+    if is_server_os(os_str):
+        return OS_KIND_SERVER
+    if is_client_os(os_str):
+        return OS_KIND_WORKSTATION
+    return OS_KIND_UNKNOWN
 
 
 def refine_server_privilege_tier(
@@ -1491,7 +1548,7 @@ def privilege_tier_for_computer_node(
     return privilege_tier_for_computer(
         is_dc=dc_role is not None,
         is_tier0_asset=is_tier0_asset,
-        is_server="server" in os_str,
+        is_server=is_server_os(os_str),
     )
 
 
@@ -1865,7 +1922,7 @@ def stamp_membership_aware_privilege_tier(graph: Mapping[str, Any]) -> None:
             sid=sid,
             is_dc=classify_computer_node_role(dict(node)) is not None,
             is_tier0_asset=is_tier0_flag,
-            is_server="server" in os_str,
+            is_server=is_server_os(os_str),
         )
         controls_tier0 = any(
             _graph_target_is_tier0(t, node_id)

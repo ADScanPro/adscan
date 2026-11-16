@@ -48,6 +48,7 @@ it stays importable from launcher, services and CLI alike. Do NOT import
 from __future__ import annotations
 
 import itertools
+import math
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -85,6 +86,13 @@ __all__ = [
 
 # Braille spinner frames — the modern default per tui-design § 5.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# Time constant (seconds) of the recent-rate EWMA that feeds the ETA. ~1 minute:
+# long enough to smooth the per-host noise of a fan-out (a live host completes in
+# a second, a dead one after its timeout), short enough that the estimate tracks a
+# rate that shifts over the run (the fast live batch first, the dead-host tail
+# after) instead of being dragged by the whole-run mean.
+_RATE_TAU_SECONDS = 60.0
 
 
 def format_eta(seconds: Optional[float]) -> str:
@@ -316,10 +324,22 @@ class ProgressDashboard:
         self._clock = _clock
         self._start = _clock()
         self._elapsed_snapshot = 0.0
+        # Recent-weighted ETA estimator (see :attr:`recent_rate`). Time-decayed
+        # EWMA of the instantaneous completion rate; ``None`` until the first
+        # completion, when the ETA falls back to the cumulative mean.
+        self._smoothed_rate: Optional[float] = None
+        self._rate_last_time = self._start
+        self._rate_last_done = 0
+        # Units a prior interrupted run already completed (resume). Shown in the
+        # bar/count on top of this run's ``_done``; never fed to the rate/ETA.
+        self._completed_before = 0
         self._done = 0
         self._success = 0
         self._error = 0
         self._in_flight = 0
+        # Items not started yet, when the caller reports a queue (a fan-out with
+        # a worker pool). None keeps the single "in-flight" gauge.
+        self._queued: Optional[int] = None
         self._last: Optional[str] = None
         self._last_detail: Optional[str] = None
         # Bounded "recent found" window. The deque maxlen guarantees the
@@ -377,11 +397,35 @@ class ProgressDashboard:
 
     @property
     def rate(self) -> float:
-        """Throughput in items/second (0.0 before any time has elapsed)."""
+        """Cumulative mean throughput in items/second (0.0 before any time).
+
+        This is the whole-run average. For the ETA use :attr:`recent_rate`: on a
+        stream whose rate shifts over the run (a host fan-out where a fast batch
+        of live hosts finishes first and thousands of dead hosts then time out
+        one per worker), the cumulative mean lags the current rate badly and an
+        ETA built on it swings — far too optimistic while the dead-host tail
+        drains. The displayed "rate" stays the honest whole-run average.
+        """
         elapsed = self.elapsed
         if elapsed <= 0 or self._done <= 0:
             return 0.0
         return self._done / elapsed
+
+    @property
+    def recent_rate(self) -> float:
+        """Recent-weighted throughput in items/second, for a stable ETA.
+
+        A time-decayed EWMA of the instantaneous completion rate (time constant
+        :data:`_RATE_TAU_SECONDS`), so it tracks the CURRENT rate rather than the
+        whole-run mean. On a dead-host-dominated sweep it settles on the slow
+        steady-state rate the timeouts impose instead of the fast first batch, so
+        the ETA converges instead of reading "almost done" with the tail still to
+        drain. Falls back to the cumulative :attr:`rate` until it has a sample
+        (the first few completions), so an early ETA is never missing.
+        """
+        if self._smoothed_rate is not None and self._smoothed_rate > 0:
+            return self._smoothed_rate
+        return self.rate
 
     @property
     def eta_seconds(self) -> Optional[float]:
@@ -391,15 +435,62 @@ class ProgressDashboard:
         externally reported remaining time when one has been fed via
         :meth:`set_reported_progress` (e.g. Nmap's ``ETC``), so a subprocess op
         that reports its own ETA still exposes one to callers (the web event).
+
+        In determinate mode the estimate divides the remaining items by
+        :attr:`recent_rate` (the recent-weighted rate), so a rate that shifts
+        mid-run does not make the ETA swing.
         """
         total = self._config.total
         if total is None or total <= 0:
             return self._reported_eta_seconds
-        rate = self.rate
+        rate = self.recent_rate
         if rate <= 0:
             return None
-        remaining = max(0, total - self._done)
+        remaining = max(0, total - self._shown_done())
         return remaining / rate
+
+    def _shown_done(self) -> int:
+        """Items complete for DISPLAY: this-run completions plus a resume offset.
+
+        The rate/ETA measure only ``_done`` (this-run completions), so the resume
+        offset never poisons the estimator, but the bar and the "N of M" count
+        include the units a prior interrupted run already finished — a resumed
+        stage shows "800 / 2000", not a restart at "0 / 2000".
+        """
+        return self._completed_before + self._done
+
+    def set_completed_before(self, count: int) -> None:
+        """Declare units a prior run already completed (resume), for the display.
+
+        Shown in the bar and the "N of M" count on top of this run's ``_done``;
+        the rate and ETA still measure only this run's completions. Default 0, so
+        a fresh run is unchanged.
+        """
+        self._completed_before = max(0, int(count))
+
+    def _sample_rate(self) -> None:
+        """Feed one completion into the recent-rate EWMA (monotonic clock only).
+
+        Called from :meth:`update` after the new ``done`` is set. Samples only
+        when ``done`` advanced (a frame-only refresh, e.g. Nmap's percent ticks,
+        never pollutes the estimator). Time-decayed so an irregular update cadence
+        (one host per completion, long gaps on a dead host) is weighted by elapsed
+        time, not by sample count.
+        """
+        now = self._start + self._elapsed_snapshot
+        done = self._done
+        dn = done - self._rate_last_done
+        dt = now - self._rate_last_time
+        if dn <= 0 or dt <= 0:
+            return
+        self._rate_last_done = done
+        self._rate_last_time = now
+        inst = dn / dt
+        if self._smoothed_rate is None:
+            self._smoothed_rate = inst
+            return
+        weight = 1.0 - math.exp(-dt / _RATE_TAU_SECONDS)
+        self._smoothed_rate += weight * (inst - self._smoothed_rate)
 
     # ------------------------------------------------------------------
     # Drive API
@@ -414,6 +505,7 @@ class ProgressDashboard:
         in_flight: Optional[int] = None,
         last: Optional[str] = None,
         last_detail: Optional[str] = None,
+        queued: Optional[int] = None,
     ) -> None:
         """Update cumulative counts and push a new frame to Live.
 
@@ -426,6 +518,9 @@ class ProgressDashboard:
             success: Items that succeeded so far.
             error: Items that errored so far.
             in_flight: Items currently being processed.
+            queued: Items waiting to start. When given, the gauge reads
+                "working N · queued M" so the queue is never shown as work in
+                progress.
             last: Raw value for the "last item" line (masked at render).
             last_detail: Optional pre-formatted detail string for the line
                 (e.g. "shares 3 · sessions 7"); rendered after the value.
@@ -438,10 +533,13 @@ class ProgressDashboard:
             self._error = error
         if in_flight is not None:
             self._in_flight = in_flight
+        if queued is not None:
+            self._queued = max(0, int(queued))
         if last is not None:
             self._last = last
             self._last_detail = last_detail
         self._elapsed_snapshot = max(0.0, self._clock() - self._start)
+        self._sample_rate()
         self._spinner_frame = next(self._spinner)
         if self._session is not None:
             self._session.update(self.render())
@@ -648,15 +746,16 @@ class ProgressDashboard:
         grid.add_column(justify="left", ratio=1)
         grid.add_column(justify="right")
         if total is not None and total > 0:
+            shown = self._shown_done()
             bar = ProgressBar(
                 total=total,
-                completed=min(self._done, total),
+                completed=min(shown, total),
                 width=28,
                 complete_style=ADSCAN_PRIMARY_BRIGHT,
                 finished_style=COLOR_SAGE,
                 style=COLOR_MUTED,
             )
-            count = Text(f"  {self._done} / {total} {self._config.unit}",
+            count = Text(f"  {shown} / {total} {self._config.unit}",
                          style=ADSCAN_PRIMARY)
             left = Table.grid(padding=(0, 0))
             left.add_row(bar, count)
@@ -724,7 +823,12 @@ class ProgressDashboard:
         row.add_row(
             Text(f"✓ {self._config.unit} {self._success}", style=COLOR_SAGE),
             Text(f"⚠ errors {self._error}", style=COLOR_AMBER),
-            Text(f"⏳ in-flight {self._in_flight}", style=COLOR_MUTED),
+            Text(
+                f"⏳ in-flight {self._in_flight}"
+                if self._queued is None
+                else f"⏳ working {self._in_flight} · queued {self._queued}",
+                style=COLOR_MUTED,
+            ),
         )
         return row
 

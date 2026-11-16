@@ -29,6 +29,7 @@ from typing import Any
 
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.mitm6.core import (
+    victim_address_in_asset_scope,
     DNSObservation,
     MITM6Callback,
     MITM6Config,
@@ -219,6 +220,8 @@ class DNSHijacker:
             return None
         tid, qname, qtype = parsed
         victim_ip = addr[0]
+        if not victim_address_in_asset_scope(victim_ip):
+            return None
         if not matches_filter(
             qname,
             allowlist=self._config.dns_allowlist,

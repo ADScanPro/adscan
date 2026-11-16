@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import time
 import uuid
@@ -79,6 +80,11 @@ _REPL_TIME_RE = re.compile(r"<ftimeLastOriginatingChange>(.+?)</ftimeLastOrigina
 _REPL_VER_RE = re.compile(r"<dwVersion>(\d+)</dwVersion>")
 
 
+#: Directory entries processed between two memory checks of the collection
+#: stage (the check itself is rate-limited by the guard).
+_MEMORY_CHECK_EVERY = 1024
+
+
 def _parse_repl_attr_metadata(
     blobs: list[Any],
     target_attrs: frozenset[str],
@@ -150,6 +156,9 @@ _COLLECT_ATTRS = [
     # governs each user without re-querying LDAP. Constructed attribute,
     # only returned when the bind has read permission.
     "msDS-ResultantPSO",
+    # A Group Policy object's ``name`` is its ``{GUID}`` CN; ``displayName`` is
+    # the name a sysadmin gave it and recognises in GPMC, so it is the label.
+    "displayName",
 ]
 
 _GPO_LINK_RE = re.compile(r"\[LDAP://[^,]*CN=\{([A-Fa-f0-9\-]+)\}", re.IGNORECASE)
@@ -766,6 +775,60 @@ def _account_common_properties(
 # ---------------------------------------------------------------------------
 
 
+_GPO_GUID_RE = re.compile(r"^\{?([0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})\}?$")
+#: Hex digits of the policy GUID a GPO label shows after its display name.
+_GPO_SHORT_GUID_LEN = 8
+
+
+def _gpo_policy_guid(cn: str) -> str:
+    """The policy GUID of a GPO (its ``{GUID}`` CN, upper case, no braces), or ``""``.
+
+    This is the GUID GPMC shows as "Unique ID", the SYSVOL folder name and what
+    ``Get-GPO -Guid`` takes; it is not the object's ``objectGUID``.
+    """
+    match = _GPO_GUID_RE.match(str(cn or "").strip())
+    return match.group(1).upper() if match else ""
+
+
+def _gpo_label(display_name: str, policy_guid: str, *, full: bool = False) -> str:
+    """``<display name> (<first 8 of the policy GUID>)``, or ``""`` without a display name.
+
+    A display name is not unique, so the label always carries part of the GUID;
+    :func:`_disambiguate_gpo_labels` widens it to the full GUID when two GPOs of a
+    domain would still share one label. The display name keeps the case the
+    directory stores (a GPO is named by a person, never shouted).
+    """
+    name = str(display_name or "").strip()
+    if not name:
+        return ""
+    if not policy_guid:
+        return name
+    suffix = policy_guid if full else policy_guid[:_GPO_SHORT_GUID_LEN]
+    return f"{name} ({suffix})"
+
+
+def _disambiguate_gpo_labels(result: CollectionResult) -> None:
+    """Give the full policy GUID to GPOs of one domain that would share a label.
+
+    The attack graph resolves a node by its label, so two GPOs named alike with
+    the same GUID prefix must not collide.
+    """
+    by_label: dict[str, list[CollectorNode]] = {}
+    for node in result.nodes.values():
+        if node.kind == "GPO" and node.properties.get("displayname"):
+            by_label.setdefault(node.name.casefold(), []).append(node)
+    for nodes in by_label.values():
+        if len(nodes) < 2:
+            continue
+        for node in nodes:
+            full = _gpo_label(
+                str(node.properties.get("displayname") or ""),
+                str(node.properties.get("gpo_guid") or ""),
+                full=True,
+            )
+            result.nodes[node.object_id.upper()] = dataclasses.replace(node, name=full)
+
+
 def _entry_to_node(entry: Any, domain: str) -> CollectorNode | None:
     attrs = _attrs(entry)
     classes = {str(v).lower() for v in _values(attrs, "objectClass")}
@@ -914,12 +977,18 @@ def _entry_to_node(entry: Any, domain: str) -> CollectorNode | None:
         )
 
     if "grouppolicycontainer" in classes:
+        policy_guid = _gpo_policy_guid(raw_name)
+        display_name = _first_str(attrs, "displayName")
+        gpo_props: dict[str, Any] = {}
+        _set_if_nonempty(gpo_props, "gpo_guid", policy_guid)
+        _set_if_nonempty(gpo_props, "displayname", display_name)
         return CollectorNode(
             object_id=guid,
             kind="GPO",
-            name=raw_name.upper(),
+            name=_gpo_label(display_name, policy_guid) or raw_name.upper(),
             domain=domain,
             distinguished_name=dn,
+            properties=gpo_props,
         )
 
     if "organizationalunit" in classes:
@@ -1623,7 +1692,19 @@ class ADscanLDAPCollector:
         }
         per_kind_seen: dict[str, int] = {"User": 0, "Group": 0, "Computer": 0}
 
-        for entry in conn.entries:
+        # The collection stage's memory guard: the ACL edges parsed here grow
+        # with the directory, so the boundary thread checks it as it goes.
+        from adscan_core.memory_guard import current_guard  # noqa: PLC0415
+
+        guard = current_guard()
+        for index, entry in enumerate(conn.entries):
+            if (
+                guard is not None
+                and index
+                and index % _MEMORY_CHECK_EVERY == 0
+                and guard.over_line()
+            ):
+                guard.stop_now()
             try:
                 node = _entry_to_node(entry, config.domain)
                 if node:
@@ -1714,6 +1795,7 @@ class ADscanLDAPCollector:
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_info_debug(f"[ldap-collector] entry processing failed: {exc}")
+        _disambiguate_gpo_labels(result)
 
     def _collect_deleted_objects(
         self,

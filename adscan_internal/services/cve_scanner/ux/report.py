@@ -162,10 +162,11 @@ def _render_markdown(report: CVEScanReport) -> str:
     if not vulnerable:
         lines.append("_No confirmed findings._")
     for result in vulnerable:
-        cvss = f"CVSS {result.cvss_v3:.1f}" if result.cvss_v3 is not None else "CVSS —"
+        # ADscan severity plus the check id (the public CVE id when there is
+        # one). No CVSS number (CLAUDE.md § "No CVSS on a client surface").
         lines.append(
             f"- `{result.aka}` on `{result.host}` — "
-            f"{result.severity.value.upper()} ({cvss}) — {result.cve_id}"
+            f"{result.severity.value.upper()} — {result.cve_id}"
         )
         if result.evidence and result.evidence.summary:
             lines.append(f"  - {result.evidence.summary}")

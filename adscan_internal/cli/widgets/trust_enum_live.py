@@ -20,6 +20,7 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
+from adscan_core.output._responsive_table import ResponsiveColumn, ResponsiveTable
 from adscan_core.rich_output import print_info_verbose
 from adscan_core.tui import LiveSession, LiveSessionConfig
 from adscan_internal import get_console
@@ -360,6 +361,39 @@ def _remediation_for(error: str) -> str:
     return "Inspect logs for the underlying cause."
 
 
+#: Trust matrix columns. The partner domain is the primary column; the source
+#: domain and the direction arrow are never dropped; the attributes give way,
+#: in priority order, and are stacked under the partner.
+TRUST_MATRIX_COLUMNS: tuple[ResponsiveColumn, ...] = (
+    ResponsiveColumn("Source", priority=0, style="bold"),
+    ResponsiveColumn("", priority=0, justify="center"),
+    ResponsiveColumn("Partner", priority=0, style="bold"),
+    ResponsiveColumn("Direction", priority=2),
+    ResponsiveColumn("Type", priority=1),
+    ResponsiveColumn("Posture", priority=3, max_width=28),
+)
+
+#: Discovered-domain columns. The domain is primary; the PDC is kept longest.
+DISCOVERED_DOMAIN_COLUMNS: tuple[ResponsiveColumn, ...] = (
+    ResponsiveColumn("Domain", priority=0, style="bold"),
+    ResponsiveColumn("PDC", priority=1, stack_label="PDC"),
+    ResponsiveColumn("Reachable", priority=3, stack_label="Reachable", justify="center"),
+    ResponsiveColumn("Trusts", priority=2, stack_label="Trusts", justify="right"),
+    ResponsiveColumn("Latency", priority=4, stack_label="Latency", justify="right", style="dim"),
+)
+
+
+def _summary_table_kwargs(title: str) -> dict[str, Any]:
+    return {
+        "title": title,
+        "title_justify": "left",
+        "title_style": "bold",
+        "expand": False,
+        "show_lines": False,
+        "pad_edge": False,
+    }
+
+
 def render_trust_summary_panel(
     result: Any,
     *,
@@ -398,20 +432,12 @@ def render_trust_summary_panel(
         header.append(f"{len(failed)} unreachable", style="bold red")
 
     # Trust matrix table
-    matrix = Table(
-        title="Trust matrix",
-        title_justify="left",
-        title_style="bold",
-        expand=False,
-        show_lines=False,
-        pad_edge=False,
+    # Both tables degrade by design inside the summary panel: the domain names
+    # always show in full, and the attributes that no longer fit are stacked
+    # under them instead of being cut ("Bidirection…", "north.sevenk…").
+    matrix = ResponsiveTable(
+        columns=TRUST_MATRIX_COLUMNS, primary=2, table_kwargs=_summary_table_kwargs("Trust matrix")
     )
-    matrix.add_column("Source", style="bold")
-    matrix.add_column("", justify="center")
-    matrix.add_column("Partner", style="bold")
-    matrix.add_column("Direction")
-    matrix.add_column("Type")
-    matrix.add_column("Posture")
 
     for trust in trusts:
         direction = getattr(trust, "trust_direction", "Unknown")
@@ -426,19 +452,11 @@ def render_trust_summary_panel(
         )
 
     # Discovered domains table
-    domains_table = Table(
-        title="Discovered domains",
-        title_justify="left",
-        title_style="bold",
-        expand=False,
-        show_lines=False,
-        pad_edge=False,
+    domains_table = ResponsiveTable(
+        columns=DISCOVERED_DOMAIN_COLUMNS,
+        primary=0,
+        table_kwargs=_summary_table_kwargs("Discovered domains"),
     )
-    domains_table.add_column("Domain", style="bold")
-    domains_table.add_column("PDC")
-    domains_table.add_column("Reachable", justify="center")
-    domains_table.add_column("Trusts", justify="right")
-    domains_table.add_column("Latency", justify="right", style="dim")
 
     trust_count_by_source: dict[str, int] = {}
     for trust in trusts:

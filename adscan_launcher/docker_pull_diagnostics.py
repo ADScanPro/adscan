@@ -37,6 +37,9 @@ import signal
 from dataclasses import dataclass
 from typing import Literal
 
+from adscan_core.outbound_links import ADSCAN_CONTACT_EMAIL
+from adscan_core.outbound_links import ADSCAN_REGISTRY_HOST
+
 from adscan_core.outbound_links import cta_markup
 
 
@@ -109,6 +112,10 @@ def tail_meaningful_lines(text: str, max_lines: int = 5) -> list[str]:
 
 
 PullFailureKind = Literal[
+    "licence_refused",
+    "registry_clock",
+    "registry_rate_limited",
+    "registry_unreachable",
     "auth_or_rate_limit",
     "manifest_not_found",
     "registry_consistency",
@@ -180,6 +187,35 @@ class PullFailureDiagnosis:
 # patterns above the generic ones so e.g. "toomanyrequests" wins over a
 # generic "unauthorized" if both appear in stderr.
 _CLASSIFIERS: tuple[tuple[re.Pattern[str], PullFailureKind, bool], ...] = (
+    # The licence-authorised PRO registry refuses with the licence's own words
+    # (license_server.registry_auth): Docker prints them after `unauthorized:`.
+    # FIRST, so a revoked or ended licence never reads as a login problem.
+    # A credential refused only for its date is this machine's clock, not the
+    # licence (ADscan steps the host clock to a domain controller during a scan).
+    (
+        re.compile(
+            r"\bunauthorized:\s*The registry credential (?:is dated in the future|expired)",
+            re.IGNORECASE,
+        ),
+        "registry_clock",
+        False,
+    ),
+    (
+        re.compile(
+            r"\bunauthorized:\s*(?:This licence\b|This machine\b|This installation\b|"
+            r"This activation key\b|The registry credential\b|Sign in with your (?:ADscan )?activation key)",
+            re.IGNORECASE,
+        ),
+        "licence_refused",
+        False,
+    ),
+    # The ADscan token service's own limits (license_server.registry_auth):
+    # retrying immediately only extends the block, so this is terminal.
+    (
+        re.compile(r"\btoomanyrequests:\s*Too many (?:failed sign-ins|registry sign-ins)", re.IGNORECASE),
+        "registry_rate_limited",
+        False,
+    ),
     (re.compile(r"\btoomanyrequests\b", re.IGNORECASE), "auth_or_rate_limit", True),
     (
         re.compile(r"\bunauthorized\b.*\bauthentication\s+required\b", re.IGNORECASE),
@@ -276,6 +312,32 @@ _CLASSIFIERS: tuple[tuple[re.Pattern[str], PullFailureKind, bool], ...] = (
 )
 
 
+#: Server-side failures of a registry (5xx), as Docker prints them.
+_SERVER_ERROR_RE = re.compile(
+    r"(unexpected\s+(?:http\s+)?status:?\s*5\d\d|\b50[234]\s+(?:bad gateway|service unavailable|gateway time-?out)\b)",
+    re.IGNORECASE,
+)
+#: Kinds that mean "the pull never reached a working registry".
+_REACH_KINDS = frozenset({"network_dns", "network_timeout"})
+#: Kinds after which the pull loop neither retries nor tries another registry.
+TERMINAL_KINDS = frozenset({"licence_refused", "registry_clock", "registry_rate_limited", "user_interrupt"})
+
+
+def refine_for_licence_registry(diagnosis: PullFailureDiagnosis, combined: str) -> PullFailureDiagnosis:
+    """A failure to REACH ADscan's registry is its own diagnosis, never a licence refusal.
+
+    DNS, a connection failure or a 5xx from ``registry.adscanpro.com`` says
+    nothing about the licence: the operator checks the route (and
+    ``adscan license check`` for the token service behind it), and the pull loop
+    may still try a legacy registry the host is logged in to.
+    """
+    if diagnosis.kind in _REACH_KINDS or (
+        diagnosis.kind in ("unknown", "registry_consistency") and _SERVER_ERROR_RE.search(combined or "")
+    ):
+        return PullFailureDiagnosis(kind="registry_unreachable", evidence=diagnosis.evidence)
+    return diagnosis
+
+
 def classify_pull_failure(stderr: str, stdout: str) -> PullFailureDiagnosis:
     """Classify a ``docker pull`` failure from captured output.
 
@@ -343,6 +405,83 @@ class PullFailurePresentation:
 
 
 _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
+    "licence_refused": PullFailurePresentation(
+        glyph="🔑",
+        title="Your ADscan PRO licence does not allow this download",
+        border_style="red",
+        what_lines=(
+            "The ADscan registry checked this machine's licence and refused the download. "
+            "Its reason is shown below.",
+        ),
+        why_lines=(
+            "Downloads follow the licence. A revoked or ended licence, or a seat released "
+            "on this machine, stops new downloads within minutes. The image already on "
+            "this machine and every workspace stay as they are.",
+        ),
+        fix_steps=(
+            "adscan license status",
+            "adscan license activate   # if this machine was never activated",
+        ),
+        followup=f"To restore access, contact ADscan at {ADSCAN_CONTACT_EMAIL}.",
+    ),
+    "registry_clock": PullFailurePresentation(
+        glyph="🕒",
+        title="This machine's clock does not match the licence server",
+        border_style="yellow",
+        what_lines=(
+            "ADscan's registry refused the download because the credential this machine "
+            "signed is dated outside the time the server accepts. The licence itself is fine.",
+        ),
+        why_lines=(
+            "ADscan sets this machine's clock to the domain controller's during a scan and "
+            "restores it at the end. A scan that stopped abruptly can leave it set.",
+        ),
+        fix_steps=(
+            "adscan license check            # shows how far off the clock is",
+            "sudo timedatectl set-ntp true   # let the system clock resynchronise",
+            "{retry_command}",
+        ),
+    ),
+    "registry_rate_limited": PullFailurePresentation(
+        glyph="⏳",
+        title="ADscan's registry is limiting downloads from this machine",
+        border_style="yellow",
+        what_lines=(
+            "The registry refused new sign-ins for a few minutes: too many failed sign-ins "
+            "from this address, or too many downloads for this licence in the last hour.",
+        ),
+        why_lines=(
+            "Retrying straight away keeps the limit in place, so ADscan stops here instead.",
+        ),
+        fix_steps=(
+            "{retry_command}                 # after a few minutes",
+        ),
+        followup=f"If it persists, contact ADscan at {ADSCAN_CONTACT_EMAIL}.",
+    ),
+    "registry_unreachable": PullFailurePresentation(
+        glyph="🌐",
+        title="ADscan's registry could not be reached",
+        border_style="yellow",
+        what_lines=(
+            f"The download from {ADSCAN_REGISTRY_HOST} failed before the licence was checked: "
+            "the name did not resolve, the connection failed, or the registry answered with "
+            "a server error. This is not a licence refusal.",
+        ),
+        why_lines=(
+            f"This machine (or the Docker daemon's proxy) needs outbound HTTPS to "
+            f"{ADSCAN_REGISTRY_HOST} and to its storage host. A firewall, a proxy or a "
+            "missing VPN stops it, and so does an outage on our side.",
+        ),
+        fix_steps=(
+            "adscan license check            # tests the route to ADscan step by step",
+            f"curl -sI https://{ADSCAN_REGISTRY_HOST}/v2/   # expect HTTP 401: reachable",
+            "{retry_command}",
+        ),
+        followup=(
+            "A host with no route to ADscan installs from a signed image archive: "
+            "`adscan install --license-file <key file> --image-archive <archive>`."
+        ),
+    ),
     "auth_or_rate_limit": PullFailurePresentation(
         glyph="🔐",
         title="The registry rejected the pull (auth or rate limit)",
@@ -367,9 +506,9 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
             "{retry_command}",
         ),
         followup=(
-            "If the image is in a private/partner repo (e.g. the PRO image on "
-            "ghcr.io), ensure your account/token has been granted read access "
-            "to it first."
+            f"ADscan PRO downloads from {ADSCAN_REGISTRY_HOST} with this machine's "
+            "licence and needs no docker login. For any other private registry, "
+            "make sure your account or token has read access first."
         ),
     ),
     "manifest_not_found": PullFailurePresentation(
@@ -383,16 +522,15 @@ _PRESENTATION: dict[PullFailureKind, PullFailurePresentation] = {
         why_lines=(
             "Either the launcher and runtime image versions drifted and "
             "the launcher is requesting an outdated tag that has been "
-            "rotated away, OR a PRO partner-tag was revoked or renamed.",
+            "rotated away, OR the PRO image tag you were given was rotated.",
         ),
         fix_steps=(
             "adscan update                   # refresh launcher to the current tag",
             "{retry_command}",
         ),
         followup=(
-            "If `adscan update` does not resolve it, the partner tag may "
-            "have been rotated. Contact ADscan support with the failing "
-            "image name."
+            "If `adscan update` does not resolve it, contact ADscan "
+            "support with the failing image name."
         ),
     ),
     "registry_consistency": PullFailurePresentation(
@@ -608,6 +746,8 @@ def consume_last_failure() -> PullFailureDiagnosis | None:
 
 
 __all__ = (
+    "TERMINAL_KINDS",
+    "refine_for_licence_registry",
     "PullFailureKind",
     "PullFailureDiagnosis",
     "PullFailurePresentation",

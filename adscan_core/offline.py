@@ -12,6 +12,14 @@ import from here.
 When the switch is active, ADscan must never reach ANY external network
 service: weakpass lookups, wordlist downloads, telemetry sends, session-recording
 uploads, or draining a previously-queued telemetry payload.
+
+The ONE exception is the PRO licence channel (launch check-in, domain
+registration, queued licence requests) of an online PRO licence, decided in
+:mod:`adscan_core.pro_license.channel` (founder decision 2026-11-13). It
+carries licence identifiers, keyed domain codes and size bands (on a partner
+licence, also each run's size counts: counts only), never scan data,
+and an offline engagement licence and the Enterprise appliance keep it closed.
+Nothing else may treat itself as an exception: read this predicate.
 """
 
 from __future__ import annotations

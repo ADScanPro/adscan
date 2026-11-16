@@ -20,6 +20,8 @@ __all__ = [
     "dn_expression",
     "adsi_path",
     "owner_restore_instruction",
+    "KIND_MSSQL_XP_CMDSHELL_ENABLED",
+    "mssql_xp_cmdshell_instruction",
     "stored_instruction_is_superseded",
     "effective_stored_instruction",
 ]
@@ -123,12 +125,112 @@ def owner_restore_instruction(
     )
 
 
+#: Ledger ``kind`` of an ``xp_cmdshell`` the assessment turned on.
+KIND_MSSQL_XP_CMDSHELL_ENABLED = "mssql_xp_cmdshell_enabled"
+
+#: What a command carries in place of a value the assessment did not record.
+_UNRECORDED_VALUE = "<value before the change>"
+
+
+def _recorded_setting(value: Any) -> tuple[str, bool]:
+    """A recorded ``sp_configure`` value as ``(text for the command, recorded)``."""
+    if value is None:
+        return _UNRECORDED_VALUE, False
+    if isinstance(value, bool):
+        return ("1" if value else "0"), True
+    text = str(value).strip().lower()
+    if text in ("1", "true"):
+        return "1", True
+    if text in ("0", "false"):
+        return "0", True
+    return _UNRECORDED_VALUE, False
+
+
+def mssql_xp_cmdshell_instruction(entry_target: str, detail: Mapping[str, Any]) -> str:
+    """Put back BOTH settings an ``xp_cmdshell`` enable changed, then read them.
+
+    Turning ``xp_cmdshell`` on also turns ``show advanced options`` on, so the
+    instruction restores each to the value the ledger recorded before the
+    change. A value that was not recorded (a linked server, or a read that
+    failed) is never assumed: the command carries a fill-in token and the text
+    says what the product default is.
+
+    Args:
+        entry_target: The ledger record's ``target`` (the instance).
+        detail: The record's ``detail`` (``host``, ``linked_server``,
+            ``original_xp_cmdshell``, ``original_advanced_options``).
+
+    Returns:
+        Prose lines followed by indented commands, no comments.
+    """
+    linked = str(detail.get("linked_server") or "").strip()
+    host = str(detail.get("host") or "").strip()
+    instance = linked or host or bare_name(entry_target) or str(entry_target or "").strip()
+    instance = instance or "<SQL Server instance>"
+    where = f"{linked}, a linked server reached through {host}" if linked and host else instance
+    xp_value, xp_known = _recorded_setting(detail.get("original_xp_cmdshell"))
+    adv_value, adv_known = _recorded_setting(detail.get("original_advanced_options"))
+    notes: list[str] = []
+    if not xp_known and not adv_known:
+        notes.append(
+            "ADscan did not record either value before the change. The SQL Server default "
+            "for both is 0."
+        )
+    elif not xp_known:
+        notes.append(
+            "ADscan did not record the value of 'xp_cmdshell' before the change. The SQL "
+            "Server default is 0."
+        )
+    elif not adv_known:
+        notes.append(
+            "ADscan did not record the value of 'show advanced options' before the change. "
+            "The SQL Server default is 0."
+        )
+    if adv_known and adv_value == "1":
+        intro = (
+            f"'xp_cmdshell' was enabled on {where} during the engagement. 'show advanced "
+            "options' was already on before the change and stays on. Set 'xp_cmdshell' back "
+            f"to its value before the change ({xp_value})."
+        )
+        query = f"EXEC sp_configure 'xp_cmdshell', {xp_value}; RECONFIGURE;"
+    else:
+        intro = (
+            f"Two SQL Server settings were changed on {where} during the engagement: "
+            "'xp_cmdshell' was enabled, and 'show advanced options' was turned on to allow "
+            "it. Set both back to their values before the change: 'xp_cmdshell' to "
+            f"{xp_value} and 'show advanced options' to {adv_value}."
+        )
+        query = (
+            "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; "
+            f"EXEC sp_configure 'xp_cmdshell', {xp_value}; RECONFIGURE; "
+            f"EXEC sp_configure 'show advanced options', {adv_value}; RECONFIGURE;"
+        )
+    lines = [" ".join([intro, *notes, "Run this as a sysadmin."])]
+    lines.append(f'  Invoke-Sqlcmd -ServerInstance {ps_quote(instance)} -Query "{query}"')
+    lines.append("Then confirm both running values.")
+    lines.append(
+        f"  Invoke-Sqlcmd -ServerInstance {ps_quote(instance)} -Query "
+        "\"SELECT name, value_in_use FROM sys.configurations WHERE name IN "
+        "('xp_cmdshell', 'show advanced options');\""
+    )
+    return "\n".join(lines)
+
+
 #: Stored instructions an earlier version wrote that do not do what they say,
 #: per kind, as lower-case substrings.
 _SUPERSEDED_MARKERS: dict[str, tuple[str, ...]] = {
     # The owner restore through ``Set-ADObject -Replace @{nTSecurityDescriptor}``
     # left the owner unchanged on a domain controller (lab, 2026-11-06).
     KIND_OWNER_CHANGED: ("-replace @{ntsecuritydescriptor",),
+}
+
+
+#: What a stored instruction of a kind must mention to be complete, as
+#: lower-case substrings. One that lacks any of them is rebuilt.
+_REQUIRED_MARKERS: dict[str, tuple[str, ...]] = {
+    # Earlier versions restored 'xp_cmdshell' alone, to an assumed 0, and left
+    # 'show advanced options' as the assessment had set it.
+    KIND_MSSQL_XP_CMDSHELL_ENABLED: ("show advanced options",),
 }
 
 
@@ -142,10 +244,16 @@ def stored_instruction_is_superseded(entry: Mapping[str, Any]) -> bool:
     """Whether the instruction stored on a ledger record is a known non-working form."""
     if not isinstance(entry, Mapping):
         return False
-    markers = _SUPERSEDED_MARKERS.get(str(entry.get("kind") or "").strip())
+    kind = str(entry.get("kind") or "").strip()
+    stored = _stored(entry).lower()
+    if not stored.strip():
+        return False
+    required = _REQUIRED_MARKERS.get(kind)
+    if required and any(marker not in stored for marker in required):
+        return True
+    markers = _SUPERSEDED_MARKERS.get(kind)
     if not markers:
         return False
-    stored = _stored(entry).lower()
     return any(marker in stored for marker in markers)
 
 
@@ -158,6 +266,8 @@ def _rebuild(entry: Mapping[str, Any]) -> str:
         object_dn = str(entry.get("remediation_object_dn") or detail.get("target_dn") or "")
         domain = str(detail.get("target_domain") or entry.get("domain") or "")
         return owner_restore_instruction(target, object_dn, detail, domain)
+    if kind == KIND_MSSQL_XP_CMDSHELL_ENABLED:
+        return mssql_xp_cmdshell_instruction(str(entry.get("target") or ""), detail)
     return ""
 
 

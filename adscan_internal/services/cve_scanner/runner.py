@@ -30,7 +30,9 @@ from adscan_internal.services.cve_scanner.result import (
     CVEStatus,
     Severity,
 )
-from adscan_internal.services.network_probe_service import tcp_probe_hosts
+from adscan_internal.services.auth_error_classification import SCOPE_EGRESS_REFUSAL_LABEL
+from adscan_internal.services.engagement_scope_targets import HELD_UNCONFIRMED_TEXT
+from adscan_internal.services.network_probe_service import PROBE_EXCLUDED, tcp_probe_hosts
 from adscan_core.rich_output import print_exception
 
 
@@ -46,6 +48,10 @@ _PREFLIGHT_PROBE_TIMEOUT_SECONDS = _pacing_consumer("probe.cve_preflight").param
 
 class _PausedBySafeguard(Exception):
     """The strain safeguard paused this host earlier in the assessment."""
+
+
+class _HeldByScope(Exception):
+    """The engagement scope keeps this host out now: nothing is sent to it."""
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,20 @@ class ScanContext:
     #: with an administrator of the host when ADscan holds one. ``None`` (tests,
     #: ad-hoc callers) keeps each check reading with the scan credential.
     patch_level: Any | None = None
+    #: The engagement scope's per-host check (``engagement_scope_targets.
+    #: host_contact_gate`` over the scan's targets), asked for a target right
+    #: before each of its checks. The target list was partitioned when it was
+    #: loaded; a scan over many hosts can outlast that answer, and the scope can
+    #: be narrowed while it runs. A target the scope keeps out now is not
+    #: contacted and its check reads as kept off by the scope
+    #: (:func:`_scope_excluded_result`). ``None`` (tests, ad-hoc callers): every
+    #: target is admitted.
+    scope_admit: Callable[[ScanTarget], bool] | None = None
+    #: Whether a target the scope keeps out is "not confirmed inside the scope"
+    #: (its place could not be established) rather than excluded. Asked only for
+    #: a target that was kept out, so its check carries the right one of the two
+    #: labels. ``None``: every kept-out target reads as excluded.
+    scope_unconfirmed: Callable[[ScanTarget], bool] | None = None
 
 
 @dataclass
@@ -185,7 +205,34 @@ class CVEScanRunner:
         global_sem = runtime.semaphore(self._concurrency)
         per_host_sems: dict[str, asyncio.Semaphore] = {}
 
+        async def _scope_admits(target: ScanTarget) -> bool:
+            # Asked off the loop: the gate may prepare the chunk it has reached.
+            if ctx.scope_admit is None:
+                return True
+            try:
+                return bool(await asyncio.to_thread(ctx.scope_admit, target))
+            except Exception as exc:  # noqa: BLE001 - a gate that cannot ask keeps the host out
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                return False
+
+        async def _scope_unconfirmed(target: ScanTarget) -> bool:
+            # Which of the two "kept off" labels the target's checks carry.
+            if ctx.scope_unconfirmed is None:
+                return False
+            try:
+                return bool(await asyncio.to_thread(ctx.scope_unconfirmed, target))
+            except Exception as exc:  # noqa: BLE001 - without an answer it reads as excluded
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+                return False
+
         async def _paced_run(check: Any, target: ScanTarget) -> Any:
+            # Engagement scope first, right before the check's first packet: the
+            # target list passed the scope when it was loaded, and that answer
+            # is not current for a check that starts an hour into the scan.
+            if not await _scope_admits(target):
+                raise _HeldByScope(target.host)
             # Per-host pause and request rate (no-op at the default level); a host
             # the safeguard paused is not checked and reads as unreachable.
             if not await runtime.before_op(target.host):
@@ -218,9 +265,35 @@ class CVEScanRunner:
         reachable_ports = await self._preflight_required_ports(
             targets_t, normal_cves, coercion_cves, cred_auth_domains
         )
+        # Ports the engagement scope kept the preflight off (nothing was sent):
+        # a check that needs one of them was not run because the scope says so,
+        # which is a different fact from a host that did not answer.
+        scope_excluded_ports: dict[str, frozenset[int]] = dict(
+            getattr(self, "_scope_excluded_ports", None) or {}
+        )
+        # Of those hosts, the ones the scope could not place (asked once per
+        # host, off the loop): their checks read "not confirmed", not "excluded".
+        unconfirmed_hosts: set[str] = set()
+        if scope_excluded_ports and ctx.scope_unconfirmed is not None:
+            for target in targets_t:
+                if target.host in scope_excluded_ports and await _scope_unconfirmed(target):
+                    unconfirmed_hosts.add(target.host)
         # Count of (host, check) pairs skipped for unreachability, for the
         # single end-of-sweep operator summary line.
         unreachable_skips = 0
+        scope_excluded_skips = 0
+
+        def _not_dispatched(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
+            """The data gap of a check whose transport port did not answer the preflight."""
+            nonlocal unreachable_skips, scope_excluded_skips
+            kept_off = scope_excluded_ports.get(target.host, frozenset())
+            if any(port in kept_off for port in cve.required_ports):
+                scope_excluded_skips += 1
+                return _scope_excluded_result(
+                    cve, target, unconfirmed=target.host in unconfirmed_hosts
+                )
+            unreachable_skips += 1
+            return _unreachable_result(cve, target)
 
         def _reachable_for(cve: CVEDefinition, target: ScanTarget) -> bool:
             """Whether ANY of the check's required ports is open on the host.
@@ -245,8 +318,7 @@ class CVEScanRunner:
                         on_result(skipped)
                     continue
                 if not _reachable_for(cve, target):
-                    unreachable = _unreachable_result(cve, target)
-                    unreachable_skips += 1
+                    unreachable = _not_dispatched(cve, target)
                     results.append(unreachable)
                     if on_result is not None:
                         on_result(unreachable)
@@ -281,8 +353,7 @@ class CVEScanRunner:
             # single adapter call time out.
             if not _reachable_for(applicable[0], target):
                 for cve in applicable:
-                    unreachable = _unreachable_result(cve, target)
-                    unreachable_skips += 1
+                    unreachable = _not_dispatched(cve, target)
                     results.append(unreachable)
                     if on_result is not None:
                         on_result(unreachable)
@@ -304,6 +375,17 @@ class CVEScanRunner:
                     )
                     cve_results = list(raw) if isinstance(raw, list) else [raw]
                     runtime.record(target.host, Outcome.OK, time.monotonic() - started)
+                except _HeldByScope:
+                    # Kept off by the scope since the list was loaded: the same
+                    # result, and the same count, as a host the preflight was
+                    # kept off.
+                    nonlocal scope_excluded_skips
+                    scope_excluded_skips += 1
+                    cve_results = [
+                        _scope_excluded_result(
+                            cve, target, unconfirmed=await _scope_unconfirmed(target)
+                        )
+                    ]
                 except _PausedBySafeguard:
                     cve_results = [_unreachable_result(cve, target)]
                 except asyncio.TimeoutError:
@@ -374,12 +456,17 @@ class CVEScanRunner:
                 started = time.monotonic()
                 technique_results: list[CVEResult] = []
                 timed_out = False
+                scope_held = False
+                scope_held_unconfirmed = False
                 try:
                     technique_results = await asyncio.wait_for(
                         _paced_run(check, target),
                         timeout=self._check_timeout,
                     )
                     runtime.record(target.host, Outcome.OK, time.monotonic() - started)
+                except _HeldByScope:
+                    scope_held = True
+                    scope_held_unconfirmed = await _scope_unconfirmed(target)
                 except _PausedBySafeguard:
                     timed_out = True
                 except asyncio.TimeoutError:
@@ -412,7 +499,14 @@ class CVEScanRunner:
                     for cve in applicable:
                         key = (cve.technique or cve.aka or "").strip()
                         adapter_result = by_technique.get(key)
-                        if adapter_result is None and timed_out:
+                        if scope_held:
+                            # The scope keeps the host out now: nothing was sent.
+                            nonlocal scope_excluded_skips
+                            scope_excluded_skips += 1
+                            final = _scope_excluded_result(
+                                cve, target, unconfirmed=scope_held_unconfirmed
+                            )
+                        elif adapter_result is None and timed_out:
                             # Sweep timed out after passing the preflight →
                             # data gap, not an error (never a false verdict).
                             final = _unreachable_result(cve, target)
@@ -466,6 +560,7 @@ class CVEScanRunner:
         )
 
         _emit_unreachable_summary(unreachable_skips, results)
+        _emit_scope_excluded_summary(scope_excluded_skips, results)
         _emit_foreign_dc_summary(results)
 
         return CVEScanReport(
@@ -514,17 +609,28 @@ class CVEScanRunner:
             return {}
 
         open_by_host: dict[str, set[int]] = {}
+        excluded_by_host: dict[str, set[int]] = {}
+        self._scope_excluded_ports = {}
         for port, hosts in port_to_hosts.items():
             probe_map = await tcp_probe_hosts(
                 sorted(hosts),
                 port,
                 timeout=component_pacing(active_pacing(), "probe.cve_preflight")["timeout_s"],
                 max_concurrency=component_pacing(active_pacing(), "probe.cve_preflight")["concurrency"],
+                # The probe fan-out asks the scope about each host right before
+                # its probe and records a refusal under the scan's own surface.
+                scope_surface="cve_probe",
             )
             for host, probe in probe_map.items():
                 if probe.status == "open":
                     open_by_host.setdefault(host, set()).add(port)
+                elif probe.status == PROBE_EXCLUDED:
+                    # The engagement scope kept the probe off: nothing was sent.
+                    excluded_by_host.setdefault(host, set()).add(port)
 
+        self._scope_excluded_ports = {
+            host: frozenset(ports) for host, ports in excluded_by_host.items()
+        }
         return {host: frozenset(ports) for host, ports in open_by_host.items()}
 
 
@@ -610,6 +716,93 @@ def _skipped_result(
     )
 
 
+#: Prefix of the error every unreachable-host result carries (see
+#: :func:`_unreachable_result`); :func:`is_unreachable_result` is its reader.
+UNREACHABLE_ERROR_PREFIX = "not evaluated: port"
+
+
+def is_unreachable_result(result: CVEResult) -> bool:
+    """True when ``result`` is a check skipped because its host did not answer."""
+    return result.status is CVEStatus.SKIPPED and str(result.error or "").startswith(
+        UNREACHABLE_ERROR_PREFIX
+    )
+
+
+#: Error of a check the engagement scope kept from being sent (see
+#: :func:`_scope_excluded_result`); :func:`is_scope_excluded_result` is its reader.
+SCOPE_EXCLUDED_ERROR = SCOPE_EGRESS_REFUSAL_LABEL
+#: The same, for a host the scope could not place: the words every host fan-out
+#: uses for that outcome (``engagement_scope_targets.HELD_UNCONFIRMED_TEXT``).
+SCOPE_UNCONFIRMED_ERROR = f"not checked: {HELD_UNCONFIRMED_TEXT}"
+
+
+def is_scope_excluded_result(result: CVEResult) -> bool:
+    """True when ``result`` is a check the engagement scope kept off its host.
+
+    Nothing was sent: the client excluded the host, or the scope could not
+    confirm it is inside (:func:`is_scope_unconfirmed_result`). It is not a host
+    that did not answer, and it never counts toward a lost domain controller.
+    """
+    return result.status is CVEStatus.SKIPPED and str(result.error or "").startswith(
+        (SCOPE_EXCLUDED_ERROR, SCOPE_UNCONFIRMED_ERROR)
+    )
+
+
+def is_scope_unconfirmed_result(result: CVEResult) -> bool:
+    """True when the check was kept off a host the scope could not confirm as inside."""
+    return result.status is CVEStatus.SKIPPED and str(result.error or "").startswith(
+        SCOPE_UNCONFIRMED_ERROR
+    )
+
+
+#: Statuses that prove the host answered the check.
+_ANSWERED_STATUSES = frozenset({CVEStatus.VULNERABLE, CVEStatus.NOT_VULNERABLE})
+
+
+def lost_domain_controllers(
+    targets: Iterable[ScanTarget],
+    results: Iterable[CVEResult],
+    *,
+    default_domain: str | None = None,
+) -> dict[str, list[str]]:
+    """Domain controllers that answered none of the checks sent to them, per domain.
+
+    A controller is lost when at least one check against it was skipped because
+    it did not answer (:func:`is_unreachable_result`) and no check against it
+    returned a verdict. A controller that answered even one check is reached
+    (its remaining skips are per-check gaps the coverage record carries); a
+    member server is never counted here.
+
+    A controller the engagement scope kept a check off
+    (:func:`is_scope_excluded_result`) is never lost either: its checks did not
+    run because the client excluded it (or keeps it to directory reads), which
+    is a gap the scope record declares, not a controller that went away.
+    """
+    dc_domain: dict[str, str] = {}
+    for target in targets:
+        if not getattr(target, "is_dc", False):
+            continue
+        domain = str(getattr(target, "domain", None) or default_domain or "").strip()
+        if domain and target.host:
+            dc_domain[str(target.host)] = domain
+    unreachable: set[str] = set()
+    answered: set[str] = set()
+    kept_off_by_scope: set[str] = set()
+    for result in results:
+        if result.host not in dc_domain:
+            continue
+        if result.status in _ANSWERED_STATUSES:
+            answered.add(result.host)
+        elif is_scope_excluded_result(result):
+            kept_off_by_scope.add(result.host)
+        elif is_unreachable_result(result):
+            unreachable.add(result.host)
+    lost: dict[str, list[str]] = {}
+    for host in sorted(unreachable - answered - kept_off_by_scope):
+        lost.setdefault(dc_domain[host], []).append(host)
+    return lost
+
+
 def _unreachable_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
     """Record a check whose transport port was unreachable from this vantage.
 
@@ -629,8 +822,57 @@ def _unreachable_result(cve: CVEDefinition, target: ScanTarget) -> CVEResult:
         cvss_v3=cve.cvss_v3,
         cvss_vector=cve.cvss_vector,
         technique=cve.technique,
-        error=f"not evaluated: port {ports}/tcp unreachable from this vantage",
+        error=f"{UNREACHABLE_ERROR_PREFIX} {ports}/tcp unreachable from this vantage",
     )
+
+
+def _scope_excluded_result(
+    cve: CVEDefinition, target: ScanTarget, *, unconfirmed: bool = False
+) -> CVEResult:
+    """Record a check the engagement scope kept from being sent to its host.
+
+    A DATA GAP (``SKIPPED``) like an unreachable host, with a different cause
+    that every reader must be able to tell apart: nothing was sent because the
+    client excluded the host, so it is neither "not vulnerable" nor a host that
+    stopped answering. ``unconfirmed``: the scope could not place the host, so
+    the check says "not confirmed" and never that the client excluded it.
+    """
+
+    return CVEResult(
+        cve_id=cve.id,
+        aka=cve.aka,
+        host=target.host,
+        status=CVEStatus.SKIPPED,
+        severity=Severity.INFO,
+        cvss_v3=cve.cvss_v3,
+        cvss_vector=cve.cvss_vector,
+        technique=cve.technique,
+        error=SCOPE_UNCONFIRMED_ERROR if unconfirmed else SCOPE_EXCLUDED_ERROR,
+    )
+
+
+def _emit_scope_excluded_summary(
+    scope_excluded_skips: int, results: list[CVEResult]
+) -> None:
+    """Emit ONE operator line for the checks the engagement scope kept off a host."""
+
+    if scope_excluded_skips <= 0:
+        return
+    unconfirmed = [r for r in results if is_scope_unconfirmed_result(r)]
+    excluded = [
+        r for r in results if is_scope_excluded_result(r) and not is_scope_unconfirmed_result(r)
+    ]
+    if excluded:
+        print_info(
+            f"  {len({r.host for r in excluded})} host(s) not checked for {len(excluded)} "
+            "CVE check(s): excluded from the engagement scope. Nothing was sent to them."
+        )
+    if unconfirmed:
+        print_info(
+            f"  {len({r.host for r in unconfirmed})} host(s) not checked for "
+            f"{len(unconfirmed)} CVE check(s): {HELD_UNCONFIRMED_TEXT}. Nothing was "
+            "sent to them."
+        )
 
 
 def _emit_unreachable_summary(
@@ -646,12 +888,7 @@ def _emit_unreachable_summary(
 
     if unreachable_skips <= 0:
         return
-    hosts = {
-        r.host
-        for r in results
-        if r.status is CVEStatus.SKIPPED
-        and (r.error or "").startswith("not evaluated: port")
-    }
+    hosts = {r.host for r in results if is_unreachable_result(r)}
     host_count = len(hosts)
     print_info(
         f"  {host_count} host(s) skipped for {unreachable_skips} CVE check(s) "
@@ -784,4 +1021,16 @@ def _new_scan_id() -> str:
     return f"cve-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
-__all__ = ["CVEScanRunner", "ScanContext", "ScanTarget", "CheckEvent"]
+__all__ = [
+    "SCOPE_EXCLUDED_ERROR",
+    "SCOPE_UNCONFIRMED_ERROR",
+    "is_scope_excluded_result",
+    "is_scope_unconfirmed_result",
+    "CVEScanRunner",
+    "CheckEvent",
+    "ScanContext",
+    "ScanTarget",
+    "UNREACHABLE_ERROR_PREFIX",
+    "is_unreachable_result",
+    "lost_domain_controllers",
+]

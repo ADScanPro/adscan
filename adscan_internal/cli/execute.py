@@ -1184,6 +1184,32 @@ def run_execute(*, config: ExecuteConfig, deps: ExecuteDeps) -> int:
 
     exit_code = 1
     try:
+        # 0) The engagement scope (rehydrated with the workspace): a domain or
+        #    host the scope keeps out is refused before any contact, through the
+        #    same gate as the REPL dispatch.
+        from adscan_internal.cli.asset_scope_cmd import (  # noqa: PLC0415
+            gate_command_targets,
+            scope_stops_unattended_run,
+        )
+
+        # A scope record that cannot be used ends an unattended run here, with
+        # exit 2 and before any contact (the same check `ci` makes).
+        if scope_stops_unattended_run(
+            shell, domain=config.domain or "", username=config.username or ""
+        ):
+            return 2
+        if config.domain and config.username:
+            # The operator passed this credential for the run: they vouch for it.
+            from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+                note_operator_credential,
+            )
+
+            note_operator_credential(shell, domain=config.domain, username=config.username)
+        scope_args = build_verb_arg_string(config, spec)
+        if config.domain and not spec.domain_is_first_positional:
+            scope_args = f"--domain {config.domain} {scope_args}"
+        if not gate_command_targets(shell, verb, scope_args, origin_domain=config.domain):
+            return 2
         # 1) Domain → DC context (DNS + posture) when the verb needs it.
         if spec.needs_domain and not _establish_domain_context(shell, config):
             return 2

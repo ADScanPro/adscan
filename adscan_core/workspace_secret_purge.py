@@ -33,7 +33,11 @@ What one purge does, in order:
    structure the report and the console read is unchanged); the attack graph
    also has any inline note secret turned into a reference; plain text has the
    value replaced; a binary file that holds one is deleted when no rule says the
-   history needs it, and is reported otherwise.
+   history needs it, and is reported otherwise. The graph store
+   (``domains/<domain>/graph_store/``) is a database, not a file to search: its
+   stored documents (relationship notes, collection data, the runtime overlay)
+   go through the same redaction and replacement, and the store then discards
+   the freed bytes (:func:`adscan_core.graph_store.interface.scrub_graph_store`).
 5. **Marks what was removed.** Every graph note that records a recovered secret
    gets ``secret_removed: true``, so a report rendered later says the value was
    removed instead of "held in the credential store".
@@ -88,6 +92,11 @@ from adscan_core.graph_secret_refs import (
     redact_graph_secrets,
     redact_secrets_deep,
 )
+from adscan_core.graph_store.interface import (
+    GRAPH_STORE_DIRNAME,
+    GraphStoreError,
+    scrub_graph_store,
+)
 from adscan_core.node_link.artifact_classes import ArtifactClass, classify
 
 #: What replaces a removed value inside a string. No brackets: a report string
@@ -119,6 +128,9 @@ _SCRUB_NOT_DELETE = (
 _VARIABLES_FILES = ("variables.json", "domains/*/variables.json")
 _LOG_PREFIX = "logs/"
 _NEVER_TOUCH = (PURGE_RECORD_FILENAME, "engagement/engagement.sqlite*")
+#: Files of a domain's graph store: purged through the store, never searched,
+#: rewritten or deleted as files (deleting the store would delete the history).
+_GRAPH_STORE_FILES = (f"domains/*/{GRAPH_STORE_DIRNAME}/*",)
 _DELIVERABLE_DIRS = ("deliverables/", "reports/")
 _DELIVERABLE_SUFFIXES = (".pdf", ".docx", ".pptx", ".xlsx")
 _RENDERED_SUFFIXES = (".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm")
@@ -146,6 +158,11 @@ _DOMAIN_SECRET_FIELDS = (
     "ccache_path",
     "unauth_description_creds_preview",
 )
+#: Every key of a ``domains_data[<domain>]`` entry that holds a secret or a
+#: credential store: what the purge empties, and what the graph build context
+#: never takes in (``graph_build.api.GraphBuildContext``), since the graph is a
+#: finding-class file and no recovered value is an input to it.
+DOMAIN_SECRET_KEYS: frozenset[str] = frozenset(_DOMAIN_STORES) | frozenset(_DOMAIN_SECRET_FIELDS)
 #: Workspace-level fields that hold the active session secret.
 _TOP_SECRET_FIELDS = ("password", "hash", "nt_hash", "aes_key", "ccache_path")
 
@@ -681,6 +698,16 @@ def _dump(obj: Any, original: str) -> str:
     return json.dumps(obj, indent=_json_indent(original), ensure_ascii=False)
 
 
+def _is_graph_export(name: str) -> bool:
+    """``attack_graph.json`` and the previous export a stopped build moved aside.
+
+    A build stopped at the memory ceiling marks the export not current or moves
+    it to ``attack_graph.previous.json`` (``graph_build.export.mark_export_incomplete``);
+    that copy carries the same edge notes, so it gets the same graph redaction.
+    """
+    return name.startswith("attack_graph.json") or name.startswith("attack_graph.previous.json")
+
+
 def _rewrite_json(
     path: Path, relpath: str, matcher: SecretMatcher, *, keep_starting: bool
 ) -> tuple[bool, StoreClearing]:
@@ -694,7 +721,7 @@ def _rewrite_json(
         if relpath != "variables.json":
             for key in ("password", "hash", "nt_hash", "aes_key"):
                 doc.pop(key, None)
-    if path.name.startswith("attack_graph.json") and isinstance(doc, dict):
+    if _is_graph_export(path.name) and isinstance(doc, dict):
         redact_graph_secrets(doc)
     elif path.name.startswith("attack_paths_snapshot"):
         doc = redact_secrets_deep(doc)
@@ -746,6 +773,8 @@ def _purge_tree(
         shown = f"{prefix}{relpath}"
         if _matches(relpath, _NEVER_TOUCH) or relpath.startswith("engagement/engagement.sqlite"):
             continue
+        if _matches(relpath, _GRAPH_STORE_FILES):
+            continue  # purged through the store by _purge_graph_stores
         artifact_class = classify(relpath)
         try:
             if _is_deliverable(relpath):
@@ -767,7 +796,7 @@ def _purge_tree(
             if size > MAX_SCAN_BYTES:
                 result.remaining.append({"path": shown, "reason": "too_large_to_search"})
                 continue
-            if path.suffix == ".json" or path.name.startswith("attack_graph.json"):
+            if path.suffix == ".json" or _is_graph_export(path.name):
                 try:
                     changed, clearing = _rewrite_json(
                         path, relpath, matcher, keep_starting=options.keep_starting_credential
@@ -801,6 +830,36 @@ def _purge_tree(
             else:
                 path.unlink()
                 result.files_deleted.append(shown)
+        except OSError as exc:
+            result.remaining.append({"path": shown, "reason": f"unreadable: {exc.__class__.__name__}"})
+
+
+def _graph_store_transform(matcher: SecretMatcher):
+    """What the purge does to one document stored in a graph store."""
+
+    def transform(doc: Any) -> Any:
+        if isinstance(doc, (dict, list)):
+            doc = redact_secrets_deep(doc)
+            mark_removed_deep(doc)
+        scrubbed, _hits = scrub_document(doc, matcher)
+        return scrubbed
+
+    return transform
+
+
+def _purge_graph_stores(root: Path, matcher: SecretMatcher, result: PurgeResult, *, prefix: str = "") -> None:
+    """Purge every domain's graph store under ``root`` through the store itself."""
+    domains = root / "domains"
+    if not domains.is_dir():
+        return
+    transform = _graph_store_transform(matcher)
+    for domain_dir in sorted(p for p in domains.iterdir() if p.is_dir()):
+        shown = f"{prefix}domains/{domain_dir.name}/{GRAPH_STORE_DIRNAME}"
+        try:
+            if scrub_graph_store(domain_dir, transform):
+                result.files_rewritten.append(shown)
+        except GraphStoreError as exc:
+            result.remaining.append({"path": shown, "reason": f"graph_store_unavailable: {exc.__class__.__name__}"})
         except OSError as exc:
             result.remaining.append({"path": shown, "reason": f"unreadable: {exc.__class__.__name__}"})
 
@@ -931,8 +990,10 @@ def purge_workspace_secrets(
     result = PurgeResult(workspace=root.name)
     result.secrets_removed = matcher.count
     result.secrets_not_substituted = dict(matcher.skipped)
+    _purge_graph_stores(root, matcher, result)
     _purge_tree(root, matcher, options, result)
     for entry in executions:
+        _purge_graph_stores(entry.path, matcher, result, prefix=f"{entry.name}/")
         _purge_tree(entry.path, matcher, options, result, prefix=f"{entry.name}/")
         result.execution_workspaces_purged.append(entry.name)
 
@@ -966,6 +1027,7 @@ def purge_workspace_secrets(
 
 
 __all__ = [
+    "DOMAIN_SECRET_KEYS",
     "ENGAGEMENT_META_KEY",
     "MIN_SUBSTRING_SECRET_LENGTH",
     "PURGED_CREDENTIAL_HASH_PREFIX",

@@ -370,7 +370,16 @@ def generate_report_with_telemetry(
             kwargs["report_file"] = report_file
         if asked_for_the_kit:
             kwargs["asked_for_the_kit"] = True
-        artifacts = generate_lite_report_artifacts(shell, **kwargs)
+        from adscan_internal.services.report_memory import (  # noqa: PLC0415
+            render_bounded,
+        )
+
+        _stopped, artifacts = render_bounded(
+            lambda: generate_lite_report_artifacts(shell, **kwargs),
+            workspace_dir=getattr(shell, "current_workspace_dir", None),
+            shell=shell,
+            total=1,
+        )
     except Exception as exc:  # noqa: BLE001 - a report must never break a scan
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

@@ -32,6 +32,14 @@ distribute.
 
 from __future__ import annotations
 
+import functools
+import inspect
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
 # Well-known SID → (display_name, kind). Stable across all Windows/AD environments
 # — no LDAP lookup needed. Public Microsoft data (no IP).
 _WELL_KNOWN: dict[str, tuple[str, str]] = {
@@ -569,8 +577,236 @@ def humanize_principal_for_prose(
     return display_name
 
 
+# --------------------------------------------------------------------------- #
+# Node identity: what a label alone cannot say
+# --------------------------------------------------------------------------- #
+#
+# The graph stores every principal label SHOUTING (``CASTELBLACKADMINS@...``),
+# so a label cannot say whether the object is a group or an account, nor how the
+# directory writes its name. The two are cased by opposite rules: an account is
+# typed lower case, a group keeps the directory's own display name. A formatter
+# given only the label has to guess, and it guessed "account", which lower-cased
+# every client-created group in the attack-route section of the report, the CLI
+# panels and the web graph while the remediation sections (which hold the node)
+# wrote the same group correctly.
+#
+# The identity therefore travels with the data being rendered. Every attack-path
+# record already carries it on its steps (``details.source_kind`` /
+# ``source_samaccountname`` and the ``target_*`` twins, stamped from the graph
+# node), and a graph carries it on its nodes. A surface declares the records or
+# the graph it is about to render with :func:`node_identity_scope`, and every
+# label-only call made inside resolves a group through that declaration. A caller
+# holding the node passes ``kind=`` / ``samaccountname=`` directly.
+#
+# Scoped (a ``ContextVar``), never process-global: a long-lived web backend
+# renders many workspaces, and a label is only meaningful beside its own data.
+
+NodeIdentities = Mapping[str, tuple[str, str]]
+
+_NODE_IDENTITIES: ContextVar[NodeIdentities | None] = ContextVar(
+    "adscan_node_identities", default=None
+)
+
+
+def node_identity_key(label: Any) -> str:
+    """Return the lookup key of a node label (id prefix stripped, upper-cased)."""
+    return strip_graph_node_id_prefix(str(label or "")).upper()
+
+
+def _remember_identity(
+    out: dict[str, tuple[str, str]], label: Any, kind: Any, samaccountname: Any
+) -> None:
+    key = node_identity_key(label)
+    kind_text = str(kind or "").strip()
+    if not key or not kind_text:
+        return
+    sam_text = str(samaccountname or "").strip()
+    known = out.get(key)
+    # A later sighting only completes an entry (adds the missing account name);
+    # it never replaces what an earlier one established.
+    if known is None or (not known[1] and sam_text):
+        out[key] = (known[0] if known else kind_text, sam_text or (known[1] if known else ""))
+
+
+def collect_node_identities(
+    *,
+    records: Iterable[Any] | None = None,
+    graph: Any = None,
+    nodes: Iterable[Any] | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Read ``label -> (kind, sAMAccountName)`` from path records and graph nodes.
+
+    Args:
+        records: Attack-path records; each step's ``details`` names its two
+            endpoints (``from`` / ``to``) with their stamped kind and account name.
+        graph: An attack graph (``{"nodes": {id: node}}``).
+        nodes: Graph node dicts (``label`` / ``kind`` / ``properties``).
+
+    Returns:
+        The identities found. Total: a malformed entry is skipped, never raised.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for record in records or ():
+        steps = record.get("steps") if isinstance(record, Mapping) else None
+        for step in steps if isinstance(steps, (list, tuple)) else ():
+            details = step.get("details") if isinstance(step, Mapping) else None
+            if not isinstance(details, Mapping):
+                continue
+            _remember_identity(
+                out,
+                details.get("from"),
+                details.get("source_kind"),
+                details.get("source_samaccountname"),
+            )
+            _remember_identity(
+                out,
+                details.get("to"),
+                details.get("target_kind"),
+                details.get("target_samaccountname"),
+            )
+    node_iter: list[Any] = list(nodes or ())
+    graph_nodes = graph.get("nodes") if isinstance(graph, Mapping) else None
+    if isinstance(graph_nodes, Mapping):
+        node_iter.extend(graph_nodes.values())
+    elif isinstance(graph_nodes, (list, tuple)):
+        node_iter.extend(graph_nodes)
+    for node in node_iter:
+        if not isinstance(node, Mapping):
+            continue
+        raw_kind = node.get("kind") or node.get("type") or node.get("labels")
+        if isinstance(raw_kind, (list, tuple)):
+            raw_kind = raw_kind[0] if raw_kind else ""
+        props = node.get("properties")
+        props = props if isinstance(props, Mapping) else {}
+        sam = props.get("samaccountname") or props.get("sAMAccountName") or ""
+        _remember_identity(out, node.get("label") or node.get("name"), raw_kind, sam)
+    return out
+
+
+def report_data_path_records(report_data: Any) -> list[Any]:
+    """Return every attack-path record a report data mapping carries.
+
+    A report's data is keyed by domain, each domain block holding its
+    ``attack_paths``. Reserved non-domain keys are skipped by shape.
+    """
+    out: list[Any] = []
+    if not isinstance(report_data, Mapping):
+        return out
+    for block in report_data.values():
+        paths = block.get("attack_paths") if isinstance(block, Mapping) else None
+        if isinstance(paths, (list, tuple)):
+            out.extend(paths)
+    return out
+
+
+@contextmanager
+def node_identity_scope(
+    identities: NodeIdentities | None = None,
+    *,
+    records: Iterable[Any] | None = None,
+    graph: Any = None,
+    nodes: Iterable[Any] | None = None,
+) -> Iterator[None]:
+    """Declare the data a surface is about to render, for its label-only calls.
+
+    Inside the block :func:`format_graph_node_label` resolves a label's kind and
+    account name from these identities when the caller did not pass them. Scopes
+    nest: an inner scope adds to the outer one and wins on a conflict.
+    """
+    merged: dict[str, tuple[str, str]] = dict(_NODE_IDENTITIES.get() or {})
+    merged.update(identities or {})
+    if records is not None or graph is not None or nodes is not None:
+        merged.update(collect_node_identities(records=records, graph=graph, nodes=nodes))
+    token = _NODE_IDENTITIES.set(merged)
+    try:
+        yield
+    finally:
+        _NODE_IDENTITIES.reset(token)
+
+
+def _as_records(value: Any) -> list[Any]:
+    """One record, a list of records, or a report data mapping, as a record list."""
+    if isinstance(value, Mapping):
+        if isinstance(value.get("steps"), (list, tuple)):
+            return [value]
+        return report_data_path_records(value)
+    if isinstance(value, (list, tuple)):
+        # A bare list of steps (each with its ``details``) is one record's steps.
+        if any(
+            isinstance(item, Mapping) and "details" in item and "steps" not in item
+            for item in value
+        ):
+            return [{"steps": list(value)}]
+        return list(value)
+    return []
+
+
+def declares_node_identities(
+    *, records: str | tuple[str, ...] = (), graph: str = ""
+) -> Callable[[_F], _F]:
+    """Run a renderer inside the identity scope of the data it was handed.
+
+    The one-line way for a surface to declare what it renders: name the
+    parameter(s) holding its attack-path record(s) and/or its graph, and every
+    label-only node display made during the call resolves through them.
+
+    Args:
+        records: Parameter name(s) holding one record, a list of records, or a
+            report data mapping.
+        graph: Parameter name holding an attack graph.
+    """
+    record_params = (records,) if isinstance(records, str) else tuple(records)
+
+    def decorate(func: _F) -> _F:
+        signature = inspect.signature(func)
+
+        def _identities(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, tuple[str, str]]:
+            try:
+                bound = signature.bind_partial(*args, **kwargs).arguments
+            except TypeError:
+                return {}
+            found: list[Any] = []
+            for name in record_params:
+                if name:
+                    found.extend(_as_records(bound.get(name)))
+            return collect_node_identities(
+                records=found, graph=bound.get(graph) if graph else None
+            )
+
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_inner(*args: Any, **kwargs: Any) -> Any:
+                with node_identity_scope(_identities(args, kwargs)):
+                    return await func(*args, **kwargs)
+
+            return async_inner  # type: ignore[return-value]
+
+        @functools.wraps(func)
+        def inner(*args: Any, **kwargs: Any) -> Any:
+            with node_identity_scope(_identities(args, kwargs)):
+                return func(*args, **kwargs)
+
+        return inner  # type: ignore[return-value]
+
+    return decorate
+
+
+def scoped_node_identity(label: Any) -> tuple[str, str]:
+    """Return the ``(kind, sAMAccountName)`` the active scope holds for a label."""
+    identities = _NODE_IDENTITIES.get()
+    if not identities:
+        return ("", "")
+    return identities.get(node_identity_key(label), ("", ""))
+
+
 def format_graph_node_label(
-    node: str, domain: str | None, context_domain: str | None = None
+    node: str,
+    domain: str | None,
+    context_domain: str | None = None,
+    *,
+    kind: str = "",
+    samaccountname: str = "",
 ) -> str:
     """Compact an attack-graph node label while preserving cross-domain clarity.
 
@@ -599,6 +835,11 @@ def format_graph_node_label(
         domain: The report / path domain, for intra- vs cross-domain compaction.
         context_domain: The edge-partner node's domain, used only to rebind a
             ``@WELLKNOWN`` sentinel to a real partner domain (cross-forest signal).
+        kind: The node's object class when the caller holds the node. A GROUP
+            keeps the directory's own display name (only a shouted name is
+            re-cased); without it the active :func:`node_identity_scope` is asked,
+            and a label nobody can place is cased as an account.
+        samaccountname: The node's real sAMAccountName, the directory's casing.
 
     Returns:
         The client-facing display label. ``"N/A"`` for an empty node.
@@ -624,6 +865,30 @@ def format_graph_node_label(
             partner_domain = str(context_domain or "").strip()
             if partner_domain:
                 node_value = f"{name}@{partner_domain}"
+        kind_value = str(kind or "").strip()
+        sam_value = str(samaccountname or "").strip()
+        if not kind_value:
+            kind_value, scoped_sam = scoped_node_identity(node)
+            sam_value = sam_value or scoped_sam
+        if kind_value.lower() == "group":
+            # A group is named as its directory writes it. The prose humanizer
+            # drops a group's realm; a graph node keeps it when the group lives
+            # in another domain, exactly as an account does.
+            display = humanize_principal_for_prose(
+                label=node_value,
+                samaccountname=sam_value,
+                kind="Group",
+                report_domain=domain or "",
+            )
+            realm = node_value.partition("@")[2].strip().rstrip(".")
+            if (
+                domain_value
+                and realm
+                and realm.lower() not in {domain_value, "wellknown"}
+                and "@" not in display
+            ):
+                return f"{display}@{realm.lower()}"
+            return display
         return humanize_principal_for_prose(label=node_value, report_domain=domain or "")
     if "\\" in node_value:
         prefix, _, name = node_value.partition("\\")

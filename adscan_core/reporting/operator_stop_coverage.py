@@ -75,6 +75,12 @@ def _remaining_clause(examined: int | None, total: int | None, unit: str) -> str
     return f" The remaining {remaining:,}{noun} {verb} not examined."
 
 
+#: ``source`` of a stop the engagement scope asked for: the directory showed
+#: the account the scan signs in with to be one the client excluded. Nobody
+#: pressed anything, so it is never worded as the operator's decision.
+SOURCE_ENGAGEMENT_SCOPE = "engagement_scope"
+
+
 def operator_stop_statement(
     *,
     action: str,
@@ -83,6 +89,7 @@ def operator_stop_statement(
     examined: int | None = None,
     total: int | None = None,
     unit: str = "",
+    source: str = "",
 ) -> str:
     """Return the client-facing sentence for one stop.
 
@@ -109,6 +116,13 @@ def operator_stop_statement(
             "not run."
         )
     where = f"during {step}{progress}" if step else f"during {phase}"
+    if source == SOURCE_ENGAGEMENT_SCOPE:
+        return _sentence(
+            f"the assessment stopped {where}: the directory showed that the account "
+            "it signs in with is excluded from the engagement scope. Results found "
+            "up to that point are included in this report; the checks that would "
+            "have run afterwards were not run."
+        )
     return _sentence(
         f"the assessment was stopped by the operator {where}. Results found up to "
         "that point are included in this report; the checks that would have run "
@@ -149,6 +163,7 @@ def build_operator_stop_entry(
             examined=examined_value,
             total=total_value,
             unit=unit,
+            source=str(source or ""),
         ),
     }
 
@@ -164,12 +179,30 @@ def append_operator_stop(block: Any, entry: Mapping[str, Any]) -> dict[str, Any]
     return {"stops": stops[-MAX_ENTRIES_PER_DOMAIN:]}
 
 
+#: Heading of the block when every stop was asked for by an operator.
+OPERATOR_STOP_HEADING = "Stopped by the operator"
+#: Heading when at least one stop was not an operator's: the engagement scope
+#: ended the run. Nobody chose it, so the block must not say an operator did.
+STOPPED_EARLY_HEADING = "Stopped before the end"
+#: The words every operator-stop sentence carries and no other stop does. The
+#: web mirrors this marker to pick the heading from the live sentences.
+OPERATOR_STOP_MARKER = "by the operator"
+
+
+def operator_stop_heading(stops: Iterable[Any]) -> str:
+    """The heading the stop block is drawn under, on every surface."""
+    for stop in stops or ():
+        if isinstance(stop, Mapping) and str(stop.get("source") or "") == SOURCE_ENGAGEMENT_SCOPE:
+            return STOPPED_EARLY_HEADING
+    return OPERATOR_STOP_HEADING
+
+
 def operator_stop_coverage_view(block: Any) -> dict[str, Any]:
     """Render-ready view of one persisted block.
 
-    Returns ``has_gap``, ``statements`` (client sentences, in order) and
-    ``stops`` (the machine entries). An absent or unreadable block yields
-    ``has_gap=False``: a scan nobody stopped renders exactly as before.
+    Returns ``has_gap``, ``heading``, ``statements`` (client sentences, in
+    order) and ``stops`` (the machine entries). An absent or unreadable block
+    yields ``has_gap=False``: a scan nobody stopped renders exactly as before.
     """
     stops: list[dict[str, Any]] = []
     if isinstance(block, Mapping):
@@ -181,7 +214,12 @@ def operator_stop_coverage_view(block: Any) -> dict[str, Any]:
         statement = str(stop.get("statement") or "").strip()
         if statement and statement not in statements:
             statements.append(statement)
-    return {"has_gap": bool(statements), "statements": statements, "stops": stops}
+    return {
+        "has_gap": bool(statements),
+        "heading": operator_stop_heading(stops),
+        "statements": statements,
+        "stops": stops,
+    }
 
 
 def merge_operator_stop_coverage(domain_entries: Iterable[Any]) -> dict[str, Any]:
@@ -196,6 +234,10 @@ def merge_operator_stop_coverage(domain_entries: Iterable[Any]) -> dict[str, Any
 
 
 __all__ = [
+    "OPERATOR_STOP_HEADING",
+    "OPERATOR_STOP_MARKER",
+    "STOPPED_EARLY_HEADING",
+    "operator_stop_heading",
     "ACTION_ABORT_SCAN",
     "ACTION_SKIP_PHASE",
     "ACTION_SKIP_STEP",
@@ -205,4 +247,5 @@ __all__ = [
     "merge_operator_stop_coverage",
     "operator_stop_coverage_view",
     "operator_stop_statement",
+    "SOURCE_ENGAGEMENT_SCOPE",
 ]

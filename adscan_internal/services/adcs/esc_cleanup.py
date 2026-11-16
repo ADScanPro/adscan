@@ -75,6 +75,37 @@ def register_ldap_change(
         return None
 
 
+def discard_ldap_change(shell: Any, change_id: Optional[str]) -> None:
+    """Drop a write-ahead-registered change whose APPLY write failed atomically.
+
+    The ESC steps register a change BEFORE writing it (write-ahead, so a crash
+    mid-write is covered by the ledger's session-died guarantee). When the write
+    that would APPLY the change then fails atomically — an LDAP ``modify`` the
+    directory refused, e.g. ``noSuchObject`` because the target had been deleted
+    by an earlier run — the registered record describes a change that never
+    happened. Leaving it lets the rollback try to revert it, which also fails,
+    and the entry settles ``manual_required`` with a phantom cleanup instruction
+    telling the client to remove something that was never written (gate finding
+    R54). Discarding it (``EnvironmentChangeLedger.discard_change``) removes the
+    record entirely: no cleanup item, no summary row.
+
+    Use it ONLY on an atomic apply failure the write proved left the object
+    untouched; a change that WAS applied and could not be undone stays
+    ``manual_required``. Never raises. Callers also suppress the change's queued
+    revert so the rollback does not re-register a manual item for it.
+    """
+    if not change_id:
+        return
+    ledger = ledger_or_warn(shell)
+    if ledger is None:
+        return
+    try:
+        ledger.discard_change(change_id)
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+
 def format_certificate_not_after(cert: Any) -> Optional[str]:
     """Format an X.509 certificate's expiry the way every ADCS surface shows it.
 
@@ -175,26 +206,66 @@ def register_issued_certificate(
         return None
 
     try:
-        ledger.mark_manual_required(
-            change_id,
-            reason=_tax.MANUAL_REASON_NOT_ATTEMPTED,
-            remediation_command=_tax.issued_certificate_remediation(
-                serial=serial,
-                request_id=request_id,
-                ca_name=ca_name,
-                ca_host=ca_host,
-                template=template,
-                principal=principal,
-                not_after=not_after,
-            ),
-            remediation_object_dn=_issued_certificate_object_label(
-                ca_name=ca_name, ca_host=ca_host, request_id=request_id
-            ),
+        remediation_command = _tax.issued_certificate_remediation(
+            serial=serial,
+            request_id=request_id,
+            ca_name=ca_name,
+            ca_host=ca_host,
+            template=template,
+            principal=principal,
+            not_after=not_after,
         )
+        object_label = _issued_certificate_object_label(
+            ca_name=ca_name, ca_host=ca_host, request_id=request_id
+        )
+        # The same floor either way (a complete manual record on disk). What
+        # differs is what the operator and the event stream are told: a
+        # certificate the final pass will revoke is pending reversal, and it is
+        # called manual only if that revocation does not happen.
+        reverter = _scheduled_certificate_reverter(
+            shell, domain=domain, serial=serial, ca_name=ca_name, ca_host=ca_host
+        )
+        if reverter:
+            ledger.mark_revert_scheduled(
+                change_id,
+                remediation_command=remediation_command,
+                remediation_object_dn=object_label,
+                reverted_by=reverter,
+            )
+        else:
+            ledger.mark_manual_required(
+                change_id,
+                reason=_tax.MANUAL_REASON_NOT_ATTEMPTED,
+                remediation_command=remediation_command,
+                remediation_object_dn=object_label,
+            )
     except Exception as exc:
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
     return change_id
+
+
+def _scheduled_certificate_reverter(
+    shell: Any,
+    *,
+    domain: str,
+    serial: Optional[str],
+    ca_name: Optional[str],
+    ca_host: Optional[str],
+) -> str:
+    """Who the final pass will revoke this certificate as (``""``: nobody will)."""
+    from adscan_internal.services.final_revert_pass import scheduled_reverter  # noqa: PLC0415
+
+    return scheduled_reverter(
+        shell,
+        {
+            "kind": _tax.KIND_ISSUED_CERTIFICATE,
+            "domain": domain,
+            "revert_status": _tax.STATUS_MANUAL_REQUIRED,
+            "manual_reason": _tax.MANUAL_REASON_NOT_ATTEMPTED,
+            "detail": {"serial": serial, "ca_name": ca_name, "ca_host": ca_host},
+        },
+    )
 
 
 def _issued_certificate_object_label(

@@ -511,11 +511,13 @@ def apply_esc14_confirmation_to_graph(
         if decision.action is Esc14CollectionAction.REMOVE_HARDENED:
             removed += 1
             continue
+        # Replace, never update in place: a graph from the compact loader may share one
+        # notes object between edges.
         notes = edge.get("notes")
-        if not isinstance(notes, dict):
-            notes = {}
-            edge["notes"] = notes
-        notes.update(esc14_edge_notes_update(decision))
+        edge["notes"] = {
+            **(notes if isinstance(notes, dict) else {}),
+            **esc14_edge_notes_update(decision),
+        }
         if decision.action is Esc14CollectionAction.KEEP_CONFIRMED:
             confirmed += 1
         else:

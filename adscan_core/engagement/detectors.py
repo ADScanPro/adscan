@@ -48,6 +48,24 @@ from adscan_core.engagement.specs import (
     C_SPRAY,
     POSTURE_PREFIX,
 )
+from adscan_core.engagement.sources import (
+    SOURCE_CA_REGISTRY,
+    SOURCE_CA_SECURITY,
+    SOURCE_CA_WEB_ENROLLMENT,
+    SOURCE_DC_PROBE,
+    SOURCE_DIRECTORY,
+    SOURCE_EXECUTION,
+    SOURCE_HOST_MSSQL,
+    SOURCE_HOST_PROBE,
+    SOURCE_HOST_REGISTRY,
+    SOURCE_HOST_SAMR,
+    SOURCE_HOST_SHARE_ACL,
+    SOURCE_HOST_SHARE_CONTENT,
+    SOURCE_HOST_SMB,
+    SOURCE_PASSWORD_SETTINGS,
+    SOURCE_SYSVOL,
+    SOURCES,
+)
 
 #: How a family can be re-observed by a recheck (spec section 10.5).
 REOBSERVE_DOMAIN_POLICY = "domain_policy_read"
@@ -82,6 +100,10 @@ class Detector:
         reobserve: How a recheck re-observes it (``REOBSERVE_*``).
         instrumented: The engine records every outcome of this family, so its
             observation is required before an absent item can close.
+        source: The data source the family is decided from
+            (``adscan_core.engagement.sources``). A source that can go unread
+            in a completed run obliges the family to carry its gap where
+            reconciliation reads it (see that module).
     """
 
     check_id: str
@@ -91,6 +113,7 @@ class Detector:
     positive_keys: tuple[str, ...] = ()
     reobserve: str = REOBSERVE_FULL_PHASE
     instrumented: bool = False
+    source: str = SOURCE_DIRECTORY
 
 
 def _d(
@@ -100,6 +123,7 @@ def _d(
     steps: str = "",
     positives: str = "",
     *,
+    src: str,
     reobserve: str = REOBSERVE_FULL_PHASE,
     instrumented: bool = False,
 ) -> Detector:
@@ -111,6 +135,7 @@ def _d(
         positive_keys=tuple(positives.split()),
         reobserve=reobserve,
         instrumented=instrumented,
+        source=src,
     )
 
 
@@ -148,6 +173,9 @@ _ESC_NUMBERS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17)
 #: InterfaceFlags), not from the collected directory. They record their own
 #: outcome per CA, so a collected CA never marks them clear by absence.
 _ESC_CA_HOST_READS = frozenset({6, 11})
+#: The read each CA-host ESC family is decided from (the rest are decided
+#: from the collected directory).
+_ESC_SOURCES = {6: SOURCE_CA_REGISTRY, 7: SOURCE_CA_SECURITY, 11: SOURCE_CA_REGISTRY}
 _ESC_POSITIVES = {
     9: "esc9_implicit_mapping_mitigated",
     14: "esc14_weak_explicit_mapping_mitigated",
@@ -161,54 +189,57 @@ def adcs_check_id(esc_number: int | str) -> str:
 
 
 def _build() -> tuple[Detector, ...]:
+    d_dir = SOURCE_DIRECTORY
     out: list[Detector] = [
         # -- directory reads by the collector -------------------------------
         _d("ldap.roastable_accounts", C_COLLECTION, "kerberoast asreproast",
            "kerberoasting asreproasting", "kerberos_roastable_accounts_absent",
-           reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.object_acl", C_COLLECTION, "excessive_cross_tier_rights",
            "genericall genericwrite writedacl writeowner owns allextendedrights "
            "forcechangepassword addmember addself addkeycredentiallink "
            "writeaccountrestrictions writespn writelogonscript",
-           "delegated_object_rights_absent", reobserve=REOBSERVE_OBJECT),
+           "delegated_object_rights_absent", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.replication_rights", C_COLLECTION,
            "dcsync unauthorized_external_tenant_replication",
            "dcsync getchanges getchangesall getchangesinfilteredset",
-           "directory_replication_rights_confined", reobserve=REOBSERVE_OBJECT),
+           "directory_replication_rights_confined", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.delegation", C_COLLECTION,
            "constrained_delegation unconstrained_delegation rbcd_configured "
            "trust_tgt_delegation_enabled",
            "allowedtodelegate allowedtoact unconstraineddelegation "
-           "crossorgtgtdelegation spnjack", reobserve=REOBSERVE_OBJECT),
+           "crossorgtgtdelegation spnjack", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.gmsa", C_COLLECTION, "gmsa_readable", "readgmsapassword",
-           reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.laps", C_COLLECTION, "laps laps_readable",
-           "readlapspassword synclapspassword", reobserve=REOBSERVE_OBJECT),
+           "readlapspassword synclapspassword", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.shadow_credentials", C_COLLECTION, "shadow_credentials_present",
-           "hasshadowcredentials", reobserve=REOBSERVE_OBJECT),
+           "hasshadowcredentials", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.account_hygiene", C_COLLECTION,
            "password_never_expires password_not_req password_not_required "
            "stale_enabled_computers stale_enabled_users stale_passwords "
            "obsolete_computers duplicate_computer_dns krbtgt_password_age",
-           "computerpre2k", reobserve=REOBSERVE_OBJECT),
+           "computerpre2k", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.attribute_secrets", C_COLLECTION,
            "credential_in_ldap_attribute ldap_user_description_password_leak "
            "user_description_credential_leak", "userdescription",
-           reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.trusts", C_COLLECTION, "trust_sid_filtering_disabled raise_child_forest_root",
-           "raisechild", reobserve=REOBSERVE_OBJECT),
+           "raisechild", reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("ldap.membership", C_COLLECTION, "",
            "memberof privilegedgroupcontrol backupoperatorescalation printoperatorabuse "
            "dnsadminabuse managerodcprp preparerodccredentialcaching",
-           reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_OBJECT, src=d_dir),
         _d("graph.tier0_exposure", C_PATHS,
-           "tier0_access_exposure tier0_highvalue_sprawl mssql_bulk_operations_overprivilege"),
+           "tier0_access_exposure tier0_highvalue_sprawl mssql_bulk_operations_overprivilege",
+           src=d_dir),
         # -- certificate services ------------------------------------------
         *(
             _d(f"adcs.esc{n}", C_ADCS, f"adcs_esc{n}", f"adcsesc{n}",
                _ESC_POSITIVES.get(n, ""),
                reobserve=REOBSERVE_PROBE if n in _ESC_CA_HOST_READS else REOBSERVE_OBJECT,
-               instrumented=n in _ESC_CA_HOST_READS)
+               instrumented=n in _ESC_CA_HOST_READS,
+               src=_ESC_SOURCES.get(n, d_dir))
             for n in _ESC_NUMBERS
         ),
         # ESC12 is read on the CA host itself, not derived from the collected
@@ -216,59 +247,73 @@ def _build() -> tuple[Detector, ...]:
         # not assessed with the reason) per CA. So it is instrumented and the
         # directory-collection pass never marks it clear by absence.
         _d("adcs.esc12", C_ADCS, "adcs_esc12", "adcsesc12",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
-        _d("adcs.ntauth", C_ADCS, "adcs_orphaned_ca_ntauth", reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_CA_REGISTRY),
+        _d("adcs.ntauth", C_ADCS, "adcs_orphaned_ca_ntauth", reobserve=REOBSERVE_OBJECT,
+           src=d_dir),
         # Segregation of duties on each CA (role separation, read from the CA
         # over CSRA with its role holders). Governance evidence with no finding
         # of its own, so it observes only its positive.
         _d("adcs.role_separation", C_ADCS, "", "", "ca_role_separation_enforced",
-           reobserve=REOBSERVE_PROBE),
-        _d("adcs.relay_to_web_enrollment", C_ADCS, "", "coerceandrelayntlmtoadcs"),
+           reobserve=REOBSERVE_PROBE, src=SOURCE_CA_SECURITY),
+        _d("adcs.relay_to_web_enrollment", C_ADCS, "", "coerceandrelayntlmtoadcs",
+           src=SOURCE_CA_WEB_ENROLLMENT),
         # -- domain policy reads --------------------------------------------
+        # The password policy and reversible storage are graded on the domain
+        # default AND every fine-grained policy, which an unprivileged bind
+        # usually cannot read.
         _d("policy.password", C_ANALYSIS, "weak_password_policy", "",
-           "strong_password_policy", reobserve=REOBSERVE_DOMAIN_POLICY),
+           "strong_password_policy", reobserve=REOBSERVE_DOMAIN_POLICY,
+           src=SOURCE_PASSWORD_SETTINGS),
         _d("policy.machine_account_quota", C_ANALYSIS, "machine_account_quota_risk", "",
-           "machine_account_quota_zero", reobserve=REOBSERVE_DOMAIN_POLICY),
+           "machine_account_quota_zero", reobserve=REOBSERVE_DOMAIN_POLICY, src=d_dir),
+        # Read from the Group Policy files in SYSVOL.
         _d("policy.machine_password_rotation", C_ANALYSIS,
            "machine_password_rotation_disabled machine_password_rotation_relaxed",
-           reobserve=REOBSERVE_DOMAIN_POLICY),
-        _d("policy.rc4_accounts", C_ANALYSIS, "rc4_only_accounts", reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_DOMAIN_POLICY, src=SOURCE_SYSVOL),
+        _d("policy.rc4_accounts", C_ANALYSIS, "rc4_only_accounts", reobserve=REOBSERVE_OBJECT,
+           src=d_dir),
         _d("policy.reversible_encryption", C_ANALYSIS, "reversible_encryption_enabled", "",
-           "reversible_encryption_disabled", reobserve=REOBSERVE_DOMAIN_POLICY),
+           "reversible_encryption_disabled", reobserve=REOBSERVE_DOMAIN_POLICY,
+           src=SOURCE_PASSWORD_SETTINGS),
         # -- posture categories (observed by the posture probe) ---------------
         _d(_posture("kerberos_rc4"), C_ANALYSIS, "kerberos_rc4_domain_accepted",
-           reobserve=REOBSERVE_PROBE),
+           reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("kerberos_aes_only"), C_ANALYSIS, "kerberos_aes_not_forced", "",
-           "kerberos_aes_only", reobserve=REOBSERVE_PROBE),
+           "kerberos_aes_only", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("ldap_signing"), C_ANALYSIS, "ldap_security_posture", "",
-           "ldap_signing_required", reobserve=REOBSERVE_PROBE),
+           "ldap_signing_required", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("ldap_channel_binding"), C_ANALYSIS, "", "",
-           "ldap_channel_binding_required", reobserve=REOBSERVE_PROBE),
+           "ldap_channel_binding_required", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("ntlm_authentication"), C_ANALYSIS, "ntlm_authentication_accepted", "",
-           "ntlm_likely_disabled", reobserve=REOBSERVE_PROBE),
+           "ntlm_likely_disabled", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("ldaps_available"), C_ANALYSIS, "ldaps_unavailable", "",
-           "ldaps_available", reobserve=REOBSERVE_PROBE),
+           "ldaps_available", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d(_posture("ldap_starttls_available"), C_ANALYSIS, "", "",
-           "starttls_available", reobserve=REOBSERVE_PROBE),
+           "starttls_available", reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
+        # The per-host signing finding comes from the host sweep's SMB negotiate.
         _d(_posture("smb_signing"), C_ANALYSIS, "smb_signing_disabled smb_relay_targets", "",
-           "smb_signing_required", reobserve=REOBSERVE_PROBE),
+           "smb_signing_required", reobserve=REOBSERVE_PROBE, src=SOURCE_HOST_SMB),
         # -- protocol probes ------------------------------------------------
         _d("probe.ldap_anonymous", C_ANALYSIS, "ldap_anonymous", "ldapanonymousbind",
-           reobserve=REOBSERVE_PROBE),
+           reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
         _d("probe.ntlmv1", C_ANALYSIS, "ntlmv1_enabled", "ntlmv1enabled",
-           reobserve=REOBSERVE_PROBE),
-        _d("probe.smb_null_session", C_ANALYSIS, "smb_null_domain", reobserve=REOBSERVE_PROBE),
+           reobserve=REOBSERVE_PROBE, src=SOURCE_DC_PROBE),
+        _d("probe.smb_null_session", C_ANALYSIS, "smb_null_domain", reobserve=REOBSERVE_PROBE,
+           src=SOURCE_DC_PROBE),
         _d("probe.http_relay_surface", C_ANALYSIS, "http_spn_relay_surface",
-           reobserve=REOBSERVE_PROBE),
+           reobserve=REOBSERVE_PROBE, src=SOURCE_HOST_PROBE),
         # -- per-host reads -------------------------------------------------
+        # SMBv1 and the registry controls are read per host by the host sweep,
+        # which records every outcome per family (read, finding, or not read on
+        # a host and why): see ``services/engagement/host_source_observations``.
         _d("host.smbv1", C_ANALYSIS, "smbv1_enabled smb_v1_enabled", "", "smbv1_disabled",
-           reobserve=REOBSERVE_PROBE),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_SMB),
         # One family per registry control: each control has its own outcome,
         # so they can never share one observation (a weak value on one control
         # must not hide the hardened value observed on another).
         *(
             _d(f"host.registry.{name}", C_ANALYSIS, finding, "", positive,
-               reobserve=REOBSERVE_OBJECT)
+               reobserve=REOBSERVE_OBJECT, instrumented=True, src=SOURCE_HOST_REGISTRY)
             for name, finding, positive in (
                 ("lsa_protection", "lsa_protection_disabled", "lsa_protection_enabled"),
                 ("wdigest", "wdigest_enabled", "wdigest_disabled"),
@@ -280,38 +325,42 @@ def _build() -> tuple[Detector, ...]:
             )
         ),
         _d("host.endpoint_protection", C_ANALYSIS, "", "", "endpoint_protection_present",
-           reobserve=REOBSERVE_OBJECT),
+           reobserve=REOBSERVE_OBJECT, src=SOURCE_HOST_REGISTRY),
         _d("host.access", C_COLLECTION_HOSTS, "",
            "adminto canrdp canpsremote executedcom scheduledtask",
-           reobserve=REOBSERVE_CONDITION),
+           reobserve=REOBSERVE_CONDITION, src=SOURCE_HOST_SAMR),
         _d("host.sessions", C_COLLECTION_HOSTS, "da_sessions", "hassession",
-           reobserve=REOBSERVE_CONDITION),
+           reobserve=REOBSERVE_CONDITION, src=SOURCE_HOST_SAMR),
+        # Recorded per host by the sweep: the hosts where every share's security
+        # descriptor was read (``host_source_observations``).
         _d("smb.share_access", C_COLLECTION_HOSTS, "",
            "readshare writeshare fullcontrolshare guestsession writesmbpath",
-           reobserve=REOBSERVE_CONDITION),
+           reobserve=REOBSERVE_CONDITION, instrumented=True, src=SOURCE_HOST_SHARE_ACL),
         _d("mssql.access", C_COLLECTION_MSSQL, "",
            "sqlaccess sqladmin mssql_impersonate_login mssql_linked_server_lateral",
-           reobserve=REOBSERVE_CONDITION),
+           reobserve=REOBSERVE_CONDITION, src=SOURCE_HOST_MSSQL),
         # -- CVE and coercion probes (every outcome recorded) ----------------
         _d("cve.zerologon", C_AUDIT, "zerologon", "zerologon", "zerologon_not_vulnerable",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.nopac", C_AUDIT, "nopac", "nopac", "nopac_not_vulnerable",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.ms17_010", C_AUDIT_HOSTS, "ms17-010", "ms17-010", "ms17_010_not_present",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.printnightmare", C_AUDIT_HOSTS, "printnightmare", "printnightmare",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.petitpotam", C_AUDIT_HOSTS, "petitpotam", "petitpotam",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.printerbug", C_AUDIT_HOSTS, "printerbug", "printerbug",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.dfscoerce", C_AUDIT_HOSTS, "dfscoerce", "dfscoerce",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
         _d("cve.mseven", C_AUDIT_HOSTS, "mseven", "mseven",
-           reobserve=REOBSERVE_PROBE, instrumented=True),
-        _d("cve.webdav", C_AUDIT_HOSTS, "webdav", reobserve=REOBSERVE_PROBE, instrumented=True),
+           reobserve=REOBSERVE_PROBE, instrumented=True, src=SOURCE_HOST_PROBE),
+        _d("cve.webdav", C_AUDIT_HOSTS, "webdav", reobserve=REOBSERVE_PROBE, instrumented=True,
+           src=SOURCE_HOST_PROBE),
         *(
-            _d(check, C_AUDIT_HOSTS, reobserve=REOBSERVE_PROBE, instrumented=True)
+            _d(check, C_AUDIT_HOSTS, reobserve=REOBSERVE_PROBE, instrumented=True,
+               src=SOURCE_HOST_PROBE)
             for check in (
                 "cve.shadowcoerce",
                 "cve.printerbug_surface",
@@ -321,33 +370,37 @@ def _build() -> tuple[Detector, ...]:
                 "cve.ntlm_reflection",
             )
         ),
+        # Certighost is graded from the CA host's registry flags and build.
         _d("cve.certighost", C_AUDIT_HOSTS, "certighost", "certighost", reobserve=REOBSERVE_PROBE,
-           instrumented=True),
+           instrumented=True, src=SOURCE_CA_REGISTRY),
         # -- credential hunting ---------------------------------------------
         _d("hunt.gpp", C_QUICK_WINS, "gpp_autologin gpp_passwords", "gpppassword",
-           reobserve=REOBSERVE_FULL_PHASE),
+           reobserve=REOBSERVE_FULL_PHASE, src=SOURCE_SYSVOL),
         _d("hunt.share_secrets", C_SHARES, "smb_guest_shares smb_share_secrets",
-           "passwordinshare passwordinfile", reobserve=REOBSERVE_FULL_PHASE),
+           "passwordinshare passwordinfile", reobserve=REOBSERVE_FULL_PHASE,
+           src=SOURCE_HOST_SHARE_CONTENT),
         # -- capture, crack and execution outcomes (never closed by absence) --
         _d("credential.recovered", C_CRACKING,
            "recovered_account_passwords krbtgt_pass ntlmv1_crack timeroast",
            "timeroasting crackntlmv1 poisoncapturentlmv2crack",
-           reobserve=REOBSERVE_EXECUTE_ONLY),
+           reobserve=REOBSERVE_EXECUTE_ONLY, src=SOURCE_EXECUTION),
         _d("credential.spray", C_SPRAY, "", "blankpassword useraspass passwordspray",
-           reobserve=REOBSERVE_EXECUTE_ONLY),
+           reobserve=REOBSERVE_EXECUTE_ONLY, src=SOURCE_EXECUTION),
         _d("credential.reuse", C_PRIV_EXERCISE, "",
            "domainpassreuse domainpassreusesource localadminpassreuse "
            "localcredreusesource localcredtodomainreuse",
-           reobserve=REOBSERVE_EXECUTE_ONLY),
+           reobserve=REOBSERVE_EXECUTE_ONLY, src=SOURCE_EXECUTION),
         _d("execution.credential_dump", C_PRIV_EXERCISE, "",
            "dumpdpapi dumplsa dumplsass dumpsam extractrodckrbtgtsecret "
-           "forgerodcgoldenticket kerberoskeylist", reobserve=REOBSERVE_EXECUTE_ONLY),
+           "forgerodcgoldenticket kerberoskeylist", reobserve=REOBSERVE_EXECUTE_ONLY,
+           src=SOURCE_EXECUTION),
         _d("execution.relay", C_PRIV_EXERCISE, "ntlmv1_relay_rbcd ntlmv1_relay_shadowcreds",
-           "ntlmv1relayrbcd ntlmv1relayshadowcreds", reobserve=REOBSERVE_EXECUTE_ONLY),
+           "ntlmv1relayrbcd ntlmv1relayshadowcreds", reobserve=REOBSERVE_EXECUTE_ONLY,
+           src=SOURCE_EXECUTION),
         _d("execution.mssql", C_PRIV_EXERCISE, "",
            "mssql_ntlmv2_theft mssql_openrowset_bulk_read mssql_seimpersonate_escalation "
            "mssql_token_theft_escalation mssql_trustworthy_db_escalation xp_cmdshell",
-           reobserve=REOBSERVE_EXECUTE_ONLY),
+           reobserve=REOBSERVE_EXECUTE_ONLY, src=SOURCE_EXECUTION),
     ]
     return tuple(out)
 
@@ -397,6 +450,22 @@ def instrumented_check_for(kind: str, key: str) -> Optional[str]:
     return det.check_id if det is not None and det.instrumented else None
 
 
+def gap_basis_for_check(check_id: str) -> str:
+    """The ``basis_not_read`` token of the source a detector check reads.
+
+    ``""`` for a check that is not a detector family's, or whose source cannot
+    go unread (a phase check, a directory read): those gaps keep their plain
+    reason code.
+    """
+    det = _BY_ID.get(str(check_id or ""))
+    if det is None:
+        return ""
+    declared = SOURCES.get(det.source)
+    if declared is None or not declared.can_go_unread:
+        return ""
+    return declared.basis
+
+
 __all__ = (
     "CVE_CHECK_IDS",
     "DETECTORS",
@@ -407,6 +476,7 @@ __all__ = (
     "detector_for",
     "detector_for_positive_key",
     "finding_keys_for_step",
+    "gap_basis_for_check",
     "instrumented_check_for",
     "step_relations_for_finding",
 )

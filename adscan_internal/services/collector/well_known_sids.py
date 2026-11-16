@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from adscan_core.directory_object_state import is_tombstoned
+
 # Re-exported from the import-safe leaf SSOT (do not duplicate the tables here).
 from adscan_internal.services.well_known_principals import (  # noqa: F401
     DYNAMIC_IDENTITY_SIDS,
@@ -92,7 +94,7 @@ def inject_all_well_known_sid_nodes(result: "CollectionResult") -> int:
 #
 # Inferring these virtual MemberOf edges in the collector propagates them to
 # BOTH attack_graph.json and memberships.json via the existing persistence
-# pipeline (``persistence._write_memberships`` filters on relation==MemberOf),
+# pipeline (``graph_build.sidecars`` writes memberships from relation==MemberOf),
 # matching the architectural pattern used by ``analyze_group_inferences``
 # for CanRDP/CanPSRemote.
 
@@ -221,6 +223,14 @@ def analyze_implicit_well_known_memberships(result: "CollectionResult") -> int:
         # Disabled accounts cannot authenticate, so they are NOT members of
         # any of the implicit authentication groups in practice.
         if node.enabled is False:
+            continue
+        # Neither can a deleted object. It keeps its userAccountControl, so it
+        # reads as enabled, but nobody signs in as an account in the Recycle
+        # Bin: it is in no sign-in group and has no primary-group membership
+        # until it is restored. Emitting these edges gave every deleted account
+        # an outgoing route through Authenticated Users, which is how deleted
+        # accounts were counted as ordinary users holding a path.
+        if is_tombstoned(node):
             continue
         # Synthetic well-known SID nodes don't represent real principals.
         if node.properties.get("well_known_sid"):

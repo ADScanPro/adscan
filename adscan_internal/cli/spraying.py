@@ -2204,6 +2204,12 @@ def validate_domain_reuse_with_password(
         "kerberos",
         f"sam_domain_password_spray_{safe_log_filename_fragment(clear_password)}.log",
     )
+    # kerbrute is a child process pointed at the domain's KDC: asked of the
+    # engagement scope here, right before its command is built and run.
+    if not _spray_kdc_in_scope(shell, domain):
+        result["status"] = "skipped"
+        result["error"] = "The domain controller is outside the engagement scope."
+        return result
     command = build_kerbrute_command(
         kerbrute_path=shell.kerbrute_path,
         domain=domain,
@@ -3229,6 +3235,51 @@ def _tcp_reachable_for_ldap_reads(ip: str, timeout: float = 2.0) -> bool:
     return False
 
 
+def _lockout_authority_outside_scope(
+    shell: SprayShell, domain: str, *, host: str | None, address: str | None
+) -> bool:
+    """True when the engagement scope keeps this domain controller from being read.
+
+    The scope SSOT decides (``host_scope_verdict``, a DIRECTORY read: a
+    domain controller kept to the directory plane stays readable, one the
+    client excluded does not). Nothing is contacted to answer it. Without an
+    asset scope it is False at once; a verdict that cannot be computed counts as
+    excluded (fail closed, which only makes the caller more conservative).
+    """
+    target = str(host or address or "").strip()
+    if not target:
+        return False
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            asset_scope_recorded,
+            host_scope_verdict,
+        )
+
+        if not asset_scope_recorded(shell):
+            return False
+        verdict = host_scope_verdict(
+            shell,
+            host=target,
+            connect_address=str(address or "").strip() or None,
+            # The lockout counters are read from the directory over LDAP.
+            contact=Contact("ldap"),
+            domain=domain,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable scope is never a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return True
+    if verdict.allowed:
+        return False
+    print_info_debug(
+        "[spray] the domain controller that holds the lockout counters for "
+        f"{mark_sensitive(domain, 'domain')} is outside the engagement scope "
+        f"({verdict.reason}); lockout reads are conservative"
+    )
+    return True
+
+
 def resolve_lockout_authority_ip(
     shell: SprayShell, domain: str
 ) -> LockoutAuthorityTarget:
@@ -3252,7 +3303,13 @@ def resolve_lockout_authority_ip(
             read_ip=operational_ip,
             kerberos_hostname=None,
             is_authoritative_pdc=False,
-            conservative=False,
+            # The engagement scope may exclude the very domain controller that
+            # holds the counters. Its counters are then not readable from
+            # inside the scope, so nothing is treated as an authoritative read:
+            # the caller keeps to one attempt per account per window.
+            conservative=_lockout_authority_outside_scope(
+                shell, domain, host=None, address=operational_ip
+            ),
         )
 
     pdc_ip = str(domain_info.get("authoritative_pdc_ip") or "").strip() or None
@@ -3262,7 +3319,15 @@ def resolve_lockout_authority_ip(
     # A Kerberos read against the PDC needs its FQDN for the LDAP SPN. Without
     # both the PDC IP AND its FQDN we cannot safely redirect the (Kerberos) read
     # — fall to conservative mode rather than reading stale replica counters.
-    if pdc_ip and pdc_hostname and _tcp_reachable_for_ldap_reads(pdc_ip):
+    # A PDC emulator the engagement scope excludes is "not reachable for reads"
+    # by contract: it is not probed and not read, so the replica's counters are
+    # never taken for authoritative ones (conservative mode below).
+    if (
+        pdc_ip
+        and pdc_hostname
+        and not _lockout_authority_outside_scope(shell, domain, host=pdc_hostname, address=pdc_ip)
+        and _tcp_reachable_for_ldap_reads(pdc_ip)
+    ):
         return LockoutAuthorityTarget(
             read_ip=pdc_ip,
             kerberos_hostname=pdc_hostname,
@@ -7468,6 +7533,19 @@ def spraying_with_username_as_password(
             pass
 
 
+def _builtin_guest_hits(shell: object, domain: str, hits: list[str]) -> list[str]:
+    """The blank-password hits that are the domain's built-in Guest account."""
+    from adscan_internal.services.smb_guest_auth_service import (  # noqa: PLC0415
+        is_builtin_guest_account,
+    )
+
+    return [
+        user
+        for user in hits
+        if is_builtin_guest_account(shell, domain=domain, username=user)
+    ]
+
+
 def spraying_with_blank_password(
     shell: SprayShell,
     domain: str,
@@ -7594,6 +7672,19 @@ def spraying_with_blank_password(
     except Exception as exc:  # noqa: BLE001 — streaming/LiveSession setup failed
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
+
+    # The built-in Guest account answering an empty password is GUEST ACCESS, not
+    # a domain credential: nothing to store, own, verify or mint a ticket for
+    # (the guest session checks report it, under a declared guest name). It is
+    # named to the operator and kept out of the credential path.
+    guest_hits = _builtin_guest_hits(shell, domain, hits)
+    if guest_hits:
+        hits = [user for user in hits if user not in guest_hits]
+        print_info(
+            "The built-in Guest account accepts an empty password: this is guest "
+            "access, not a domain credential. It is covered by the guest session "
+            "checks; no credential is stored and no ticket is requested for it."
+        )
 
     # Persist hits through the centralized path (credential store + TGT mint +
     # attack-graph provenance), then record the blank sentinel for coverage de-dup.
@@ -8397,6 +8488,22 @@ def domain_spray_command(
     )
 
 
+def _spray_kdc_in_scope(shell: "SprayShell", domain: str) -> bool:
+    """Whether the engagement scope lets a spray child send to ``domain``'s KDC."""
+    from adscan_internal.services.engagement_scope import Contact  # noqa: PLC0415
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        subprocess_dc_in_scope,
+    )
+
+    return subprocess_dc_in_scope(
+        shell,
+        domain,
+        surface="password_spray",
+        what="Password spray",
+        contact=Contact("kerberos"),
+    )
+
+
 def _run_spray_with_dashboard(
     shell: SprayShell,
     *,
@@ -8429,8 +8536,14 @@ def _run_spray_with_dashboard(
     Returns:
         A CompletedProcess-shaped result (``StreamedProcessResult`` on the
         streaming path, ``subprocess.CompletedProcess`` on the fallback), or
-        ``None`` if even the fallback could not execute.
+        ``None`` if even the fallback could not execute, or if the engagement
+        scope keeps the domain's KDC out (the spray is then not started).
     """
+    # kerbrute is a child process that sends its requests to the domain's KDC,
+    # where the in-process socket guard cannot see them: the controller is asked
+    # of the engagement scope here, immediately before the child is started.
+    if domain and not _spray_kdc_in_scope(shell, domain):
+        return None
 
     def _buffered() -> "subprocess.CompletedProcess[str] | None":
         # Heartbeat spinner so a non-streaming run still shows it is alive
@@ -9303,6 +9416,7 @@ def _drop_owned_with_summary(
     the summary, so the spray set is unchanged.
     """
     items = _drop_cleanup_accounts(shell, domain, names, context=context)
+    items = _drop_accounts_outside_engagement_scope(shell, domain, items, context=context)
     owned = _owned_usernames(shell, domain)
     if not owned:
         return items, OwnedPrincipalDrop(list_size=len(items))
@@ -9386,6 +9500,63 @@ def _drop_cleanup_accounts(shell: "SprayShell", domain: str, names, *, context: 
         f"{mark_sensitive(domain, 'domain')}"
     )
     return kept
+
+
+#: Shell attribute: (domain, accounts) sets whose scope exclusion was already announced.
+_SCOPE_EXCLUSION_NOTED_ATTR = "_spray_scope_exclusion_noted"
+
+
+def _drop_accounts_outside_engagement_scope(
+    shell: "SprayShell", domain: str, names, *, context: str
+) -> list[str]:
+    """``names`` minus the accounts the engagement scope excludes.
+
+    An account the client excluded never receives a password guess. Like the
+    cleanup account, it is left out before anything else counts the list, so the
+    eligibility funnel, the coverage denominator and the selector all read as if
+    it was never listed, and the operator is told how many were left out, once
+    per domain and set of accounts (eligibility is recomputed many times in a
+    run). This is the one exclusion point of every spray path (user sprays,
+    hash-reuse sprays and the pre2k computer-account spray), and the only gate a
+    spray run by an external process has. The scope SSOT decides each account
+    (``principal_scope_verdict``, through the shared account-list seam); an
+    account it cannot place is left out too. Without an asset scope the list is
+    returned as it is.
+    """
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        announce_principals_left_out,
+        partition_principals_in_scope,
+    )
+
+    items = list(names)
+    try:
+        partition = partition_principals_in_scope(
+            shell, items, domain=domain, what="Password spraying", announce=False
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable scope is never a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
+    if partition.refused:
+        noted = getattr(shell, _SCOPE_EXCLUSION_NOTED_ATTR, None)
+        if not isinstance(noted, set):
+            noted = set()
+            try:
+                setattr(shell, _SCOPE_EXCLUSION_NOTED_ATTR, noted)
+            except Exception:  # noqa: BLE001 - a read-only shell just announces again
+                pass
+        key = (
+            str(domain or "").strip().lower(),
+            tuple(sorted(str(name).casefold() for name in partition.refused_items)),
+        )
+        if key not in noted:
+            noted.add(key)
+            announce_principals_left_out("Password spraying", partition.refused)
+        print_info_debug(
+            f"[spray] {context}: left out {len(partition.refused)} account(s) outside the "
+            f"engagement scope for {mark_sensitive(domain, 'domain')}"
+        )
+    return partition.allowed
 
 
 def _drop_owned(shell: "SprayShell", domain: str, names, *, context: str) -> list[str]:

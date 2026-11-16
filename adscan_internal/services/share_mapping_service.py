@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any
 import os
 
+from adscan_core.memory_guard import current_guard, refuse_whole_load
+from adscan_core.reporting.resource_coverage import STAGE_SHARE_MAPPING
 from adscan_internal.services.base_service import BaseService
+from adscan_internal.services.share_mapping_bounds import (
+    RETENTION_ALL_FILE_NAMES,
+    RETENTION_CANDIDATE_FILES,
+    RETENTION_KEY,
+    is_share_mapping_candidate,
+)
 from adscan_internal.services.smb_exclusion_policy import (
     is_globally_excluded_smb_relative_path,
 )
@@ -47,8 +55,17 @@ class ShareMappingService(BaseService):
         requested_hosts: list[str],
         requested_shares: list[str],
         host_share_permissions: dict[str, dict[str, str]] | None = None,
+        share_outcomes: dict[str, dict[str, dict[str, Any]]] | None = None,
+        candidates_only: bool = False,
+        all_file_names: bool = False,
     ) -> dict[str, Any]:
         """Merge one spider_plus run into a consolidated mapping JSON.
+
+        With ``candidates_only`` (the rclone and CIFS mappings) the map holds
+        candidate files only (the files a later phase could read, see
+        :mod:`adscan_internal.services.share_mapping_bounds`), so its size
+        follows the candidates and not the size of the estate. Host files are
+        read one at a time.
 
         Args:
             domain: Domain where the spidering run was executed.
@@ -59,6 +76,15 @@ class ShareMappingService(BaseService):
             requested_hosts: Host targets requested for the run.
             requested_shares: Shares requested/known at run start.
             host_share_permissions: Optional host->share->permission map.
+            share_outcomes: Optional ``{host: {share: outcome}}`` from the
+                mapping run. Each share then records ``files_listed`` (every
+                file the listing saw) and ``listing_complete``.
+            all_file_names: The run was mapped for the AI review and kept
+                every file name up to its total. The map is marked so; a later
+                static merge marks it back.
+            candidates_only: The run kept candidate files only. The map is
+                marked so, and a map written before that is reduced to its
+                candidate files when it is loaded.
 
         Returns:
             Summary dictionary with counts and output paths.
@@ -68,7 +94,10 @@ class ShareMappingService(BaseService):
         aggregate = self._load_or_init_aggregate(
             domain=domain,
             aggregate_map_path=aggregate_map_path,
+            candidates_only=candidates_only,
         )
+        if all_file_names:
+            aggregate[RETENTION_KEY] = RETENTION_ALL_FILE_NAMES
         merged_file_entries = 0
         merged_hosts = 0
         merged_shares = 0
@@ -144,6 +173,14 @@ class ShareMappingService(BaseService):
                     merged_file_entries += 1
 
                 share_bucket["file_count"] = len(share_bucket["files"])
+                outcome = (
+                    (share_outcomes or {}).get(host, {}).get(share_name)
+                    if isinstance((share_outcomes or {}).get(host), dict)
+                    else None
+                )
+                if isinstance(outcome, dict):
+                    share_bucket["files_listed"] = int(outcome.get("entries_listed") or 0)
+                    share_bucket["listing_complete"] = outcome.get("complete") is not False
 
         principal_key = principal.strip() or "unknown"
         principal_bucket = aggregate["principals"].setdefault(
@@ -328,18 +365,28 @@ class ShareMappingService(BaseService):
         *,
         domain: str,
         aggregate_map_path: str,
+        candidates_only: bool = False,
     ) -> dict[str, Any]:
         """Load existing aggregate map or create a default structure."""
         if os.path.exists(aggregate_map_path):
+            if current_guard() is not None:
+                # Inside the share-mapping stage: a map too large to load is
+                # that stage's stop, declared at its boundary, never a kill.
+                refuse_whole_load(
+                    os.path.getsize(aggregate_map_path), stage=STAGE_SHARE_MAPPING
+                )
             existing = read_json_file(aggregate_map_path)
             if isinstance(existing, dict) and existing.get("schema_version") == 1:
                 existing.setdefault("hosts", {})
                 existing.setdefault("principals", {})
                 existing.setdefault("runs", [])
+                if candidates_only and existing.get(RETENTION_KEY) != RETENTION_CANDIDATE_FILES:
+                    self._keep_candidate_files_only(existing)
+                    existing[RETENTION_KEY] = RETENTION_CANDIDATE_FILES
                 return existing
 
         now = _now_utc_iso()
-        return {
+        aggregate: dict[str, Any] = {
             "schema_version": 1,
             "domain": domain,
             "created_at": now,
@@ -348,3 +395,33 @@ class ShareMappingService(BaseService):
             "principals": {},
             "runs": [],
         }
+        if candidates_only:
+            aggregate[RETENTION_KEY] = RETENTION_CANDIDATE_FILES
+        return aggregate
+
+    @staticmethod
+    def _keep_candidate_files_only(aggregate: dict[str, Any]) -> None:
+        """Reduce a map written before candidate retention to its candidate files.
+
+        An earlier version kept every listed file. The files a later phase
+        could read are the same ones the mapping keeps now, so nothing a phase
+        uses is dropped.
+        """
+        hosts = aggregate.get("hosts")
+        if not isinstance(hosts, dict):
+            return
+        for host_entry in hosts.values():
+            shares = host_entry.get("shares") if isinstance(host_entry, dict) else None
+            if not isinstance(shares, dict):
+                continue
+            for share_entry in shares.values():
+                files = share_entry.get("files") if isinstance(share_entry, dict) else None
+                if not isinstance(files, dict):
+                    continue
+                share_entry.setdefault("files_listed", len(files))
+                share_entry["files"] = {
+                    path: metadata
+                    for path, metadata in files.items()
+                    if isinstance(path, str) and is_share_mapping_candidate(path)
+                }
+                share_entry["file_count"] = len(share_entry["files"])

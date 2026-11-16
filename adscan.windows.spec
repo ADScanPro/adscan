@@ -174,6 +174,10 @@ hiddenimports = [
     "playwright.sync_api",
     # Engine internals PyInstaller cannot always trace from a dynamic import.
     "adscan_internal.services.attack_graph_service",
+    # The graph store backend is imported lazily by its factory, and it is the
+    # one module that needs the stdlib sqlite3 extension (_sqlite3.pyd).
+    "sqlite3",
+    "adscan_core.graph_store.sqlite_backend",
 ]
 
 # collect_submodules pulls in the deep module trees of the vendored stack so no

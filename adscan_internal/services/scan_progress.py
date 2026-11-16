@@ -202,6 +202,92 @@ def is_incomplete(shell: Any, domain: str) -> bool:
     return read_scan_progress(shell, domain).get("status") == STATUS_RUNNING
 
 
+#: Record key: the digest of the asset scope the scan last ran under (``""``:
+#: none). A record written before the asset scope existed has no key, which
+#: reads the same as "no scope", and that is what it ran under.
+ASSET_SCOPE_DIGEST_KEY = "asset_scope_digest"
+#: Never equal to a stored digest: the session's scope record cannot be read.
+_ASSET_SCOPE_UNREADABLE = "unreadable"
+
+
+def current_asset_scope_digest(shell: Any) -> str:
+    """Digest of the asset scope this session runs under (``""`` when it has none).
+
+    The digest covers the allow and deny lists and the domain-controller rule,
+    so two runs with equal digests assess exactly the same set. A record that
+    cannot be read, or an answer that cannot be had, never equals a stored
+    digest: a resume is then refused rather than assumed.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import asset_scope  # noqa: PLC0415
+
+        scope = asset_scope(shell)
+        if scope is None:
+            return ""
+        if getattr(scope, "unreadable", False):
+            return _ASSET_SCOPE_UNREADABLE
+        return str(scope.digest() or _ASSET_SCOPE_UNREADABLE)
+    except Exception:  # noqa: BLE001 - an unknown scope is never "the same scope"
+        return _ASSET_SCOPE_UNREADABLE
+
+
+#: Incomplete-mark reason: the engagement scope was widened after this work
+#: finished, and the scan was continued without running it again. A declared
+#: gap, never a "run me again": see :func:`declare_asset_scope_widened`.
+REASON_ASSET_SCOPE_WIDENED = "asset_scope_widened"
+#: The collection's own integrity phase (``collector.collection_integrity``).
+_COLLECTION_PHASE_ID = "domain_collection"
+
+
+def _mark_reopens_phase(mark: Any) -> bool:
+    """Whether an incomplete mark means "a re-run can still finish this phase".
+
+    Every mark does, except one whose only reason is a widened engagement
+    scope: the operator continued the scan knowing its finished phases would
+    not run again, so the mark declares the gap and never reopens the phase (a
+    blind re-run of a finished phase, password spraying above all, is what the
+    resume gate exists to prevent).
+    """
+    if not isinstance(mark, dict):
+        return True
+    reasons = [str(r).split(":", 1)[0].strip().lower() for r in mark.get("reasons") or ()]
+    reasons = [r for r in reasons if r]
+    return not reasons or any(r != REASON_ASSET_SCOPE_WIDENED for r in reasons)
+
+
+def declare_asset_scope_widened(shell: Any, domain: str, *, finished_phases: bool = True) -> None:
+    """A scan is continued under a wider scope: mark what will not run again.
+
+    The collection always (a resume and a replay both work over the collected
+    data), and each finished phase when ``finished_phases``. Each keeps the
+    reasons another stage already recorded on it.
+    """
+    detail = (
+        "the engagement scope was widened after this work finished, so what the "
+        "scope added was not assessed by it; start a fresh scan to assess it"
+    )
+    record = read_scan_progress(shell, domain)
+    completed = record.get("phases_complete")
+    targets = [_COLLECTION_PHASE_ID]
+    if finished_phases and isinstance(completed, list):
+        targets += [p for p in RUN_ENUMERATION_PHASE_IDS if p in completed]
+    for phase_id in targets:
+        existing = incomplete_phases(shell, domain).get(phase_id) or {}
+        reasons = [
+            str(r)
+            for r in existing.get("reasons") or ()
+            if str(r).split(":", 1)[0].strip().lower() != REASON_ASSET_SCOPE_WIDENED
+        ]
+        prior = str(existing.get("detail") or "").strip()
+        mark_phase_incomplete(
+            shell,
+            domain,
+            phase_id,
+            reasons=(*reasons, REASON_ASSET_SCOPE_WIDENED),
+            detail=f"{prior}; {detail}" if prior and detail not in prior else (prior or detail),
+        )
+
+
 def mark_scan_running(
     shell: Any,
     domain: str,
@@ -230,6 +316,16 @@ def mark_scan_running(
         record["scan_type"] = scan_type
     if phase_id is not None:
         record["last_phase_reached"] = phase_id
+    scope_digest = current_asset_scope_digest(shell)
+    record[ASSET_SCOPE_DIGEST_KEY] = scope_digest
+    if scope_digest != _ASSET_SCOPE_UNREADABLE:
+        # The lists behind the digest, kept beside the domain's data so a later
+        # resume can say whether the scope was narrowed or widened since.
+        from adscan_internal.services.scan_scope_lineage import (  # noqa: PLC0415
+            remember_scan_asset_scope,
+        )
+
+        remember_scan_asset_scope(shell, domain, scope_digest)
     record["updated_at"] = _now_iso()
     entry[SCAN_PROGRESS_KEY] = record
     _debug(
@@ -287,6 +383,33 @@ def mark_phase_complete(shell: Any, domain: str, phase_id: str) -> None:
     record["updated_at"] = _now_iso()
     entry[SCAN_PROGRESS_KEY] = record
     _best_effort_save(shell)
+    _engagement_scope_checkpoint(shell)
+
+
+def _engagement_scope_checkpoint(shell: Any) -> None:
+    """A phase boundary of the engagement scope (``scope_checkpoint``).
+
+    Every scan flow passes here (``start``, ``ci``, the web worker's ``ci``):
+    the scope's pending entries and evidence windows are refreshed, a scope
+    recorded elsewhere is adopted, and what the session counted is written.
+    One attribute read when no asset scope is recorded. Best-effort: the
+    checkpoint of the scan never fails because of it, and a failure is never
+    silent (telemetry, and the traceback in the debug log).
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            asset_scope_recorded,
+            scope_checkpoint,
+        )
+
+        if asset_scope_recorded(shell):
+            scope_checkpoint(shell)
+    except Exception as exc:  # noqa: BLE001 - never break the scan's own checkpoint
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def phase_already_complete(shell: Any, domain: str, phase_id: str) -> bool:
@@ -294,10 +417,31 @@ def phase_already_complete(shell: Any, domain: str, phase_id: str) -> bool:
 
     The single gate ``run_enumeration`` consults to SKIP a phase on resume —
     especially Password Spraying, whose blind re-run risks account lockout.
-    """
-    completed = read_scan_progress(shell, domain).get("phases_complete")
-    return isinstance(completed, list) and phase_id in completed
 
+    A phase that reached its completion marker but was flagged incomplete (a
+    bounded attack-path discovery stopped at the memory ceiling, recorded by
+    :func:`mark_phase_incomplete`) is NOT complete for resume purposes: a reopen
+    with more memory must recompute it. A sampled-by-design result carries NO
+    incomplete mark (only a resource stop does), so it stays complete and is
+    skipped — the distinction the coverage block already draws.
+    """
+    record = read_scan_progress(shell, domain)
+    completed = record.get("phases_complete")
+    if not (isinstance(completed, list) and phase_id in completed):
+        return False
+    incomplete = record.get(PHASES_INCOMPLETE_KEY)
+    if (
+        isinstance(incomplete, dict)
+        and phase_id in incomplete
+        and _mark_reopens_phase(incomplete[phase_id])
+    ):
+        return False
+    return True
+
+
+#: Integrity id of a run-level stop that names no scan phase (see
+#: :data:`ASSESSMENT_INTEGRITY_PHASE_IDS`).
+UNATTRIBUTED_STOP_PHASE_ID = "run_stopped"
 
 #: The phases an authenticated assessment of a domain cannot do without. Until
 #: both completed, the run has not looked at the domain's identities, ACLs and
@@ -350,10 +494,17 @@ ASSESSMENT_INTEGRITY_PHASE_IDS: tuple[str, ...] = (
     # own mark, so it never clears, nor is cleared by, the directory read's.
     "domain_collection.mssql",
     *CORE_ASSESSMENT_PHASE_IDS,
+    # A stop that carried no phase (the memory sentinel stopped the run in work
+    # that belongs to no scan phase, for example a share review started from
+    # the prompt). Not a chapter-strip phase: it states the run stopped without
+    # naming a phase the stop did not occur in, and it keeps ``adscan ci`` at
+    # exit 3 like any other incomplete mark.
+    UNATTRIBUTED_STOP_PHASE_ID,
 )
 #: Titles of the integrity ids that are not chapter-strip phases.
 _INTEGRITY_SUBPHASE_TITLES: dict[str, str] = {
     "domain_collection.mssql": "SQL Server Collection",
+    UNATTRIBUTED_STOP_PHASE_ID: "Assessment run",
 }
 
 #: Key, inside the ``scan_progress`` record, of the phases that ran but did not
@@ -414,6 +565,7 @@ def mark_phase_incomplete(
     record["updated_at"] = _now_iso()
     entry[SCAN_PROGRESS_KEY] = record
     _best_effort_save(shell)
+    sync_assessment_integrity_to_report(shell, domain)
 
 
 def clear_phase_incomplete(shell: Any, domain: str, phase_id: str) -> None:
@@ -430,6 +582,74 @@ def clear_phase_incomplete(shell: Any, domain: str, phase_id: str) -> None:
         incomplete.pop(phase_id, None)
         record["updated_at"] = _now_iso()
         _best_effort_save(shell)
+        sync_assessment_integrity_to_report(shell, domain)
+
+
+def drop_phase_incomplete_reason(
+    shell: Any, domain: str, phase_id: str, reason: str
+) -> bool:
+    """Remove ONE reason from ``phase_id``'s incomplete mark; clear it when none remain.
+
+    For a stage that now completed (a graph build that fitted after an earlier
+    one stopped at the memory ceiling): its own reason no longer describes the
+    phase, while a reason another stage left (a lost domain controller, another
+    stage's memory stop) still does. Returns whether the mark changed.
+    """
+    entry = _domain_data(shell, domain)
+    record = entry.get(SCAN_PROGRESS_KEY) if isinstance(entry, dict) else None
+    incomplete = record.get(PHASES_INCOMPLETE_KEY) if isinstance(record, dict) else None
+    mark = incomplete.get(phase_id) if isinstance(incomplete, dict) else None
+    if not isinstance(mark, dict):
+        return False
+    reasons = [str(r) for r in mark.get("reasons") or ()]
+    if reason not in reasons:
+        return False
+    remaining = [r for r in reasons if r != reason]
+    if not remaining:
+        clear_phase_incomplete(shell, domain, phase_id)
+        return True
+    mark["reasons"] = remaining
+    _notify_coverage_incomplete(shell, domain, phase_id, tuple(remaining))
+    record["updated_at"] = _now_iso()
+    _best_effort_save(shell)
+    sync_assessment_integrity_to_report(shell, domain)
+    return True
+
+
+def sync_assessment_integrity_to_report(shell: Any, domain: str, *, create: bool = False) -> None:
+    """Mirror ``domain``'s incomplete phases into ``technical_report.json``.
+
+    The report is the artifact a deliverable is rendered from later and the one
+    the web ingests, so it must carry the same completeness verdict the console,
+    the exit status and ``coverage.json`` read (``record_assessment_integrity``).
+    Called on every change of the record; ``create`` writes the report even when
+    no producer has created it yet (the end of an ``adscan ci`` run). Never raises.
+    """
+    if not domain:
+        return
+    try:
+        from adscan_core.reporting import technical_report as tr  # noqa: PLC0415
+
+        if not create and not tr._get_technical_report_path(shell).exists():
+            return
+        marks = incomplete_phases(shell, domain)
+        ids = tuple(marks)
+        rows = [
+            {
+                "phase_id": phase_id,
+                "title": title,
+                "reasons": [str(r) for r in (marks[phase_id].get("reasons") or ())],
+                "detail": str(marks[phase_id].get("detail") or ""),
+            }
+            for phase_id, title in zip(ids, phase_titles(ids))
+        ]
+        tr.record_assessment_integrity(shell, domain, incomplete_phases=rows)
+    except Exception as exc:  # noqa: BLE001 - the report mirror never breaks a scan
+        from adscan_core import telemetry  # noqa: PLC0415
+        from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def incomplete_phases(shell: Any, domain: str) -> dict[str, dict[str, Any]]:
@@ -441,6 +661,93 @@ def incomplete_phases(shell: Any, domain: str) -> dict[str, dict[str, Any]]:
         str(phase): dict(value) if isinstance(value, dict) else {"reasons": [], "detail": ""}
         for phase, value in incomplete.items()
     }
+
+
+def _incomplete_excluding_asset_scope(shell: Any, domain: str) -> set[str]:
+    """Incomplete phases, dropping those whose only gaps are asset exclusions.
+
+    An unfinished-work reason that names an object the client excluded from the
+    engagement scope is a gap the client asked for, not a scan that stopped
+    early. A phase whose reasons are ALL asset-scope reasons is complete over its
+    in-scope set and does not count as lacking. SSOT for the reason tokens:
+    :data:`adscan_core.reporting.engagement_scope.ASSET_SCOPE_GAP_REASONS`.
+
+    The exception is a scope record that cannot be used: nobody asked for that
+    gap. Its reason token is not an asset-scope gap reason, and while the
+    session's record is unusable no phase is dropped at all, so the phases it
+    kept from running read as incomplete.
+    """
+    from adscan_core.reporting.engagement_scope import ASSET_SCOPE_GAP_REASONS
+
+    marks = incomplete_phases(shell, domain)
+    if marks and _scope_record_unusable(shell):
+        return set(marks)
+    lacking: set[str] = set()
+    for phase_id, mark in marks.items():
+        reasons = [str(r).split(":", 1)[0].strip().lower() for r in (mark or {}).get("reasons") or ()]
+        reasons = [r for r in reasons if r]
+        if reasons and all(r in ASSET_SCOPE_GAP_REASONS for r in reasons):
+            continue
+        lacking.add(phase_id)
+    return lacking
+
+
+def _scope_record_unusable(shell: Any) -> bool:
+    """Whether the session's engagement-scope record cannot be used (fail closed)."""
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            asset_scope_unreadable,
+        )
+
+        return bool(asset_scope_unreadable(shell))
+    except Exception:  # noqa: BLE001 - an unreadable answer never hides a gap
+        return True
+
+
+def resumable_recomputable_phases(shell: Any, domain: str) -> tuple[str, ...]:
+    """Return the resume phases that ran but were flagged incomplete.
+
+    A resume phase lands here when it carries an incomplete mark
+    (:func:`mark_phase_incomplete`). Two origins, both meaning "a re-run can
+    still finish this":
+
+    * a bounded attack-path discovery stopped at the memory ceiling (the phase
+      is ALSO in ``phases_complete`` — the seam marked it complete because the
+      compute returned a partial result);
+    * a phase the operator cut short from the Ctrl+C menu (``skip_step`` /
+      ``skip_phase``) — the phase is NOT in ``phases_complete`` because
+      ``_mark_done`` skips a stopped phase, but the scan continued and later
+      phases completed, so the cut phase sits BELOW the completed frontier.
+
+    Either way it is a deliberate "re-run me", NOT a checkpoint hole to skip. The
+    distinguisher is the incomplete MARK: a true checkpoint hole (a phase
+    announced but never checkpointed, with no incomplete mark) is left to the
+    frontier logic, which correctly treats it as already-passed.
+
+    In pipeline order. Empty for a clean scan, and for a sampled-by-design result
+    (which records no incomplete mark).
+    """
+    record = read_scan_progress(shell, domain)
+    incomplete = record.get(PHASES_INCOMPLETE_KEY)
+    # A mark that only declares a widened scope is a gap, not a "re-run me".
+    incomplete_set = (
+        {phase for phase, mark in incomplete.items() if _mark_reopens_phase(mark)}
+        if isinstance(incomplete, dict)
+        else set()
+    )
+    return tuple(p for p in RUN_ENUMERATION_PHASE_IDS if p in incomplete_set)
+
+
+def has_recomputable_phase_gap(shell: Any, domain: str) -> bool:
+    """Return True when a resume phase ran but a re-run can still finish it.
+
+    The second resume trigger beyond ``is_incomplete``: a scan whose status flag
+    is ``complete`` but which left a phase incomplete — a bounded attack-path
+    discovery, or a phase the operator cut short from the Ctrl+C menu — still has
+    work a reopen can do. Used by the resume offer so the workspace surfaces the
+    re-run even though the scan "finished".
+    """
+    return bool(resumable_recomputable_phases(shell, domain))
 
 
 def authenticated_assessment_gap(
@@ -478,8 +785,50 @@ def authenticated_assessment_gap(
         except Exception:  # noqa: BLE001 - without the gate, judge every core phase
             pass
     # A phase marked incomplete RAN (it is never a scope choice), so no gate.
-    lacking = set(missing) | set(incomplete_phases(shell, domain))
-    return tuple(p for p in ASSESSMENT_INTEGRITY_PHASE_IDS if p in lacking)
+    # Exception: a phase whose ONLY unfinished work is an asset the client
+    # excluded from the engagement scope is complete over its in-scope set. The
+    # client asked for the exclusion, so it never reads as an incomplete
+    # assessment (``ci`` exit 3), the same way a policy-disabled phase does not.
+    incomplete = _incomplete_excluding_asset_scope(shell, domain)
+    lacking = set(missing) | incomplete
+    # A stage stopped at the memory ceiling and recorded in the workspace's
+    # technical report: the record also covers a stop that happened under
+    # another session object (the report render rebuilds the graph under its
+    # own throwaway shell), so the run never reads complete over it.
+    try:
+        from adscan_internal.services.resource_coverage_recorder import (  # noqa: PLC0415
+            resource_coverage_gap_phases,
+        )
+
+        lacking |= set(resource_coverage_gap_phases(shell, domain))
+    except Exception:  # noqa: BLE001 - the record is a second source, never a blocker
+        pass
+    integrity = tuple(p for p in ASSESSMENT_INTEGRITY_PHASE_IDS if p in lacking)
+    # A phase whose domain controller stopped answering (``target_loss``) counts
+    # wherever it sits in the pipeline: its checks were never evaluated, so the
+    # run is not a complete assessment of the domain even when collection and
+    # discovery finished before the controller went away.
+    return integrity + target_loss_phases(shell, domain, exclude=integrity)
+
+
+def target_loss_phases(
+    shell: Any, domain: str, *, exclude: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Phases of ``domain`` marked incomplete because the domain controller stopped answering.
+
+    In pipeline order (:data:`RUN_ENUMERATION_PHASE_IDS` first, then any other
+    phase id in sorted order). See :mod:`adscan_internal.services.target_loss`.
+    """
+    from adscan_internal.services.target_loss import mark_has_target_loss  # noqa: PLC0415
+
+    marked = {
+        phase
+        for phase, mark in incomplete_phases(shell, domain).items()
+        if phase not in exclude and mark_has_target_loss(mark)
+    }
+    ordered = [p for p in RUN_ENUMERATION_PHASE_IDS if p in marked]
+    ordered += sorted(marked - set(ordered))
+    return tuple(ordered)
 
 
 def phase_titles(phase_ids: tuple[str, ...]) -> tuple[str, ...]:
@@ -553,6 +902,16 @@ def resume_phase_id(shell: Any, domain: str, scan_type: str) -> str | None:
         applicable = {phase.phase_id for phase in phases_for_scan_type(scan_type)}
     except Exception:  # noqa: BLE001 — degrade to the full checkpoint set
         applicable = set(RUN_ENUMERATION_PHASE_IDS)
+
+    # A phase that ran to its completion marker but was flagged incomplete (a
+    # bounded attack-path discovery stopped at the memory ceiling) is a
+    # deliberate "re-run me", NOT a checkpoint hole: resume at the EARLIEST such
+    # phase so a reopen with more memory recomputes it, even when later phases
+    # completed on the bounded result and the frontier below would skip it.
+    for phase_id in resumable_recomputable_phases(shell, domain):
+        if applicable and phase_id not in applicable:
+            continue
+        return phase_id
 
     # The frontier: the highest order index among completed phases (restricted to
     # the known checkpoint vocabulary). ``-1`` when nothing completed yet, so the

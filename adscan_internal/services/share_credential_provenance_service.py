@@ -146,8 +146,10 @@ def resolve_ambient_share_read_provenance(
       ``reached_via``, and the matching ``perspective``
       (``"guest"``/``"anonymous"``) so the no-read-set fallback resolves to
       the honest well-known node (GUESTS / ANONYMOUS LOGON) instead of the
-      scanner's OWN transport identity (the guest session's default username,
-      ``ADscan`` — see :data:`adscan_internal.services.smb_guest_auth_service.DEFAULT_SMB_GUEST_USERNAME`).
+      scanner's OWN transport identity (the engagement's generated guest name,
+      ``adscan-<8 hex>``, see
+      :func:`adscan_internal.services.smb_guest_auth_service.resolve_smb_guest_username`),
+      which is never a client account.
     """
     bind = current_credential_less_share_bind()
     if not bind:
@@ -259,6 +261,97 @@ _READ_CAPABLE_RELATIONS = frozenset(
         "fullcontrolshare",
     }
 )
+
+
+def read_set_tiers_from_records(
+    records: Any,
+    smb_shares_entries: Any,
+    share_name: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """``(primary, others)`` read-capable principals of ``share_name``, by tier.
+
+    The pure half of :meth:`ShareCredentialProvenanceService.resolve_share_read_set_tiers`:
+    ``records`` are share-ACL relationship records in the
+    ``inventory/relationships.json`` shape (``relation``, ``notes.share_name``,
+    ``notes.verification``, ``source_object_id``, ``source_name``, ``method``),
+    ``smb_shares_entries`` the light probe's measured read-set for this share.
+    Strict tier precedence self_mxac > ntfs_computed > share_acl_only; a SID is
+    attributed to its highest tier only; never an entry without a SID. Shared
+    by the shell-bound resolver and the graph build's share pass
+    (``graph_build/passes/shares.py``), which feeds it the store's facts.
+    """
+    records = list(records or ())
+    smb_shares_entries = list(smb_shares_entries or ())
+    if not records and not smb_shares_entries:
+        return [], []
+    share_key = share_name.lower()
+    # One bucket per verification tier, keyed by canonical order.
+    buckets: dict[str, dict[str, dict[str, str]]] = {tier: {} for tier in _VERIFICATION_PRECEDENCE}
+    seen_sids: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        relation = str(record.get("relation") or "").strip().lower()
+        if relation not in _READ_CAPABLE_RELATIONS:
+            continue
+        notes = record.get("notes") if isinstance(record.get("notes"), dict) else {}
+        if str(notes.get("share_name") or "").strip().lower() != share_key:
+            continue
+        sid = str(record.get("source_object_id") or "").strip()
+        if not sid:
+            # Exposure-Validation: never fabricate a principal without a SID.
+            continue
+        verification = str(notes.get("verification") or "").strip().lower()
+        if verification not in buckets:
+            # An unknown / missing verification is the lowest-confidence lead.
+            verification = _SHARE_ACL_ONLY
+        entry = {
+            "sid": sid,
+            "label": str(record.get("source_name") or "").strip(),
+            "verification": verification,
+            "method": str(record.get("method") or "").strip(),
+        }
+        buckets[verification].setdefault(sid, entry)
+
+    # Merge the light-probe measured read-set into the SAME buckets, so a
+    # relationships.json share_acl_only entry never masks a HIGHER-tier
+    # (ntfs_computed) measurement the credential-less probe made for the
+    # same SID — the standard highest-tier-wins attribution below handles
+    # it uniformly regardless of which source produced it.
+    for entry in smb_shares_entries:
+        sid = str(entry.get("sid") or "").strip()
+        if not sid:
+            continue
+        verification = str(entry.get("verification") or "").strip().lower()
+        if verification not in buckets:
+            verification = _SHARE_ACL_ONLY
+        buckets[verification].setdefault(sid, entry)
+
+    # Attribute each SID to its HIGHEST tier only, walking most-certain first.
+    tiered: list[list[dict[str, str]]] = []
+    for tier in _VERIFICATION_PRECEDENCE:
+        tier_entries: list[dict[str, str]] = []
+        for sid, entry in buckets[tier].items():
+            if sid in seen_sids:
+                continue
+            seen_sids.add(sid)
+            tier_entries.append(entry)
+        tiered.append(tier_entries)
+
+    # PRIMARY = the first non-empty tier; OTHER = every remaining tier's entries.
+    primary: list[dict[str, str]] = []
+    primary_index = -1
+    for index, tier_entries in enumerate(tiered):
+        if tier_entries:
+            primary = tier_entries
+            primary_index = index
+            break
+    if primary_index < 0:
+        return [], []
+    others: list[dict[str, str]] = [
+        entry for tier_entries in tiered[primary_index + 1 :] for entry in tier_entries
+    ]
+    return primary, others
 
 
 class ShareCredentialProvenanceService(BaseService):
@@ -376,74 +469,7 @@ class ShareCredentialProvenanceService(BaseService):
         if not records and not smb_shares_entries:
             return [], []
 
-        share_key = share_name.lower()
-        # One bucket per verification tier, keyed by canonical order.
-        buckets: dict[str, dict[str, dict[str, str]]] = {tier: {} for tier in _VERIFICATION_PRECEDENCE}
-        seen_sids: set[str] = set()
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            relation = str(record.get("relation") or "").strip().lower()
-            if relation not in _READ_CAPABLE_RELATIONS:
-                continue
-            notes = record.get("notes") if isinstance(record.get("notes"), dict) else {}
-            if str(notes.get("share_name") or "").strip().lower() != share_key:
-                continue
-            sid = str(record.get("source_object_id") or "").strip()
-            if not sid:
-                # Exposure-Validation: never fabricate a principal without a SID.
-                continue
-            verification = str(notes.get("verification") or "").strip().lower()
-            if verification not in buckets:
-                # An unknown / missing verification is the lowest-confidence lead.
-                verification = _SHARE_ACL_ONLY
-            entry = {
-                "sid": sid,
-                "label": str(record.get("source_name") or "").strip(),
-                "verification": verification,
-                "method": str(record.get("method") or "").strip(),
-            }
-            buckets[verification].setdefault(sid, entry)
-
-        # Merge the light-probe measured read-set into the SAME buckets, so a
-        # relationships.json share_acl_only entry never masks a HIGHER-tier
-        # (ntfs_computed) measurement the credential-less probe made for the
-        # same SID — the standard highest-tier-wins attribution below handles
-        # it uniformly regardless of which source produced it.
-        for entry in smb_shares_entries:
-            sid = str(entry.get("sid") or "").strip()
-            if not sid:
-                continue
-            verification = str(entry.get("verification") or "").strip().lower()
-            if verification not in buckets:
-                verification = _SHARE_ACL_ONLY
-            buckets[verification].setdefault(sid, entry)
-
-        # Attribute each SID to its HIGHEST tier only, walking most-certain first.
-        tiered: list[list[dict[str, str]]] = []
-        for tier in _VERIFICATION_PRECEDENCE:
-            tier_entries: list[dict[str, str]] = []
-            for sid, entry in buckets[tier].items():
-                if sid in seen_sids:
-                    continue
-                seen_sids.add(sid)
-                tier_entries.append(entry)
-            tiered.append(tier_entries)
-
-        # PRIMARY = the first non-empty tier; OTHER = every remaining tier's entries.
-        primary: list[dict[str, str]] = []
-        primary_index = -1
-        for index, tier_entries in enumerate(tiered):
-            if tier_entries:
-                primary = tier_entries
-                primary_index = index
-                break
-        if primary_index < 0:
-            return [], []
-        others: list[dict[str, str]] = [
-            entry for tier_entries in tiered[primary_index + 1 :] for entry in tier_entries
-        ]
-        return primary, others
+        return read_set_tiers_from_records(records, smb_shares_entries, share_name)
 
     @staticmethod
     def _share_from_artifact(artifact: str | None) -> str:
@@ -1365,6 +1391,12 @@ def reconcile_share_credential_edge_sources(
     the graph edge-mutation SSOT (``upsert_edge``) — the stale edge is removed and
     a new one upserted so status and notes are preserved.
 
+    The rule itself is :func:`graph_build.passes.shares.reconcile_share_credential_edges`
+    (shell-free); this binds it to the workspace's ``relationships.json`` /
+    ``smb/shares.json`` read-set and the shell's principal resolution. The
+    graph build calls the same rule over the store's share facts
+    (``passes.shares.reconcile_share_credential_sources``).
+
     Args:
         shell: Session shell exposing the workspace context.
         domain: Domain whose inventory / attack graph to reconcile.
@@ -1373,140 +1405,31 @@ def reconcile_share_credential_edge_sources(
     Returns:
         The number of edges reconciled (0 when none qualified or no read-set).
     """
-    edges = graph.get("edges")
-    if not isinstance(edges, list) or not edges:
-        return 0
-
-    # Lazy import to avoid a module-level import cycle (attack_graph_service
-    # imports this module's classes for CredentialSourceStep building).
-    from adscan_internal.services.attack_graph_service import (
+    from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
         _resolve_wellknown_source_entry,
         ensure_entry_node_for_domain,
-        upsert_edge,
+    )
+    from adscan_internal.services.graph_build.passes.shares import (  # noqa: PLC0415
+        reconcile_share_credential_edges,
     )
 
     service = ShareCredentialProvenanceService()
-    reconciled = 0
 
-    # Snapshot the candidate edges first: upsert_edge appends/rewrites the edges
-    # list, so iterate over a stable copy.
-    candidates = [edge for edge in edges if isinstance(edge, dict)]
-    for edge in candidates:
-        relation = str(edge.get("relation") or "").strip().lower()
-        if relation not in _SHARE_FILE_EDGE_RELATIONS:
-            continue
-        notes = edge.get("notes") if isinstance(edge.get("notes"), dict) else {}
-        origin = str(notes.get("origin") or "").strip().lower()
-        if origin not in _SHARE_FILE_EDGE_ORIGINS:
-            continue
-        from_id = str(edge.get("from") or "").strip()
-        if not _is_provisional_fallback_source(from_id):
-            continue  # already on a measured read-set principal — never rewrite
-
-        artifact = str(notes.get("artifact") or "").strip()
-        share = str(notes.get("share") or notes.get("shares") or "").strip()
-        sources = service.resolve_share_read_capable_sources(
-            artifact=artifact or None,
-            share=share or None,
-            domain=domain,
-            shell=shell,
-            relationships_path=None,
+    def _read_set(artifact: str | None, share: str | None) -> list[dict[str, str]]:
+        return service.resolve_share_read_capable_sources(
+            artifact=artifact, share=share, domain=domain, shell=shell, relationships_path=None
         )
 
-        # Preserve the proven-no-credential FACT across the source upgrade. The
-        # source node is correctly rewritten to the measured read-set ("who can
-        # read"), but an ``unauth_enrichment`` edge was read over a pre-credential
-        # bind — that separate fact must not be erased, so it rides onto the
-        # rewritten edge as an attribute. The bind kind is carried from the
-        # build-time notes (``null_session`` or ``guest_session``) so a guest read
-        # stays a guest read through reconciliation; a legacy/missing value
-        # normalizes to ``null_session``. Idempotent: re-stamping is a no-op.
-        preserve_unauth_reachable = _origin_is_unauthenticated_reachable(origin)
-        preserved_reached_via = _normalize_reached_via(notes.get("reached_via"))
-        authorized_by_acl: list[str] | None = None
-        if preserve_unauth_reachable:
-            # A credential-less (guest/null) proven read can only be attributed
-            # to a principal the proven token can actually present — never to a
-            # domain-authenticated grantee the measured ACL also happens to
-            # list. Filter down to what the token can use before it becomes the
-            # edge source; the surviving labels ride along as the ACL evidence.
-            # See :func:`_filtered_credential_less_readset` (the shared
-            # filter+attribution helper ``build_credential_source_steps`` and
-            # ``build_password_artifact_source_steps`` also call), including
-            # its self_mxac exemption and Authenticated-Users carve-out.
-            sources, authorized_by_acl_list = _filtered_credential_less_readset(
-                sources, preserved_reached_via
+    def _resolve_entry(label: str, notes: dict[str, Any], _sid: str) -> str | None:
+        entry_id = _resolve_wellknown_source_entry(graph, label, notes)
+        if entry_id is None:
+            entry_id = ensure_entry_node_for_domain(
+                shell, domain, graph, label=label, entry_kind="group"
             )
-            authorized_by_acl = authorized_by_acl_list or None
+        return entry_id or None
 
-        if not sources:
-            continue  # no read-set → leave the honest fallback, never fabricate
+    return reconcile_share_credential_edges(
+        graph, read_set=_read_set, resolve_entry=_resolve_entry
+    )
 
-        to_id = str(edge.get("to") or "").strip()
-        edge_type = str(edge.get("edge_type") or "").strip()
-        status = str(edge.get("status") or "discovered").strip()
-        if not to_id or not edge_type:
-            continue
 
-        # Resolve the read-set source node(s) through the SAME fusion the
-        # credential-recording path uses. When several principals read the share,
-        # each becomes its own source edge to the credential owner.
-        resolved_any = False
-        # A measured winner CAN fuse onto the SAME node id the provisional
-        # fallback already points from — the honest case where the read is a
-        # null-session read AND the measured NTFS ACEs name Anonymous Logon
-        # itself (the fallback label and the measured source coincide). When
-        # that happens ``upsert_edge`` below matches the EXISTING edge by
-        # (from, to, relation) identity and mutates it IN PLACE, so the
-        # measured evidence (``authorized_by_acl``/``source_sid``/
-        # ``verification``) lands directly on it — there is no stale
-        # duplicate to remove afterward. Skipping the upsert in this case (as
-        # earlier code did) silently left the edge on its incomplete
-        # provisional notes forever, never attaching the measured evidence.
-        edge_updated_in_place = False
-        for src in sources:
-            src_notes = {k: v for k, v in notes.items()}
-            if preserve_unauth_reachable:
-                src_notes["unauthenticated_reachable"] = True
-                src_notes["reached_via"] = preserved_reached_via
-                if authorized_by_acl:
-                    src_notes["authorized_by_acl"] = authorized_by_acl
-            src_notes["source_sid"] = src.get("sid", "")
-            if src.get("verification"):
-                src_notes["verification"] = src["verification"]
-            if src.get("method"):
-                src_notes["method"] = src["method"]
-            entry_label = str(src.get("label") or src.get("sid") or "").strip()
-            entry_id = _resolve_wellknown_source_entry(graph, entry_label, src_notes)
-            if entry_id is None:
-                entry_id = ensure_entry_node_for_domain(
-                    shell, domain, graph, label=entry_label, entry_kind="group"
-                )
-            if not entry_id:
-                continue
-            new_edge = upsert_edge(
-                graph,
-                from_id=entry_id,
-                to_id=to_id,
-                relation=edge.get("relation") or relation,
-                edge_type=edge_type,
-                status=status,
-                notes=src_notes,
-            )
-            if not new_edge:
-                continue
-            resolved_any = True
-            if entry_id == from_id:
-                edge_updated_in_place = True
-
-        if not resolved_any:
-            continue
-
-        if not edge_updated_in_place:
-            # Remove the stale provisional-fallback edge now that the measured
-            # source edge(s) are in place under a different node id. Identity
-            # by the original dict object.
-            graph["edges"] = [e for e in graph.get("edges", []) if e is not edge]
-        reconciled += 1
-
-    return reconciled

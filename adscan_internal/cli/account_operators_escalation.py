@@ -9,6 +9,7 @@ from adscan_internal import telemetry
 from adscan_internal import print_info_list
 from adscan_internal.rich_output import (
     mark_sensitive,
+    markup_object_label,
     print_info,
     print_info_debug,
     print_panel,
@@ -21,11 +22,7 @@ from adscan_internal.services.adcs_target_filter import (
 from adscan_internal.services.attack_graph_core import (
     _node_is_terminal_target as _attack_graph_node_is_terminal_target,
 )
-from adscan_internal.services.attack_graph_service import (
-    add_bloodhound_path_edges,
-    load_attack_graph,
-    save_attack_graph,
-)
+from adscan_internal.services.graph_runtime_edits import record_path_edges
 from adscan_core.rich_output import print_exception
 
 
@@ -442,8 +439,6 @@ def _offer_group_tier_zero_enrichment(
         )
         return False
 
-    graph = load_attack_graph(shell, domain)
-
     # Persist all candidate paths so the central attack-path UX can recalculate
     # and present the enriched graph in one place.
     seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
@@ -484,18 +479,19 @@ def _offer_group_tier_zero_enrichment(
             continue
         seen.add(key)
 
-        total_edges_added += add_bloodhound_path_edges(
-            graph,
+        total_edges_added += record_path_edges(
+            shell,
+            domain,
             nodes=nodes,
             relations=rels,
             status="discovered",
             edge_type="graph_collection",
-            shell=shell,
+            origin="account_operators_escalation",
         )
 
         # Ensure the user + account operators nodes exist for display resolution.
         if isinstance(user_node, dict):
-            from adscan_internal.services.attack_graph_service import upsert_nodes
+            from adscan_internal.services import graph_runtime
 
             # Wrap raw BloodHound properties into our node shape to avoid
             # persisting Users as kind=Unknown (which would use SID-based IDs).
@@ -504,7 +500,9 @@ def _offer_group_tier_zero_enrichment(
                 "kind": ["User"],
                 "properties": user_node,
             }
-            upsert_nodes(graph, [user_record])
+            graph_runtime.record_runtime_node(
+                shell, domain, user_record, origin="account_operators_escalation"
+            )
 
         # Account Operators node must exist from the candidate path; if not, add a minimal one.
         if nodes and str(nodes[0].get("name") or "").strip():
@@ -519,17 +517,16 @@ def _offer_group_tier_zero_enrichment(
                 str(n.get("name") or "") for n in nodes[1:]
             ]
             relations = ["MemberOf"] + list(rels)
-            step_str = f"{mark_sensitive(node_labels[0], 'node')}"
+            step_str = f"{markup_object_label(node_labels[0])}"
             for idx, rel in enumerate(relations):
                 step_str += (
-                    f" -> {str(rel)} -> {mark_sensitive(node_labels[idx + 1], 'node')}"
+                    f" -> {str(rel)} -> {markup_object_label(node_labels[idx + 1])}"
                 )
             if step_str not in sampled_seen and len(sampled_steps) < sample_limit:
                 sampled_seen.add(step_str)
                 sampled_steps.append(step_str)
 
     if total_edges_added:
-        save_attack_graph(shell, domain, graph)
         print_info(
             f"{display_name} enrichment: results={len(filtered)}; attack steps recorded={total_edges_added}."
         )

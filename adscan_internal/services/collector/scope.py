@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, Mapping
@@ -72,21 +73,49 @@ def save_scope(
     """Write a ScopeResult JSON artifact to disk.
 
     ``extra`` carries the engagement-scope record
-    (``services.engagement_scope``): the origin domains, who decided the scope
-    and the cross-domain steps it kept from running. Readers of ``scope-1.0``
-    ignore the extra keys.
+    (``services.engagement_scope``): the origin domains, who decided the scope,
+    the cross-domain steps it kept from running and the asset scope
+    (``asset_scope``). ``scope.json`` is an output-contract file
+    (``adscan_core/engagement/output_formats.py``, ``engagement_scope``): the
+    marker comes from the registry, and readers of an older minor ignore the
+    keys they do not know.
     """
+    from adscan_core.engagement.output_formats import output_marker  # noqa: PLC0415
+
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     payload: dict[str, Any] = {
-        "schema_version": "scope-1.1" if extra else "scope-1.0",
+        "schema_version": output_marker("engagement_scope"),
         "generated_at": result.generated_at,
         "entries": [asdict(entry) for entry in result.entries],
     }
     for key, value in (extra or {}).items():
         if key not in payload:
             payload[key] = value
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2)
+    # Write to a temporary file in the same directory and rename it over the
+    # target: a crash mid-write leaves the previous file intact, never a
+    # truncated one (an unreadable scope.json makes the engine fail closed).
+    directory = os.path.dirname(os.path.abspath(path))
+    # Created like a plain open() would (0666 less the process umask), under a
+    # name nothing else uses: the operator's umask decides who reads the file,
+    # and a file that already exists keeps the mode it has.
+    temp_path = os.path.join(directory, f".scope.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    handle = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        try:
+            os.chmod(temp_path, os.stat(path).st_mode & 0o777)
+        except OSError:
+            pass  # no earlier file: the mode the umask gave stands
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_scope_payload(path: str) -> dict[str, Any] | None:

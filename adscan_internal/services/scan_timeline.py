@@ -249,17 +249,16 @@ def capture_phase_metrics(shell: Any, domain: str) -> PhaseMetrics:
 
 
 def _count_graph_size(graph_path: Path) -> tuple[int, int]:
+    """Streamed count (``graph_compact.count_graph_file``), never a whole parse
+    of a format-2 export."""
+    from adscan_core.graph_compact import count_graph_file  # noqa: PLC0415
+
     if not graph_path.is_file():
         return (0, 0)
     try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        return count_graph_file(graph_path)
     except (OSError, ValueError):
         return (0, 0)
-    nodes = data.get("nodes")
-    edges = data.get("edges")
-    n = len(nodes) if isinstance(nodes, (dict, list)) else 0
-    e = len(edges) if isinstance(edges, list) else 0
-    return (n, e)
 
 
 def _count_credentials(creds_path: Path) -> int:

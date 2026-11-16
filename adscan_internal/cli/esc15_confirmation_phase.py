@@ -24,6 +24,7 @@ data gap), never a flat critical, never silently dropped.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from adscan_internal import telemetry
@@ -34,6 +35,7 @@ from adscan_core.rich_output import (
     print_info_verbose,
     print_success,
 )
+from adscan_internal.services.graph_runtime_edits import apply_graph_edit
 from adscan_internal.services.adcs.esc15_confirmation import (
     Esc15CollectionAction,
     Esc15TemplateRef,
@@ -66,10 +68,7 @@ def run_esc15_confirmation_phase(
     (the safe, honest default) rather than dropping it.
     """
     try:
-        from adscan_internal.services.attack_graph_service import (
-            load_attack_graph,
-            save_attack_graph,
-        )
+        from adscan_internal.services.attack_graph_service import load_attack_graph
 
         graph = load_attack_graph(shell, domain)
         if not isinstance(graph, dict):
@@ -88,8 +87,7 @@ def run_esc15_confirmation_phase(
         # cert, leave every ESC15 edge confirmation-pending.
         if esc15_confirmation_disabled():
             reason = "active ESC15 confirmation opted out (ADSCAN_NO_ESC15_CONFIRM)"
-            _apply_all_pending(graph, refs, reason)
-            save_attack_graph(shell, domain, graph)
+            _apply_all_pending(shell, domain, graph, refs, reason)
             print_info_verbose(
                 f"ESC15 confirmation skipped for {marked_domain} (opt-out); "
                 f"{len(refs)} candidate(s) left confirmation-pending."
@@ -97,8 +95,7 @@ def run_esc15_confirmation_phase(
             return
         if not username or not secret:
             reason = "no password / NT-hash credential available to enroll (data gap)"
-            _apply_all_pending(graph, refs, reason)
-            save_attack_graph(shell, domain, graph)
+            _apply_all_pending(shell, domain, graph, refs, reason)
             print_info_debug(
                 f"[esc15-confirm] no enrolling credential for {marked_domain}; "
                 f"{len(refs)} candidate(s) left confirmation-pending."
@@ -123,8 +120,7 @@ def run_esc15_confirmation_phase(
                 "the certificate enrollment that confirms ESC15 is not allowed by "
                 "the scan policy or was declined"
             )
-            _apply_all_pending(graph, refs, reason)
-            save_attack_graph(shell, domain, graph)
+            _apply_all_pending(shell, domain, graph, refs, reason)
             print_info_verbose(
                 f"ESC15 confirmation not run for {marked_domain}; "
                 f"{len(refs)} candidate(s) left confirmation-pending."
@@ -152,10 +148,16 @@ def run_esc15_confirmation_phase(
             elif hardened_cn is not None:
                 hardened_templates.append(hardened_cn)
 
-        removed, marked = apply_esc15_verdicts_to_graph(
-            graph, verdicts, notes_by_template=notes_by_template
+        (removed, marked), _outcome = apply_graph_edit(
+            shell,
+            domain,
+            graph,
+            lambda view: apply_esc15_verdicts_to_graph(
+                view, verdicts, notes_by_template=notes_by_template
+            ),
+            edge_filter=_is_esc15_edge,
+            origin="esc15_confirmation",
         )
-        save_attack_graph(shell, domain, graph)
 
         # A hardened CA has NO ESC15 exposure — record the verified control
         # (the graph edge is gone; this is the separate positive-control store).
@@ -176,8 +178,16 @@ def run_esc15_confirmation_phase(
         )
 
 
+def _is_esc15_edge(edge: Mapping[str, Any]) -> bool:
+    return str(edge.get("relation") or "").strip() == "ADCSESC15"
+
+
 def _apply_all_pending(
-    graph: dict[str, Any], refs: list[Esc15TemplateRef], reason: str
+    shell: Any,
+    domain: str,
+    graph: dict[str, Any],
+    refs: list[Esc15TemplateRef],
+    reason: str,
 ) -> None:
     """Mark every ESC15 edge confirmation-pending (opt-out / no-credential path)."""
     verdicts = {ref.object_id: Esc15CollectionAction.KEEP_PENDING for ref in refs}
@@ -187,7 +197,16 @@ def _apply_all_pending(
         )
         for ref in refs
     }
-    apply_esc15_verdicts_to_graph(graph, verdicts, notes_by_template=notes_by_template)
+    apply_graph_edit(
+        shell,
+        domain,
+        graph,
+        lambda view: apply_esc15_verdicts_to_graph(
+            view, verdicts, notes_by_template=notes_by_template
+        ),
+        edge_filter=_is_esc15_edge,
+        origin="esc15_confirmation",
+    )
 
 
 def _resolve_enrolling_credential(

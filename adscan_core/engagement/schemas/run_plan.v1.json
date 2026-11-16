@@ -429,6 +429,18 @@
             "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{1,64}$"}
           }
         },
+        "asset_scope": {
+          "type": "object",
+          "$comment": "The asset-level engagement scope (adscan_internal/services/scan_config.py ASSET_SCOPE_KEYS; grammar adscan_core/engagement_scope_model.py, validated by the engine). Present, even with both lists empty, it REPLACES the workspace's recorded scope; absent keeps it. Entries only, never a file path.",
+          "additionalProperties": false,
+          "properties": {
+            "allow": {"type": "array", "maxItems": 100000, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "deny": {"type": "array", "maxItems": 100000, "items": {"type": "string", "minLength": 1, "maxLength": 1024}},
+            "dc_access": {"enum": ["directory", "directory_only", "full"]},
+            "decided_by": {"enum": ["scan_configuration", "web_user"]},
+            "decided_by_label": {"type": "string", "maxLength": 200}
+          }
+        },
         "checks": {
           "type": "object",
           "$comment": "The scan policy (adscan_core/scan_policy/policy.py parse_policy_definition).",

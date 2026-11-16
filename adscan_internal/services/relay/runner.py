@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
+from adscan_internal.services.engagement_scope import (
+    Contact,
+    partition_targets_in_scope,
+)
+from adscan_internal.services.engagement_scope_targets import prepare_targets_for_scope
 from adscan_internal.services.relay.core import (
     RelayEngine,
     RelayListenerUnavailableError,
@@ -27,6 +32,10 @@ from adscan_internal.services.relay.sources import (
 )
 
 logger = logging.getLogger("adscan")
+
+#: Reused by every "not run" result this module returns once every expected
+#: source host has been refused by the engagement scope.
+RELAY_NOT_RUN_OUTSIDE_SCOPE_REASON = "outside the engagement scope"
 
 RelaySourceKind = Literal["smb", "ldap", "ldaps", "http-ntlm"]
 
@@ -53,6 +62,8 @@ async def run_native_relay(
     config: NativeRelayRunConfig | None = None,
     success_event: asyncio.Event | None = None,
     listener_ready: asyncio.Event | None = None,
+    shell: Any = None,
+    domain: str | None = None,
 ) -> RelayRunResult:
     """Start a native relay listener and dispatch captured auth to targets.
 
@@ -68,9 +79,41 @@ async def run_native_relay(
     broker, which routes the expected sources' connections here while the
     background capture (poisoning, the write-share bait) keeps every other
     caller. Capture and relay run at the same time on one port.
+
+    ``shell`` is the active session, when one is in reach of the caller. Any
+    named ``expected_sources`` host is checked against the engagement scope
+    before the listener is opened; a host with no known scope (or ``shell``
+    left unset) is treated as in scope, unchanged from before this check
+    existed. An empty ``expected_sources`` ("any caller") names no specific
+    host and is left unchecked.
     """
 
     effective = config or NativeRelayRunConfig()
+    in_scope_targets = relay_targets_in_scope(targets, shell=shell, domain=domain)
+    if targets and not in_scope_targets:
+        logger.debug(
+            "[relay] skipped: every relay destination is %s",
+            RELAY_NOT_RUN_OUTSIDE_SCOPE_REASON,
+        )
+        return RelayRunResult(results=(), timed_out=False, authentications_seen=0)
+    targets = in_scope_targets
+    if effective.expected_sources:
+        prepare_targets_for_scope(shell, effective.expected_sources, domain=domain)
+        partition = partition_targets_in_scope(
+            shell,
+            effective.expected_sources,
+            surface="native_relay",
+            what="Relay",
+            domain=domain,
+        )
+        if not partition.allowed:
+            logger.debug(
+                "[relay] skipped: every expected source host is %s",
+                RELAY_NOT_RUN_OUTSIDE_SCOPE_REASON,
+            )
+            return RelayRunResult(results=(), timed_out=False, authentications_seen=0)
+        effective = replace(effective, expected_sources=tuple(partition.allowed))
+
     auth_queue = asyncio.Queue()
     source = _build_source(effective, auth_queue)
     engine = RelayEngine(
@@ -114,6 +157,66 @@ async def run_native_relay(
         print_info_debug("relay-teardown run_native_relay finally: stopping relay source listener")
         await source.stop()
         print_info_debug("relay-teardown relay source listener stopped cleanly")
+
+
+def _relay_destination(target: RelayTarget) -> tuple[str, str, str]:
+    """``(name, address, protocol)`` of the host a relay target sends to.
+
+    Read from the target's own configuration: a certification authority
+    (``ca_fqdn`` / ``ca_host``) or a directory server (``dc_ip``). ``("", "",
+    "")`` when the target names no destination this module knows; the egress
+    backstop then remains its only gate.
+    """
+
+    target_config = getattr(target, "config", None)
+    ca_host = str(getattr(target_config, "ca_host", "") or "").strip()
+    if ca_host:
+        ca_fqdn = str(getattr(target_config, "ca_fqdn", "") or "").strip()
+        return ca_fqdn or ca_host, ca_host, "http"
+    dc_ip = str(getattr(target_config, "dc_ip", "") or "").strip()
+    if dc_ip:
+        return dc_ip, dc_ip, "ldap"
+    return "", "", ""
+
+
+def relay_targets_in_scope(
+    targets: list[RelayTarget], *, shell: Any, domain: str | None
+) -> list[RelayTarget]:
+    """The relay targets whose destination host the engagement scope allows.
+
+    Asked before the listener opens, so an authentication is never forwarded
+    to an excluded host. Each refusal is recorded once by the scope engine.
+    A list with no named destination is returned as it came.
+    """
+
+    kept = list(targets or ())
+    by_protocol: dict[str, list[RelayTarget]] = {}
+    for target in kept:
+        name, _address, protocol = _relay_destination(target)
+        if name:
+            by_protocol.setdefault(protocol, []).append(target)
+    prepare_targets_for_scope(
+        shell,
+        [target for group in by_protocol.values() for target in group],
+        key=lambda item: _relay_destination(item)[0],
+        address=lambda item: _relay_destination(item)[1],
+        domain=domain,
+    )
+    for protocol, group in by_protocol.items():
+        partition = partition_targets_in_scope(
+            shell,
+            group,
+            key=lambda item: _relay_destination(item)[0],
+            address=lambda item: _relay_destination(item)[1],
+            # What the relay opens on the destination, never a named purpose.
+            contact=Contact(protocol),
+            surface="native_relay_destination",
+            what="Relay",
+            domain=domain,
+        )
+        refused = {id(item) for item in partition.refused_items}
+        kept = [item for item in kept if id(item) not in refused]
+    return kept
 
 
 def _build_source(

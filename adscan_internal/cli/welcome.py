@@ -157,6 +157,12 @@ def print_welcome(
         f"[{badge_style}]{str(license_mode).upper()}[/{badge_style}]"
     )
     out.print("  ".join(header_bits))
+    # PRO: one line on the licence (contract end, or no end date).
+    from adscan_core.pro_license.status_view import banner_text
+
+    licence_line = banner_text(license_mode)
+    if licence_line is not None:
+        out.print(licence_line)
 
     # 2. Headline + tagline (Fraunces-equivalent gravitas in a terminal:
     #    bold brand cyan headline, italic dim tagline).

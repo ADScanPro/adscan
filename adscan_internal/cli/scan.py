@@ -1057,6 +1057,7 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
     """
     from adscan_internal.services.unauth_probe_service import (
         UnauthProbeConfig,
+        drop_scope_excluded_probes,
         render_smb_share_table,
         render_unauth_summary,
         run_unauth_probes,
@@ -1081,6 +1082,12 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         guest_targets = []
     if not guest_targets:
         guest_targets = [pdc]
+
+    # The engagement scope decides what this sweep may open BEFORE anything is
+    # resolved or probed: a guest or null sign-in is a contact like any other.
+    ldap_in_scope, null_in_scope, guest_targets = _unauth_probe_scope(
+        self, domain=domain, pdc=pdc, guest_targets=guest_targets
+    )
 
     # Resolve guest targets to IPs before probing. ``guest_smb_targets`` is seeded
     # with raw hostnames/FQDNs (from ``shell.hosts``), and in-container DNS does not
@@ -1111,7 +1118,21 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
             continue
         seen_ips.add(resolved_ip)
         resolved_guest_targets.append(resolved_ip)
-    guest_targets = resolved_guest_targets
+    # A name the scope allows can resolve to an address it excludes: the
+    # resolved addresses are judged too, so the probe never opens one.
+    guest_targets = _unauth_guest_addresses_in_scope(
+        self, domain=domain, addresses=resolved_guest_targets
+    )
+
+    # The guest probe sends the engagement's guest name (never a real account),
+    # declared to the lockout guard once its absence is established.
+    guest_identity_name = ""
+    if guest_targets:
+        from adscan_internal.services.smb_guest_auth_service import (
+            authorize_smb_guest_identity,
+        )
+
+        guest_identity_name = authorize_smb_guest_identity(self, domain=domain).name
 
     config = UnauthProbeConfig(
         domain=domain,
@@ -1119,8 +1140,17 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         smb_null_targets=[pdc],
         smb_guest_targets=guest_targets,
         timeout=20,
+        smb_guest_username=guest_identity_name,
+        skip_smb_null=not null_in_scope,
+        skip_ldap_anonymous=not ldap_in_scope,
     )
 
+    from adscan_internal.services.target_loss import (
+        begin_target_watch,
+        declare_target_unreachable,
+    )
+
+    begin_target_watch(self, domain, _UNAUTH_PHASE_ID)
     try:
         results = run_unauth_probes(config)
     except Exception as e:  # noqa: BLE001
@@ -1129,15 +1159,152 @@ def _run_unauth_native_probes(self: Any, *, domain: str, pdc: str) -> Any:
         print_error(f"Concurrent unauth probes failed: {e}")
         return None
 
+    # A probe the engagement scope stopped at the wire was never sent. It is no
+    # answer about its host, so it leaves the results before the summary, the
+    # flags and every later panel: none may read it as a refused session.
+    not_sent = drop_scope_excluded_probes(results)
+    if not_sent:
+        print_info(
+            f"Engagement scope: {not_sent} unauthenticated "
+            f"check{'s were' if not_sent != 1 else ' was'} not sent, because the "
+            "host is excluded from the engagement scope."
+        )
+
     # Render the share tables and the summary panel.
     render_smb_share_table(results.smb_null, domain=domain, auth_label="null")
     render_smb_share_table(results.smb_guest, domain=domain, auth_label="guest")
     render_unauth_summary(results, domain=domain)
+    if _pdc_never_answered(results, pdc):
+        declare_target_unreachable(
+            self,
+            domain,
+            _UNAUTH_PHASE_ID,
+            hosts=(pdc,),
+            what="its pre-authentication checks",
+            # Asked for the anonymous bind, a directory read: it is the one
+            # check of this phase the scope allows on every controller it
+            # allows at all, so a controller kept to directory reads that stops
+            # answering LDAP is still lost, and an excluded one never is.
+            contact=_unauth_ldap_contact(),
+        )
 
     # Apply results into ADscan state via the existing handlers. This keeps
     # the CLI/report/graph integration coherent with every other scan flow.
     _apply_unauth_probe_results(self, domain=domain, results=results)
     return results
+
+
+def _unauth_probe_scope(
+    shell: Any, *, domain: str, pdc: str, guest_targets: list[str]
+) -> tuple[bool, bool, list[str]]:
+    """What the engagement scope lets the unauthenticated sweep open.
+
+    Three contacts, each judged for what it is: the anonymous LDAP bind is a
+    directory read, the SMB null session and the guest sign-in are host work.
+    So a domain controller the scope keeps to directory reads still answers the
+    LDAP probe and gets no SMB session, and an excluded host gets no guest
+    sign-in. Each refusal is recorded and told to the operator by the scope
+    SSOT; nothing here is contacted.
+
+    Returns:
+        ``(ldap_in_scope, null_in_scope, guest_targets_in_scope)``. Without an
+        asset scope everything passes untouched.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        asset_scope_recorded,
+        partition_targets_in_scope,
+        require_host_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    targets = [str(t).strip() for t in guest_targets if str(t or "").strip()]
+    if not asset_scope_recorded(shell):
+        return True, True, targets
+    scope_domain = str(domain or "").strip() or None
+    prepare_targets_for_scope(shell, [pdc, *targets], domain=scope_domain)
+    ldap_in_scope = require_host_in_scope(
+        shell,
+        host=pdc,
+        surface="unauth_ldap_anonymous_probe",
+        what="LDAP anonymous bind check",
+        domain=scope_domain,
+        contact=Contact("ldap"),
+    )
+    null_in_scope = require_host_in_scope(
+        shell,
+        host=pdc,
+        surface="unauth_smb_null_probe",
+        what="SMB null session check",
+        domain=scope_domain,
+        contact=Contact("smb"),
+    )
+    guests = partition_targets_in_scope(
+        shell,
+        targets,
+        surface="unauth_smb_guest_probe",
+        what="SMB guest session check",
+        domain=scope_domain,
+        contact=Contact("smb"),
+    )
+    return ldap_in_scope, null_in_scope, list(guests.allowed)
+
+
+def _unauth_guest_addresses_in_scope(
+    shell: Any, *, domain: str, addresses: list[str]
+) -> list[str]:
+    """The resolved guest probe addresses the engagement scope allows."""
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        asset_scope_recorded,
+        partition_targets_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    if not addresses or not asset_scope_recorded(shell):
+        return list(addresses)
+    scope_domain = str(domain or "").strip() or None
+    prepare_targets_for_scope(shell, addresses, domain=scope_domain)
+    return list(
+        partition_targets_in_scope(
+            shell,
+            addresses,
+            surface="unauth_smb_guest_probe",
+            what="SMB guest session check",
+            domain=scope_domain,
+            contact=Contact("smb"),
+        ).allowed
+    )
+
+
+def _unauth_ldap_contact() -> Any:
+    """The anonymous LDAP bind, as the engagement scope reads it."""
+    from adscan_internal.services.engagement_scope import Contact  # noqa: PLC0415
+
+    return Contact("ldap")
+
+
+#: The scan phase the pre-authentication probes run in (``scan_phases``).
+_UNAUTH_PHASE_ID = "unauthenticated_attack_surface"
+
+
+def _pdc_never_answered(results: Any, pdc: str) -> bool:
+    """True when every probe aimed at the domain controller found it silent.
+
+    The null-session probe and the LDAP anonymous probe both target the PDC; a
+    guest probe of another host says nothing about it. A probe that was refused
+    or answered at all means the controller is there.
+    """
+    aimed = [r for r in (getattr(results, "smb_null", None) or ()) if getattr(r, "target", None) == pdc]
+    aimed += [r for r in (getattr(results, "smb_guest", None) or ()) if getattr(r, "target", None) == pdc]
+    ldap = getattr(results, "ldap_anonymous", None)
+    if ldap is not None:
+        aimed.append(ldap)
+    return bool(aimed) and all(getattr(r, "unreachable", False) for r in aimed)
 
 
 def _set_probe_flag(
@@ -1180,7 +1347,9 @@ def _apply_unauth_probe_results(self: Any, *, domain: str, results: Any) -> None
             _set_probe_flag(self, domain_data, domain, "smb_null_session", True)
             if domain_data.get("auth") not in ("auth", "pwned"):
                 domain_data.setdefault("auth", "unauth")
-        else:
+        elif not all(getattr(r, "unreachable", False) for r in results.smb_null):
+            # A host that never answered was not asked: leave the flag unset
+            # rather than record a refusal nobody observed.
             _set_probe_flag(self, domain_data, domain, "smb_null_session", False)
 
     # ── SMB guest ─────────────────────────────────────────────────────────
@@ -1196,7 +1365,7 @@ def _apply_unauth_probe_results(self: Any, *, domain: str, results: Any) -> None
 
     # ── LDAP anonymous ────────────────────────────────────────────────────
     ldap = results.ldap_anonymous
-    if ldap is not None:
+    if ldap is not None and (ldap.status == "open" or not getattr(ldap, "unreachable", False)):
         ldap_open = ldap.status == "open"
         _set_probe_flag(self, domain_data, domain, "ldap_anonymous", ldap_open)
 
@@ -1231,6 +1400,19 @@ def _apply_unauth_probe_results(self: Any, *, domain: str, results: Any) -> None
                 "[unauth] LDAP anonymous enrichment delegated to Phase 2.5 "
                 "(unauth_enrichment_service)"
             )
+
+
+def _guest_rid_cycling_in_scope(shell: Any, *, domain: str) -> bool:
+    """Whether the guest session RID cycling opens on the domain controller is in scope.
+
+    RID cycling runs over the LSA pipe, which is host work (the directory plane
+    of a controller kept to directory reads covers SAMR, not LSA).
+    """
+    from adscan_internal.cli.smb import pdc_share_host_in_scope  # noqa: PLC0415
+
+    return pdc_share_host_in_scope(
+        shell, domain, surface="smb_rid_cycling", what="RID cycling over a guest session"
+    )
 
 
 def _run_unauth_enrichment(self: Any, *, domain: str, pdc: str) -> Any:
@@ -1270,7 +1452,9 @@ def _run_unauth_enrichment(self: Any, *, domain: str, pdc: str) -> Any:
         # the config is non-fatal — the enrichment service treats a None
         # smb_guest_config as "guest session unavailable".
         smb_guest_config = None
-        if bool(domain_data.get("smb_guest_shares")):
+        if bool(domain_data.get("smb_guest_shares")) and _guest_rid_cycling_in_scope(
+            self, domain=domain
+        ):
             try:
                 from adscan_internal.cli.smb import _smb_config_for_guest
                 smb_guest_config = _smb_config_for_guest(self, domain)

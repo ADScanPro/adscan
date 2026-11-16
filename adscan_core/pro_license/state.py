@@ -9,12 +9,16 @@ container so the host command and the engine read the same state):
 * ``pro-pending.json`` — requests signed but not yet answered (0600: an
   activation request carries the activation key).
 * ``pro-register.json`` — one entry per domain code: pending, registered
-  (with our signed receipt) or refused; plus the usage lines, one per
+  (with our signed receipt, and only while that receipt verifies:
+  :meth:`ProLicenseStore.verified_receipt`) or refused; plus the usage lines, one per
   assessment of a code (run kind, run id, parent run, band, date), from which
   :mod:`adscan_core.pro_license.billable_engagements` counts engagements.
 * ``pro-notice.json`` — the last terminal notice (revoked, deactivated).
+* ``pro-checkin.json`` — when this machine last checked in and what came back.
 * ``clock-state.json`` — shared with the Enterprise licence: the clock
-  high-water mark, plus the sealed ``first_seen`` of each pending code.
+  high-water mark, the sealed ``first_seen`` of each pending code, and the
+  latest domain-controller time seen during a scan (``pro_dc_time_witness``,
+  an expiry witness the operator does not control).
 
 Every change goes through :meth:`ProLicenseStore.apply_answer`, which accepts
 an answer only when it is signed by the server, names this installation and
@@ -46,7 +50,13 @@ PENDING_FILENAME = "pro-pending.json"
 REGISTER_FILENAME = "pro-register.json"
 NOTICE_FILENAME = "pro-notice.json"
 CREDENTIAL_FILENAME = "pro-registry-credential.json"
+CHECK_IN_FILENAME = "pro-checkin.json"
 FIRST_SEEN_SEAL_KEY = "pro_first_seen"
+DC_TIME_WITNESS_KEY = "pro_dc_time_witness"
+
+#: Check-in outcome recorded when the server did not answer (same value as
+#: ``client.CHECK_IN_UNREACHABLE``; the client imports this module, not the reverse).
+CHECK_IN_UNREACHABLE_RESULT = "unreachable"
 
 STATUS_PENDING = "pending"
 STATUS_REGISTERED = "registered"
@@ -161,6 +171,12 @@ class ProLicenseStore:
             notice = self._path(NOTICE_FILENAME)
             if notice.exists():
                 notice.unlink()
+            # A document the server just signed supersedes what a domain
+            # controller's clock said about the previous one.
+            state = self._clock_state()
+            if DC_TIME_WITNESS_KEY in state:
+                state.pop(DC_TIME_WITNESS_KEY)
+                write_json(self._path(CLOCK_STATE_FILENAME), state)
         self.record_server_time(licence.issued_at)
         return licence
 
@@ -181,8 +197,63 @@ class ProLicenseStore:
         items = data.get("requests") if isinstance(data, Mapping) else None
         return [item for item in (items or []) if isinstance(item, dict)]
 
-    def _write_pending(self, items: list[dict[str, Any]]) -> None:
-        write_json(self._path(PENDING_FILENAME), {"requests": items}, mode=0o600)
+    def withdrawn_sequences(self) -> list[int]:
+        """Sequence numbers dropped unsent and not yet declared to the server (spec § 5.6)."""
+        data = read_json(self._path(PENDING_FILENAME))
+        values = data.get("withdrawn") if isinstance(data, Mapping) else None
+        return [n for n in (values or []) if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+
+    def _write_pending(self, items: list[dict[str, Any]], *, withdrawn: list[int] | None = None) -> None:
+        if withdrawn is None:
+            withdrawn = self.withdrawn_sequences()
+        # Bounded: a machine that never reaches the server keeps only the newest numbers.
+        kept = sorted(set(withdrawn))[-4096:]
+        write_json(self._path(PENDING_FILENAME), {"requests": items, "withdrawn": kept}, mode=0o600)
+
+    def build_request(self, kind: str, *, engine_version: str, **fields: Any) -> dict[str, Any]:
+        """Sign a request that also states which earlier sequence numbers are held or withdrawn.
+
+        The server uses the two lists to tell a request that was lost from one
+        that is still queued here or was replaced (spec § 5.6). Every request
+        this machine queues is built here.
+        """
+        held = []
+        for item in self.pending():
+            sequence = item.get("document", {}).get("payload", {}).get("sequence")
+            if isinstance(sequence, int):
+                held.append(sequence)
+        context = {
+            docs.PENDING_SEQUENCES_FIELD: docs.sequence_ranges(held),
+            docs.WITHDRAWN_SEQUENCES_FIELD: docs.sequence_ranges(self.withdrawn_sequences()),
+            # Which held numbers are registrations or engagement reports: the
+            # server then closes each only when that same request arrives.
+            docs.PENDING_USAGE_FIELD: docs.pending_usage(self.pending()),
+        }
+        return docs.build_request(self.installation(), kind, engine_version=engine_version, **context, **fields)
+
+    def withdraw_pending(self, request_id: str) -> None:
+        """Drop a queued request WITHOUT sending it (it was replaced) and remember its number.
+
+        The next requests declare the number as withdrawn, so the server does
+        not read it as a request that was lost.
+        """
+        with state_file_lock(self.directory):
+            items = self.pending()
+            dropped = next((i for i in items if i.get("request_id") == request_id), None)
+            withdrawn = self.withdrawn_sequences()
+            sequence = (dropped or {}).get("document", {}).get("payload", {}).get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                withdrawn.append(sequence)
+            self._write_pending([i for i in items if i.get("request_id") != request_id], withdrawn=withdrawn)
+
+    def _acknowledge_withdrawn(self, payload: Mapping[str, Any]) -> None:
+        """Forget withdrawn numbers a request the server answered already declared."""
+        declared = docs.parse_sequence_ranges(payload.get(docs.WITHDRAWN_SEQUENCES_FIELD))
+        if not declared:
+            return
+        with state_file_lock(self.directory):
+            remaining = [n for n in self.withdrawn_sequences() if not docs.in_sequence_ranges(n, declared)]
+            self._write_pending(self.pending(), withdrawn=remaining)
 
     def add_pending(self, document: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
         """Queue a signed request."""
@@ -260,6 +331,38 @@ class ProLicenseStore:
             self._write_register(entries)
             return entry
 
+    def verified_receipt(
+        self, code: str, *, trusted_keys: Mapping[str, str] | None = None
+    ) -> dict[str, Any] | None:
+        """The payload of ``code``'s registration receipt, or None when it does not prove a registration.
+
+        The ONE test of "this domain is registered": the entry says so, it
+        carries the receipt, the receipt is signed by a trusted licence-server
+        key, and it names this domain code and this installation. A status
+        written into ``pro-register.json`` by hand passes none of that.
+        Never raises.
+        """
+        entry = self.register_entries().get(code) or {}
+        receipt = entry.get("receipt")
+        if entry.get("status") != STATUS_REGISTERED or not isinstance(receipt, Mapping):
+            return None
+        try:
+            payload = docs.verify_server_document(
+                receipt, trusted_keys=trusted_keys, kinds={docs.KIND_REGISTRATION_RECEIPT}
+            )
+        except (LicenseError, ValueError, TypeError, KeyError):
+            return None
+        installation = self.existing_installation()
+        if installation is None or payload.get("installation_id") != installation.installation_id:
+            return None
+        if payload.get("domain_code") != code:
+            return None
+        return payload
+
+    def is_registered(self, code: str, *, trusted_keys: Mapping[str, str] | None = None) -> bool:
+        """True when ``code`` holds a receipt that verifies (:meth:`verified_receipt`)."""
+        return self.verified_receipt(code, trusted_keys=trusted_keys) is not None
+
     def last_contact(self) -> str | None:
         value = self._register_doc().get("last_contact")
         return value if isinstance(value, str) else None
@@ -315,6 +418,40 @@ class ProLicenseStore:
         """Record the identity band counted at scan end on that run's line."""
         return self._update_line(run_id, code, band=band)
 
+    def set_assessment_size(
+        self,
+        run_id: str,
+        code: str,
+        *,
+        domain_sizes: Any,
+        run_status: str | None,
+    ) -> bool:
+        """Record the scan-end counts and run status on that run's line.
+
+        Both are normalised (:mod:`adscan_core.pro_license.run_size`) before
+        they are stored. Returns True only when the line changed, so a second
+        scan-end pass of the same run (``adscan ci`` records at its end and
+        again at exit) queues nothing new.
+        """
+        from adscan_core.pro_license.run_size import normalize_domain_sizes, normalize_run_status
+
+        fields = {
+            "domain_sizes": normalize_domain_sizes(domain_sizes),
+            "run_status": normalize_run_status(run_status),
+        }
+        with state_file_lock(self.directory):
+            lines = self.assessment_lines()
+            changed = False
+            for line in lines:
+                if line.get("run_id") != run_id or line.get("domain_code") != code:
+                    continue
+                if any(line.get(key) != value for key, value in fields.items()):
+                    line.update(fields)
+                    changed = True
+            if changed:
+                self._write_register_doc(assessments=lines)
+            return changed
+
     # ── Grace seal and clock floor (clock-state.json) ────────────────────────
 
     def _clock_state(self) -> dict[str, Any]:
@@ -365,6 +502,59 @@ class ProLicenseStore:
                 pass
             state["last_seen"] = docs.format_instant(instant)
             write_json(self._path(CLOCK_STATE_FILENAME), state)
+
+    def record_dc_time_witness(self, instant: datetime) -> None:
+        """Remember the latest domain-controller time a scan measured.
+
+        Only ever moves forward. It is an EXPIRY witness: a document whose end
+        (plus grace and a drift tolerance) is behind the client's DC clock is
+        expired for new assessments, whatever this machine's clock says. It
+        never extends validity. Cleared when a new document is installed.
+        """
+        with state_file_lock(self.directory):
+            state = self._clock_state()
+            current = state.get(DC_TIME_WITNESS_KEY)
+            try:
+                if isinstance(current, str) and docs.parse_instant(current) >= instant:
+                    return
+            except ValueError:
+                pass
+            state[DC_TIME_WITNESS_KEY] = docs.format_instant(instant)
+            write_json(self._path(CLOCK_STATE_FILENAME), state)
+
+    def dc_time_witness(self) -> datetime | None:
+        value = self._clock_state().get(DC_TIME_WITNESS_KEY)
+        try:
+            return docs.parse_instant(value) if isinstance(value, str) else None
+        except ValueError:
+            return None
+
+    # ── Check-ins ────────────────────────────────────────────────────────────
+
+    def record_check_in(self, outcome: str, *, error: str = "") -> None:
+        """Remember the last check-in attempt and its outcome.
+
+        ``unreachable_since`` is the first failed attempt of the current run of
+        failures (cleared by any answer), so a notice can say since when.
+        """
+        now = docs.format_instant(docs.utc_now())
+        with state_file_lock(self.directory):
+            data = read_json(self._path(CHECK_IN_FILENAME))
+            data = dict(data) if isinstance(data, Mapping) else {}
+            data["last_attempt_at"] = now
+            data["last_result"] = outcome
+            if outcome == CHECK_IN_UNREACHABLE_RESULT:
+                data.setdefault("unreachable_since", now)
+                data["last_error"] = str(error or "")[:200]
+            else:
+                data.pop("unreachable_since", None)
+                data.pop("last_error", None)
+            write_json(self._path(CHECK_IN_FILENAME), data)
+
+    def last_check_in(self) -> dict[str, Any]:
+        """``{"last_attempt_at", "last_result", "unreachable_since"?, "last_error"?}``, or {}."""
+        data = read_json(self._path(CHECK_IN_FILENAME))
+        return dict(data) if isinstance(data, Mapping) else {}
 
     # ── Notices ──────────────────────────────────────────────────────────────
 
@@ -418,6 +608,7 @@ class ProLicenseStore:
         if result.applied:
             with state_file_lock(self.directory):
                 self._set_last_contact(docs.format_instant(docs.utc_now()))
+            self._acknowledge_withdrawn(pending.get("document", {}).get("payload", {}))
             if isinstance(server_time, str):
                 try:
                     self.record_server_time(docs.parse_instant(server_time))
@@ -506,7 +697,9 @@ class ProLicenseStore:
 
 __all__ = [
     "ApplyResult",
+    "CHECK_IN_FILENAME",
     "CREDENTIAL_FILENAME",
+    "DC_TIME_WITNESS_KEY",
     "LICENCE_FILENAME",
     "NOTICE_FILENAME",
     "PENDING_FILENAME",

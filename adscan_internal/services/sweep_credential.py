@@ -345,8 +345,26 @@ def resolve_sweep_credential(
     # the credential". Only fall back to that wording when the cause is unknown.
     classified_cause = _classify_premint_failure(mint_exc, mint_note)
     from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+    from adscan_internal.services.kerberos_ticket_service import (  # noqa: PLC0415
+        SCOPE_REFUSED_NOTE,
+    )
 
-    if refusal_in_chain(mint_exc) is not None or LOCKOUT_REFUSAL_MARKER in mint_note:
+    refusal = refusal_in_chain(mint_exc)
+    if (refusal is not None and refusal.outside_scope) or SCOPE_REFUSED_NOTE in mint_note:
+        # The engagement scope excludes the account (or the host it is local
+        # to), and the scope check already told the operator. One sentence per
+        # cause: this is not lockout protection, and nothing was sent.
+        notes.append("pre-mint withheld by the engagement scope")
+        return SweepCredential(
+            aborted=True,
+            abort_reason=(
+                "Skipped: the engagement scope excludes the account this sweep "
+                "signs in with, so no sign-in was sent and no host was contacted. "
+                "The credential was not tested."
+            ),
+            notes=tuple(notes),
+        )
+    if refusal is not None or LOCKOUT_REFUSAL_MARKER in mint_note:
         # The guard withheld the sign-in and already told the operator why. The
         # credential was not judged, so do not tell them to verify it.
         notes.append("pre-mint withheld by the account-lockout guard")

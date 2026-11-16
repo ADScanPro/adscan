@@ -729,6 +729,11 @@ def ask_for_enum_cve(self, target_domain: str) -> None:
 
         announce_phase_skip(self, "audit_extras", label="CVE Verification")
         return
+    # A re-run judges the domain controller afresh: an earlier "it stopped
+    # answering" mark is dropped now and written again only if it recurs.
+    from adscan_internal.services.target_loss import begin_target_watch
+
+    begin_target_watch(self, target_domain, "audit_extras")
     if self.auto:
         # CVE target scope (audit_extras.target_scope). ``default`` keeps today's
         # behavior — DCs always, plus every host for the audit engagement.

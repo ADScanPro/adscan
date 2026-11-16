@@ -200,11 +200,15 @@ def build_ca_host_smb_config_builder(
         from adscan_internal.services.async_bridge import run_sync_off_loop  # noqa: PLC0415
         from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
             collection_host_verdict,
+            prepare_scope_targets,
         )
 
         # The collection of ``domain`` contacts only hosts ``domain`` owns (the
         # engagement-scope SSOT). The collector gates first; this keeps the
-        # orchestrator re-run behind the same rule.
+        # orchestrator re-run behind the same rule. The verdict only reads what
+        # the session was told, so the host is prepared first (a no-op when the
+        # collector already did, or when the scope has no address rule).
+        prepare_scope_targets(shell, [ca_host], domain=domain)
         verdict = collection_host_verdict(shell, host=ca_host, collecting_domain=domain)
         if not verdict.allowed:
             from adscan_core.rich_output import print_info_debug  # noqa: PLC0415

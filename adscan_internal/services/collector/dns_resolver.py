@@ -227,6 +227,13 @@ async def _resolve_all(
         ipv4s = [ip for ip in ips if _is_ipv4(ip)]
         if ipv4s:
             host_to_ips[hostname] = ipv4s
+    # Every address every name resolved to is reported to the engagement scope,
+    # in one call for the batch (in memory, no lookup, no write).
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        report_resolved_addresses,
+    )
+
+    report_resolved_addresses(host_to_ips)
     return host_to_ips
 
 

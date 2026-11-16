@@ -137,6 +137,9 @@ _RULES: tuple[tuple[str, ArtifactClass], ...] = (
     ("scan_summary.json", _F),
     ("purge_record.json", _F),  # when recovered secrets were removed, by whom, counts
     ("coverage.json", _F),
+    # The engagement scope (domains and the allow/deny lists, their resolution
+    # and what they excluded): names hosts, accounts and addresses, no secret.
+    ("scope.json", _F),
     (ARTIFACT_MANIFEST_FILENAME, _F),
     ("technical_report.json", _F),
     ("report_model.json", _F),
@@ -217,6 +220,7 @@ CONTENT_AUDITED_CLEAN: frozenset[str] = frozenset(
         "scan_summary.json",
         "purge_record.json",
         "coverage.json",
+        "scope.json",
         ARTIFACT_MANIFEST_FILENAME,
         "trusts.json",
         "network_reachability_report.json",

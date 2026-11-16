@@ -23,6 +23,7 @@ synthetic object id ``{DOMAIN_UPPER}-{GUID}`` that cannot collide with the
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -33,6 +34,7 @@ from adscan_internal.rich_output import (
     mark_sensitive,
     print_info_debug,
     print_info_verbose,
+    print_warning,
     print_warning_debug,
 )
 from adscan_internal.services.adcs.ca_registry_checks import (
@@ -108,10 +110,40 @@ def _is_expected_ca_security_denial(exc: BaseException) -> bool:
     back to a substring match on the message for any error object that exposes no
     code.
     """
-    code = getattr(exc, "error_code", None)
-    if isinstance(code, int) and (code & 0xFFFFFFFF) in _CA_ACCESS_DENIED_CODES:
-        return True
-    return any(marker in str(exc).lower() for marker in _CA_ACCESS_DENIED_MARKERS)
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "error_code", None)
+        if isinstance(code, int) and (code & 0xFFFFFFFF) in _CA_ACCESS_DENIED_CODES:
+            return True
+        if any(marker in str(current).lower() for marker in _CA_ACCESS_DENIED_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+#: Budget for one CA security-descriptor read (connect, DCOM activation, two
+#: calls). Generous for a VPN link (each step is a few round trips), bounded so a
+#: CA host that never answers cannot stall the collection.
+CA_SECURITY_READ_TIMEOUT_SECONDS = 90.0
+
+#: Why a CA's own security descriptor was not read (the ESC7 gap reason).
+CA_SECURITY_GAP_ACCESS_DENIED = "ca_security_access_denied"
+CA_SECURITY_GAP_TIMED_OUT = "ca_security_read_timed_out"
+CA_SECURITY_GAP_READ_FAILED = "ca_security_read_failed"
+
+#: ESC7's detector check id (``adscan_core.engagement.detectors``).
+CHECK_ESC7 = "adcs.esc7"
+
+_CA_SECURITY_GAP_WHY = {
+    CA_SECURITY_GAP_ACCESS_DENIED: (
+        "reading them needs CA administrator rights, so this is expected for a "
+        "standard account."
+    ),
+    CA_SECURITY_GAP_TIMED_OUT: "the CA did not answer in time.",
+    CA_SECURITY_GAP_READ_FAILED: "the CA did not return them.",
+}
 
 
 # A CA whose FQDN cannot be resolved from the current vantage (the DC-DNS gap on
@@ -677,6 +709,10 @@ class ADCSCollector:
         # Set once a PKI-container search returns ``noSuchObject`` so the whole
         # domain reports "no ADCS" as a single quiet line, not per-container.
         self._adcs_absent = False
+        # CA object id -> why the CA's own security descriptor was not read
+        # (access denied, timed out, read failed). Each becomes a declared gap
+        # on the ESC7 check of that CA (see ``_observe_ca_security_gap``).
+        self._ca_security_gaps: dict[str, str] = {}
         # Object ids of PKI objects returned WITHOUT a security descriptor (the
         # account cannot read it). An ACL-derived ESC verdict on such an object
         # is unknown, never clear: an unread ACL must not read as "nobody can
@@ -1022,6 +1058,11 @@ class ADCSCollector:
             # ASSESSED with its reason, never clear by absence. A CA that only
             # lacked a CA-host administrator is deferred to the orchestrator's
             # re-run instead, which records it once (see the constructor).
+            # ESC7 on this CA is incomplete when the CA's own security
+            # descriptor was not read (a declared gap, never clear by absence).
+            self._observe_ca_security_gap(
+                ca=ca, ca_edge_relations={e.relation for e in new_edges}
+            )
             pending = self._pending_registry_probe(ca, probe)
             if pending is not None:
                 result.adcs_registry_pending.append(pending)
@@ -1458,8 +1499,12 @@ class ADCSCollector:
             return None
         from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
             collection_host_verdict,
+            prepare_scope_targets,
         )
 
+        # The verdict only reads what the session was told: tell it where this
+        # CA host is first (one lookup per host, no-op without address rules).
+        prepare_scope_targets(self._shell, [ca_host], domain=self._domain)
         return collection_host_verdict(
             self._shell, host=ca_host, collecting_domain=self._domain
         )
@@ -1638,8 +1683,7 @@ class ADCSCollector:
             f"ca_name={mark_sensitive(ca_name, 'hostname')} source={source}"
         )
 
-        sd_bytes = None
-        try:
+        async def _read_ca_security() -> Any:
             async with smb_machine_with_fallback(smb_config) as machine:
                 # The security descriptor and the role-separation flag are read
                 # on ONE CA-administration interface, one after the other, so
@@ -1662,20 +1706,36 @@ class ADCSCollector:
                     )
                 if facts.get("security_error") is not None:
                     raise facts["security_error"]
-                sd_bytes = facts.get("security")
+                return facts.get("security")
+
+        sd_bytes = None
+        try:
+            # Bounded: the DCE/RPC receive under DCOM has no timeout of its own,
+            # so a CA host that accepts the connection and never answers would
+            # otherwise hold the whole AD CS stage (and the collection) forever.
+            sd_bytes = await asyncio.wait_for(
+                _read_ca_security(), timeout=CA_SECURITY_READ_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            self._declare_ca_security_gap(
+                ca, ca_name=ca_name, reason=CA_SECURITY_GAP_TIMED_OUT
+            )
+            return []
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {rich.markup.escape(str(exc))}"
             if _is_expected_ca_security_denial(exc):
                 # Reading the CA security descriptor requires CA-admin rights,
                 # so ACCESS_DENIED is the NORMAL outcome for the vast majority
-                # of authenticated scans. Reporting the expected answer as an
-                # error told the operator something had gone wrong on nearly
-                # every run against a domain with ADCS, and sent an exception to
-                # error tracking for a case that is not one.
+                # of authenticated scans: one calm operator line (never an
+                # error, never an exception to error tracking) and a declared
+                # gap on the checks that need the descriptor.
                 print_info_debug(
                     "adcs GetCASecurity not permitted for "
                     f"{mark_sensitive(ca_name, 'hostname')} (CA-admin rights "
                     f"required): {detail}"
+                )
+                self._declare_ca_security_gap(
+                    ca, ca_name=ca_name, reason=CA_SECURITY_GAP_ACCESS_DENIED
                 )
                 return []
             if _is_ca_host_unresolvable(exc):
@@ -1696,6 +1756,9 @@ class ADCSCollector:
                 f"adcs GetCASecurity read failed for "
                 f"{mark_sensitive(ca_name, 'hostname')}: {detail}"
             )
+            self._declare_ca_security_gap(
+                ca, ca_name=ca_name, reason=CA_SECURITY_GAP_READ_FAILED
+            )
             return []
 
         edges = parse_ca_security_edges(sd_bytes, ca.object_id)
@@ -1713,6 +1776,69 @@ class ADCSCollector:
                 f"edge(s) for {mark_sensitive(ca_name, 'hostname')}"
             )
         return edges
+
+    def _declare_ca_security_gap(
+        self, ca: CollectorNode, *, ca_name: str, reason: str
+    ) -> None:
+        """Tell the operator once which CA permissions were not read, and why.
+
+        Not an error: for an account that does not administer the CA, being
+        refused its security descriptor is the expected answer. The line says
+        what was not read and what is still evaluated, so it can never be read
+        as "the CA is secure". The gap itself is recorded per CA on the ESC7
+        check by :meth:`_observe_ca_security_gap` once detection ran.
+        """
+        if ca.object_id in self._ca_security_gaps:
+            return
+        self._ca_security_gaps[ca.object_id] = reason
+        why = _CA_SECURITY_GAP_WHY.get(
+            reason, _CA_SECURITY_GAP_WHY[CA_SECURITY_GAP_READ_FAILED]
+        )
+        try:
+            print_warning(
+                f"CA permissions not read on {mark_sensitive(ca_name, 'hostname')}: "
+                f"{why} Who can administer this CA or approve its certificates is "
+                "not evaluated in this scan; certificate templates and the CA "
+                "object's directory permissions are still evaluated."
+            )
+        except Exception:  # noqa: BLE001 - an operator line must not break collection
+            pass
+
+    def _observe_ca_security_gap(
+        self, *, ca: CollectorNode, ca_edge_relations: set[str]
+    ) -> None:
+        """Record ESC7 for one CA as incomplete when its descriptor was not read.
+
+        ESC7 is decided from two sources: the CA object's permissions in the
+        directory (read for every account) and the CA's own security descriptor
+        (CA administrators only). When the second was not read the check is not
+        complete for that CA: a finding from the directory stays a finding, an
+        absence is not a clear reading.
+        """
+        reason = self._ca_security_gaps.get(ca.object_id)
+        if not reason or self._shell is None:
+            return
+        try:
+            from adscan_core.engagement.observations import Outcome  # noqa: PLC0415
+            from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
+                note_observation,
+            )
+
+            found = "ADCSESC7" in ca_edge_relations
+            note_observation(
+                self._shell,
+                CHECK_ESC7,
+                Outcome.FINDING if found else Outcome.CLEAR,
+                domain=self._domain,
+                scope_kind="host",
+                complete=False,
+                examined=0,
+                total=1,
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 - coverage never breaks collection
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     async def _check_esc12(
         self, *, ca_host: str, ca_name: str, host_verdict: Any = None

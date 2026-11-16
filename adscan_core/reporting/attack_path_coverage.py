@@ -98,6 +98,29 @@ class AttackPathCoverage:
     exposure_source_count: int | None = None
     hard_stop: bool = False
     reported_routes: int | None = None
+    #: The ``resource_coverage`` stage whose stop left the domain without a
+    #: graph, when discovery did not run at all (:meth:`not_evaluated`).
+    not_evaluated_upstream: str = ""
+
+    @classmethod
+    def not_evaluated(cls, upstream: str) -> "AttackPathCoverage":
+        """Return the coverage of a discovery that did not run: no graph.
+
+        ``upstream`` is the stage whose stop left the domain without a graph
+        (``graph_build``, ``collection``). Nothing was examined and no route is
+        reported; the declaration says discovery did not run and why, so an
+        empty result can never read as "complete, no route".
+        """
+        block = build_attack_path_coverage(not_evaluated_upstream=upstream)
+        return cls(
+            engine_used=ENGINE_DFS,
+            bounded=True,
+            declaration=str(block.get("statement") or ""),
+            reason="",
+            examined_routes=0,
+            hard_stop=True,
+            not_evaluated_upstream=str(upstream or ""),
+        )
 
     @classmethod
     def complete(
@@ -172,6 +195,10 @@ class AttackPathCoverage:
         writer, the web serializer) persists and renders it through the SAME block
         a memory-gate abort already records — one wording, one shape, no drift.
         """
+        if self.not_evaluated_upstream:
+            return build_attack_path_coverage(
+                not_evaluated_upstream=self.not_evaluated_upstream
+            )
         if self.engine_used == ENGINE_DFS and not self.bounded:
             return build_attack_path_coverage(
                 examined_routes=self.examined_routes,

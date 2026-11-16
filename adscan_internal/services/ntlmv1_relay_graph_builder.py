@@ -35,16 +35,13 @@ builds that callback's verdicts from ``relay_feasibility.evaluate_relay_feasibil
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_exception, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.models.domain import DomainControllers, resolve_dc_ip
-from adscan_internal.workspaces import domain_subpath
 
 _RBCD_BADGE = "Local Admin via NTLMv1→RBCD relay"
 _SHADOW_BADGE = "Computer credential via NTLMv1→Shadow Creds relay"
@@ -325,12 +322,6 @@ def plan_ntlmv1_relay_edges(
     return edges
 
 
-def _attack_graph_path(shell: object, domain: str) -> Path:
-    workspace_dir = getattr(shell, "current_workspace_dir", "") or ""
-    domains_dir = getattr(shell, "domains_dir", "domains")
-    return Path(domain_subpath(workspace_dir, domains_dir, domain, "attack_graph.json"))
-
-
 def _edge_signature(edge: Mapping[str, Any]) -> tuple[str, str, str]:
     return (
         str(edge.get("from") or edge.get("source") or ""),
@@ -353,60 +344,37 @@ def persist_ntlmv1_relay_edges(
     """
     if not edges:
         return 0
-    graph_path = _attack_graph_path(shell, domain)
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
 
-    graph: dict[str, Any]
-    # ``nodes`` defaults to a MAPPING, the shape every persisted attack graph
-    # uses (``upsert_nodes`` keys it by node id) and the shape the canonical save
-    # path reads when it prunes Tier-0-source edges.
-    if graph_path.exists():
-        try:
-            graph = json.loads(graph_path.read_text(encoding="utf-8"))
-            if not isinstance(graph, dict):
-                graph = {"nodes": {}, "edges": []}
-        except (OSError, ValueError, TypeError):
-            graph = {"nodes": {}, "edges": []}
-    else:
-        graph = {"nodes": {}, "edges": []}
-    graph.setdefault("nodes", {})
-    edges_list = graph.setdefault("edges", [])
-    if not isinstance(edges_list, list):
-        edges_list = []
-        graph["edges"] = edges_list
-
-    index: dict[tuple[str, str, str], int] = {}
-    for pos, existing in enumerate(edges_list):
-        if isinstance(existing, Mapping):
-            index[_edge_signature(existing)] = pos
-
-    written = 0
-    for edge in edges:
-        edge = {**edge, "recorded_at": _utc_now_iso()}
-        sig = _edge_signature(edge)
-        if sig in index:
-            edges_list[index[sig]] = edge
-        else:
-            index[sig] = len(edges_list)
-            edges_list.append(edge)
-        written += 1
-
-    # Persist through the canonical seam, never a raw write: it is what stamps
-    # ``category`` / ``vuln_key`` onto these edges (without which the finding
-    # derivation cannot see them), invalidates the materialized attack-path
-    # artifacts, and syncs technical findings. A raw ``write_text`` here is
-    # exactly how the whole NTLMv1 family stayed out of the client's report.
+    # Recorded through the runtime facade, one overlay operation per edge: it is the
+    # single writer that classifies each edge (``category`` / ``vuln_key``, without
+    # which the finding derivation cannot see them), invalidates the materialized
+    # attack-path artifacts and syncs technical findings. A raw write here is
+    # exactly how the whole NTLMv1 family once stayed out of the client's report.
+    # Re-running a plan lands on the same edge identity, so it never duplicates.
     try:
-        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
-            save_attack_graph,
-        )
+        from adscan_core.graph_store import EdgeRef  # noqa: PLC0415
+        from adscan_internal.services import graph_runtime  # noqa: PLC0415
 
-        save_attack_graph(shell, domain, graph)
+        written = 0
+        for edge in edges:
+            source, relation, target = _edge_signature(edge)
+            notes = edge.get("notes") if isinstance(edge.get("notes"), Mapping) else {}
+            recorded = graph_runtime.record_runtime_edge(
+                shell,
+                domain,
+                EdgeRef(from_id=source, to_id=target, relation=relation),
+                edge_type=str(edge.get("edge_type") or "ntlmv1_relay"),
+                status=str(edge.get("status") or "theoretical"),
+                notes={**dict(notes), "recorded_at": _utc_now_iso()},
+                origin="ntlmv1_relay_graph_builder",
+            )
+            if recorded:
+                written += 1
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         print_error(
-            f"[ntlmv1_relay_graph_builder] failed to write attack_graph.json: {exc}"
+            f"[ntlmv1_relay_graph_builder] failed to record the NTLMv1 edges: {exc}"
         )
         return 0
 
@@ -712,20 +680,16 @@ def materialize_ntlmv1_relay_edges(shell: object, domain: str) -> int:
         if not has_ntlmv1:
             return 0
 
-        graph_path = _attack_graph_path(shell, domain)
-        if not graph_path.exists():
+        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+            load_attack_graph,
+        )
+
+        graph = load_attack_graph(shell, domain)
+        if not isinstance(graph, dict) or not graph.get("nodes"):
             print_info_verbose(
-                "[ntlmv1_relay_graph_builder] no attack_graph.json yet for "
+                "[ntlmv1_relay_graph_builder] no attack graph yet for "
                 f"{mark_sensitive(domain, 'domain')}; skipping NTLMv1 materialization"
             )
-            return 0
-        try:
-            graph = json.loads(graph_path.read_text(encoding="utf-8"))
-            if not isinstance(graph, dict):
-                return 0
-        except (OSError, ValueError, TypeError) as exc:
-            telemetry.capture_exception(exc)
-            print_exception(exception=exc)
             return 0
 
         ip_to_node_id, domain_users_node_id, dc_nodes = _resolve_graph_resolvers(graph)

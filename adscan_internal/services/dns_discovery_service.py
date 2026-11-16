@@ -14,8 +14,8 @@ to external CLI resolvers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field, replace
+from typing import Any, Protocol
 import ipaddress
 import re
 import socket
@@ -248,9 +248,191 @@ class DcIpSelection:
     source_by_ip: dict[str, str]
     reason: str
     unreachable_dns_ip: str | None = None
+    #: Candidates the engagement scope excludes. They were never probed and are
+    #: never selected; a caller records them so the excluded domain controller
+    #: stays known (the lockout authority, for one) without being contacted.
+    scope_excluded_ips: list[str] = field(default_factory=list)
+
+
+#: ``DcIpSelection.reason`` when every candidate is excluded from the scope.
+DC_SELECTION_EXCLUDED_BY_SCOPE = "excluded_by_engagement_scope"
+
+#: Shell attribute: per domain, the PDC emulator the engagement scope excludes
+#: (``{"ip": ..., "hostname": ...}``). Session state, never ``domains_data``.
+_SCOPE_EXCLUDED_PDC_ATTR = "_engagement_scope_excluded_pdc"
+
+
+def _report_resolved_to_engagement_scope(host: Any, name: str, addresses: list[str]) -> None:
+    """Report every address a name resolved to (a domain controller's included).
+
+    ``host`` is the shell the discovery runs for when it is one; the report
+    falls back to the registered session otherwise. The name of a domain is
+    skipped by the reporting call itself: its A records are its controllers'.
+    """
+    if not addresses:
+        return
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        report_resolved_addresses,
+    )
+
+    shell = host if hasattr(host, "domains_data") else None
+    report_resolved_addresses({name: addresses}, shell=shell)
+
+
+def _dc_candidates_in_scope(
+    host: Any,
+    candidates: list[str],
+    *,
+    fqdn: str | None,
+    domain: str | None,
+    resolved: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split DC candidates by the engagement scope, before any probe.
+
+    The scope SSOT decides (``engagement_scope.partition_targets_in_scope``,
+    directory purpose: locating a domain controller is LDAP and Kerberos). The
+    addresses the name resolved to (``resolved``: the DNS answers for ``fqdn``,
+    never an address the operator supplied, which may be another controller's)
+    are reported first, so an entry naming the domain controller excludes each
+    of its addresses and the controller is recognised at each of them. Returns
+    ``(allowed, excluded)``; without an asset scope every candidate is allowed.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        asset_scope_recorded,
+        note_host_addresses,
+        partition_targets_in_scope,
+    )
+
+    if not candidates or not asset_scope_recorded(host):
+        return list(candidates), []
+    if fqdn and resolved:
+        note_host_addresses(host, host=fqdn, addresses=resolved)
+    split = partition_targets_in_scope(
+        host,
+        candidates,
+        contact=Contact("ldap"),
+        surface="dc_selection",
+        what="Domain controller selection",
+        domain=domain,
+    )
+    return list(split.allowed), [str(item) for item in split.refused_items]
+
+
+def note_scope_excluded_pdc(
+    host: Any, *, domain: str | None, hostname: str | None, ips: list[str]
+) -> None:
+    """Remember that ``domain``'s PDC emulator is excluded from the scope."""
+    name = str(domain or "").strip().rstrip(".").lower()
+    if not name or not ips:
+        return
+    try:
+        store = getattr(host, _SCOPE_EXCLUDED_PDC_ATTR, None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(host, _SCOPE_EXCLUDED_PDC_ATTR, store)
+        store[name] = {"ip": str(ips[0]), "hostname": str(hostname or "")}
+    except Exception:  # noqa: BLE001 - a frozen double keeps no session state
+        pass
+
+
+def scope_excluded_pdc(host: Any, domain: str | None) -> dict[str, str] | None:
+    """The PDC emulator of ``domain`` the scope excludes, when one was seen."""
+    store = getattr(host, _SCOPE_EXCLUDED_PDC_ATTR, None)
+    if not isinstance(store, dict):
+        return None
+    entry = store.get(str(domain or "").strip().rstrip(".").lower())
+    return dict(entry) if isinstance(entry, dict) else None
 
 
 def select_reachable_dc_ip(
+    *,
+    reachability_host: NetworkPreflightHost,
+    dns_candidates: list[str],
+    provided_ips: list[str | None] | None = None,
+    reference_ip: str | None = None,
+    probe_ports: tuple[int, ...] = DC_REACHABILITY_PROBE_PORTS,
+    expected_interface: str | None = None,
+    timeout_seconds: float = DC_REACHABILITY_VPN_BUDGET_SECONDS,
+    cross_domain: bool = False,
+    fqdn: str | None = None,
+    domain: str | None = None,
+) -> DcIpSelection:
+    """Select a reachable DC/KDC IP among the candidates the engagement scope allows.
+
+    The engagement scope is applied FIRST, to every input a later step could
+    pick from (the probe loop, the subnet hint, the pure fallback): a domain
+    controller the scope excludes is never probed, never selected and never the
+    fallback. The selection itself is :func:`_select_reachable_dc_ip_in_scope`
+    (see it for the reachability and realm rules, which are unchanged).
+
+    Args:
+        reachability_host: Host handle exposing ``run_command`` (the shell).
+        dns_candidates: A-records of the domain controller name.
+        provided_ips: Operator-provided / known-reachable IPs.
+        reference_ip: Subnet-match hint for the pure-selector fallback only.
+        probe_ports: TCP ports defining a DC (default 389/88).
+        expected_interface: Optional expected route interface.
+        timeout_seconds: Per-probe TCP budget.
+        cross_domain: Resolving a DIFFERENT (trusted) realm's DC.
+        fqdn: The domain controller name the DNS candidates were resolved from,
+            when the caller knows it. Reported to the engagement scope so an
+            entry naming the host excludes each of its addresses.
+        domain: The domain the candidates belong to, when known.
+
+    Returns:
+        A ``DcIpSelection``. ``scope_excluded_ips`` lists the candidates the
+        scope excludes; when every candidate is excluded the result is
+        ``selected_ip=None, reason="excluded_by_engagement_scope"``.
+    """
+    requested: list[str] = []
+    for ip_val in (
+        *normalize_ipv4_candidates(list(provided_ips or [])),
+        *normalize_ipv4_candidates(list(dns_candidates or [])),
+    ):
+        if not _is_loopback_ip(ip_val) and ip_val not in requested:
+            requested.append(ip_val)
+    allowed, scope_excluded = _dc_candidates_in_scope(
+        reachability_host,
+        requested,
+        fqdn=fqdn,
+        domain=domain,
+        resolved=[ip for ip in normalize_ipv4_candidates(list(dns_candidates or []))],
+    )
+    if scope_excluded:
+        excluded = set(scope_excluded)
+        dns_candidates = [ip for ip in (dns_candidates or []) if str(ip).strip() not in excluded]
+        provided_ips = [
+            ip for ip in (provided_ips or []) if ip and str(ip).strip() not in excluded
+        ]
+        if reference_ip and str(reference_ip).strip() in excluded:
+            reference_ip = None
+        if not allowed:
+            return DcIpSelection(
+                selected_ip=None,
+                candidates=[],
+                reachable_ips=[],
+                source_by_ip={},
+                reason=DC_SELECTION_EXCLUDED_BY_SCOPE,
+                unreachable_dns_ip=None,
+                scope_excluded_ips=scope_excluded,
+            )
+    selection = _select_reachable_dc_ip_in_scope(
+        reachability_host=reachability_host,
+        dns_candidates=dns_candidates,
+        provided_ips=provided_ips,
+        reference_ip=reference_ip,
+        probe_ports=probe_ports,
+        expected_interface=expected_interface,
+        timeout_seconds=timeout_seconds,
+        cross_domain=cross_domain,
+    )
+    if scope_excluded:
+        return replace(selection, scope_excluded_ips=scope_excluded)
+    return selection
+
+
+def _select_reachable_dc_ip_in_scope(
     *,
     reachability_host: NetworkPreflightHost,
     dns_candidates: list[str],
@@ -542,6 +724,26 @@ class DNSDiscoveryService:
     def __init__(self, host: _DNSDiscoveryHost, runtime: DNSDiscoveryRuntime):
         self._host = host
         self._rt = runtime
+
+    def _note_pdc_scope_exclusion(
+        self,
+        domain: str,
+        hostname: str | None,
+        ip_candidates: list[str],
+        selection: DcIpSelection,
+    ) -> None:
+        """Remember a PDC emulator the engagement scope excludes.
+
+        The PDC emulator is the lockout authority. When the scope excludes it,
+        the scan runs against another domain controller and must know it is a
+        replica (lockout counters read there are not authoritative), so the
+        excluded PDC's identity is kept, from DNS data, without contacting it.
+        """
+        excluded = [ip for ip in ip_candidates if ip in set(selection.scope_excluded_ips)]
+        if excluded:
+            note_scope_excluded_pdc(
+                self._host, domain=domain, hostname=hostname, ips=excluded
+            )
 
     def _resolve_query_nameservers(self, resolver: str | None) -> list[str]:
         """Return resolver IPs to use for a DNS query in priority order."""
@@ -838,6 +1040,7 @@ class DNSDiscoveryService:
         print_info_debug(
             f"[_resolve_ipv4_addresses] Final IP candidates for {marked_fqdn}: {candidates}"
         )
+        _report_resolved_to_engagement_scope(self._host, fqdn, candidates)
         return candidates
 
     def resolve_ipv4_addresses_robust(
@@ -1138,6 +1341,7 @@ class DNSDiscoveryService:
             print_info_debug(
                 f"[dns] getent resolved {marked_fqdn} -> {candidates}"
             )
+        _report_resolved_to_engagement_scope(self._host, fqdn_clean, candidates)
         return candidates
 
     def _reverse_resolve_via_getent(self, ip: str) -> str | None:
@@ -1350,8 +1554,13 @@ class DNSDiscoveryService:
             provided_ips=preferred_ips,
             reference_ip=reference_ip,
             cross_domain=cross_domain,
+            fqdn=fqdn,
+            domain=normalized_domain,
         )
         selected_ip = selection.selected_ip
+        self._note_pdc_scope_exclusion(
+            normalized_domain, pdc_hostname, ip_candidates, selection
+        )
 
         if selected_ip:
             marked_ip_candidates = mark_sensitive(ip_candidates, "ip")
@@ -1455,6 +1664,8 @@ class DNSDiscoveryService:
                 provided_ips=pref_list if pref_list else None,
                 reference_ip=reference_ip,
                 cross_domain=cross_domain,
+                fqdn=str(dc or "").strip().rstrip(".") or None,
+                domain=str(domain or "").strip().rstrip(".").lower() or None,
             )
             selected_ip = selection.selected_ip
 
@@ -1539,8 +1750,13 @@ class DNSDiscoveryService:
             dns_candidates=ip_candidates,
             provided_ips=preferred_ips,
             cross_domain=cross_domain,
+            fqdn=fqdn,
+            domain=normalized_domain,
         )
         selected_ip = selection.selected_ip
+        self._note_pdc_scope_exclusion(
+            normalized_domain, pdc_hostname, ip_candidates, selection
+        )
 
         if selected_ip:
             marked_domain = mark_sensitive(normalized_domain, "domain")

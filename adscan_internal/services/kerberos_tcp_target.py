@@ -40,6 +40,22 @@ def is_ip_address(value: str) -> bool:
         return False
 
 
+def _report_addresses_to_engagement_scope(hostname: str, addresses: list[str]) -> None:
+    """Tell the engagement scope every address a name resolved to.
+
+    Through the one reporting call every resolver makes
+    (``engagement_scope_targets.report_resolved_addresses``). One attribute
+    read when no asset scope is recorded; never raises.
+    """
+    if not addresses:
+        return
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        report_resolved_addresses,
+    )
+
+    report_resolved_addresses({hostname: addresses})
+
+
 def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> list[str]:
     """Resolve ALL A records (in resolution order), optionally via a resolver.
 
@@ -47,7 +63,17 @@ def _query_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> li
     resolves to. Callers that only need one address use :func:`_query_a_record`;
     callers that must choose among multiple A records (e.g. a multi-homed host
     that advertises both an internal and a routable address) use this.
+
+    Every address found is reported to the engagement scope (all of them, not
+    the one a caller ends up connecting to).
     """
+    found = _resolve_a_records(fqdn, resolver_ip, timeout_s)
+    _report_addresses_to_engagement_scope(str(fqdn or "").strip().rstrip("."), found)
+    return found
+
+
+def _resolve_a_records(fqdn: str, resolver_ip: str | None, timeout_s: float) -> list[str]:
+    """The lookup behind :func:`_query_a_records` (system resolver, else ``resolver_ip``)."""
     hostname = str(fqdn or "").strip().rstrip(".")
     if not hostname:
         return []

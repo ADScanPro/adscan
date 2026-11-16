@@ -60,6 +60,9 @@ CHECK_PASSWORD_POLICY = "policy.password"
 CHECK_MACHINE_ACCOUNT_QUOTA = "policy.machine_account_quota"
 CHECK_ROASTABLE = "ldap.roastable_accounts"
 
+#: An account the directory returned without its SID: nothing is decided on it.
+REASON_ACCOUNT_IDENTITY_NOT_READ = "account_identity_not_read"
+
 #: Accounts per ``(|(objectSid=...)...)`` filter in a per-object read.
 SID_BATCH = 50
 
@@ -178,13 +181,18 @@ def observe_roastable_accounts(ctx: ReadContext, objects: Optional[frozenset[str
 
     kerberoastable: set[str] = set()
     asrep: set[str] = set()
+    unidentified = 0
 
     def grade(entries: list[Any]) -> set[str]:
+        nonlocal unidentified
         seen: set[str] = set()
         for entry in entries:
             exposure = roasting_exposure_from_attrs(ldap_entry_attributes(entry))
             sid = exposure["sid"]
             if not sid:
+                # The directory returned an account matching the filter but not
+                # its identity: it can be neither graded nor ruled out.
+                unidentified += 1
                 continue
             seen.add(sid)
             if exposure["kerberoastable"]:
@@ -211,6 +219,10 @@ def observe_roastable_accounts(ctx: ReadContext, objects: Optional[frozenset[str
         # longer exists, so it cannot be roasted.
         examined = frozenset(sids)
         status = CheckStatus.PARTIAL
+    if unidentified:
+        return ReadOutcome(
+            CHECK_ROASTABLE, ctx.domain_id, CheckStatus.FAILED, None, {}, REASON_ACCOUNT_IDENTITY_NOT_READ
+        )
     present = {
         "kerberoast": frozenset(kerberoastable),
         "kerberoasting": frozenset(kerberoastable),
@@ -259,12 +271,34 @@ def has_read_only_check(check_id: Optional[str]) -> bool:
     return bool(check_id) and check_id in OBSERVERS
 
 
+#: The directory returned nothing for the one read it always answers (the
+#: domain object itself): every other empty result of this session would be
+#: indistinguishable from an absent weakness, so nothing is decided from it.
+REASON_DIRECTORY_NOT_ANSWERING = "directory_not_answering"
+
+
+def directory_answers(ctx: ReadContext) -> bool:
+    """Whether this session can read the directory at all (one cached BASE read).
+
+    An authenticated session always gets the domain object back. When it does
+    not, an empty search result says nothing about the directory: "no roastable
+    account", "no certification authority", "the object is gone" would all be
+    read off a session that sees nothing. Observers that read over LDAP are
+    not run on such a session.
+    """
+    return _domain_root(ctx) is not None
+
+
 def run_observer(check_id: str, ctx: ReadContext, objects: Optional[frozenset[str]]) -> ReadOutcome:
     """Run one observer; any error becomes a ``failed`` outcome (never closes)."""
     from adscan_core import telemetry  # noqa: PLC0415
     from adscan_core.rich_output import print_exception  # noqa: PLC0415
 
     try:
+        if check_id not in POSTURE_OBSERVERS and ctx.conn is not None and not directory_answers(ctx):
+            return ReadOutcome(
+                check_id, ctx.domain_id, CheckStatus.FAILED, None, {}, REASON_DIRECTORY_NOT_ANSWERING
+            )
         return OBSERVERS[check_id](ctx, objects)
     except Exception as exc:  # noqa: BLE001 - a read error must never close an item
         telemetry.capture_exception(exc)
@@ -280,7 +314,9 @@ __all__ = (
     "NOT_RECHECKABLE_KEYS",
     "OBSERVERS",
     "SCAN_GRADERS",
+    "REASON_DIRECTORY_NOT_ANSWERING",
     "ReadContext",
+    "directory_answers",
     "has_read_only_check",
     "run_observer",
 )

@@ -1146,6 +1146,13 @@ def emit_chapter(phase_id: str, scan_type: str = "default") -> None:
     if phase is None:
         return
 
+    # The chapter is also the scan-control phase boundary. A stop is honoured
+    # here (ScanAbortRequested, before anything is drawn), and a stop later in
+    # the phase names it, so coverage.json can list it as incomplete. Phases
+    # whose chapter comes from another module (Topology & Trusts, Domain
+    # Collection) were otherwise invisible to the control plane.
+    _enter_scan_control_phase(phase_id)
+
     visible = phases_for_scan_type(scan_type)
     try:
         index = visible.index(phase)
@@ -1170,6 +1177,23 @@ def emit_chapter(phase_id: str, scan_type: str = "default") -> None:
             all_phases=tuple(p.title for p in visible),
         )
     )
+
+
+def _enter_scan_control_phase(phase_id: str) -> None:
+    """Declare ``phase_id`` to the scan control plane, inside a scan only.
+
+    Idempotent for the phase already entered: ``adscan.py``'s ``_enter_phase``
+    enters it (with the domain) before rendering the chapter, and entering it a
+    second time would drop a "skip the rest of this phase" requested in between.
+    A pending stop raises :class:`ScanAbortRequested` (the controller's boundary
+    contract); nothing else can raise from here.
+    """
+    from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
+    control = scan_control()
+    if not control.in_scan() or control.phase_id == phase_id:
+        return
+    control.enter_phase(phase_id)
 
 
 def _emit_phase_event(phase_id: str) -> None:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import tempfile
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from adscan_internal.services.collector.models import (
     CollectionResult,
@@ -15,9 +18,13 @@ from adscan_internal.services.collector.models import (
     PasswordComplianceReport,
     PasswordSettingsObject,
 )
+from adscan_core.directory_object_state import is_tombstoned
 from adscan_core.engagement.coverage_io import stamp_artifact_run_id
 from adscan_core.engagement.output_formats import output_marker
 from adscan_internal.workspaces import domain_subpath, write_json_file
+
+if TYPE_CHECKING:
+    from adscan_internal.services.collector.inventory_streaming import SortedRecordSpool
 
 INVENTORY_SCHEMA_VERSION = output_marker("inventory")  # owned by the output contract
 
@@ -70,147 +77,199 @@ _DCSYNC_RELATIONS: frozenset[str] = frozenset(
 _DEFAULT_EDGE_FILE = "acls.json"
 
 
-class CollectorInventoryPersistence:
-    """Persist complete collector inventory into query-oriented JSON files."""
+def adcs_attack_step_records(result: CollectionResult) -> list[dict[str, Any]]:
+    """The ``adcs_attack_steps.json`` records of ``result`` (one pass over its edges)."""
+    records = [
+        _edge_inventory_record(edge, result)
+        for edge in result.edges
+        if _edge_inventory_filename(edge) == ADCS_ATTACK_STEPS_FILE
+    ]
+    return sorted(records, key=_record_sort_key)
 
-    def persist(
-        self,
-        shell: object,
-        *,
-        domain: str,
-        result: CollectionResult,
-    ) -> dict[str, int]:
-        """Persist inventory files for one collector result.
 
-        Args:
-            shell: Runtime shell used to resolve workspace paths.
-            domain: Domain being persisted.
-            result: Complete collector output.
+def write_inventory_files(
+    inventory_dir: str,
+    *,
+    domain: str,
+    result: CollectionResult,
+    run_id: str = "",
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Write every ``inventory/*.json`` of one domain from ``result``. No shell.
 
-        Returns:
-            File/category counters useful for logs and tests.
-        """
-        generated_at = datetime.now(timezone.utc).isoformat()
-        inventory_dir = _inventory_dir(shell, domain)
-        os.makedirs(inventory_dir, exist_ok=True)
+    The single writer of the inventory files: the collector's own persist and
+    the store's sidecar export (``graph_build.sidecars``) both call it, so the
+    files are the same whichever path wrote them. Returns the counters and the
+    AD CS escalation records (the observation the caller records with them).
+
+    Streamed (``collector.inventory_streaming``): ``result.edges`` is walked
+    ONCE (it may be the store's :class:`~adscan_internal.services.graph_build.ingest.CollectedEdges`
+    view, which holds no relationship), each record is encoded as it is made
+    and sorted in bounded chunks, and each file is written record by record.
+    The bytes are exactly what ``write_json_file`` writes for the whole
+    document (locked by ``tests/unit/services/graph_build/test_sidecar_streaming.py``).
+    """
+    from adscan_core.workspace_freeze import write_blocked  # noqa: PLC0415
+    from adscan_internal.services.collector.inventory_streaming import (  # noqa: PLC0415
+        SPILL_CHUNK,
+        SortedRecordSpool,
+        encode_record,
+    )
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    os.makedirs(inventory_dir, exist_ok=True)
+    # A frozen workspace writes nothing: keep the chunks in memory there (no
+    # spill file in the frozen directory); the writes themselves are no-ops.
+    frozen = write_blocked(os.path.join(os.path.abspath(inventory_dir), "index.json"))
+
+    files_written = 0
+    object_count = 0
+    edge_count = 0
+    index_files: dict[str, dict[str, Any]] = {}
+    adcs_records: list[dict[str, Any]] = []
+
+    # The sorted chunks spill into a hidden directory of the inventory itself
+    # (engagement data never leaves the workspace), removed when the files are
+    # written.
+    spool_scope = (
+        contextlib.nullcontext("")
+        if frozen
+        else tempfile.TemporaryDirectory(dir=inventory_dir, prefix=".inventory-spool-")
+    )
+    with spool_scope as spool_dir:
+        chunk = 1 << 62 if frozen else SPILL_CHUNK
+
+        def _spool() -> SortedRecordSpool:
+            return SortedRecordSpool(spool_dir, chunk=chunk)
+
+        # One pass over the relationships: the classification indices and the
+        # edge files' records together.
+        signals = _EdgeSignals()
+        edge_spools: dict[str, SortedRecordSpool] = defaultdict(_spool)
+        for edge in result.edges:
+            signals.observe(edge)
+            filename = _edge_inventory_filename(edge)
+            record = _edge_inventory_record(edge, result)
+            if filename == ADCS_ATTACK_STEPS_FILE:
+                adcs_records.append(record)
+            edge_spools[filename].add(_record_sort_key(record), encode_record(record))
 
         principal_class_by_id, principal_tier_by_id, principal_tier_basis_by_id = (
-            _classify_principals_by_membership(result)
+            _classify_principals_by_membership(result, signals)
         )
-        node_records_by_file = _group_node_records(
-            result,
-            principal_class_by_id,
-            principal_tier_by_id,
-            principal_tier_basis_by_id,
-        )
-        edge_records_by_file = _group_edge_records(result)
+        signals = None  # the indices are no longer needed while the files are written
+        node_spools: dict[str, SortedRecordSpool] = defaultdict(_spool)
+        for node in result.nodes.values():
+            record = _node_record_with_axes(
+                node,
+                principal_class_by_id,
+                principal_tier_by_id,
+                principal_tier_basis_by_id,
+            )
+            node_spools[_node_inventory_filename(node)].add(
+                _record_sort_key(record), encode_record(record)
+            )
 
-        files_written = 0
-        object_count = 0
-        edge_count = 0
-        index_files: dict[str, dict[str, Any]] = {}
-
-        for filename, records in sorted(node_records_by_file.items()):
+        for filename, spool in sorted(node_spools.items()):
             _write_inventory_file(
                 inventory_dir,
                 filename,
                 domain=domain,
                 generated_at=generated_at,
                 record_type="nodes",
-                records=records,
+                spool=spool,
             )
             files_written += 1
-            object_count += len(records)
-            index_files[filename] = {"type": "nodes", "count": len(records)}
+            object_count += spool.count
+            index_files[filename] = {"type": "nodes", "count": spool.count}
 
-        run_id = _active_run_id(shell)
-        for filename, records in sorted(edge_records_by_file.items()):
+        for filename, spool in sorted(edge_spools.items()):
             _write_inventory_file(
                 inventory_dir,
                 filename,
                 domain=domain,
                 generated_at=generated_at,
                 record_type="edges",
-                records=records,
+                spool=spool,
                 run_id=run_id,
             )
             files_written += 1
-            edge_count += len(records)
-            index_files[filename] = {"type": "edges", "count": len(records)}
+            edge_count += spool.count
+            index_files[filename] = {"type": "edges", "count": spool.count}
+    adcs_records.sort(key=_record_sort_key)
 
-        # Persist the DomainPolicy snapshot when the collector captured it.
-        # This unblocks the web app's Password posture card — the data was
-        # collected for the spray-policy heuristics but never made it past
-        # the collector's in-process state. Writing it as one inventory
-        # file keeps the workspace shape consistent with every other
-        # collector artefact.
-        if isinstance(result.domain_policy, DomainPolicy):
-            _write_domain_policy_file(
-                inventory_dir,
-                domain=domain,
-                generated_at=generated_at,
-                policy=result.domain_policy,
-            )
-            files_written += 1
-            index_files["domain_policy.json"] = {
-                "type": "policy",
-                "count": 1,
-            }
-
-        # PSOs (fine-grained password policies). One file per workspace
-        # listing every PSO under the Password Settings Container — can
-        # be empty (no PSO configured) which is the common case.
-        if result.psos:
-            _write_psos_file(
-                inventory_dir,
-                domain=domain,
-                generated_at=generated_at,
-                psos=result.psos,
-            )
-            files_written += 1
-            index_files["password_settings_objects.json"] = {
-                "type": "psos",
-                "count": len(result.psos),
-            }
-
-        # Password compliance snapshot — per-user diagnostic of which
-        # users are likely outside the current policy because their
-        # pwdLastSet predates the last modification of the policy
-        # object that governs them. Consumed by the report builder,
-        # the web product and password-spraying candidate selection.
-        if isinstance(result.password_compliance, PasswordComplianceReport):
-            _write_password_compliance_file(
-                inventory_dir,
-                domain=domain,
-                generated_at=generated_at,
-                report=result.password_compliance,
-            )
-            files_written += 1
-            index_files["password_compliance.json"] = {
-                "type": "password_compliance",
-                "count": result.password_compliance.users_total,
-            }
-
-        index = {
-            "schema_version": INVENTORY_SCHEMA_VERSION,
-            "domain": domain,
-            "generated_at": generated_at,
-            "files": index_files,
-            "totals": {
-                "files": files_written,
-                "nodes": object_count,
-                "edges": edge_count,
-            },
-        }
-        write_json_file(os.path.join(inventory_dir, "index.json"), index)
-        _observe_adcs_escalations(
-            shell, domain, result, edge_records_by_file.get(ADCS_ATTACK_STEPS_FILE, [])
+    # Persist the DomainPolicy snapshot when the collector captured it.
+    # This unblocks the web app's Password posture card — the data was
+    # collected for the spray-policy heuristics but never made it past
+    # the collector's in-process state. Writing it as one inventory
+    # file keeps the workspace shape consistent with every other
+    # collector artefact.
+    if isinstance(result.domain_policy, DomainPolicy):
+        _write_domain_policy_file(
+            inventory_dir,
+            domain=domain,
+            generated_at=generated_at,
+            policy=result.domain_policy,
         )
-        return {
+        files_written += 1
+        index_files["domain_policy.json"] = {
+            "type": "policy",
+            "count": 1,
+        }
+
+    # PSOs (fine-grained password policies). One file per workspace
+    # listing every PSO under the Password Settings Container — can
+    # be empty (no PSO configured) which is the common case.
+    if result.psos:
+        _write_psos_file(
+            inventory_dir,
+            domain=domain,
+            generated_at=generated_at,
+            psos=result.psos,
+        )
+        files_written += 1
+        index_files["password_settings_objects.json"] = {
+            "type": "psos",
+            "count": len(result.psos),
+        }
+
+    # Password compliance snapshot — per-user diagnostic of which
+    # users are likely outside the current policy because their
+    # pwdLastSet predates the last modification of the policy
+    # object that governs them. Consumed by the report builder,
+    # the web product and password-spraying candidate selection.
+    if isinstance(result.password_compliance, PasswordComplianceReport):
+        _write_password_compliance_file(
+            inventory_dir,
+            domain=domain,
+            generated_at=generated_at,
+            report=result.password_compliance,
+        )
+        files_written += 1
+        index_files["password_compliance.json"] = {
+            "type": "password_compliance",
+            "count": result.password_compliance.users_total,
+        }
+
+    index = {
+        "schema_version": INVENTORY_SCHEMA_VERSION,
+        "domain": domain,
+        "generated_at": generated_at,
+        "files": index_files,
+        "totals": {
+            "files": files_written,
+            "nodes": object_count,
+            "edges": edge_count,
+        },
+    }
+    write_json_file(os.path.join(inventory_dir, "index.json"), index)
+    return (
+        {
             "inventory_files": files_written + 1,
             "inventory_nodes": object_count,
             "inventory_edges": edge_count,
-        }
+        },
+        adcs_records,
+    )
 
 
 def _inventory_dir(shell: object, domain: str) -> str:
@@ -342,8 +401,71 @@ def _computer_controls_tier0_asset(
     return False
 
 
+#: Relationships or objects walked between two questions to the enclosing
+#: memory-bounded stage's guard (see ``memory_guard.check_enclosing_stage``).
+_MEMORY_CHECK_EVERY = 1024
+
+
+class _EdgeSignals:
+    """The relationship indices the principal classification reads, from ONE
+    pass over the relationships.
+
+    * ``parents_by_id``: object -> the groups it is a direct ``MemberOf``.
+    * ``admin_grant_targets_by_src``: principal/computer -> the computers it
+      administers by grant (``AdminTo`` / ``SQLAdmin``).
+    * ``broad_logon_targets``: computers a broad user population can ``CanRDP``.
+    * ``deleg_targets_by_src``: computer -> what it can delegate to
+      (``AllowedToDelegate``).
+
+    Built either from ``result.edges`` (:meth:`from_edges`) or fed edge by edge
+    (:meth:`observe`) by a caller that walks the relationships anyway, so the
+    inventory export reads every relationship once (they are streamed from the
+    store, never held).
+    """
+
+    def __init__(self) -> None:
+        from adscan_internal.services.compromise_class import (  # noqa: PLC0415
+            relation_is_admin_grant,
+        )
+
+        self._is_admin_grant = relation_is_admin_grant
+        self.parents_by_id: dict[str, set[str]] = defaultdict(set)
+        self.admin_grant_targets_by_src: dict[str, set[str]] = defaultdict(set)
+        self.broad_logon_targets: set[str] = set()
+        self.deleg_targets_by_src: dict[str, set[str]] = defaultdict(set)
+
+    @classmethod
+    def from_edges(cls, edges: Iterable[CollectorEdge]) -> "_EdgeSignals":
+        from adscan_core.memory_guard import check_enclosing_stage  # noqa: PLC0415
+
+        signals = cls()
+        for index, edge in enumerate(edges):
+            if index % _MEMORY_CHECK_EVERY == 0:
+                # The indices grow with the directory: the enclosing stage (the
+                # derivation at persist, the graph build) may stop here.
+                check_enclosing_stage()
+            signals.observe(edge)
+        return signals
+
+    def observe(self, edge: CollectorEdge) -> None:
+        relation = str(edge.relation or "").strip()
+        src = str(edge.source_object_id or "").upper()
+        dst = str(edge.target_object_id or "").upper()
+        if not src or not dst:
+            return
+        if relation == "MemberOf":
+            self.parents_by_id[src].add(dst)
+        if self._is_admin_grant(relation):
+            self.admin_grant_targets_by_src[src].add(dst)
+        elif relation == "CanRDP" and _sid_is_broad_logon_population(src):
+            self.broad_logon_targets.add(dst)
+        elif relation == "AllowedToDelegate":
+            self.deleg_targets_by_src[src].add(dst)
+
+
 def _classify_principals_by_membership(
     result: CollectionResult,
+    signals: "_EdgeSignals | None" = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     """Map each User/Computer object_id to its privilege class, tier AND tier-basis.
 
@@ -402,6 +524,12 @@ def _classify_principals_by_membership(
     All are kept compact: a default principal (NONE / Tier 2) carries no
     class/tier field, so a missing field reads as "Standard / Tier 2".
 
+    Args:
+        result: The collected objects (and, when ``signals`` is not given, the
+            relationships the indices are built from).
+        signals: The relationship indices, when the caller already built them in
+            its own pass over the relationships (the inventory export).
+
     Returns:
         A ``(class_by_id, tier_by_id, tier_basis_by_id)`` triple of mappings keyed
         by upper-cased object_id. Tier-2 principals are omitted from
@@ -426,22 +554,28 @@ def _classify_principals_by_membership(
         privilege_tier_for_computer,
         privilege_tier_for_principal,
         refine_server_privilege_tier,
-        relation_is_admin_grant,
         spns_indicate_app_server,
         spns_indicate_server_role,
         spns_indicate_session_host,
     )
 
     # group object_id (upper) → set of parent group object_ids (upper) it is a
-    # MemberOf, so we can expand a principal's groups transitively.
-    parents_by_id: dict[str, set[str]] = defaultdict(set)
-    for edge in result.edges:
-        if str(edge.relation or "").strip() != "MemberOf":
-            continue
-        src = str(edge.source_object_id or "").upper()
-        dst = str(edge.target_object_id or "").upper()
-        if src and dst:
-            parents_by_id[src].add(dst)
+    # MemberOf, so we can expand a principal's groups transitively; plus the
+    # edge-signal indices for the Tier-1 refinements (PART A + PART B), built in
+    # the same single pass (see :class:`_EdgeSignals`):
+    #   admin_grant_targets_by_src: principal/computer -> {computer it ADMINISTERS
+    #       BY GRANT (AdminTo/SQLAdmin)} — feeds PART B (principal floor) and
+    #       PART A's controls-Tier0 signal (a server admin OVER a Tier 0 asset).
+    #   broad_logon_targets:  {computer a BROAD user population can CanRDP into} —
+    #       feeds PART A's RDS/Citrix downgrade.
+    #   deleg_targets_by_src: computer -> {computer it can delegate TO
+    #       (AllowedToDelegate)} — a jump-server-to-DC / hypervisor signal.
+    if signals is None:
+        signals = _EdgeSignals.from_edges(result.edges)
+    parents_by_id = signals.parents_by_id
+    admin_grant_targets_by_src = signals.admin_grant_targets_by_src
+    broad_logon_targets = signals.broad_logon_targets
+    deleg_targets_by_src = signals.deleg_targets_by_src
 
     def _expand_groups(start: str) -> set[str]:
         """Return the upper-cased object_ids of every group reached from start."""
@@ -471,31 +605,6 @@ def _classify_principals_by_membership(
                 tokens.append(grp.name)
         return tokens
 
-    # ── Edge-signal indices for the Tier-1 refinements (PART A + PART B) ──────
-    # Built once from result.edges so the per-node passes are O(1) lookups.
-    #   admin_grant_targets_by_src: principal/computer -> {computer it ADMINISTERS
-    #       BY GRANT (AdminTo/SQLAdmin)} — feeds PART B (principal floor) and
-    #       PART A's controls-Tier0 signal (a server admin OVER a Tier 0 asset).
-    #   broad_logon_targets:  {computer a BROAD user population can CanRDP into} —
-    #       feeds PART A's RDS/Citrix downgrade.
-    #   deleg_targets_by_src: computer -> {computer it can delegate TO
-    #       (AllowedToDelegate)} — a jump-server-to-DC / hypervisor signal.
-    admin_grant_targets_by_src: dict[str, set[str]] = defaultdict(set)
-    broad_logon_targets: set[str] = set()
-    deleg_targets_by_src: dict[str, set[str]] = defaultdict(set)
-    for edge in result.edges:
-        relation = str(edge.relation or "").strip()
-        src = str(edge.source_object_id or "").upper()
-        dst = str(edge.target_object_id or "").upper()
-        if not src or not dst:
-            continue
-        if relation_is_admin_grant(relation):
-            admin_grant_targets_by_src[src].add(dst)
-        elif relation == "CanRDP" and _sid_is_broad_logon_population(src):
-            broad_logon_targets.add(dst)
-        elif relation == "AllowedToDelegate":
-            deleg_targets_by_src[src].add(dst)
-
     def _tier_of_node(oid_upper: str) -> "PrivilegeTier | None":
         """Return the resolved computer/principal tier of a node id, if known."""
         return _COMPUTER_TIER_CACHE.get(oid_upper)
@@ -512,9 +621,13 @@ def _classify_principals_by_membership(
     # account's application-class SPN host to its tier (service-identity flooring).
     _COMPUTER_TIER_BY_HOST: dict[str, PrivilegeTier] = {}
 
+    from adscan_core.memory_guard import check_enclosing_stage  # noqa: PLC0415
+
     # ── PASS 1 — Computers (PART A): membership tier, then graph refinement ──
     # Runs BEFORE the principal pass so PART B consumes CORRECTED computer tiers.
-    for node in result.nodes.values():
+    for index, node in enumerate(result.nodes.values()):
+        if index % _MEMORY_CHECK_EVERY == 0:
+            check_enclosing_stage()
         if str(node.kind) != "Computer":
             continue
         oid = str(node.object_id or "").upper()
@@ -581,7 +694,9 @@ def _classify_principals_by_membership(
             tier_basis[oid] = basis
 
     # ── PASS 2 — Users (PART B): membership tier floored by administered assets ─
-    for node in result.nodes.values():
+    for index, node in enumerate(result.nodes.values()):
+        if index % _MEMORY_CHECK_EVERY == 0:
+            check_enclosing_stage()
         if str(node.kind) != "User":
             continue
         oid = str(node.object_id or "").upper()
@@ -692,45 +807,54 @@ def _group_node_records(
         )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for node in result.nodes.values():
-        if node.properties.get("well_known_sid"):
-            filename = "well_known_principals.json"
-        else:
-            filename = _NODE_KIND_TO_FILE.get(str(node.kind), "objects.json")
-        record = _node_inventory_record(node)
-        oid_upper = str(node.object_id or "").upper()
-        cls_value = principal_class_by_id.get(oid_upper)
-        if cls_value:
-            record["privilege_class"] = cls_value
-        # Axis 1 — Privilege Tier (ESAE). Users and Computers both get the
-        # membership-derived tier from the single classifier above.
-        tier_value = principal_tier_by_id.get(oid_upper)
-        if tier_value:
-            record["privilege_tier"] = tier_value
-        # Axis-1 confidence — HOW a computer's tier was inferred (heuristic
-        # Tier 1 vs deterministic Tier 0), so the client report can declare it.
-        basis_value = principal_tier_basis_by_id.get(oid_upper)
-        if basis_value:
-            record["privilege_tier_basis"] = basis_value
-        grouped[filename].append(record)
+        grouped[_node_inventory_filename(node)].append(
+            _node_record_with_axes(
+                node,
+                principal_class_by_id,
+                principal_tier_by_id,
+                principal_tier_basis_by_id,
+            )
+        )
     return {
         name: sorted(records, key=_record_sort_key) for name, records in grouped.items()
     }
+
+
+def _node_inventory_filename(node: CollectorNode) -> str:
+    if node.properties.get("well_known_sid"):
+        return "well_known_principals.json"
+    return _NODE_KIND_TO_FILE.get(str(node.kind), "objects.json")
+
+
+def _node_record_with_axes(
+    node: CollectorNode,
+    principal_class_by_id: dict[str, str],
+    principal_tier_by_id: dict[str, str],
+    principal_tier_basis_by_id: dict[str, str],
+) -> dict[str, Any]:
+    """One object's inventory record with its privilege class, tier and basis."""
+    record = _node_inventory_record(node)
+    oid_upper = str(node.object_id or "").upper()
+    cls_value = principal_class_by_id.get(oid_upper)
+    if cls_value:
+        record["privilege_class"] = cls_value
+    # Axis 1 — Privilege Tier (ESAE). Users and Computers both get the
+    # membership-derived tier from the single classifier.
+    tier_value = principal_tier_by_id.get(oid_upper)
+    if tier_value:
+        record["privilege_tier"] = tier_value
+    # Axis-1 confidence — HOW a computer's tier was inferred (heuristic
+    # Tier 1 vs deterministic Tier 0), so the client report can declare it.
+    basis_value = principal_tier_basis_by_id.get(oid_upper)
+    if basis_value:
+        record["privilege_tier_basis"] = basis_value
+    return record
 
 
 # OS strings that mark a member server (not a workstation). AD exposes the role
 # only through the ``operatingSystem`` string; "Server" is the canonical marker
 # Microsoft uses for every server SKU.
 _SERVER_OS_MARKER = "server"
-
-
-def _group_edge_records(result: CollectionResult) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for edge in result.edges:
-        filename = _edge_inventory_filename(edge)
-        grouped[filename].append(_edge_inventory_record(edge, result))
-    return {
-        name: sorted(records, key=_record_sort_key) for name, records in grouped.items()
-    }
 
 
 def _edge_inventory_filename(edge: CollectorEdge) -> str:
@@ -749,7 +873,7 @@ def _node_inventory_record(node: CollectorNode) -> dict[str, Any]:
     properties = (
         payload.get("properties") if isinstance(payload.get("properties"), dict) else {}
     )
-    return {
+    record = {
         "object_id": node.object_id,
         "kind": node.kind,
         "name": node.name,
@@ -760,6 +884,14 @@ def _node_inventory_record(node: CollectorNode) -> dict[str, Any]:
         "highvalue": node.highvalue,
         "properties": properties,
     }
+    if is_tombstoned(node):
+        # A deleted object, read from the Recycle Bin by an account allowed to.
+        # Stated at the record's top level because ``enabled`` beside it is the
+        # value the object had when it was deleted, and a reader counting the
+        # directory's accounts must be able to leave it out without opening the
+        # opaque ``properties`` (adscan_core.directory_object_state).
+        record["tombstoned"] = True
+    return record
 
 
 def _edge_inventory_record(
@@ -789,32 +921,26 @@ def _write_inventory_file(
     domain: str,
     generated_at: str,
     record_type: str,
-    records: list[dict[str, Any]],
+    spool: "SortedRecordSpool",
     run_id: str = "",
 ) -> None:
-    payload = {
+    from adscan_internal.services.collector.inventory_streaming import (  # noqa: PLC0415
+        write_records_document,
+    )
+
+    header: dict[str, Any] = {
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "domain": domain,
         "generated_at": generated_at,
         "record_type": record_type,
-        "count": len(records),
-        "records": records,
+        "count": spool.count,
     }
     # Which recorded run wrote this file, so the run's observation record can be
     # matched to it (``adscan_core.engagement.coverage_io``). Empty outside a run.
-    stamp_artifact_run_id(payload, run_id)
-    write_json_file(os.path.join(inventory_dir, filename), payload)
-
-
-def _active_run_id(shell: object) -> str:
-    try:
-        from adscan_internal.services.engagement.coverage_recorder import (  # noqa: PLC0415
-            active_run_id,
-        )
-
-        return active_run_id(shell)
-    except Exception:  # noqa: BLE001 - an unknown run stamps nothing
-        return ""
+    stamp_artifact_run_id(header, run_id)
+    write_records_document(
+        os.path.join(inventory_dir, filename), header, spool.iter_sorted(), spool.count
+    )
 
 
 #: Node kinds whose presence in the collection proves certificate services were

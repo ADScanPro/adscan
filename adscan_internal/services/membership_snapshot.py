@@ -19,6 +19,7 @@ from adscan_internal.workspaces import (
     write_json_file,
 )
 from adscan_internal.services import attack_paths_core
+from adscan_internal.services import membership_snapshot_shape as shape
 from adscan_internal.services.cache_metrics import (
     copy_stats,
     increment_stats,
@@ -204,6 +205,136 @@ def _normalize_runtime_membership_metadata(
     }
 
 
+
+#: ``edge_type`` of the ``MemberOf`` overlay edge a runtime membership records.
+RUNTIME_MEMBERSHIP_EDGE_TYPE = "runtime_membership"
+
+
+def _principal_node_payload(label: str, kind: str) -> dict[str, Any]:
+    """A node payload for a principal the graph does not hold yet.
+
+    For an account ADscan created at runtime (a machine account for RBCD) whose
+    node the collector never saw. Keyed the way ``upsert_nodes`` keys it, from
+    the canonical ``NAME@REALM`` label.
+    """
+    name, _sep, realm = label.partition("@")
+    properties: dict[str, Any] = {"name": label, "domain": realm}
+    if kind == "Computer":
+        properties["samaccountname"] = name
+    elif kind == "User":
+        properties["samaccountname"] = name.lower()
+    return {"name": label, "label": label, "kind": [kind], "properties": properties}
+
+
+def _record_runtime_memberof_edge(
+    shell: object,
+    domain: str,
+    *,
+    member_label: str,
+    group_label: str,
+    metadata: dict[str, Any] | None,
+    member_kind: str = "User",
+    group_object_id: str = "",
+    remove: bool = False,
+) -> bool:
+    """Record a runtime membership change as a ``MemberOf`` overlay edge, then
+    export so the sidecar is current for the next reader.
+
+    ``memberships.json`` is a sidecar derived from the store (inventory
+    ``MemberOf`` facts plus the overlay's ``MemberOf`` edges), so a runtime
+    membership is ONLY an overlay edge (``edge_type`` ``runtime_membership``,
+    the metadata under ``notes.runtime_membership``); its removal retires the
+    edge this writer created. No writer reads or rewrites the file. The export
+    is forced synchronously, so a follow-up step that resolves the membership
+    right after an AddMember sees it (the snapshot cache invalidates on the
+    file's mtime). A collected membership is never touched. Returns whether the
+    change was recorded.
+    """
+    from adscan_core.graph_store import EdgeRef  # noqa: PLC0415
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+    from adscan_internal.services.attack_graph_node_identity import (  # noqa: PLC0415
+        resolve_node_candidates,
+    )
+    from adscan_internal.services.graph_build.overlay import find_edge  # noqa: PLC0415
+
+    recorded = False
+    try:
+        with graph_runtime.write_scope(shell, origin="runtime_membership"):
+            graph = graph_runtime.scoped_graph(shell, domain)
+            if graph is None:
+                graph = graph_runtime.live_graph(shell, domain, create=True, finalize=False)
+            if not isinstance(graph, dict):
+                return False
+            nodes = graph.get("nodes") if isinstance(graph.get("nodes"), dict) else {}
+            members = resolve_node_candidates(nodes, member_label)
+            groups = resolve_node_candidates(nodes, group_label)
+            if groups:
+                group_id = groups[0]
+            elif remove:
+                return False
+            else:
+                # The group was never collected (an ADscan-created account's
+                # well-known primary group): synthesize its node so the edge
+                # has an endpoint, as the old file write recorded the label.
+                payload = _principal_node_payload(group_label, "Group")
+                if group_object_id:
+                    payload["objectId"] = group_object_id
+                    payload["properties"]["objectid"] = group_object_id
+                group_id = graph_runtime.record_runtime_node(
+                    shell, domain, payload, origin="runtime_membership"
+                )
+                if not group_id:
+                    print_info_debug(
+                        "[membership] runtime membership not recorded: "
+                        f"group={mark_sensitive(group_label, 'group')} reason=group_unresolved"
+                    )
+                    return False
+            if members:
+                member_id = members[0]
+            elif remove:
+                return False
+            else:
+                # An account ADscan created (an RBCD machine account): give it a
+                # node so the edge has an endpoint, as the old file write did.
+                member_id = graph_runtime.record_runtime_node(
+                    shell, domain, _principal_node_payload(member_label, member_kind),
+                    origin="runtime_membership",
+                )
+                if not member_id:
+                    return False
+            ref = EdgeRef(from_id=member_id, to_id=group_id, relation="MemberOf")
+            existing = find_edge(graph, ref)
+            if remove:
+                if existing is not None and existing.get("edge_type") == RUNTIME_MEMBERSHIP_EDGE_TYPE:
+                    recorded = graph_runtime.retire_runtime_edge(
+                        shell, domain, ref, reason="runtime_membership_removed",
+                        origin="remove_runtime_user_group_membership",
+                    )
+            elif existing is not None:
+                recorded = False
+            else:
+                recorded = graph_runtime.record_runtime_edge(
+                    shell, domain, ref,
+                    edge_type=RUNTIME_MEMBERSHIP_EDGE_TYPE,
+                    notes={"runtime_membership": dict(metadata or {})},
+                    origin="add_runtime_membership",
+                )
+    except Exception as exc:  # noqa: BLE001 - a membership write never ends a scan
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+    if recorded:
+        # Force the export so the sidecar (and the snapshot cache's next read)
+        # reflects the change for the follow-up step.
+        try:
+            graph_runtime.export_graph_if_due(shell, domain, force=True)
+            _invalidate_membership_snapshot_cache(domain)
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+    return recorded
+
+
 def add_runtime_user_group_membership(
     shell: object,
     domain: str,
@@ -239,46 +370,6 @@ def add_runtime_user_group_membership(
     if not user_label or not group_label:
         return False
 
-    path = membership_snapshot_path(shell, domain)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = read_json_file(path) if os.path.exists(path) else {}
-    if not isinstance(data, dict):
-        data = {}
-
-    user_to_groups = data.setdefault("user_to_groups", {})
-    if not isinstance(user_to_groups, dict):
-        user_to_groups = {}
-        data["user_to_groups"] = user_to_groups
-
-    current_groups = user_to_groups.setdefault(user_label, [])
-    if not isinstance(current_groups, list):
-        current_groups = []
-        user_to_groups[user_label] = current_groups
-
-    changed = False
-    if group_label not in current_groups:
-        current_groups.append(group_label)
-        current_groups.sort(key=str.lower)
-        changed = True
-
-    group_labels = data.setdefault("group_labels", [])
-    if not isinstance(group_labels, list):
-        group_labels = []
-        data["group_labels"] = group_labels
-    if group_label not in group_labels:
-        group_labels.append(group_label)
-        group_labels.sort(key=str.lower)
-        changed = True
-
-    data.setdefault("computer_to_groups", {})
-    data.setdefault("group_to_parents", {})
-    data.setdefault("label_to_sid", {})
-    data.setdefault("sid_to_label", {})
-
-    runtime_memberships = data.setdefault("runtime_memberships", [])
-    if not isinstance(runtime_memberships, list):
-        runtime_memberships = []
-        data["runtime_memberships"] = runtime_memberships
     metadata = _normalize_runtime_membership_metadata(
         source=source,
         evidence=evidence,
@@ -287,37 +378,14 @@ def add_runtime_user_group_membership(
         origin_relation=origin_relation,
         cleanup_behavior=cleanup_behavior,
     )
-    runtime_key = (
-        user_label,
-        group_label,
-        str(metadata.get("source") or "").strip(),
-        str(metadata.get("origin_relation") or "").strip(),
+    # The membership is ONLY a ``MemberOf`` overlay edge now; ``memberships.json``
+    # is derived from the store and never read or rewritten here.
+    recorded = _record_runtime_memberof_edge(
+        shell, domain, member_label=user_label, group_label=group_label,
+        metadata=metadata, member_kind="User",
     )
-    existing_runtime = {
-        (
-            str(item.get("user") or ""),
-            str(item.get("group") or ""),
-            str(item.get("source") or ""),
-            str(item.get("origin_relation") or ""),
-        )
-        for item in runtime_memberships
-        if isinstance(item, dict)
-    }
-    if runtime_key not in existing_runtime:
-        runtime_memberships.append(
-            {
-                "user": user_label,
-                "group": group_label,
-                **metadata,
-            }
-        )
-        changed = True
-
-    if not changed:
+    if not recorded:
         return False
-
-    _write_membership_snapshot(path, data, domain=domain)
-    _invalidate_membership_snapshot_cache(domain)
     _invalidate_pac_for_membership_change(
         domain=domain,
         user_label=user_label,
@@ -325,11 +393,10 @@ def add_runtime_user_group_membership(
         action="add",
     )
     print_info_debug(
-        "[membership] runtime membership persisted: "
+        "[membership] runtime membership recorded: "
         f"user={mark_sensitive(user_label, 'user')} "
         f"group={mark_sensitive(group_label, 'group')} "
-        f"source={mark_sensitive(str(source), 'detail')} "
-        f"path={mark_sensitive(path, 'path')}"
+        f"source={mark_sensitive(str(source), 'detail')}"
     )
     return True
 
@@ -383,28 +450,29 @@ def add_runtime_computer_group_membership(
     Returns:
         True when the snapshot was created or updated, otherwise False.
     """
-    computer_label = _canonical_membership_label(domain, computer_name)
+    # A machine account's membership label carries the trailing ``$`` (the
+    # sAMAccountName form), whether or not the caller passed it.
+    raw_name = str(computer_name or "").strip()
+    if raw_name and not raw_name.endswith("$") and "@" not in raw_name and "\\" not in raw_name:
+        raw_name += "$"
+    computer_label = _canonical_membership_label(domain, raw_name)
     if not computer_label:
         return False
 
-    path = membership_snapshot_path(shell, domain)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = read_json_file(path) if os.path.exists(path) else {}
-    if not isinstance(data, dict):
-        data = {}
-
-    # Resolve the group label.  Preference order:
+    # The group label comes from the prepared snapshot (``load_membership_snapshot``,
+    # the streamed reader), never from a direct file read. Preference order:
     # 1. Explicit ``group_name`` argument.
     # 2. ``sid_to_label`` lookup for ``<domain_sid>-<group_rid>``.
     # 3. Synthetic fallback (``DOMAIN COMPUTERS`` for RID 515).
+    snapshot = load_membership_snapshot(shell, domain) or {}
     resolved_group_label: str = ""
     if group_name and str(group_name).strip():
         resolved_group_label = _canonical_membership_label(domain, str(group_name))
     if not resolved_group_label:
-        domain_sid = str(data.get("domain_sid") or "").strip()
+        domain_sid = str(snapshot.get("domain_sid") or "").strip()
         if domain_sid:
             target_sid = f"{domain_sid}-{group_rid}"
-            sid_to_label = data.get("sid_to_label")
+            sid_to_label = snapshot.get("sid_to_label")
             if isinstance(sid_to_label, dict):
                 candidate = sid_to_label.get(target_sid)
                 if isinstance(candidate, str) and candidate.strip():
@@ -427,40 +495,6 @@ def add_runtime_computer_group_membership(
             )
             return False
 
-    computer_to_groups = data.setdefault("computer_to_groups", {})
-    if not isinstance(computer_to_groups, dict):
-        computer_to_groups = {}
-        data["computer_to_groups"] = computer_to_groups
-
-    current_groups = computer_to_groups.setdefault(computer_label, [])
-    if not isinstance(current_groups, list):
-        current_groups = []
-        computer_to_groups[computer_label] = current_groups
-
-    changed = False
-    if resolved_group_label not in current_groups:
-        current_groups.append(resolved_group_label)
-        current_groups.sort(key=str.lower)
-        changed = True
-
-    group_labels = data.setdefault("group_labels", [])
-    if not isinstance(group_labels, list):
-        group_labels = []
-        data["group_labels"] = group_labels
-    if resolved_group_label not in group_labels:
-        group_labels.append(resolved_group_label)
-        group_labels.sort(key=str.lower)
-        changed = True
-
-    data.setdefault("user_to_groups", {})
-    data.setdefault("group_to_parents", {})
-    data.setdefault("label_to_sid", {})
-    data.setdefault("sid_to_label", {})
-
-    runtime_memberships = data.setdefault("runtime_memberships", [])
-    if not isinstance(runtime_memberships, list):
-        runtime_memberships = []
-        data["runtime_memberships"] = runtime_memberships
     metadata = _normalize_runtime_membership_metadata(
         source=source,
         evidence=evidence,
@@ -469,43 +503,28 @@ def add_runtime_computer_group_membership(
         origin_relation=origin_relation,
         cleanup_behavior=cleanup_behavior,
     )
-    runtime_key = (
-        computer_label,
-        resolved_group_label,
-        str(metadata.get("source") or "").strip(),
-        str(metadata.get("origin_relation") or "").strip(),
+    # A ``MemberOf`` overlay edge only; the Computer node is created when the
+    # graph does not hold the account yet (an ADscan-created machine account).
+    group_object_id = ""
+    domain_sid = str((snapshot or {}).get("domain_sid") or "").strip()
+    if domain_sid:
+        group_object_id = f"{domain_sid}-{group_rid}"
+    recorded = _record_runtime_memberof_edge(
+        shell,
+        domain,
+        member_label=computer_label,
+        group_label=resolved_group_label,
+        metadata=metadata,
+        member_kind="Computer",
+        group_object_id=group_object_id,
     )
-    existing_runtime = {
-        (
-            str(item.get("computer") or item.get("user") or ""),
-            str(item.get("group") or ""),
-            str(item.get("source") or ""),
-            str(item.get("origin_relation") or ""),
-        )
-        for item in runtime_memberships
-        if isinstance(item, dict)
-    }
-    if runtime_key not in existing_runtime:
-        runtime_memberships.append(
-            {
-                "computer": computer_label,
-                "group": resolved_group_label,
-                **metadata,
-            }
-        )
-        changed = True
-
-    if not changed:
+    if not recorded:
         return False
-
-    _write_membership_snapshot(path, data, domain=domain)
-    _invalidate_membership_snapshot_cache(domain)
     print_info_debug(
-        "[membership] runtime computer membership persisted: "
+        "[membership] runtime computer membership recorded: "
         f"computer={mark_sensitive(computer_label, 'user')} "
         f"group={mark_sensitive(resolved_group_label, 'group')} "
-        f"source={mark_sensitive(str(source), 'detail')} "
-        f"path={mark_sensitive(path, 'path')}"
+        f"source={mark_sensitive(str(source), 'detail')}"
     )
     return True
 
@@ -758,60 +777,15 @@ def remove_runtime_user_group_membership(
     if not user_label or not group_label:
         return False
 
-    path = membership_snapshot_path(shell, domain)
-    if not os.path.exists(path):
+    # The membership lives as a ``MemberOf`` overlay edge; retiring it (and
+    # re-exporting) is the whole removal. ``memberships.json`` is derived from
+    # the store and never read or rewritten here.
+    recorded = _record_runtime_memberof_edge(
+        shell, domain, member_label=user_label, group_label=group_label,
+        metadata=None, remove=True,
+    )
+    if not recorded:
         return False
-    data = read_json_file(path)
-    if not isinstance(data, dict):
-        return False
-
-    changed = False
-
-    user_to_groups = data.get("user_to_groups")
-    if isinstance(user_to_groups, dict):
-        current_groups = user_to_groups.get(user_label)
-        if isinstance(current_groups, list) and group_label in current_groups:
-            user_to_groups[user_label] = [
-                item for item in current_groups if str(item) != group_label
-            ]
-            changed = True
-            if not user_to_groups[user_label]:
-                user_to_groups.pop(user_label, None)
-
-    runtime_memberships = data.get("runtime_memberships")
-    if isinstance(runtime_memberships, list):
-        source_value = str(source or "").strip()
-        relation_value = str(origin_relation or "").strip()
-        filtered_runtime_memberships = []
-        removed_runtime = False
-        for item in runtime_memberships:
-            if not isinstance(item, dict):
-                filtered_runtime_memberships.append(item)
-                continue
-            item_user = str(item.get("user") or "")
-            item_group = str(item.get("group") or "")
-            item_source = str(item.get("source") or "").strip()
-            item_relation = str(item.get("origin_relation") or "").strip()
-            source_matches = not source_value or item_source == source_value
-            relation_matches = not relation_value or item_relation == relation_value
-            if (
-                item_user == user_label
-                and item_group == group_label
-                and source_matches
-                and relation_matches
-            ):
-                removed_runtime = True
-                continue
-            filtered_runtime_memberships.append(item)
-        if removed_runtime:
-            data["runtime_memberships"] = filtered_runtime_memberships
-            changed = True
-
-    if not changed:
-        return False
-
-    _write_membership_snapshot(path, data, domain=domain)
-    _invalidate_membership_snapshot_cache(domain)
     _invalidate_pac_for_membership_change(
         domain=domain,
         user_label=user_label,
@@ -822,10 +796,62 @@ def remove_runtime_user_group_membership(
         "[membership] runtime membership removed: "
         f"user={mark_sensitive(user_label, 'user')} "
         f"group={mark_sensitive(group_label, 'group')} "
-        f"source={mark_sensitive(str(source or ''), 'detail')} "
-        f"path={mark_sensitive(path, 'path')}"
+        f"source={mark_sensitive(str(source or ''), 'detail')}"
     )
     return True
+
+
+def _file_mentions_key(path: str, key: bytes) -> bool:
+    """True when the quoted ``key`` appears anywhere in the file's bytes."""
+    needle = b'"' + key + b'"'
+    overlap = len(needle) - 1
+    tail = b""
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1 << 20)
+            if not chunk:
+                return False
+            if needle in tail + chunk[: len(needle)] or needle in chunk:
+                return True
+            tail = chunk[-overlap:]
+
+
+def _read_prepared_snapshot(
+    path: str, domain: str
+) -> tuple[dict[str, Any] | None, list[str], Any] | None:
+    """Read ``memberships.json`` into its prepared snapshot.
+
+    Returns ``(snapshot, root_keys, generated_at)``; the snapshot is ``None``
+    when the document is not a membership export. Returns ``None`` when the
+    file is not a JSON object at all.
+
+    A raw export (the collector's and the store export's) is read element by
+    element (``graph_compact.iter_graph_file``) and the prepared maps are built
+    directly, so neither the raw ``nodes`` nor ``edges`` are ever resident.
+    Anything else keeps the whole-document path, so its snapshot is unchanged:
+    a file a runtime write re-embedded the prepared maps into, an indent-4
+    file from before the streamed layout the reader cannot stream, a file that
+    is not parseable (``read_json_file`` quarantines it as before).
+    """
+    from adscan_core.graph_compact import iter_graph_file  # noqa: PLC0415
+
+    streamed = None
+    try:
+        streamed = shape.prepare_membership_snapshot_from_events(
+            iter_graph_file(path), domain
+        )
+    except ValueError:
+        streamed = None
+    if streamed is not None and not streamed.prepared:
+        saw_nodes = streamed.saw_nodes or _file_mentions_key(path, b"nodes")
+        saw_edges = streamed.saw_edges or _file_mentions_key(path, b"edges")
+        snapshot = streamed.snapshot if (saw_nodes and saw_edges) else None
+        return snapshot, streamed.root_keys, streamed.generated_at
+    data = read_json_file(path)
+    if not isinstance(data, dict):
+        return None
+    snapshot = attack_paths_core.prepare_membership_snapshot(data, domain)
+    return snapshot, list(data.keys()), data.get("generated_at")
 
 
 def load_membership_snapshot(
@@ -916,22 +942,21 @@ def load_membership_snapshot(
         _MEMBERSHIP_SNAPSHOT_CACHE[domain_key] = None
         _MEMBERSHIP_SNAPSHOT_MTIME[domain_key] = None
         return None
-    data = read_json_file(path)
-    if not isinstance(data, dict):
+    loaded = _read_prepared_snapshot(path, domain)
+    if loaded is None:
         increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "misses")
         _MEMBERSHIP_SNAPSHOT_CACHE[domain_key] = None
         _MEMBERSHIP_SNAPSHOT_MTIME[domain_key] = None
         return None
-    if not data:
+    snapshot, root_keys, generated_at = loaded
+    if not root_keys:
         print_info_debug(
             f"[membership] snapshot JSON is empty for {domain_key}: path={path}"
         )
-
-    snapshot = attack_paths_core.prepare_membership_snapshot(data, domain)
     if snapshot is None:
         print_info_debug(
             f"[membership] snapshot normalization failed for {domain_key}; "
-            f"raw_keys={sorted(data.keys())} path={path}"
+            f"raw_keys={sorted(root_keys)} path={path}"
         )
     if snapshot and not snapshot_has_sid_metadata(snapshot) and augment_fn:
         print_info_debug(
@@ -942,7 +967,6 @@ def load_membership_snapshot(
     if snapshot:
         increment_stats(_MEMBERSHIP_SNAPSHOT_STATS, "loaded")
         domain_sid = snapshot.get("domain_sid")
-        generated_at = data.get("generated_at") if isinstance(data, dict) else None
         print_info_debug(
             f"[membership] snapshot loaded: domain={domain_key} path={path} "
             f"keys={sorted(snapshot.keys())} "

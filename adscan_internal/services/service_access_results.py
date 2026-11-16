@@ -68,8 +68,13 @@ def render_service_access_results(
     username: str,
     findings: list[ServiceAccessFinding],
     total_targets: int | None = None,
+    not_checked: int = 0,
 ) -> None:
-    """Render a premium summary and table for service-access results."""
+    """Render a premium summary and table for service-access results.
+
+    ``not_checked`` is the number of hosts a stop left unchecked: they are
+    stated as not checked, never folded into "unconfirmed".
+    """
     confirmed_findings = [
         finding for finding in findings if finding.category == "confirmed"
     ]
@@ -86,6 +91,8 @@ def render_service_access_results(
     ]
     if total_targets is not None:
         summary_lines.append(f"Targets tested: {total_targets}")
+    if not_checked:
+        summary_lines.append(f"Not checked (sweep stopped): {not_checked}")
     summary_lines.append(f"Confirmed access: {confirmed}")
     summary_lines.append(f"Unconfirmed: {unconfirmed}")
 
@@ -150,6 +157,7 @@ def render_no_confirmed_service_access(
     service: str,
     username: str,
     total_targets: int | None = None,
+    not_checked: int = 0,
 ) -> None:
     """Render the empty-result UX for services without normalized unconfirmed findings."""
     marked_user = mark_sensitive(username, "user")
@@ -158,6 +166,8 @@ def render_no_confirmed_service_access(
     ]
     if total_targets is not None:
         summary_lines.append(f"Targets tested: {total_targets}")
+    if not_checked:
+        summary_lines.append(f"Not checked (sweep stopped): {not_checked}")
     summary_lines.append("Confirmed access: 0")
     summary_lines.append("No hosts returned a confirmed privileged session.")
 

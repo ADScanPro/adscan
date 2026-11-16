@@ -1365,13 +1365,24 @@ def _credential_obligation(
     """
     count = len(principals)
     if count:
+        # What this figure counts is said in the sentence: the accounts ADscan
+        # holds a usable credential for, which are the ones to rotate here. It is
+        # not the number of accounts whose password hashes went through password
+        # recovery (the Password Hygiene figures, which include krbtgt and the
+        # account the assessment ran as). Both once read "credential material ...
+        # N accounts" and a reader took 16 and 18 for the same figure.
         proof = (
-            f"The assessment recovered credential material for {count} "
-            f"{_plural(count, 'account')} in {_domains_phrase(domains)}: "
-            f"{_join_names(principals)}. Each is compromised, whatever was "
-            "recovered for it: a password hash and a Kerberos key authenticate as "
-            "the account just as a password does."
+            f"The assessment holds a usable credential for {count} "
+            f"{_plural(count, 'account')} in {_domains_phrase(domains)}, listed "
+            f"here to be rotated: {_join_names(principals)}. Each is compromised, "
+            "whatever was recovered for it: a password hash and a Kerberos key "
+            "authenticate as the account just as a password does."
         )
+        if krbtgt_obligation_present:
+            proof += (
+                " The krbtgt account is not in this count, because its reset is "
+                "its own action above."
+            )
     else:
         # Only the built-in Guest was reached — the proof is about disabling it,
         # not rotating a secret that does not exist.

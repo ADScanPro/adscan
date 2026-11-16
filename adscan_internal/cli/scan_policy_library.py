@@ -98,7 +98,7 @@ from adscan_core.scan_policy.settings import (
 )
 from adscan_core.scan_policy.registry import CheckRegistry, load_registry
 from adscan_core.scan_policy.resolve import ResolvedScanPolicy
-from adscan_core.scan_policy.summary import build_policy_safety_summary
+from adscan_core.scan_policy.summary import build_policy_safety_summary, policy_counts, policy_views
 from adscan_internal.cli.library_common import (
     add_scope_argument,
     require_workspace,
@@ -154,13 +154,12 @@ def resolve_for_display(definition: ScanPolicyDefinition) -> ResolvedScanPolicy:
 
 
 def counts_line(resolved: ResolvedScanPolicy) -> str:
-    """``N of M attack steps, K of L vulnerability checks`` for one resolved policy."""
-    summary = build_policy_safety_summary(resolved)
-    return (
-        f"{summary['attack_steps_enabled']} of {summary['attack_steps_total']} attack steps, "
-        f"{summary['vulnerability_checks_enabled']} of {summary['vulnerability_checks_total']} "
-        "vulnerability checks"
-    )
+    """``N of M attack steps, K of L vulnerability checks`` for one resolved policy.
+
+    Worded by the SSOT :func:`adscan_core.scan_policy.summary.policy_counts`, so
+    it does not depend on whether a cleanup account is loaded right now.
+    """
+    return policy_counts(resolved).line
 
 
 def pace_label(definition: ScanPolicyDefinition) -> str:
@@ -713,7 +712,8 @@ def pace_detail_lines(definition: ScanPolicyDefinition) -> list[tuple[str, str]]
 # ---------------------------------------------------------------------------
 
 
-def _family_option(family: Any, reg: CheckRegistry) -> str:
+def _family_option(family: Any, reg: CheckRegistry, view: ResolvedScanPolicy) -> str:
+    """``ACL & Object Control (12 techniques), 6 of 12 on``: the family and what runs of it now."""
     checks = [c for c in reg.checks_in_family(family.family_id) if _toggleable(c)]
     techniques = sum(1 for c in checks if c.kind == KIND_TECHNIQUE)
     detections = len(checks) - techniques
@@ -722,11 +722,80 @@ def _family_option(family: Any, reg: CheckRegistry) -> str:
         parts.append(f"{techniques} technique{'s' if techniques != 1 else ''}")
     if detections:
         parts.append(f"{detections} detection{'s' if detections != 1 else ''}")
-    return f"{family.label} ({', '.join(parts)})"
+    on, total = _family_on(family.family_id, view, reg)
+    return f"{family.label} ({', '.join(parts)}), {on} of {total} on"
+
+
+def _policy_alone(definition: ScanPolicyDefinition) -> ResolvedScanPolicy:
+    """The policy resolved on its own (no cleanup account), the view the editor counts in.
+
+    The same view :func:`policy_counts` leads with, so a family count never moves
+    because a cleanup account happens to be loaded.
+    """
+    return policy_views(resolve_for_display(definition))[0]
+
+
+def _family_on(family_id: str, view: ResolvedScanPolicy, reg: CheckRegistry) -> tuple[int, int]:
+    """How many of a family's switchable checks run under ``view``, of how many."""
+    members = [c for c in reg.checks_in_family(family_id) if _toggleable(c)]
+    return sum(1 for c in members if c.check_id in view.effective_ids), len(members)
+
+
+def _still_off_reason(check: CheckDefinition, view: ResolvedScanPolicy, reg: CheckRegistry) -> str:
+    """Why a check of a ticked family does not run, in a few words."""
+    if check.locked_state == LOCKED_NEVER_EXECUTED:
+        return "ADscan never runs it"
+    if check.check_id in view.revert_excluded_ids:
+        return "runs only with a cleanup account, the one account that can undo its change"
+    blocker = view.dependency_excluded.get(check.check_id)
+    if blocker:
+        needed = reg.get(blocker)
+        return f"needs {needed.title if needed is not None and needed.title else blocker}, which is off"
+    return "left off in this policy"
+
+
+def _print_family_changes(
+    before: ScanPolicyDefinition,
+    after: ScanPolicyDefinition,
+    ticked: Iterable[str],
+    families: list[Any],
+    reg: CheckRegistry,
+) -> None:
+    """Each family's count before and after the edit, and what a ticked family still leaves off."""
+    before_view, after_view = _policy_alone(before), _policy_alone(after)
+    ticked_ids = set(ticked)
+    for family in families:
+        on_before, total = _family_on(family.family_id, before_view, reg)
+        on_after, _ = _family_on(family.family_id, after_view, reg)
+        if on_before != on_after:
+            print_info(
+                f"{escape(family.label)}: {on_before} of {total} on before, {on_after} of {total} now."
+            )
+        if family.family_id not in ticked_ids:
+            continue
+        off = [
+            c
+            for c in reg.checks_in_family(family.family_id)
+            if (_toggleable(c) or c.locked_state == LOCKED_NEVER_EXECUTED)
+            and c.check_id not in after_view.effective_ids
+        ]
+        if off:
+            names = "; ".join(
+                f"{c.title or c.check_id} ({_still_off_reason(c, after_view, reg)})" for c in off
+            )
+            print_info(f"Still off in {escape(family.label)}: {escape(names)}.")
 
 
 def edit_definition_interactive(shell: Any, source: SavedPolicy) -> ScanPolicyDefinition | None:
     """Toggle families and checks and set the pace, starting from ``source``.
+
+    The family step reads as a tick means "all of it": a family is pre-ticked
+    only when every check in it is on; ticking one turns on every check in it a
+    policy may switch on; clearing one that was on turns it off; a family partly
+    on that is left unticked keeps its selection (single checks are adjusted in
+    the next step). After the edit, each family whose count moved is shown
+    before and after, and every check of a ticked family that still does not
+    run is named with the reason.
 
     Returns the new definition, or ``None`` when the operator cancels. Every
     prompt resolves to the source's own state when there is no operator, so a
@@ -735,15 +804,18 @@ def edit_definition_interactive(shell: Any, source: SavedPolicy) -> ScanPolicyDe
     reg = load_registry()
     current = set(selection_of(source.definition, reg))
     families = [f for f in FAMILIES if any(_toggleable(c) for c in reg.checks_in_family(f.family_id))]
-    options = [_family_option(f, reg) for f in families]
-    defaults = [
-        option
-        for option, family in zip(options, families)
-        if any(c.check_id in current for c in reg.checks_in_family(family.family_id))
-    ]
+    members_of = {
+        f.family_id: [c.check_id for c in reg.checks_in_family(f.family_id) if _toggleable(c)]
+        for f in families
+    }
+    fully_on = {fid for fid, members in members_of.items() if all(cid in current for cid in members)}
+    source_view = _policy_alone(source.definition)
+    options = [_family_option(f, reg, source_view) for f in families]
+    defaults = [option for option, family in zip(options, families) if family.family_id in fully_on]
     print_info(
-        f"Starting from '{escape(source.name)}'. Clear a family to turn all its checks off; "
-        "tick one to turn it on."
+        f"Starting from '{escape(source.name)}'. Tick a family to turn on every check in it; "
+        "clear a ticked family to turn all its checks off. A family partly on starts unticked "
+        "and stays as it is unless you tick it; you can adjust single checks next."
     )
     picked = questionary_checkbox_values(
         title="Families this policy runs",
@@ -754,15 +826,18 @@ def edit_definition_interactive(shell: Any, source: SavedPolicy) -> ScanPolicyDe
     if picked is None:
         return None
     picked_set = set(picked)
+    ticked: list[str] = []  # families the operator ticked now (not the pre-ticked ones)
     for option, family in zip(options, families):
-        members = [c.check_id for c in reg.checks_in_family(family.family_id) if _toggleable(c)]
-        if option not in picked_set:
-            current.difference_update(members)
-        elif not any(cid in current for cid in members):
+        members = members_of[family.family_id]
+        if option in picked_set:
+            if family.family_id not in fully_on:
+                ticked.append(family.family_id)
             current.update(members)
+        elif family.family_id in fully_on:
+            current.difference_update(members)
 
     if confirm_ask("Choose individual checks inside a family?", False):
-        chosen = [f for f, o in zip(families, options) if o in picked_set]
+        chosen = [f for f in families if any(cid in current for cid in members_of[f.family_id])]
         while chosen:
             labels = [f.label for f in chosen] + ["Done"]
             idx = questionary_select_index(
@@ -789,6 +864,7 @@ def edit_definition_interactive(shell: Any, source: SavedPolicy) -> ScanPolicyDe
 
     pacing = _choose_pace(shell, source.definition)
     result = definition_for_selection(source.definition, current, pacing=pacing, registry=reg)
+    _print_family_changes(source.definition, result, ticked, families, reg)
     print_panel(
         Text("\n".join(definition_summary_lines(result))),
         title="[bold]This policy[/bold]",
@@ -1051,6 +1127,13 @@ def _unknown_policy_message(name: str, workspace_dir: str | None) -> str:
     return f"No scan policy named '{name}'. Available: {available}."
 
 
+def _list_figure(enabled: int, with_account: int, total: int) -> str:
+    """One ``policy list`` cell: the figure of :func:`policy_counts`, compact."""
+    if with_account != enabled:
+        return f"{enabled} of {total} ({with_account} with a cleanup account)"
+    return f"{enabled} of {total}"
+
+
 def _cmd_list(ctx: LibraryContext) -> None:
     current = ctx.current_policy()
     current_id = current.definition.identity.policy_id if current is not None else ""
@@ -1065,8 +1148,7 @@ def _cmd_list(ctx: LibraryContext) -> None:
     table.add_column("Attack\nsteps", justify="right", overflow="fold")
     table.add_column("Vulnerability\nchecks", justify="right", overflow="fold")
     for policy in store.list_policies(ctx.workspace_dir, include_shadowed=True):
-        resolved = resolve_for_display(policy.definition)
-        summary = build_policy_safety_summary(resolved)
+        counts = policy_counts(resolve_for_display(policy.definition))
         marker = "●" if current_id and current_id in (policy.reference, f"builtin:{policy.key}") else ""
         style = "dim" if policy.shadowed else ""
         saved = _LIST_SCOPE_LABELS.get(policy.scope, policy.scope) + (
@@ -1079,11 +1161,14 @@ def _cmd_list(ctx: LibraryContext) -> None:
             # A built-in is its own base; the column is for what a saved policy starts from.
             Text("" if policy.read_only else BUILTIN_LABELS.get(policy.definition.base, policy.definition.base), style=style),
             Text(pace_label(policy.definition), style=style),
-            Text(f"{summary['attack_steps_enabled']} of {summary['attack_steps_total']}", style=style),
-            Text(
-                f"{summary['vulnerability_checks_enabled']} of {summary['vulnerability_checks_total']}",
-                style=style,
-            ),
+            Text(_list_figure(
+                counts.attack_steps_enabled, counts.attack_steps_with_cleanup_account,
+                counts.attack_steps_total,
+            ), style=style),
+            Text(_list_figure(
+                counts.vulnerability_checks_enabled, counts.vulnerability_checks_with_cleanup_account,
+                counts.vulnerability_checks_total,
+            ), style=style),
         )
     print_table(table)
     for path, reason in store.unreadable_policy_files(ctx.workspace_dir):

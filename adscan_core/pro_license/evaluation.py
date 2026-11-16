@@ -3,7 +3,13 @@
 Two questions, answered locally without any network:
 
 * :func:`check_pro_license` — may a NEW assessment start? Same states and
-  clock-rollback rule as the Enterprise licence, plus ``revoked``.
+  clock-rollback rule as the Enterprise licence, plus ``revoked``. The
+  status keeps two dates apart: the CONTRACT end (ADscan's to extend, possibly
+  none) is what the operator is told about; the DOCUMENT validity (how long
+  this machine may work without checking in) is internal and refreshed by the
+  launch check-in (:func:`adscan_core.pro_license.client.check_in`). Only a
+  machine that cannot refresh (offline mode, no route) hears about the
+  document, and only when its renewal date has passed.
 * :func:`admit_domain` — may assessment of THIS forest start? Decided by the
   licence's registration policy: a registered code always passes; a trial
   queues the code and passes; a partner or paid licence passes during the
@@ -26,8 +32,9 @@ licence, which is what lets this ship before the licence server is deployed.
 from __future__ import annotations
 
 import math
+import time as _time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +45,7 @@ from adscan_core.enterprise_license import (
     read_last_seen,
     record_last_seen,
 )
+from adscan_core.engagement.model import RUN_INTERRUPTED
 from adscan_core.environment_ledger import ForestIdentity
 from adscan_core.pro_license import documents as docs
 from adscan_core.pro_license.billable_engagements import (
@@ -48,6 +56,7 @@ from adscan_core.pro_license.billable_engagements import (
 )
 from adscan_core.pro_license.domain_code import code_for_identity
 from adscan_core.pro_license.model import (
+    CONTRACT_OPEN_ENDED,
     EDITION_TRIAL,
     POLICY_DEFERRED,
     POLICY_OFFLINE,
@@ -78,6 +87,69 @@ _WARNING_STATES = frozenset({STATE_EXPIRING, STATE_GRACE})
 
 TRIAL_WARN_DAYS = 7
 WARN_DAYS = 30
+#: Contract days remaining at or below which the launch notice is a warning on
+#: every start (above it, up to WARN_DAYS, a quiet note at most once a day).
+WARNING_DAYS = 7
+#: At or below this, the notice is urgent (and on the last day).
+URGENT_DAYS = 3
+
+#: Presentation tiers of the launch notice (:attr:`ProLicenseStatus.notice_level`).
+NOTICE_NONE = "none"
+NOTICE_NOTE = "note"
+NOTICE_WARNING = "warning"
+NOTICE_URGENT = "urgent"
+NOTICE_CRITICAL = "critical"
+
+#: Version of ``adscan license status --json`` (the ``license_status`` output format).
+STATUS_SCHEMA_NAME = "license_status"
+
+#: How far a domain controller's clock may run past a document's grace before
+#: that DC time counts as proof the document expired. Generous on purpose: lab
+#: and client DCs drift by hours, and this witness only ever SHORTENS validity.
+DC_WITNESS_TOLERANCE = timedelta(hours=DEFAULT_CLOCK_TOLERANCE_HOURS)
+
+# ── Session clock ─────────────────────────────────────────────────────────────
+#
+# The launch decision reads the wall clock BEFORE ADscan steps it to a domain
+# controller (PKINIT, Kerberos skew). Every later licence decision in the same
+# process (a domain admitted mid-scan) reads the SESSION clock instead: the
+# launch instant plus monotonic elapsed time. So neither ADscan's own clock
+# steps nor an operator moving the wall clock back mid-run can make a long
+# session outlive its document, and a step does not read as a clock rollback.
+# CLOCK_MONOTONIC restarts at boot, so this never carries across processes.
+
+_SESSION_ANCHOR: tuple[datetime, float] | None = None
+
+
+def anchor_session_clock(now: datetime) -> None:
+    """Pin the session clock to the launch instant (the licence gate calls it once)."""
+    global _SESSION_ANCHOR
+    _SESSION_ANCHOR = (now, _time.monotonic())
+
+
+def reset_session_clock() -> None:
+    """Forget the session anchor (tests; a new launch in the same process)."""
+    global _SESSION_ANCHOR
+    _SESSION_ANCHOR = None
+
+
+#: Floor of a new code's registration grace. A licence issued with no grace
+#: still lets the FIRST assessment of a new forest run (both its phases) when
+#: the server does not answer; the next day it needs the registration.
+MIN_REGISTRATION_GRACE = timedelta(days=1)
+
+
+def registration_grace_until(licence: ProLicense, first_seen: datetime) -> datetime:
+    """End of a pending code's grace: its OWN ``first_seen`` plus the licence's grace (floored)."""
+    return first_seen + max(timedelta(days=licence.registration_grace_days), MIN_REGISTRATION_GRACE)
+
+
+def session_now() -> datetime:
+    """The session clock, or the wall clock when no launch anchored it."""
+    if _SESSION_ANCHOR is None:
+        return docs.utc_now()
+    wall, mono = _SESSION_ANCHOR
+    return wall + timedelta(seconds=max(0.0, _time.monotonic() - mono))
 
 OUTCOME_REGISTERED = "registered"
 OUTCOME_DEFERRED = "deferred"
@@ -93,8 +165,60 @@ REASON_REGISTRATION_REFUSED = "pro_registration_refused"
 #: never registers a domain nor starts its grace.
 REASON_RECHECK_UNKNOWN_DOMAIN = "pro_recheck_unknown_domain"
 
-_KEEPS_DATA = "Existing reports and workspaces remain available."
-_HOW_TO_ACTIVATE = "Activate this machine once with `adscan license activate`."
+#: What ``adscan license status`` says on a machine with no licence and no PRO
+#: build. True for both editions: the free one needs no licence, PRO needs one
+#: (since 15.0.0). It once read "this build does not require one yet", which
+#: was the wording of the release before the licence became mandatory for PRO.
+DORMANT_MESSAGE = (
+    "No ADscan PRO licence is installed on this machine. The free edition needs none and "
+    "runs as it is. ADscan PRO needs one. Run `adscan license activate` with the activation "
+    "key from your onboarding email."
+)
+#: Every refusal says where the user's own evidence still is: the launch is
+#: refused (``start`` included), ``adscan deliver`` never passes the licence seam.
+_KEEPS_DATA = "Your workspaces and reports are untouched, and `adscan deliver` still renders a report from any of them."
+_HOW_TO_ACTIVATE = "Run `adscan license activate` once, with the activation key from your ADscan onboarding email."
+
+
+def licence_contact_email() -> str:
+    """Where a licence holder writes to ADscan (one place for every licence message)."""
+    from adscan_core.outbound_links import ADSCAN_SITE_HOST
+
+    return f"hello@{ADSCAN_SITE_HOST}"
+
+
+def _no_key_line() -> str:
+    return f"No key? Write to {licence_contact_email()}."
+
+
+def _contact_line() -> str:
+    return f"To extend it, contact ADscan at {licence_contact_email()}."
+
+
+def offline_until(licence: ProLicense) -> datetime:
+    """First instant (UTC) new assessments can no longer start without refreshing this document.
+
+    The document's end plus its grace: the same instant the ``grace`` state
+    names as "new assessments stop after". Every surface that tells a person how
+    long this machine works without the licence server reads it here.
+    """
+    return licence.grace_ends_at
+
+
+def _refresh_how(offline: bool) -> str:
+    if offline:
+        return (
+            "Offline mode is on, so this machine cannot refresh it by itself. Run "
+            "`adscan license relay export`, send the file through your platform, then run "
+            "`adscan license relay import`."
+        )
+    return (
+        "Let this machine reach the ADscan licence server once (any launch refreshes it, "
+        "offline mode included). `adscan license check` finds what blocks the connection and "
+        "refreshes it once the route works. With no route to ADscan, run "
+        "`adscan license relay export`, send the file through your platform, then run "
+        "`adscan license relay import`."
+    )
 
 
 def _human_date(value: datetime) -> str:
@@ -105,6 +229,18 @@ def _days_until(target: datetime, now: datetime) -> int:
     return max(0, math.ceil((target - now).total_seconds() / 86400))
 
 
+def _plural(days: int) -> str:
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def _contract_level(days: int) -> str:
+    if days <= URGENT_DAYS:
+        return NOTICE_URGENT
+    if days <= WARNING_DAYS:
+        return NOTICE_WARNING
+    return NOTICE_NOTE
+
+
 @dataclass(frozen=True)
 class ProLicenseStatus:
     """May a new assessment start, and what do we tell the operator?"""
@@ -113,7 +249,19 @@ class ProLicenseStatus:
     message: str
     licence: ProLicense | None = None
     error_code: str = ""
+    #: Days the DOCUMENT (or its grace) still allows new assessments.
     days_remaining: int | None = None
+    #: Days to the end of the CONTRACT (None: no end date or not stated).
+    contract_days_remaining: int | None = None
+    #: How loudly a launch tells the operator (NOTICE_*).
+    notice_level: str = NOTICE_NONE
+    #: True when the notice is about refreshing the document (offline host),
+    #: not about the contract.
+    refresh_notice: bool = False
+    #: Offline mode was on when the status was computed.
+    offline: bool = False
+    #: Last answer this machine got from the licence server (ISO instant).
+    last_check_in: str | None = None
 
     @property
     def scans_allowed(self) -> bool:
@@ -127,16 +275,43 @@ class ProLicenseStatus:
     def warning(self) -> bool:
         return self.state in _WARNING_STATES
 
-    def to_dict(self) -> dict[str, Any]:
+    @property
+    def renews_automatically(self) -> bool:
+        """True when this machine refreshes its licence document on its own (online launches)."""
         lic = self.licence
+        return bool(lic is not None and lic.needs_server and not self.offline and self.state not in (
+            STATE_REVOKED,
+        ))
+
+    def to_dict(self, *, enforced: bool = True) -> dict[str, Any]:
+        """Machine-readable status.
+
+        ``enforced`` is :func:`enforcement_required`. While enforcement is dormant
+        (no licensed-build marker, no licence installed) a missing licence is not a
+        block: ``required`` is false, ``scans_allowed`` is true and the message is
+        the dormant one, so a pipeline never reads "scans blocked" when they run.
+        """
+        from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
+
+        lic = self.licence
+        dormant = (not enforced) and self.state == STATE_MISSING
         return {
+            SCHEMA_VERSION_KEY: output_marker(STATUS_SCHEMA_NAME),
             "state": self.state,
-            "required": self.required,
-            "scans_allowed": self.scans_allowed,
+            "required": False if dormant else self.required,
+            "scans_allowed": True if dormant else self.scans_allowed,
             "warning": self.warning,
-            "message": self.message,
+            "message": DORMANT_MESSAGE if dormant else self.message,
             "error_code": self.error_code or None,
             "days_remaining": self.days_remaining,
+            "contract_term": lic.contract_term if lic is not None else None,
+            "contract_ends_on": lic.contract_ends_on.isoformat() if lic and lic.contract_ends_on else None,
+            "contract_days_remaining": self.contract_days_remaining,
+            "document_valid_until": lic.valid_until.isoformat() if lic is not None else None,
+            "renews_automatically": self.renews_automatically,
+            "last_refreshed_at": docs.format_instant(lic.issued_at) if lic is not None else None,
+            "last_check_in_at": self.last_check_in,
+            "notice_level": NOTICE_NONE if dormant else self.notice_level,
             "license": None
             if lic is None
             else {
@@ -187,24 +362,48 @@ def evaluate_pro_license(
     error: LicenseError | None = None,
     notice: Mapping[str, Any] | None = None,
     last_seen: datetime | None = None,
+    offline: bool = False,
+    last_check_in: str | None = None,
+    dc_time_witness: datetime | None = None,
 ) -> ProLicenseStatus:
-    """Decide the licence state at ``now``. Pure: no I/O, no clock reads."""
+    """Decide the licence state at ``now``. Pure: no I/O, no clock reads.
+
+    ``dc_time_witness`` is the latest domain-controller time a scan measured.
+    When it is past the document's grace by more than
+    :data:`DC_WITNESS_TOLERANCE`, the document is expired for new assessments
+    whatever this machine's clock says (an operator controls their own clock,
+    rarely their client's DC). It never extends validity.
+
+    Enforcement reads the DOCUMENT (its end and grace). The wording reads the
+    CONTRACT: a document about to end while the contract continues is a
+    refresh this machine does on its own, so it is mentioned only once the
+    renewal date passed without one (and from the renewal date under offline
+    mode, where the operator has to carry it).
+    """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
+    extra = {"offline": offline, "last_check_in": last_check_in}
     if licence is None:
         if error is None:
             return ProLicenseStatus(
                 STATE_MISSING,
                 f"No ADscan PRO licence is active on this machine, so new assessments cannot start. "
-                f"{_HOW_TO_ACTIVATE} {_KEEPS_DATA}",
+                f"{_HOW_TO_ACTIVATE} {_no_key_line()} {_KEEPS_DATA}",
                 error_code="missing",
+                notice_level=NOTICE_CRITICAL,
+                **extra,
             )
         return ProLicenseStatus(
             STATE_INVALID,
             f"The PRO licence on this machine cannot be accepted: {error} New assessments cannot "
             f"start. {_KEEPS_DATA}",
             error_code=error.code,
+            notice_level=NOTICE_CRITICAL,
+            **extra,
         )
+    contract_end = licence.contract_ends_at
+    contract_days = _days_until(contract_end, now) if contract_end is not None else None
+    extra["contract_days_remaining"] = contract_days
     notice_payload = (notice or {}).get("payload") if isinstance(notice, Mapping) else None
     if isinstance(notice_payload, Mapping) and notice_payload.get("code") in docs.TERMINAL_NOTICES:
         released = notice_payload.get("code") == docs.NOTICE_DEACTIVATED
@@ -219,6 +418,8 @@ def evaluate_pro_license(
             ),
             licence=licence,
             error_code=str(notice_payload.get("code")),
+            notice_level=NOTICE_CRITICAL,
+            **extra,
         )
     tolerance = timedelta(hours=DEFAULT_CLOCK_TOLERANCE_HOURS)
     reference = max([licence.issued_at] + ([last_seen] if last_seen else []))
@@ -230,6 +431,8 @@ def evaluate_pro_license(
             f"corrected. {_KEEPS_DATA}",
             licence=licence,
             error_code="clock_rollback",
+            notice_level=NOTICE_CRITICAL,
+            **extra,
         )
     if now < licence.starts_at:
         return ProLicenseStatus(
@@ -237,41 +440,119 @@ def evaluate_pro_license(
             f"Your {licence.label} licence starts on {_human_date(licence.starts_at)}.",
             licence=licence,
             error_code="not_yet_valid",
+            notice_level=NOTICE_CRITICAL,
+            **extra,
+        )
+    outlasts = licence.contract_outlasts_document
+    last_doc_day = _human_date(licence.ends_at - timedelta(days=1))
+    if dc_time_witness is not None and dc_time_witness - DC_WITNESS_TOLERANCE >= licence.grace_ends_at:
+        return ProLicenseStatus(
+            STATE_EXPIRED,
+            f"A domain controller this machine assessed reports a date after this {licence.label} "
+            f"licence ended ({last_doc_day}), so new assessments cannot start. "
+            f"{_refresh_how(offline) if outlasts else _contact_line()} {_KEEPS_DATA}",
+            licence=licence,
+            error_code="expired_by_dc_time",
+            days_remaining=0,
+            notice_level=NOTICE_CRITICAL,
+            refresh_notice=outlasts,
+            **extra,
         )
     if now < licence.ends_at:
         days = _days_until(licence.ends_at, now)
         warn = TRIAL_WARN_DAYS if licence.edition == EDITION_TRIAL else WARN_DAYS
-        last_day = _human_date(licence.ends_at - timedelta(days=1))
-        if licence.ends_at - now <= timedelta(days=warn):
+        if contract_days is not None and contract_days <= warn:
+            last_day = _human_date(contract_end - timedelta(days=1))
+            when = "today" if contract_days <= 1 else f"on {last_day} ({_plural(contract_days)} left)"
             return ProLicenseStatus(
                 STATE_EXPIRING,
-                f"Your {licence.label} licence ends on {last_day} ({days} day"
-                f"{'s' if days != 1 else ''} left).",
+                f"Your {licence.label} licence ends {when}. {_contact_line()}",
                 licence=licence,
                 days_remaining=days,
+                notice_level=_contract_level(contract_days),
+                **extra,
             )
+        renew_after = licence.renew_after
+        if outlasts and renew_after is not None:
+            overdue_from = renew_after if offline else renew_after + timedelta(days=1)
+            if now.date() >= overdue_from:
+                # The date new assessments stop (document end plus its grace),
+                # the one the launch notice and `adscan license status` show.
+                stop = offline_until(licence)
+                stop_days = _days_until(stop, now)
+                level = _contract_level(stop_days)
+                if not offline:
+                    level = NOTICE_URGENT if stop_days <= URGENT_DAYS else NOTICE_WARNING
+                return ProLicenseStatus(
+                    STATE_EXPIRING,
+                    f"This machine has not refreshed its {licence.label} licence, so new assessments can "
+                    f"start without the licence server until {_human_date(stop - timedelta(days=1))} "
+                    f"({_plural(stop_days)} left). {_refresh_how(offline)}",
+                    licence=licence,
+                    days_remaining=days,
+                    notice_level=level,
+                    refresh_notice=True,
+                    **extra,
+                )
+        if licence.contract_term == CONTRACT_OPEN_ENDED:
+            summary = f"{licence.label} licence for {licence.customer}, no end date."
+        elif contract_end is not None:
+            summary = (
+                f"{licence.label} licence for {licence.customer}, valid until "
+                f"{_human_date(contract_end - timedelta(days=1))}."
+            )
+        else:
+            summary = f"{licence.label} licence for {licence.customer}, active."
         return ProLicenseStatus(
             STATE_VALID,
-            f"{licence.label} licence for {licence.customer}, valid until {last_day}.",
+            summary,
             licence=licence,
             days_remaining=days,
+            **extra,
         )
     if now < licence.grace_ends_at:
         days = _days_until(licence.grace_ends_at, now)
+        stop_day = _human_date(licence.grace_ends_at - timedelta(days=1))
+        if outlasts:
+            message = (
+                f"This machine has not refreshed its {licence.label} licence since "
+                f"{_human_date(licence.issued_at)}. New assessments stop after {stop_day} "
+                f"({_plural(days)} left). {_refresh_how(offline)}"
+            )
+        else:
+            message = (
+                f"Your {licence.label} licence ended on {last_doc_day}. New assessments stop after "
+                f"{stop_day} ({_plural(days)} left). {_contact_line()}"
+            )
         return ProLicenseStatus(
             STATE_GRACE,
-            f"Your {licence.label} licence ended on {_human_date(licence.ends_at - timedelta(days=1))}. "
-            f"New assessments remain possible for {days} more day{'s' if days != 1 else ''}.",
+            message,
             licence=licence,
             days_remaining=days,
+            notice_level=NOTICE_CRITICAL,
+            refresh_notice=outlasts,
+            **extra,
+        )
+    if outlasts:
+        message = (
+            f"This machine's {licence.label} licence could not be refreshed since "
+            f"{_human_date(licence.issued_at)}, so new assessments cannot start. "
+            f"{_refresh_how(offline)} {_KEEPS_DATA}"
+        )
+    else:
+        message = (
+            f"Your {licence.label} licence ended on {last_doc_day}, so new assessments cannot start. "
+            f"{_contact_line()} {_KEEPS_DATA}"
         )
     return ProLicenseStatus(
         STATE_EXPIRED,
-        f"Your {licence.label} licence ended on {_human_date(licence.ends_at - timedelta(days=1))}, "
-        f"so new assessments cannot start. {_KEEPS_DATA}",
+        message,
         licence=licence,
         error_code="expired",
         days_remaining=0,
+        notice_level=NOTICE_CRITICAL,
+        refresh_notice=outlasts,
+        **extra,
     )
 
 
@@ -281,13 +562,23 @@ def check_pro_license(
     now: datetime | None = None,
     trusted_keys: Mapping[str, str] | None = None,
     record: bool = False,
+    session_clock: bool = False,
 ) -> ProLicenseStatus:
     """Read, verify and evaluate the installed PRO licence.
 
     ``record`` advances the shared clock high-water mark when the launch is
     allowed (scan-launch seams only), exactly like the Enterprise check.
+    ``session_clock`` reads :func:`session_now` instead of the wall clock
+    (mid-session decisions, after ADscan may have stepped the host clock).
+    Offline mode changes only the wording, and only when it keeps the licence
+    channel closed (:func:`adscan_core.pro_license.channel.licence_channel_offline`;
+    an online licence still refreshes itself under offline mode): the
+    document's validity, grace, clock floor and DC-time witness are enforced
+    exactly the same.
     """
-    current = now or docs.utc_now()
+    from adscan_core.pro_license.channel import licence_channel_offline
+
+    current = now or (session_now() if session_clock else docs.utc_now())
     licence, error = store.load_licence(trusted_keys=trusted_keys)
     status = evaluate_pro_license(
         licence,
@@ -295,6 +586,9 @@ def check_pro_license(
         error=error,
         notice=store.terminal_notice(),
         last_seen=read_last_seen(store.directory),
+        offline=licence_channel_offline(licence),
+        last_check_in=store.last_contact(),
+        dc_time_witness=store.dc_time_witness(),
     )
     if record and status.scans_allowed:
         record_last_seen(current, store.directory)
@@ -315,6 +609,18 @@ class DomainAdmission:
     message: str = ""
     reason_code: str = ""
     grace_until: datetime | None = None
+    #: Set when the local register said "registered" without a receipt that
+    #: verifies: one line for the operator. The code was then handled as a
+    #: domain that is not registered yet (registered now, or its normal grace).
+    receipt_problem: str = ""
+
+
+def _receipt_problem_line(code: str) -> str:
+    return (
+        f"The local licence record marked this forest (domain code {code}) as registered, but it holds "
+        "no valid receipt from the ADscan licence server, so ADscan treats it as not registered yet "
+        "and registers it again."
+    )
 
 
 def _queue_registration(
@@ -333,8 +639,7 @@ def _queue_registration(
         return existing
     # The registration is also the report of the code's FIRST engagement: it
     # carries the opening run, so the server needs no second message for it.
-    document = docs.build_request(
-        store.installation(),
+    document = store.build_request(
         docs.KIND_REGISTRATION,
         engine_version=engine_version,
         license_id=licence.license_id,
@@ -370,6 +675,15 @@ def admit_domain(
 ) -> DomainAdmission:
     """Decide whether assessment of ``identity``'s forest may start (spec § 6.2).
 
+    Grace is PER DOMAIN: it counts from that code's own ``first_seen`` (the
+    earliest sealed sighting), never from the licence or another domain. A new
+    code is never refused at its first assessment, server down or not (the
+    grace is at least :data:`MIN_REGISTRATION_GRACE`), and a registered code
+    never needs the server. Registered means the entry holds the server's
+    receipt and it verifies (:meth:`ProLicenseStore.verified_receipt`); an
+    entry that only says so is handled as a code not registered yet and the
+    admission carries ``receipt_problem`` for the operator.
+
     ``run_kind`` :data:`RUN_KIND_RECHECK` never registers the code and never
     seals a ``first_seen`` (it would start a grace): see :func:`_admit_recheck`.
     """
@@ -384,8 +698,40 @@ def admit_domain(
         return DomainAdmission(True, OUTCOME_OFFLINE, code, basis)
 
     entry = store.register_entries().get(code) or {}
-    if entry.get("status") == STATUS_REGISTERED:
+    if entry.get("status") != STATUS_REGISTERED:
+        return _admit_unregistered(
+            store, licence, code, basis, entry, current, engine_version, send, trusted_keys, supersedes,
+            run_kind, run_id,
+        )
+    if store.is_registered(code, trusted_keys=trusted_keys):
         return DomainAdmission(True, OUTCOME_REGISTERED, code, basis)
+    # "registered" with no receipt that verifies (signed by us, for this code
+    # and this installation) is a status somebody wrote, not a registration.
+    # It goes back to the normal path: registered now when the server answers,
+    # else the grace that counts from the code's sealed first sighting.
+    entry = store.upsert_entry(code, status="pending", receipt=None, receipt_id=None, registered_at=None)
+    admission = _admit_unregistered(
+        store, licence, code, basis, entry, current, engine_version, send, trusted_keys, supersedes,
+        run_kind, run_id,
+    )
+    return replace(admission, receipt_problem=_receipt_problem_line(code))
+
+
+def _admit_unregistered(
+    store: ProLicenseStore,
+    licence: ProLicense,
+    code: str,
+    basis: str,
+    entry: Mapping[str, Any],
+    current: datetime,
+    engine_version: str,
+    send: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None,
+    trusted_keys: Mapping[str, str] | None,
+    supersedes: str | None,
+    run_kind: str,
+    run_id: str,
+) -> DomainAdmission:
+    """Admission of a code that holds no verified registration (see :func:`admit_domain`)."""
     if run_kind == RUN_KIND_RECHECK:
         return _admit_recheck(store, licence, code, basis, entry, current)
 
@@ -411,8 +757,7 @@ def admit_domain(
             answer = None
         if isinstance(answer, Mapping):
             result = store.apply_answer(answer, trusted_keys=trusted_keys)
-            settled = store.register_entries().get(code) or {}
-            if settled.get("status") == STATUS_REGISTERED:
+            if store.is_registered(code, trusted_keys=trusted_keys):
                 return DomainAdmission(True, OUTCOME_REGISTERED, code, basis)
             if result.applied and result.notice_code:
                 if licence.registration_policy == POLICY_DEFERRED:
@@ -439,7 +784,7 @@ def admit_domain(
         )
 
     first_seen = docs.parse_instant(first_seen_text)
-    grace_until = first_seen + timedelta(days=licence.registration_grace_days)
+    grace_until = registration_grace_until(licence, first_seen)
     if current < grace_until:
         return DomainAdmission(
             True,
@@ -509,7 +854,7 @@ def _admit_recheck(
     if first_seen_text is None:
         return _recheck_unknown(code, basis)
     first_seen = docs.parse_instant(first_seen_text)
-    grace_until = first_seen + timedelta(days=licence.registration_grace_days)
+    grace_until = registration_grace_until(licence, first_seen)
     if now < grace_until:
         return DomainAdmission(
             True,
@@ -568,6 +913,9 @@ def record_assessment(
         parent_run_id=parent_run_id if is_recheck else "",
         band=band or "pending",
         window_days=None if is_recheck else licence.retest_window_days,
+        # A full scan reads "interrupted" until its scan end records how it
+        # ended (the coverage.json convention: an unfinished run closes nothing).
+        run_status="" if is_recheck else RUN_INTERRUPTED,
     )
     prior = [
         r
@@ -583,8 +931,7 @@ def record_assessment(
         return AssessmentOutcome(record, opens)
     if store.pending_of_kind(docs.KIND_ENGAGEMENT_REPORT, domain_code=domain_code, run_id=run_id) is None:
         store.add_pending(
-            docs.build_request(
-                store.installation(),
+            store.build_request(
                 docs.KIND_ENGAGEMENT_REPORT,
                 engine_version=engine_version or "unknown",
                 license_id=licence.license_id,
@@ -600,6 +947,15 @@ def record_assessment(
 
 
 __all__ = [
+    "NOTICE_CRITICAL",
+    "NOTICE_NONE",
+    "NOTICE_NOTE",
+    "NOTICE_URGENT",
+    "NOTICE_WARNING",
+    "STATUS_SCHEMA_NAME",
+    "anchor_session_clock",
+    "reset_session_clock",
+    "session_now",
     "AssessmentOutcome",
     "DomainAdmission",
     "OUTCOME_DEFERRED",

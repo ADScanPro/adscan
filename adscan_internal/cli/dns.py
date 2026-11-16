@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from adscan_core.scan_policy import settings as policy_settings
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, Literal
 from collections.abc import Callable, Iterable
 
+import functools
 import ipaddress
 import os
 import re
@@ -401,6 +402,191 @@ class PdcPreflightResult:
     # supplied via the contextual prompt when the DC did not answer TCP/53.
     # Feeds only the resolver; ``pdc_ip`` stays the DC/KDC. Absent -> DC is DNS.
     dns_server: str | None = None
+
+
+# ── Engagement scope: an excluded domain controller is never the operational DC ──
+#
+# 126 callers read the operational DC through ``resolve_dc_ip`` (a pure ladder
+# over ``domains_data``). So the scope is applied where the operational DC is
+# DECIDED, the PDC preflight, and its answer is persisted through the existing
+# replica override below (``lockout_authority = "replica"``): none of those
+# callers changes, and none can read an excluded DC.
+
+
+def dc_candidate_scope_error(shell: Any, *, domain: str, candidate_ip: str) -> str:
+    """Why ``candidate_ip`` may not be used as ``domain``'s DC (``""`` when it may).
+
+    The engagement-scope SSOT answers (``dc_scope_configuration_error``): the
+    named domain controller is excluded, or every recorded one is. Fails closed:
+    when the answer cannot be computed the candidate is not contacted.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            dc_scope_configuration_error,
+            declare_scan_target,
+        )
+
+        # The operator (or the discovery) names this address as a domain
+        # controller of the domain: the scope is told first, so the names it
+        # is still waiting on can be asked through the domain's own name
+        # server before the candidate is judged.
+        declare_scan_target(shell, domain=domain, dc_ip=candidate_ip, target=None)
+        return str(
+            dc_scope_configuration_error(shell, domain=domain, dc_ip=candidate_ip) or ""
+        )
+    except Exception as exc:  # noqa: BLE001 - an unknown verdict contacts nobody
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return (
+            "The engagement scope could not be checked for this domain controller, "
+            "so it was not contacted."
+        )
+
+
+def _in_scope_replica(shell: Any, domain: str, *, excluded_ip: str) -> str | None:
+    """A domain controller of ``domain`` inside the scope, to run against instead.
+
+    Chosen among the domain controllers the workspace records, by the DC
+    selection SSOT (which drops excluded candidates before probing them).
+    """
+    from adscan_core.dc_topology import resolve_domain_controllers  # noqa: PLC0415
+    from adscan_internal.services.dns_discovery_service import (  # noqa: PLC0415
+        select_reachable_dc_ip,
+    )
+
+    domains_data = getattr(shell, "domains_data", None)
+    data = domains_data.get(domain) if isinstance(domains_data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    candidates: list[str] = []
+    for record in resolve_domain_controllers(data).dcs:
+        for alias in record.aliases:
+            text = str(alias or "").strip()
+            if is_ip_address(text) and text != excluded_ip and text not in candidates:
+                candidates.append(text)
+    if not candidates:
+        return None
+    selection = select_reachable_dc_ip(
+        reachability_host=shell, dns_candidates=candidates, domain=domain
+    )
+    return selection.selected_ip
+
+
+def apply_asset_scope_to_pdc_decision(
+    shell: Any, decision: PdcPreflightResult | None
+) -> PdcPreflightResult | None:
+    """Hold a PDC preflight decision to the engagement scope (DC rule 1).
+
+    * The decided domain controller is excluded: the decision is rewritten to a
+      domain controller inside the scope, and the excluded one is kept as the
+      authoritative PDC for the record. With none inside the scope the decision
+      becomes ``fallback``: the domain has no directory the scan may read, and
+      the operator is told so.
+    * The decided domain controller is inside the scope but the domain's PDC
+      emulator is excluded: the decision is marked as running on a replica, so
+      lockout counters read there are never treated as authoritative.
+
+    Without an asset scope the decision is returned untouched.
+    """
+    if decision is None or decision.action != "use" or not decision.pdc_ip:
+        return decision
+    try:
+        from adscan_internal.services.dns_discovery_service import (  # noqa: PLC0415
+            scope_excluded_pdc,
+        )
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            asset_scope_recorded,
+            dc_scope_configuration_error,
+            host_scope_verdict,
+        )
+
+        if not asset_scope_recorded(shell):
+            return decision
+        domain = decision.domain
+        marked_domain = mark_sensitive(domain, "domain")
+        verdict = host_scope_verdict(
+            shell, host=decision.pdc_ip, contact=Contact("ldap"), domain=domain
+        )
+        if verdict.allowed:
+            excluded_pdc = scope_excluded_pdc(shell, domain)
+            if (
+                excluded_pdc
+                and excluded_pdc.get("ip")
+                and excluded_pdc["ip"] != decision.pdc_ip
+                and not decision.operator_overrode_pdc
+            ):
+                print_info(
+                    f"The PDC emulator of {marked_domain} is excluded from the "
+                    "engagement scope. Using "
+                    f"{mark_sensitive(decision.pdc_ip, 'ip')} as the scan DC; "
+                    "password-attempt limits stay conservative because lockout "
+                    "counters cannot be read from the PDC emulator."
+                )
+                return replace(
+                    decision,
+                    authoritative_pdc_ip=excluded_pdc["ip"],
+                    authoritative_pdc_hostname=_normalize_hostname_label(
+                        excluded_pdc.get("hostname")
+                    ),
+                    operator_overrode_pdc=True,
+                )
+            return decision
+        replica = _in_scope_replica(shell, domain, excluded_ip=decision.pdc_ip)
+        if replica:
+            print_warning(
+                f"The domain controller {mark_sensitive(decision.pdc_ip, 'ip')} of "
+                f"{marked_domain} is excluded from the engagement scope. Using "
+                f"{mark_sensitive(replica, 'ip')} instead."
+            )
+            return replace(
+                decision,
+                pdc_ip=replica,
+                pdc_hostname=None,
+                authoritative_pdc_ip=decision.pdc_ip,
+                authoritative_pdc_hostname=decision.pdc_hostname,
+                operator_overrode_pdc=True,
+            )
+        print_error(
+            dc_scope_configuration_error(shell, domain=domain, dc_ip=decision.pdc_ip)
+            or f"No domain controller of {domain} is inside the engagement scope."
+        )
+        return PdcPreflightResult(action="fallback", domain=domain)
+    except Exception as exc:  # noqa: BLE001 - an unknown verdict keeps no DC
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_error(
+            "The engagement scope could not be checked for the selected domain "
+            "controller, so it was not used."
+        )
+        return PdcPreflightResult(action="fallback", domain=decision.domain)
+
+
+def _asset_scope_checked_preflight(refused_action: str) -> Callable[..., Any]:
+    """Wrap a PDC preflight so it can neither contact nor return an excluded DC.
+
+    Before the preflight runs, the candidate is checked: the preflight queries
+    and probes it. After it returns, the decision is held to the scope
+    (:func:`apply_asset_scope_to_pdc_decision`). ``refused_action`` is the
+    decision returned for an excluded candidate: ``reenter`` lets an interactive
+    operator name another domain controller, ``fallback`` ends an unattended one.
+    """
+
+    def _decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def _wrapper(shell: Any, *, domain: str, candidate_ip: str, **kwargs: Any) -> Any:
+            error = dc_candidate_scope_error(
+                shell, domain=domain, candidate_ip=candidate_ip
+            )
+            if error:
+                print_error(error)
+                return PdcPreflightResult(action=refused_action, domain=domain)
+            decision = func(shell, domain=domain, candidate_ip=candidate_ip, **kwargs)
+            return apply_asset_scope_to_pdc_decision(shell, decision)
+
+        return _wrapper
+
+    return _decorate
 
 
 def persist_pdc_preflight_result(shell: Any, result: PdcPreflightResult | None) -> None:
@@ -1450,6 +1636,25 @@ def _select_reachable_dc_resolver(
         ordered_candidates = normalize_ipv4_candidates(
             [discovered_pdc_ip, provided_ip, *(dc_ips or [])]
         )
+    # Engagement scope: a candidate resolver is probed on 53 and queried below,
+    # so an excluded one is dropped first (one partition call for the set). The
+    # SRV-discovered candidates above already passed the DC selection's own
+    # check; this covers the provided IP and a separate DNS server.
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        partition_targets_in_scope,
+    )
+
+    ordered_candidates = list(
+        partition_targets_in_scope(
+            shell,
+            ordered_candidates,
+            contact=Contact("dns"),
+            surface="dc_resolver_selection",
+            what="DNS resolver selection",
+            domain=domain,
+        ).allowed
+    )
     assessments: list[DcResolverCandidateAssessment] = []
     expected_interface = getattr(shell, "interface", None)
 
@@ -1734,6 +1939,7 @@ def _maybe_auto_adopt_separate_dns_server(
     return dns_host
 
 
+@_asset_scope_checked_preflight("fallback")
 def preflight_domain_pdc_noninteractive(
     shell: Any,
     *,
@@ -1929,6 +2135,7 @@ def preflight_domain_pdc_noninteractive(
     )
 
 
+@_asset_scope_checked_preflight("reenter")
 def preflight_domain_pdc_interactive(
     shell: Any,
     *,

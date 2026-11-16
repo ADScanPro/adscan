@@ -119,7 +119,7 @@ if _STATIC_ANALYSIS:
     from .share_map_ai_triage_service import ShareMapAITriageService
     from .share_mapping_service import ShareMappingService
     from .smb_guest_auth_service import (
-        DEFAULT_SMB_GUEST_USERNAME,
+        GUEST_NAME_PREFIX,
         is_guest_alias,
         resolve_smb_guest_username,
     )
@@ -249,7 +249,7 @@ _EXPORT_MODULES: dict[str, str] = {
     "ShareFileAnalysisPipelineService": ".share_file_analysis_pipeline_service",
     "ShareFilePipelineAnalysisResult": ".share_file_analysis_pipeline_service",
     "ShareCredentialProvenanceService": ".share_credential_provenance_service",
-    "DEFAULT_SMB_GUEST_USERNAME": ".smb_guest_auth_service",
+    "GUEST_NAME_PREFIX": ".smb_guest_auth_service",
     "is_guest_alias": ".smb_guest_auth_service",
     "resolve_smb_guest_username": ".smb_guest_auth_service",
     "DEFAULT_SMB_SENSITIVE_FILE_PROFILE": ".smb_sensitive_file_policy",

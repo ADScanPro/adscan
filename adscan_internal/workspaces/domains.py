@@ -98,6 +98,16 @@ def delete_domain_dir(workspace_dir: str, domains_dir_name: str, domain: str) ->
     path = resolve_domain_paths(workspace_dir, domains_dir_name, domain).domain_dir
     import shutil
 
+    try:
+        # An open store whose directory is deleted keeps writing into an
+        # unlinked database: close it first (graph_runtime.close_graph_stores_under).
+        from adscan_internal.services.graph_runtime import (  # noqa: PLC0415
+            close_graph_stores_under,
+        )
+
+        close_graph_stores_under(path)
+    except Exception:  # noqa: BLE001 - best-effort; never block the delete
+        pass
     shutil.rmtree(path)
     return path
 

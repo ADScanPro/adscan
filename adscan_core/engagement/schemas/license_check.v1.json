@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://adscanpro.com/schemas/adscan.license_check/1",
+  "title": "ADscan licence server check v1",
+  "description": "The output of `adscan license check --json`: the route from this machine to the ADscan licence server step by step, the cause of a failure and its fix, what was sent once the server answered, and the licence's offline clocks. Exit code 0 when the licence server answered, 1 when it did not. Written by one writer (_check_document in adscan_launcher/license_command.py). Version marker: schema_version, '1.<minor>'. Declared objects may gain fields within a major; do not reject unknown keys.",
+  "type": "object",
+  "required": ["schema_version", "reachable", "cause", "fix", "route", "sent", "licence", "licence_notice"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "reachable": {"type": "boolean"},
+    "cause": {"oneOf": [{"enum": ["proxy", "dns", "egress", "tls_inspection", "tls_clock", "tls", "http", "clock_ahead", "clock_behind"]}, {"type": "null"}]},
+    "fix": {"type": ["string", "null"]},
+    "route": {
+      "type": "object",
+      "required": ["url", "proxy", "reachable", "cause", "steps", "server_time", "clock_offset_seconds", "clock_stepped_by_adscan"],
+      "properties": {
+        "url": {"type": "string"},
+        "proxy": {"type": ["string", "null"], "$comment": "The proxy URL without its credentials."},
+        "reachable": {"type": "boolean"},
+        "cause": {"type": ["string", "null"]},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "ok", "detail", "cause"],
+            "properties": {
+              "name": {"enum": ["proxy", "dns", "tcp", "tls", "health", "clock"]},
+              "ok": {"type": ["boolean", "null"], "$comment": "null: skipped or informational."},
+              "detail": {"type": "string"},
+              "cause": {"type": ["string", "null"]}
+            }
+          }
+        },
+        "server_time": {"$ref": "#/$defs/nullable_licence_timestamp"},
+        "clock_offset_seconds": {"type": ["number", "null"], "$comment": "The server's clock minus this machine's."},
+        "clock_stepped_by_adscan": {"type": "boolean", "$comment": "ADscan holds this machine's clock at a domain controller's time (a scan is running, or one stopped before restoring it)."}
+      }
+    },
+    "sent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["requests", "answered", "requeued_after_clock"],
+          "properties": {
+            "requests": {"type": "integer", "minimum": 0},
+            "answered": {"type": "integer", "minimum": 0},
+            "requeued_after_clock": {"type": "integer", "minimum": 0}
+          }
+        },
+        {"type": "null"}
+      ]
+    },
+    "licence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state", "scans_allowed", "contract_ends_on", "works_offline_until", "offline_days_left", "registered_domains", "pending_domains"],
+          "properties": {
+            "state": {"type": "string"},
+            "scans_allowed": {"type": "boolean"},
+            "contract_ends_on": {"$ref": "#/$defs/licence_nullable_date"},
+            "works_offline_until": {"$ref": "#/$defs/licence_nullable_date"},
+            "offline_days_left": {"$ref": "#/$defs/licence_nullable_days"},
+            "registered_domains": {"type": "integer", "minimum": 0},
+            "pending_domains": {"type": "integer", "minimum": 0}
+          }
+        },
+        {"type": "null"}
+      ]
+    },
+    "licence_notice": {"oneOf": [{"$ref": "#/$defs/licence_notice"}, {"type": "null"}]}
+  },
+  "$defs": {
+    "licence_notice": {
+      "type": "object",
+      "$comment": "Written by adscan_core/pro_license/connection.py (LicenceNotice.to_dict). The same block in license_status, license_check and the licence_notice event; tests/unit/contracts/test_licence_notice_contract.py keeps the three copies identical. Present only when the licence server was not reached at the latest check-in, a domain is waiting to be registered, or the contract end is near.",
+      "required": ["level", "server_reached", "check_in_result", "last_contact", "unreachable_since", "works_offline_until", "offline_days_left", "contract_ends_on", "contract_days_left", "registered_domains", "pending_domains"],
+      "properties": {
+        "level": {"enum": ["none", "note", "warning", "urgent", "critical"]},
+        "server_reached": {"type": ["boolean", "null"], "$comment": "Whether the licence server answered the latest check-in (this launch's when one ran)."},
+        "check_in_result": {"type": ["string", "null"], "$comment": "current, refreshed, notice, revoked, rejected or unreachable."},
+        "last_contact": {"$ref": "#/$defs/nullable_licence_timestamp"},
+        "unreachable_since": {"$ref": "#/$defs/nullable_licence_timestamp", "$comment": "First failed check-in of the current run of failures."},
+        "works_offline_until": {"$ref": "#/$defs/licence_nullable_date", "$comment": "Last day new assessments can start on this machine without reaching the licence server (document end plus its grace)."},
+        "offline_days_left": {"$ref": "#/$defs/licence_nullable_days"},
+        "contract_ends_on": {"$ref": "#/$defs/licence_nullable_date"},
+        "contract_days_left": {"$ref": "#/$defs/licence_nullable_days"},
+        "registered_domains": {"type": "integer", "minimum": 0},
+        "pending_domains": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["domain_code", "first_seen", "assessment_allowed_until", "days_left"],
+            "properties": {
+              "domain_code": {"type": "string"},
+              "first_seen": {"$ref": "#/$defs/nullable_licence_timestamp"},
+              "assessment_allowed_until": {"$ref": "#/$defs/licence_nullable_date", "$comment": "Last day a new assessment of this domain may start without registering it; null when it never blocks."},
+              "days_left": {"$ref": "#/$defs/licence_nullable_days"}
+            }
+          }
+        }
+      }
+    },
+    "licence_timestamp": {"type": "string", "minLength": 10, "maxLength": 64},
+    "nullable_licence_timestamp": {"oneOf": [{"$ref": "#/$defs/licence_timestamp"}, {"type": "null"}]},
+    "licence_nullable_date": {"oneOf": [{"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}, {"type": "null"}]},
+    "licence_nullable_days": {"oneOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}
+  }
+}

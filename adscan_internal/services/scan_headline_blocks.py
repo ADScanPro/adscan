@@ -65,6 +65,14 @@ def stamp_headline_blocks_for_domain(
         engine_marker_bounded: The engine-marker fallback for the ``bounded``
             caveat, used only when no coverage block is persisted.
     """
+    shell = SimpleNamespace(
+        current_workspace_dir=str(workspace_dir), domains_dir="domains"
+    )
+    # A domain whose graph is not available has no listing this run measured:
+    # an empty one would stamp a clean score and zero KPIs. Its route-derived
+    # blocks are removed instead (the not-evaluated declaration stands alone).
+    if _graph_unavailable(shell, domain):
+        return
     # Deep copies: the not-executed annotation below writes step notes in place,
     # and the caller's listing is the one it persists for the web.
     records = [copy.deepcopy(dict(r)) for r in summaries if isinstance(r, Mapping)]
@@ -80,9 +88,6 @@ def stamp_headline_blocks_for_domain(
     )
 
     annotate_report_policy_exclusions(str(workspace_dir), domain, records)
-    shell = SimpleNamespace(
-        current_workspace_dir=str(workspace_dir), domains_dir="domains"
-    )
 
     computed_at = _stamp_exposure_score(shell, domain, records)
 
@@ -115,6 +120,24 @@ def stamp_headline_blocks_for_domain(
             value_terminal_ids=value_terminal_ids,
             engine_marker_bounded=engine_marker_bounded,
         )
+
+
+def _graph_unavailable(shell: SimpleNamespace, domain: str) -> bool:
+    """Whether ``domain``'s graph is not available; clears its figures if so."""
+    try:
+        from adscan_internal.services.graph_availability import (  # noqa: PLC0415
+            clear_route_derived_figures,
+            domain_graph_unavailable_stage,
+        )
+
+        if not domain_graph_unavailable_stage(shell, domain):
+            return False
+        clear_route_derived_figures(shell, domain)
+        return True
+    except Exception as exc:  # noqa: BLE001 - one check never breaks the stamp
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
 
 
 def _stamp_exposure_score(

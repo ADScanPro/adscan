@@ -58,6 +58,11 @@ REASON_NO_RESULT = "no_result"
 #: the data either.
 REASON_CLOCK_SKEW = "clock_skew_unrecovered"
 
+#: The stage stopped because the process reached the memory ceiling ADscan
+#: keeps under the system's limit (``adscan_core.memory_guard``). Same token as
+#: ``adscan_core.reporting.resource_coverage.REASON_MEMORY``.
+REASON_MEMORY = "memory"
+
 #: Markers of a Kerberos clock-skew failure in a library error message.
 _CLOCK_SKEW_MARKERS: tuple[str, ...] = ("krb_ap_err_skew", "clock skew too great")
 
@@ -201,6 +206,10 @@ def describe_incomplete(failures: Iterable[Any]) -> str:
             "Kerberos refused "
             + _join(list(dict.fromkeys(skewed)))
             + " because the clock difference with the domain controller could not be corrected"
+        )
+    if any(f.reason == REASON_MEMORY for f in failures):
+        clauses.append(
+            "the directory read stopped because the memory available to ADscan ran out"
         )
     if any(f.reason == REASON_NO_OBJECTS for f in failures):
         clauses.append("the directory returned no user objects")

@@ -18,6 +18,8 @@ from adscan_internal import (
     telemetry,
 )
 from adscan_core.interaction import is_non_interactive
+from adscan_core.scan_control import scan_control
+from adscan_core.scan_control.fanout import SweepCoverage
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.cli.rdp import run_rdp_service_access_sweep
 from adscan_internal.services.service_access_probe_history import (
@@ -52,6 +54,17 @@ from adscan_internal.services.mssql_access_probe_service import (
     MSSQL_ACCESS_PROBE_BACKEND,
     get_mssql_probe_worker_count,
     run_mssql_access_probe_sweep,
+)
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
+from adscan_internal.services.engagement_scope_targets import prepare_targets_for_scope
+from adscan_internal.services.sweep_stop import (
+    SERVICE_SWEEP_LABELS,
+    announce_not_checked,
+    checked_only,
+    finish_sweep_step,
+    service_sweep_step,
+    service_sweep_step_id,
+    stop_ends_operation,
 )
 from adscan_internal.workspaces import domain_subpath, resolve_workspace_cwd
 from adscan_internal.workspaces.computers import (
@@ -141,8 +154,14 @@ def _run_winrm_psrp_service_access_sweep(
     targets: list[str],
     prompt: bool,
     workflow_intent: str | None = None,
+    coverage: SweepCoverage | None = None,
 ) -> bool:
-    """Run a reusable PSRP-backed WinRM access sweep and persist normalized results."""
+    """Run a reusable PSRP-backed WinRM access sweep and persist normalized results.
+
+    Runs as a long scan-control step: Ctrl+C can stop it, the hosts checked so
+    far are kept (rendered, recorded, edges written) and the rest are named as
+    not checked. ``coverage`` (when given) tells the caller what was left.
+    """
     posture_sink = None
     posture_snapshot = None
     try:
@@ -212,58 +231,68 @@ def _run_winrm_psrp_service_access_sweep(
         return False
     winrm_secret = winrm_cred.ccache_path or winrm_cred.password or password
 
-    findings = run_winrm_access_probe_sweep(
-        domain=domain,
-        username=username,
-        password=winrm_secret,
-        targets=targets,
-        workspace_dir=workspace_dir,
-        domains_dir=domains_dir,
-        domain_data=shell.domains_data.get(domain, {}),
-        auth_mode="kerberos",
-        max_workers=get_winrm_probe_worker_count(),
-        sync_clock_with_pdc=lambda value: bool(
-            shell.do_sync_clock_with_pdc(value, verbose=True)
-        ),
-        posture_sink=posture_sink,
-        posture_snapshot=posture_snapshot,
-    )
-    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
-    if findings:
-        render_service_access_results(
-            service="winrm",
-            username=username,
-            findings=findings,
-            total_targets=len(targets),
-        )
-    else:
-        render_no_confirmed_service_access(
-            service="winrm",
-            username=username,
-            total_targets=len(targets),
-        )
-
-    try:
-        record_service_access_probe_batch(
-            workspace_dir=workspace_dir,
-            domains_dir=domains_dir,
+    sweep_coverage = coverage if coverage is not None else SweepCoverage()
+    with service_sweep_step("winrm") as step:
+        findings = run_winrm_access_probe_sweep(
             domain=domain,
             username=username,
-            service="winrm",
+            password=winrm_secret,
             targets=targets,
-            confirmed_hosts=[finding.host for finding in confirmed_findings],
-            source="run_winrm_psrp_service_access_sweep",
-            backend=WINRM_ACCESS_PROBE_BACKEND,
-            pivot_capable=is_service_pivot_capable("winrm"),
+            workspace_dir=workspace_dir,
+            domains_dir=domains_dir,
+            domain_data=shell.domains_data.get(domain, {}),
+            auth_mode="kerberos",
+            max_workers=get_winrm_probe_worker_count(),
+            sync_clock_with_pdc=lambda value: bool(
+                shell.do_sync_clock_with_pdc(value, verbose=True)
+            ),
+            posture_sink=posture_sink,
+            posture_snapshot=posture_snapshot,
+            should_stop=step.should_stop,
+            coverage=sweep_coverage,
+            shell=shell,
         )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[service-access] failed to persist WinRM PSRP probe history: {exc}"
-        )
+        finish_sweep_step(step, sweep_coverage)
+        confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+        tested_targets = checked_only(targets, sweep_coverage)
+        not_checked = len(sweep_coverage.not_checked)
+        if findings:
+            render_service_access_results(
+                service="winrm",
+                username=username,
+                findings=findings,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        else:
+            render_no_confirmed_service_access(
+                service="winrm",
+                username=username,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        announce_not_checked(label=SERVICE_SWEEP_LABELS["winrm"], coverage=sweep_coverage)
 
-    if confirmed_findings:
+        try:
+            record_service_access_probe_batch(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+                username=username,
+                service="winrm",
+                targets=tested_targets,
+                confirmed_hosts=[finding.host for finding in confirmed_findings],
+                source="run_winrm_psrp_service_access_sweep",
+                backend=WINRM_ACCESS_PROBE_BACKEND,
+                pivot_capable=is_service_pivot_capable("winrm"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[service-access] failed to persist WinRM PSRP probe history: {exc}"
+            )
+
         for finding in confirmed_findings:
             try:
                 from adscan_internal.services.attack_graph_service import (
@@ -281,6 +310,8 @@ def _run_winrm_psrp_service_access_sweep(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
+
+    if confirmed_findings and not stop_ends_operation(step):
         _handle_confirmed_service_followups(
             shell,
             domain=domain,
@@ -409,13 +440,15 @@ def _run_native_smb_service_access_sweep(
     password,
     targets,
     prompt,
+    coverage: SweepCoverage | None = None,
 ) -> bool:
     """Run a native aiosmb SMB admin-access sweep and persist the results.
 
     Mirrors :func:`_run_winrm_psrp_service_access_sweep`: posture-aware,
     bounded concurrency, TCP pre-filter on 445, normalized findings, probe
     history persistence, attack-graph edge recording, and the batched SMB
-    follow-up UX. Returns whether any host confirmed admin access.
+    follow-up UX. Returns whether any host confirmed admin access. Runs as a
+    long scan-control step (see the WinRM sweep).
     """
     from adscan_internal.services.async_bridge import run_async_sync
 
@@ -465,60 +498,70 @@ def _run_native_smb_service_access_sweep(
         )
         return False
 
-    findings = run_async_sync(
-        run_smb_access_probe_sweep(
-            domain=domain,
-            username=username,
-            password=sweep_cred.password,
-            nt_hash=sweep_cred.nt_hash,
-            aes_key=sweep_cred.aes_key,
-            ccache_path=sweep_cred.ccache_path,
-            targets=targets,
-            auth_domain=auth_domain,
-            kdc_ip=dc_ip or None,
-            target_hostnames=target_hostnames,
-            max_workers=get_smb_probe_worker_count(),
-            posture_sink=posture_sink,
-            posture_snapshot=posture_snapshot,
+    sweep_coverage = coverage if coverage is not None else SweepCoverage()
+    with service_sweep_step("smb") as step:
+        findings = run_async_sync(
+            run_smb_access_probe_sweep(
+                domain=domain,
+                username=username,
+                password=sweep_cred.password,
+                nt_hash=sweep_cred.nt_hash,
+                aes_key=sweep_cred.aes_key,
+                ccache_path=sweep_cred.ccache_path,
+                targets=targets,
+                auth_domain=auth_domain,
+                kdc_ip=dc_ip or None,
+                target_hostnames=target_hostnames,
+                max_workers=get_smb_probe_worker_count(),
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+                should_stop=step.should_stop,
+                coverage=sweep_coverage,
+                shell=shell,
+            )
         )
-    )
+        finish_sweep_step(step, sweep_coverage)
 
-    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
-    if findings:
-        render_service_access_results(
-            service="smb",
-            username=username,
-            findings=findings,
-            total_targets=len(targets),
-        )
-    else:
-        render_no_confirmed_service_access(
-            service="smb",
-            username=username,
-            total_targets=len(targets),
-        )
+        confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+        tested_targets = checked_only(targets, sweep_coverage)
+        not_checked = len(sweep_coverage.not_checked)
+        if findings:
+            render_service_access_results(
+                service="smb",
+                username=username,
+                findings=findings,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        else:
+            render_no_confirmed_service_access(
+                service="smb",
+                username=username,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        announce_not_checked(label=SERVICE_SWEEP_LABELS["smb"], coverage=sweep_coverage)
 
-    try:
-        record_service_access_probe_batch(
-            workspace_dir=workspace_dir,
-            domains_dir=domains_dir,
-            domain=domain,
-            username=username,
-            service="smb",
-            targets=targets,
-            confirmed_hosts=[finding.host for finding in confirmed_findings],
-            source="run_native_smb_service_access_sweep",
-            backend=SMB_ACCESS_PROBE_BACKEND,
-            pivot_capable=is_service_pivot_capable("smb"),
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[service-access] failed to persist native SMB probe history: {exc}"
-        )
+        try:
+            record_service_access_probe_batch(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+                username=username,
+                service="smb",
+                targets=tested_targets,
+                confirmed_hosts=[finding.host for finding in confirmed_findings],
+                source="run_native_smb_service_access_sweep",
+                backend=SMB_ACCESS_PROBE_BACKEND,
+                pivot_capable=is_service_pivot_capable("smb"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[service-access] failed to persist native SMB probe history: {exc}"
+            )
 
-    if confirmed_findings:
         for finding in confirmed_findings:
             try:
                 from adscan_internal.services.membership_snapshot import (
@@ -536,6 +579,8 @@ def _run_native_smb_service_access_sweep(
             except Exception as exc:  # noqa: BLE001
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
+
+    if confirmed_findings and not stop_ends_operation(step):
         _handle_confirmed_service_followups(
             shell,
             domain=domain,
@@ -660,6 +705,7 @@ def _run_native_mssql_service_access_sweep(
     password,
     targets,
     prompt,
+    coverage: SweepCoverage | None = None,
 ) -> bool:
     """Run a native impacket MSSQL login sweep and trigger the followups.
 
@@ -739,53 +785,69 @@ def _run_native_mssql_service_access_sweep(
         password=password,
     )
 
-    findings = run_async_sync(
-        run_mssql_access_probe_sweep(
-            domain=domain,
-            username=username,
-            secret=mssql_secret,
-            targets=targets,
-            target_hostnames=target_hostnames,
-            kdc_host=kdc_host,
-            max_workers=get_mssql_probe_worker_count(),
-            ntlm_fallback_secret=mssql_ntlm_fallback_secret,
+    sweep_coverage = coverage if coverage is not None else SweepCoverage()
+    with service_sweep_step("mssql") as step:
+        findings = run_async_sync(
+            run_mssql_access_probe_sweep(
+                domain=domain,
+                username=username,
+                secret=mssql_secret,
+                targets=targets,
+                target_hostnames=target_hostnames,
+                kdc_host=kdc_host,
+                max_workers=get_mssql_probe_worker_count(),
+                ntlm_fallback_secret=mssql_ntlm_fallback_secret,
+                should_stop=step.should_stop,
+                coverage=sweep_coverage,
+                shell=shell,
+            )
         )
-    )
+        finish_sweep_step(step, sweep_coverage)
 
-    confirmed_findings = [finding for finding in findings if finding.is_confirmed]
-    if findings:
-        render_service_access_results(
-            service="mssql",
-            username=username,
-            findings=findings,
-            total_targets=len(targets),
-        )
-    else:
-        render_no_confirmed_service_access(
-            service="mssql",
-            username=username,
-            total_targets=len(targets),
-        )
+        confirmed_findings = [finding for finding in findings if finding.is_confirmed]
+        tested_targets = checked_only(targets, sweep_coverage)
+        not_checked = len(sweep_coverage.not_checked)
+        if findings:
+            render_service_access_results(
+                service="mssql",
+                username=username,
+                findings=findings,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        else:
+            render_no_confirmed_service_access(
+                service="mssql",
+                username=username,
+                total_targets=len(tested_targets),
+                not_checked=not_checked,
+            )
+        announce_not_checked(label=SERVICE_SWEEP_LABELS["mssql"], coverage=sweep_coverage)
 
-    try:
-        record_service_access_probe_batch(
-            workspace_dir=workspace_dir,
-            domains_dir=domains_dir,
-            domain=domain,
-            username=username,
-            service="mssql",
-            targets=targets,
-            confirmed_hosts=[finding.host for finding in confirmed_findings],
-            source="run_native_mssql_service_access_sweep",
-            backend=MSSQL_ACCESS_PROBE_BACKEND,
-            pivot_capable=is_service_pivot_capable("mssql"),
-        )
-    except Exception as exc:  # noqa: BLE001
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        print_info_debug(
-            f"[service-access] failed to persist native MSSQL probe history: {exc}"
-        )
+        try:
+            record_service_access_probe_batch(
+                workspace_dir=workspace_dir,
+                domains_dir=domains_dir,
+                domain=domain,
+                username=username,
+                service="mssql",
+                targets=tested_targets,
+                confirmed_hosts=[finding.host for finding in confirmed_findings],
+                source="run_native_mssql_service_access_sweep",
+                backend=MSSQL_ACCESS_PROBE_BACKEND,
+                pivot_capable=is_service_pivot_capable("mssql"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            print_info_debug(
+                f"[service-access] failed to persist native MSSQL probe history: {exc}"
+            )
+
+    if stop_ends_operation(step):
+        # A skipped phase or a stopped scan: what was checked is recorded;
+        # the authorization collection and the follow-ups are not started.
+        return bool(confirmed_findings)
 
     # Edge materialization — delegate to the SSOT collector for this credential
     # (proper SID correlation + group blast-radius + evidence). This replaces the
@@ -904,7 +966,23 @@ def _select_effective_service_targets(
     By default, previously tested targets are skipped. When every target was
     already checked, the caller may offer a re-check prompt with a default of
     ``No`` so the operator can intentionally opt back into reprobing.
+
+    Engagement scope: every target list a sweep is about to use passes through
+    here (the first choice, a re-check, and each broader-scope retry), so the
+    scope is applied here once, before the probe history is read. A host the
+    scope excludes is never probed, never offered for a re-check and never
+    written to the probe history; a broader target scope cannot bring it back.
     """
+    prepare_targets_for_scope(shell, current_targets, domain=domain)
+    current_targets = partition_targets_in_scope(
+        shell,
+        current_targets,
+        surface=service_sweep_step_id(service),
+        what=SERVICE_SWEEP_LABELS.get(
+            str(service or "").strip().lower(), f"{str(service).upper()} access sweep"
+        ),
+        domain=domain,
+    ).allowed
     if include_previously_tested:
         return list(current_targets)
 
@@ -1167,6 +1245,13 @@ def run_postauth_service_and_share_followup(
     )
     if not gate_check_runner(shell, NEW_CREDENTIAL_SHARE_ACCESS_CHECK_ID):
         return
+    # The live share view below connects to the domain's PDC (no host named).
+    from adscan_internal.cli.smb import pdc_share_host_in_scope  # noqa: PLC0415
+
+    if not pdc_share_host_in_scope(
+        shell, domain, surface="smb_share_enumeration", what="SMB share enumeration"
+    ):
+        return
     run_native_shares_view(
         shell,
         domain=domain,
@@ -1385,6 +1470,7 @@ def run_service_access_sweep(
                 print_info(
                     f"Starting {service} privilege enumeration for user {marked_username}"
                 )
+                sweep_coverage = SweepCoverage()
                 if service == "rdp":
                     print_info_debug(
                         "[privileges] service access sweep dispatch: "
@@ -1405,6 +1491,7 @@ def run_service_access_sweep(
                                 if cleaned_hosts
                                 else len(effective_target_list)
                             ),
+                            coverage=sweep_coverage,
                         )
                     )
                 elif service == "winrm":
@@ -1435,6 +1522,7 @@ def run_service_access_sweep(
                         targets=effective_target_list,
                         prompt=prompt,
                         workflow_intent=workflow_intent,
+                        coverage=sweep_coverage,
                     )
                 elif service == "smb":
                     print_info(
@@ -1456,6 +1544,7 @@ def run_service_access_sweep(
                         password=password,
                         targets=effective_target_list,
                         prompt=prompt,
+                        coverage=sweep_coverage,
                     )
                 elif service == "mssql":
                     print_info(
@@ -1477,6 +1566,7 @@ def run_service_access_sweep(
                         password=password,
                         targets=effective_target_list,
                         prompt=prompt,
+                        coverage=sweep_coverage,
                     )
                 else:
                     # Every service ADscan sweeps (smb, winrm, rdp, mssql) has a
@@ -1494,6 +1584,13 @@ def run_service_access_sweep(
                         f"No native access-check backend for service '{service}'; skipping."
                     )
                     found_hosts = False
+                if sweep_coverage.stopped:
+                    # The operator stopped this sweep: never widen its scope.
+                    # A skipped phase or a stopped scan or command also ends the
+                    # remaining services (their sweeps belong to the same stop).
+                    if _sweep_stop_ends_services():
+                        return
+                    break
                 if found_hosts or cleaned_hosts:
                     break
 
@@ -1540,6 +1637,12 @@ def run_service_access_sweep(
             telemetry.capture_exception(exc)
             print_error(f"Error processing service {service}.")
             print_exception(show_locals=False, exception=exc)
+
+
+def _sweep_stop_ends_services() -> bool:
+    """Whether the stop that ended a sweep also ends the remaining services."""
+    control = scan_control()
+    return bool(control.abort_requested() or control.phase_skip_active())
 
 
 _NEW_CREDENTIAL_PASSWORD_REUSE = "module:new_credential.password_reuse"

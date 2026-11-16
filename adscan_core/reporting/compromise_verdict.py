@@ -63,7 +63,11 @@ __all__ = [
     "NOT_EXECUTED_THIS_RUN",
     "OPERATOR_DECISION_ROUTES_KEY",
     "OUTSIDE_SCOPE_DOMAINS_KEY",
+    "OUTSIDE_SCOPE_OBJECTS_KEY",
+    "OUTSIDE_SCOPE_UNCONFIRMED_KEY",
     "outside_scope_domains_of",
+    "outside_scope_objects_of",
+    "unconfirmed_scope_objects_of",
     "REACH_ATTEMPTED",
     "REACH_ENTRY_PROVEN",
     "REACH_MAPPED",
@@ -78,6 +82,8 @@ __all__ = [
     "CompromiseVerdict",
     "aggregate_awaiting_wait_seconds",
     "aggregate_reach_evidence",
+    "HEADLINE_VALIDATED",
+    "scope_headline",
     "operator_awaiting_wait_seconds",
     "OPERATOR_AWAITING_WAIT_KEY",
     "derive_compromise_verdict",
@@ -128,6 +134,13 @@ OPERATOR_AWAITING_WAIT_KEY = "operator_awaiting_wait_seconds"
 #: domain compromise pass through, so the verdict can name them. Absent when
 #: there are none.
 OUTSIDE_SCOPE_DOMAINS_KEY = "outside_scope_domains"
+#: ``exposure_kpis`` key: the hosts and accounts the ASSET scope excluded on
+#: those routes (inside an in-scope domain), so the verdict names the object and
+#: never calls the client's own domain outside the scope. Absent when none.
+OUTSIDE_SCOPE_OBJECTS_KEY = "outside_scope_objects"
+#: ``exposure_kpis`` key: the objects on those routes the engine could not
+#: confirm as within the scope (left alone as a precaution). Absent when none.
+OUTSIDE_SCOPE_UNCONFIRMED_KEY = "outside_scope_unconfirmed_objects"
 
 #: How far the strongest route to domain compromise was executed. Drives the
 #: reach phrase (``reach_claim``) so a mapped route is never described as having
@@ -207,6 +220,29 @@ _SENTENCE_REASON: dict[str, tuple[str, str]] = {
 }
 
 
+#: The headline beside the exposure-to-domain-compromise figure, one per
+#: outcome. "Validated" is reserved for a route walked end to end: the release
+#: gate found the platform printing "Validated exposure to domain compromise"
+#: beside "Proven exposure 0%" for a scan that executed no route.
+HEADLINE_VALIDATED = "Validated exposure to domain compromise"
+HEADLINE_COMPROMISE_PROVEN = "Full domain compromise proven"
+HEADLINE_MAPPED_AWAITING = "Mapped exposure to domain compromise, awaiting approval"
+HEADLINE_MAPPED_NOT_EXECUTED = "Mapped exposure to domain compromise, not walked end to end"
+HEADLINE_HELD_ATTEMPTED = "Every route to domain compromise was attempted, none completed"
+HEADLINE_HELD_CLOSED = "Every route to domain compromise is closed by configuration"
+HEADLINE_NO_ROUTE = "No route to domain compromise found"
+HEADLINE_INCOMPLETE = "Assessment incomplete, so the outcome cannot be stated"
+#: Statement order when several domains share one headline (strongest first).
+_HEADLINE_KIND_ORDER = (
+    VERDICT_DOMAIN_COMPROMISED,
+    VERDICT_ASSESSMENT_INCOMPLETE,
+    VERDICT_ROUTES_NOT_EXECUTED,
+    VERDICT_ROUTES_AWAITING_OPERATOR,
+    VERDICT_HELD,
+    VERDICT_NO_ROUTE_FOUND,
+)
+
+
 @dataclass(frozen=True)
 class CompromiseVerdict:
     """The outcome a surface may state for one domain.
@@ -227,6 +263,10 @@ class CompromiseVerdict:
     causes: tuple[tuple[str, int], ...] = field(default_factory=tuple)
     missing_phases: tuple[str, ...] = ()
     outside_scope_domains: tuple[str, ...] = ()
+    #: Excluded hosts or accounts the unexecuted routes pass through (display form).
+    outside_scope_objects: tuple[str, ...] = ()
+    #: Objects those routes pass through that could not be confirmed as in scope.
+    unconfirmed_scope_objects: tuple[str, ...] = ()
     #: The recorded wait of the approval requests that timed out (seconds); 0
     #: when the routes awaiting approval had nobody to ask.
     awaiting_wait_seconds: int = 0
@@ -289,6 +329,31 @@ class CompromiseVerdict:
             return "assessment incomplete"
         return "full domain compromise"
 
+    def headline(self) -> str:
+        """The short headline a surface prints beside the exposure figure.
+
+        "Validated" leads only when a route to full domain compromise was walked
+        end to end. A route that was mapped and not executed reads as mapped; the
+        reasons are stated by :meth:`sentence`, beside the headline.
+        """
+        if self.proven > 0:
+            return HEADLINE_VALIDATED
+        if self.kind == VERDICT_DOMAIN_COMPROMISED:
+            # Domain Admin control proven by other evidence; no route was walked
+            # end to end, so the figure beside it is not "validated".
+            return HEADLINE_COMPROMISE_PROVEN
+        if self.kind == VERDICT_ASSESSMENT_INCOMPLETE:
+            return HEADLINE_INCOMPLETE
+        if self.kind == VERDICT_ROUTES_AWAITING_OPERATOR:
+            return HEADLINE_MAPPED_AWAITING
+        if self.kind == VERDICT_ROUTES_NOT_EXECUTED:
+            return HEADLINE_MAPPED_NOT_EXECUTED
+        if self.kind == VERDICT_HELD:
+            if self.closed and not self.attempted:
+                return HEADLINE_HELD_CLOSED
+            return HEADLINE_HELD_ATTEMPTED
+        return HEADLINE_NO_ROUTE
+
     def sentence(self) -> str:
         """A full client sentence (or two) for a report or the platform."""
         if self.kind == VERDICT_DOMAIN_COMPROMISED:
@@ -322,6 +387,14 @@ class CompromiseVerdict:
                 one, many = _outside_scope_clauses(
                     self.outside_scope_domains, entry_proven=self.entry_proven > 0
                 )
+            elif reason == NOT_EXECUTED_OUTSIDE_SCOPE and (
+                self.outside_scope_objects or self.unconfirmed_scope_objects
+            ):
+                one, many = _asset_scope_clauses(
+                    self.outside_scope_objects,
+                    self.unconfirmed_scope_objects,
+                    entry_proven=self.entry_proven > 0,
+                )
             if reason == NOT_EXECUTED_THIS_RUN and self.entry_proven and not self.not_executed:
                 one = "was walked only as far as its entry step"
                 many = "were walked only as far as their entry step"
@@ -343,11 +416,51 @@ class CompromiseVerdict:
             "closed": self.closed,
             "causes": [{"reason": r, "routes": n} for r, n in self.causes],
             "outside_scope_domains": list(self.outside_scope_domains),
+            "outside_scope_objects": list(self.outside_scope_objects),
+            "unconfirmed_scope_objects": list(self.unconfirmed_scope_objects),
             "awaiting_wait_seconds": self.awaiting_wait_seconds,
             "reach_evidence": self.reach_evidence,
             "recap_phrase": self.recap_phrase(),
+            "headline": self.headline(),
             "sentence": self.sentence(),
         }
+
+
+def _join_names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _asset_scope_clauses(
+    excluded: tuple[str, ...], unconfirmed: tuple[str, ...], *, entry_proven: bool
+) -> tuple[str, str]:
+    """The fourth reason's clauses for objects inside an in-scope domain.
+
+    ``excluded`` are the hosts and accounts the client excluded ("excluded from
+    the engagement scope"); ``unconfirmed`` those the engine could not confirm as
+    within the scope ("not confirmed as within the engagement scope"). Each is
+    named in its own words, and neither ever reads as a domain the client owns
+    being "outside" the scope.
+    """
+    parts: list[str] = []
+    if excluded:
+        verb = "is" if len(excluded) == 1 else "are"
+        parts.append(f"{_join_names(list(excluded))}, which {verb} excluded from the engagement scope")
+    if unconfirmed:
+        verb = "was" if len(unconfirmed) == 1 else "were"
+        parts.append(
+            f"{_join_names(list(unconfirmed))}, which {verb} not confirmed as within the "
+            "engagement scope"
+        )
+    where = ", or ".join(parts)
+    if entry_proven:
+        return (
+            f"was walked up to {where}, and not executed past it",
+            f"were walked up to {where}, and not executed past it",
+        )
+    return (
+        f"was mapped and not executed because it passes through {where}",
+        f"were mapped and not executed because they pass through {where}",
+    )
 
 
 def _outside_scope_clauses(
@@ -355,7 +468,7 @@ def _outside_scope_clauses(
 ) -> tuple[str, str]:
     """The fourth reason's clauses, naming the out-of-scope domains it crosses."""
     names = list(domains)
-    where = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    where = _join_names(names)
     verb = "is" if len(names) == 1 else "are"
     if entry_proven:
         return (
@@ -401,6 +514,48 @@ def outside_scope_domains_of(records: Iterable[Any]) -> list[str]:
         if isinstance(steps, list):
             found.update(split_route_at_scope(steps).out_domains)
     return sorted(found)
+
+
+def outside_scope_objects_of(records: Iterable[Any]) -> list[str]:
+    """The excluded hosts and accounts the unproven routes to full compromise cross.
+
+    The asset-scope twin of :func:`outside_scope_domains_of`, read from the same
+    route split, in display form (the humanization SSOT). In route order,
+    de-duplicated. Only the client's exclusions; the objects the engine could
+    not confirm as in scope are :func:`unconfirmed_scope_objects_of`.
+    """
+    return _asset_objects_of(records, unconfirmed=False)
+
+
+def unconfirmed_scope_objects_of(records: Iterable[Any]) -> list[str]:
+    """The objects those routes cross that could not be confirmed as in scope."""
+    return _asset_objects_of(records, unconfirmed=True)
+
+
+def _asset_objects_of(records: Iterable[Any], *, unconfirmed: bool) -> list[str]:
+    from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+        asset_objects_display,
+        split_route_at_scope,
+    )
+    from adscan_core.scan_policy.annotate import (  # noqa: PLC0415
+        route_not_executed_cause,
+    )
+
+    found: list[str] = []
+    for record in records or ():
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("compromise_class") or "").strip().lower() != "domain_breaker":
+            continue
+        if str(record.get("status") or "").strip().lower() in _PROVEN:
+            continue
+        if route_not_executed_cause(record) != NOT_EXECUTED_OUTSIDE_SCOPE:
+            continue
+        steps = record.get("steps")
+        if isinstance(steps, list):
+            split = split_route_at_scope(steps)
+            found.extend(split.unconfirmed_objects if unconfirmed else split.out_objects)
+    return asset_objects_display(found)
 
 
 def _short_reason(reason: str) -> str:
@@ -486,6 +641,8 @@ def derive_compromise_verdict(
     operator_decisions: Mapping[str, Any] | None = None,
     outside_scope_domains: Iterable[str] = (),
     awaiting_wait_seconds: int = 0,
+    outside_scope_objects: Iterable[str] = (),
+    unconfirmed_scope_objects: Iterable[str] = (),
 ) -> CompromiseVerdict:
     """Return the verdict for one domain's ``path_axis.domain_breaker`` bucket.
 
@@ -550,6 +707,17 @@ def derive_compromise_verdict(
         )
     )
 
+    scope_objects = tuple(
+        dict.fromkeys(
+            str(o).strip() for o in (outside_scope_objects or ()) if str(o or "").strip()
+        )
+    )
+    unconfirmed_objects = tuple(
+        dict.fromkeys(
+            str(o).strip() for o in (unconfirmed_scope_objects or ()) if str(o or "").strip()
+        )
+    )
+
     def _make(kind: str) -> CompromiseVerdict:
         return CompromiseVerdict(
             kind=kind,
@@ -562,6 +730,8 @@ def derive_compromise_verdict(
             causes=causes,
             missing_phases=missing,
             outside_scope_domains=scope_domains,
+            outside_scope_objects=scope_objects,
+            unconfirmed_scope_objects=unconfirmed_objects,
             awaiting_wait_seconds=_int(awaiting_wait_seconds),
         )
 
@@ -617,6 +787,8 @@ def verdict_from_kpis(
     bucket = path_axis.get("domain_breaker") if isinstance(path_axis, Mapping) else None
     decisions = kpis.get(OPERATOR_DECISION_ROUTES_KEY)
     scope_domains = kpis.get(OUTSIDE_SCOPE_DOMAINS_KEY)
+    scope_objects = kpis.get(OUTSIDE_SCOPE_OBJECTS_KEY)
+    unconfirmed_objects = kpis.get(OUTSIDE_SCOPE_UNCONFIRMED_KEY)
     return derive_compromise_verdict(
         bucket,
         domain_compromised=domain_compromised,
@@ -625,7 +797,31 @@ def verdict_from_kpis(
         operator_decisions=decisions if isinstance(decisions, Mapping) else None,
         outside_scope_domains=scope_domains if isinstance(scope_domains, (list, tuple)) else (),
         awaiting_wait_seconds=_int(kpis.get(OPERATOR_AWAITING_WAIT_KEY)),
+        outside_scope_objects=scope_objects if isinstance(scope_objects, (list, tuple)) else (),
+        unconfirmed_scope_objects=(
+            unconfirmed_objects if isinstance(unconfirmed_objects, (list, tuple)) else ()
+        ),
     )
+
+
+def scope_headline(verdicts: Iterable[CompromiseVerdict]) -> str:
+    """One headline for several domains stated together (an "all domains" view).
+
+    "Validated" leads only when some domain proved a route end to end; otherwise
+    the strongest outcome in :data:`_HEADLINE_KIND_ORDER` speaks for the scope,
+    so a scope never claims more than its strongest domain proves.
+    """
+    items = [v for v in verdicts if isinstance(v, CompromiseVerdict)]
+    proven = [v for v in items if v.proven > 0]
+    if proven:
+        return proven[0].headline()
+    for kind in _HEADLINE_KIND_ORDER:
+        match = [v for v in items if v.kind == kind]
+        if match:
+            # Among held domains, an attempted route outranks a configuration close.
+            match.sort(key=lambda v: 0 if v.attempted else 1)
+            return match[0].headline()
+    return HEADLINE_NO_ROUTE
 
 
 def aggregate_awaiting_wait_seconds(verdicts: Iterable[CompromiseVerdict]) -> int:

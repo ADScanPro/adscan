@@ -41,6 +41,7 @@ from adscan_core.scan_policy.model import (
     CheckDefinition,
 )
 from adscan_core.scan_policy.registry import CheckRegistry, load_registry
+from adscan_core.output._state import markup_object_label
 from adscan_internal import telemetry
 from adscan_internal.rich_output import mark_sensitive
 
@@ -373,7 +374,7 @@ def refuse(
     if operator_required:
         if target:
             line = (
-                f"{rich_markup_escape(title)} on {mark_sensitive(target, 'node')} "
+                f"{rich_markup_escape(title)} on {markup_object_label(target)} "
                 f"{suffix}"
             )
         else:
@@ -430,8 +431,8 @@ def refuse(
     print_info_debug(
         "scan-policy refuse: "
         f"check={mark_sensitive(resolved_id or '?', 'detail')} surface={surface} "
-        f"from={mark_sensitive(from_label or 'N/A', 'node')} "
-        f"to={mark_sensitive(target or 'N/A', 'node')} first={first_time}"
+        f"from={markup_object_label(from_label or 'N/A')} "
+        f"to={markup_object_label(target or 'N/A')} first={first_time}"
     )
 
     notes = scan_policy_note(resolved_id)

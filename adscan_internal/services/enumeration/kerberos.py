@@ -413,6 +413,86 @@ def _format_userenum_response_distribution(
     return summary
 
 
+def _userenum_wordlist_in_scope(
+    wordlist: str, *, domain: str, output_file: Path
+) -> "tuple[str, Path | None]":
+    """The word list a user enumeration may send, under the engagement scope.
+
+    Returns ``(path, copy)``. Without an asset scope it is the caller's own list
+    and no copy (no cost, nothing written). With one, the candidates are
+    streamed through the scope SSOT (one verdict per name, through the shared
+    account-list seam) into a copy beside the tool's output file, holding only
+    the names that may be asked about; ``copy`` is that file, for the caller to
+    remove afterwards. A list that cannot be checked is not sent: ``("", None)``.
+    """
+    try:
+        from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+            principal_scope_predicate_for_session,
+        )
+
+        allowed = principal_scope_predicate_for_session(domain)
+    except Exception as exc:  # noqa: BLE001 - an unreadable scope is never a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        print_warning(
+            "Kerberos user enumeration not run: the candidate names could not be "
+            "checked against the engagement scope."
+        )
+        return "", None
+    if allowed is None:
+        return wordlist, None
+    copy = output_file.with_name(f"{output_file.name}.in-scope-candidates.txt")
+    kept = 0
+    left_out = 0
+    try:
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            open(wordlist, encoding="utf-8", errors="ignore") as source,
+            open(copy, "w", encoding="utf-8") as target,
+        ):
+            for line in source:
+                name = line.strip()
+                if not name:
+                    continue
+                if allowed(name):
+                    target.write(f"{name}\n")
+                    kept += 1
+                else:
+                    left_out += 1
+    except Exception as exc:  # noqa: BLE001 - an unchecked list is never sent
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        _remove_userenum_scope_copy(copy)
+        print_warning(
+            "Kerberos user enumeration not run: the candidate names could not be "
+            "checked against the engagement scope."
+        )
+        return "", None
+    if left_out:
+        noun = "name" if left_out == 1 else "names"
+        print_info(
+            f"Kerberos user enumeration left out {left_out} candidate {noun} that the "
+            "engagement scope excludes or that could not be confirmed inside it."
+        )
+    if not kept:
+        _remove_userenum_scope_copy(copy)
+        print_info(
+            "Kerberos user enumeration not run: no candidate name is inside the engagement scope."
+        )
+        return "", None
+    return str(copy), copy
+
+
+def _remove_userenum_scope_copy(copy: "Path | None") -> None:
+    """Remove the scope-filtered word list copy (best effort)."""
+    if copy is None:
+        return
+    try:
+        copy.unlink(missing_ok=True)
+    except OSError as exc:
+        print_info_debug(f"[userenum] could not remove the scope-filtered word list: {exc}")
+
+
 def _default_executor(command: str, timeout: int) -> subprocess.CompletedProcess[str]:
     """Execute a command using the shared command runner.
 
@@ -696,7 +776,22 @@ def _stream_userenum_into_dashboard(
     seen_valid: set[str] = set()
     state = {"tested": 0}
 
+    def _report_tested_to_step() -> None:
+        # Carry "N of M tried" to the active scan-control long step, so a stop's
+        # declared gap and the web event say how far the enumeration got. The
+        # enum runs directly inside the user-enum long step (cli_cooperative_stop),
+        # so the active step is that one. Best-effort; never breaks the run.
+        try:
+            from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
+            step = scan_control().current_step()
+            if step is not None and getattr(step, "long", False):
+                step.progress(done=state["tested"])
+        except Exception:  # noqa: BLE001 — progress reporting never breaks the run
+            pass
+
     def _push_frame(last: "str | None") -> None:
+        _report_tested_to_step()
         try:
             if early_stop is not None:
                 # Live early-stop budget footer (found N/target · idle · cap).
@@ -1365,6 +1460,44 @@ class KerberosEnumerationMixin:
             message=f"Enumerating users via Kerberos on {domain}",
         )
 
+        # Engagement scope: kerbrute is a separate process, so neither the
+        # sign-in guard nor the egress backstop sees what it sends. It is
+        # pointed at one domain controller, asked about here, right before the
+        # child starts (a Kerberos exchange is a directory contact).
+        from adscan_internal.services.engagement_scope import Contact  # noqa: PLC0415
+        from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+            subprocess_host_in_scope,
+        )
+
+        if not subprocess_host_in_scope(
+            None,
+            pdc,
+            surface="kerberos_user_enumeration",
+            what="Kerberos user enumeration",
+            domain=domain,
+            contact=Contact("kerberos"),
+        ):
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="kerberos_user_enumeration",
+                progress=1.0,
+                message="Kerberos user enumeration not run",
+            )
+            return []
+        # The word list is the gate on the names: a name the client excluded is
+        # never in it.
+        wordlist, scope_wordlist_copy = _userenum_wordlist_in_scope(
+            wordlist, domain=domain, output_file=output_file
+        )
+        if not wordlist:
+            self.parent._emit_progress(
+                scan_id=scan_id,
+                phase="kerberos_user_enumeration",
+                progress=1.0,
+                message="Kerberos user enumeration not run",
+            )
+            return []
+
         # Build kerbrute command. ``-v`` makes kerbrute log ONE line per
         # ATTEMPTED username (valid AND invalid) -- empirically confirmed
         # against lab.local @ 10.99.0.1 (kerbrute v1.0.3). Counting those lines
@@ -1512,6 +1645,8 @@ class KerberosEnumerationMixin:
                 message="Kerberos user enumeration failed",
             )
             return []
+        finally:
+            _remove_userenum_scope_copy(scope_wordlist_copy)
 
         if getattr(result, "cancelled", False):
             # An early stop fired mid-run: either the operator (Ctrl+C) / platform

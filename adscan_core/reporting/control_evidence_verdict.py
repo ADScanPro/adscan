@@ -346,8 +346,45 @@ def resolve_control_verdict(
         if isinstance(block, Mapping):
             verdict = anti_malware_verdict_from_block(block)
             if verdict is not None:
-                return verdict
-    return _record_verdict(control)
+                return _drop_excluded_hosts(verdict, domain_data)
+    return _drop_excluded_hosts(_record_verdict(control), domain_data)
+
+
+def _drop_excluded_hosts(
+    verdict: ControlVerdict, domain_data: Mapping[str, Any] | None
+) -> ControlVerdict:
+    """Never credit a control on the strength of an excluded host alone.
+
+    A host the client excluded from the engagement scope was never contacted, so
+    a positive reading that rests only on excluded hosts is not evidence the
+    control holds: it is a coverage gap the client asked for. When every host a
+    green reading names is excluded, the verdict becomes ``incomplete`` and the
+    control carries none, exactly as a not-assessed control does. SSOT for the
+    excluded hosts: ``engagement_scope.excluded_host_aliases``.
+    """
+    if verdict.verdict != VERDICT_OBSERVED_GOOD or not verdict.observed_hosts:
+        return verdict
+    try:
+        from adscan_core.reporting.engagement_scope import (  # noqa: PLC0415
+            excluded_host_aliases,
+        )
+
+        excluded = excluded_host_aliases(domain_data)
+    except Exception:  # noqa: BLE001 - without the set, credit the record as read
+        return verdict
+    if not excluded:
+        return verdict
+    kept = [h for h in verdict.observed_hosts if display_host(h) not in excluded]
+    if kept:
+        return verdict
+    return ControlVerdict(
+        verdict=VERDICT_INCOMPLETE,
+        statement=(
+            "The only hosts this control was observed on were excluded from the "
+            "engagement scope at your request, so it was not assessed. A control "
+            "is credited only on a host the assessment reached."
+        ),
+    )
 
 
 __all__ = [

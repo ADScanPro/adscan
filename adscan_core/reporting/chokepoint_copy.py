@@ -480,13 +480,15 @@ def reach_uniform_note(
         # the numbers that actually rank the rows. The overlap caveat is not
         # repeated here: the headline SSOT states it once.
         if foothold_fixes > 0 and reach_fixes:
+            # Where those routes start is each row's own statement (it reads the
+            # kinds of its sources); this note only says no ordinary user is on them.
             others = (
-                "The other fix closes only routes that start from a computer or "
-                "group foothold, and its row says so."
+                "The other fix closes only routes no ordinary user account runs "
+                "through, and its row says so."
                 if foothold_fixes == 1
                 else (
-                    f"The other {foothold_fixes:,} close only routes that start from "
-                    f"a computer or group foothold, and their rows say so."
+                    f"The other {foothold_fixes:,} close only routes no ordinary "
+                    f"user account runs through, and their rows say so."
                 )
             )
             tail = _uniform_order_tail(containment_count)
@@ -507,22 +509,60 @@ def reach_uniform_note(
     )
 
 
-def _foothold_reach_sentence(paths_broken: int, *, executed: bool) -> str:
+#: The source kinds a "foothold" sentence may name. Anything else is not one.
+_FOOTHOLD_KIND_PHRASE: dict[frozenset[str], str] = {
+    frozenset({"computer"}): "computer footholds",
+    frozenset({"group"}): "group footholds",
+    frozenset({"computer", "group"}): "computer or group footholds",
+}
+
+
+def normalize_source_kinds(source_kinds: object) -> frozenset[str]:
+    """The distinct, lower-cased source kinds of a row's paths (``unknown`` kept)."""
+    if not isinstance(source_kinds, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(str(kind).strip().lower() for kind in source_kinds if str(kind).strip())
+
+
+def _foothold_reach_sentence(
+    paths_closed: int, *, executed: bool, source_kinds: object = None
+) -> str:
     """Return the honest lead for a fix no ordinary USER account runs through.
 
-    A fix can break real attack paths while reaching 0% of ordinary users: its
-    paths originate from computer or group footholds, not user accounts. Rendering
-    "0% of users" beside "eliminates N paths" reads as a bug; this states the
-    honest reason instead. Client-safe: no em-dash, no percentage.
+    A fix can break real attack paths while reaching 0% of ordinary users.
+    Rendering "0% of users" beside "eliminates N paths" reads as a bug; this
+    states the reason instead. Two rules, both from a release-gate defect:
+
+    * ``paths_closed`` is EVERY path the fix closes (the row's all-status
+      count), because the clause says "the N attack paths it closes". It once
+      received the executed count, so a row read "the 1 attack path it closes"
+      beside "6 of 10 attack paths in total".
+    * Where the paths start is read from ``source_kinds``, the kinds of the
+      principals those paths actually start from. "Computer or group footholds"
+      is said only when every source is a computer or a group. A source that is
+      a user account outside the ordinary population is named as that, and when
+      the kinds are not known the sentence says nothing about the origin.
+
+    Client-safe: no em-dash, no percentage.
     """
-    routes_noun = "attack path" if paths_broken == 1 else "attack paths"
+    routes_noun = "attack path" if paths_closed == 1 else "attack paths"
     verb = "closes" if executed else "would close"
-    originate = "originates" if paths_broken == 1 else "originate"
-    return (
-        f"No ordinary user account runs through this technique; the "
-        f"{paths_broken:,} {routes_noun} it {verb} {originate} from computer or "
-        f"group footholds."
-    )
+    head = "No ordinary user account runs through this technique"
+    kinds = normalize_source_kinds(source_kinds)
+    phrase = _FOOTHOLD_KIND_PHRASE.get(kinds)
+    if phrase:
+        originate = "originates" if paths_closed == 1 else "originate"
+        return (
+            f"{head}; the {paths_closed:,} {routes_noun} it {verb} {originate} "
+            f"from {phrase}."
+        )
+    if kinds and kinds <= {"user", "computer", "group"}:
+        start = "starts" if paths_closed == 1 else "start"
+        return (
+            f"{head}; the {paths_closed:,} {routes_noun} it {verb} {start} from "
+            f"accounts outside the ordinary user population."
+        )
+    return f"{head}."
 
 
 def _count_noun(count: int, singular: str, plural: str) -> str:
@@ -805,6 +845,7 @@ def remediation_item_line(
     reach_total: int | None = None,
     reach_pct: float | None = None,
     reach_is_uniform: bool = False,
+    source_kinds: object = None,
 ) -> str:
     """Return the per-item client line for a prioritised remediation.
 
@@ -862,6 +903,9 @@ def remediation_item_line(
             not exceed ``paths_broken`` (nothing wider to state).
         total_mapped: The denominator for ``mapped_breadth`` (the all-status
             total in scope). Required alongside ``mapped_breadth``.
+        source_kinds: The object kinds of the principals this row's paths start
+            from (``TechniquePriority.source_kinds``). Read only by the lead of a
+            row no ordinary user runs through, to say where its paths start.
 
     Returns:
         A single human-grade English line. No em-dash. A percentage appears only
@@ -877,7 +921,14 @@ def remediation_item_line(
     #    once) and lead the row with the discriminating attack-path count.
     #  * reach VARIES -> the affected-user reach lead is the discriminator.
     if reach_total and reach_users == 0:
-        lead: str | None = _foothold_reach_sentence(paths_broken, executed=executed)
+        # "The N attack paths it closes" is every path the fix closes: the
+        # all-status breadth on an executed row, the row's own count otherwise.
+        paths_closed = (
+            mapped_breadth if executed and mapped_breadth is not None else paths_broken
+        )
+        lead: str | None = _foothold_reach_sentence(
+            paths_closed, executed=executed, source_kinds=source_kinds
+        )
     elif reach_is_uniform:
         lead = None
     else:

@@ -20,8 +20,28 @@ def activate_workspace(shell: Any, *, workspaces_dir: str, workspace_name: str) 
         Absolute workspace directory path.
     """
     paths = resolve_workspace_paths(workspaces_dir, workspace_name)
+    # The graph stores of the workspace being left: export what its session changed
+    # and close them BEFORE the shell points at another workspace (the export reads
+    # the session's domains_data, which describes only the current workspace).
+    try:
+        from adscan_internal.services.graph_runtime import close_graph_stores
+
+        close_graph_stores(shell)
+    except Exception as exc:  # noqa: BLE001 - never block a workspace switch
+        from adscan_core.rich_output import print_exception
+
+        print_exception(exception=exc)
     shell.current_workspace = workspace_name
     shell.current_workspace_dir = paths.root
+    # The memory sentinel's marker follows the active workspace.
+    try:
+        from adscan_internal.services.memory_sentinel_wiring import (
+            point_sentinel_marker_at,
+        )
+
+        point_sentinel_marker_at(paths.root)
+    except Exception:  # noqa: BLE001 - never block a workspace switch
+        pass
 
     # Initialise the environment change ledger for the newly activated workspace.
     # Wrapped in a broad except so a ledger failure never blocks workspace activation.

@@ -20,6 +20,10 @@ OUTPUT_IO_CONTAINER_DIR = f"{CONTAINER_IO_ROOT}/output"
 # can save a copy of a report outside ADscan's own tree. See
 # ``adscan_core.deliverable_destination``.
 DELIVERABLES_CONTAINER_DIR = f"{CONTAINER_IO_ROOT}/deliverables"
+# Engagement-scope files (``--scope-allow-file`` / ``--scope-deny-file``): each
+# host file is mounted read-only here under its own name, one sub-folder per
+# file, so the engine reads (and names in an error) the file the operator gave.
+SCOPE_IO_CONTAINER_DIR = f"{CONTAINER_IO_ROOT}/scope"
 
 
 def is_container_io_path(path: str) -> bool:
@@ -32,5 +36,6 @@ __all__ = [
     "DELIVERABLES_CONTAINER_DIR",
     "OUTPUT_IO_CONTAINER_DIR",
     "POLICY_IO_CONTAINER_DIR",
+    "SCOPE_IO_CONTAINER_DIR",
     "is_container_io_path",
 ]

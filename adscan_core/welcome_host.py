@@ -117,6 +117,12 @@ def print_welcome_host(
         parts.append(f"[dim]{version_tag}[/dim]")
     parts.append(f"[{badge_style}]{str(license_mode).upper()}[/{badge_style}]")
     out.print("  ".join(parts))
+    # PRO: one line on the licence (contract end, or no end date).
+    from adscan_core.pro_license.status_view import banner_text
+
+    licence_line = banner_text(license_mode)
+    if licence_line is not None:
+        out.print(licence_line)
 
     out.print(
         f"  [bold {ADSCAN_PRIMARY}]{WELCOME_HEADLINE}[/bold {ADSCAN_PRIMARY}]"
@@ -219,40 +225,6 @@ def load_latest_posture_host() -> tuple[PostureScore | None, str | None, int | N
 # ---------------------------------------------------------------------------
 
 
-def _load_pro_license_metadata() -> tuple[str, str]:
-    """Return ``(org, expires)`` from ``~/.adscan/license.json`` defensively.
-
-    Falls back to ``("registered", "no expiration")`` on any failure so the
-    intro never breaks because the license file is missing or malformed.
-    """
-    org = "registered"
-    expires = "no expiration"
-    try:
-        from adscan_core.paths import get_adscan_home_dir
-
-        license_path = get_adscan_home_dir() / "license.json"
-        if not license_path.exists():
-            return org, expires
-        data = json.loads(license_path.read_text())
-    except Exception as exc:  # noqa: BLE001 — defensive: never fail the intro
-        telemetry.capture_exception(exc)
-        print_exception(exception=exc)
-        return org, expires
-
-    if not isinstance(data, dict):
-        return org, expires
-
-    org_val = data.get("org") or data.get("organization") or data.get("customer")
-    if isinstance(org_val, str) and org_val.strip():
-        org = org_val.strip()
-
-    exp_val = data.get("expires") or data.get("expiration") or data.get("expires_at")
-    if isinstance(exp_val, str) and exp_val.strip():
-        expires = exp_val.strip()
-
-    return org, expires
-
-
 def _render_intro_lite() -> Group:
     """Render the LITE intro body (without the brand ASCII / logo strip).
 
@@ -285,27 +257,19 @@ def _render_intro_lite() -> Group:
     )
 
 
-def _render_intro_pro(*, org: str | None = None, expires: str | None = None) -> Group:
-    """Render the PRO intro body with license metadata.
+def _render_intro_pro() -> Group:
+    """Render the PRO intro body.
 
-    Args:
-        org: Organization name from ``license.json``. Falls back to a
-            defensive read when ``None``.
-        expires: Expiration string from ``license.json``. Falls back to
-            a defensive read when ``None``.
+    It carries no licence line of its own. The licence is stated once, by the
+    banner directly above it (``status_view.banner_text``, read from the signed
+    licence). A second line here read a retired ``license.json`` that no longer
+    exists, fell back to "registered · expires no expiration", and printed that
+    under a banner reading "licence until 28 Dec 2026".
     """
-    if org is None or expires is None:
-        loaded_org, loaded_exp = _load_pro_license_metadata()
-        org = org or loaded_org
-        expires = expires or loaded_exp
-
     headline = Text(
         "ADscan PRO — your client deliverable kit is ready",
         style=f"bold {_BRAND_CYAN}",
     )
-    license_line = Text()
-    license_line.append("License: ", style="bold")
-    license_line.append(f"{org} · expires {expires}")
 
     cmd_demo = Text()
     cmd_demo.append("  adscan demo      ", style=f"{_BRAND_CYAN} on grey11")
@@ -324,7 +288,6 @@ def _render_intro_pro(*, org: str | None = None, expires: str | None = None) -> 
 
     return Group(
         headline,
-        license_line,
         Text(""),
         cmd_demo,
         cmd_ci,

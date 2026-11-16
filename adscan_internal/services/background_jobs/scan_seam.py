@@ -167,6 +167,7 @@ def maybe_launch_writeshare_bait_job(
     spn_host: Optional[str] = None,
     listener_bind_ip: Optional[str] = None,
     pivot_plan: Any = None,
+    consent_granted: bool = False,
 ) -> Optional[BackgroundJob]:
     """Decide + launch a write-share NTLMv2-bait background job. Best-effort.
 
@@ -177,6 +178,12 @@ def maybe_launch_writeshare_bait_job(
     resolved enable) / non-interactive auto-launch iff enabled → plant + register.
     Returns the job on launch (or the existing active job), else ``None``. Never
     raises — a launch failure must not abort the scan.
+
+    ``consent_granted`` short-circuits the interactive per-host confirm: when the
+    caller already collected consent up front (the writable-share capture
+    multi-select, where selecting a host IS the consent to plant on it), passing
+    ``True`` plants without re-prompting. It has no effect non-interactively (that
+    branch still auto-launches only when ``writeshare_bait_enabled``).
     """
     try:
         if not target_host or not targets or not listener_ip:
@@ -198,6 +205,13 @@ def maybe_launch_writeshare_bait_job(
         if is_non_interactive(shell):
             if not enabled:
                 return None
+        elif consent_granted:
+            # Consent was already given up front: the operator selected this host
+            # in the writable-share capture multi-select, which IS the per-host
+            # consent (the one list replaced the N per-host prompts). The explicit
+            # selection overrides the posture default exactly as a per-host "yes"
+            # would, so do not re-prompt here.
+            pass
         else:
             _render_writeshare_bait_consent_panel(scope, len(targets))
             consent = confirm_ask(

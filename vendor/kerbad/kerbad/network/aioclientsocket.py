@@ -4,6 +4,32 @@ from kerbad.common.target import KerberosTarget
 from asysocks.unicomm.common.target import UniProto
 from asysocks.unicomm.client import UniClient
 from asysocks.unicomm.common.packetizers import Packetizer
+from kerbad.protocol.errors import KerberosReplyMalformedError
+
+# Size of the TCP record mark that precedes every Kerberos message (RFC 4120 7.2.2).
+_LENGTH_PREFIX_SIZE = 4
+
+
+async def _read_one_reply(connection, addr):
+	"""Read exactly one complete KDC reply, or say precisely why there is none.
+
+	The connection's reader yields ``None`` on a transport error and simply
+	ends when the peer closes before a whole message arrived. Both used to
+	reach the caller as an unrelated ``TypeError`` / ``StopAsyncIteration``.
+	"""
+	read_gen = connection.read()
+	try:
+		try:
+			packet = await read_gen.__anext__()
+		except StopAsyncIteration:
+			packet = None
+	finally:
+		await read_gen.aclose()
+	if packet is None:
+		raise KerberosReplyMalformedError(
+			'The KDC at %s closed the connection before a complete reply was received (truncated KDC reply)' % addr
+		)
+	return packet
 
 
 class KerberosPacketizer(Packetizer):
@@ -13,11 +39,18 @@ class KerberosPacketizer(Packetizer):
 		self.in_buffer = b''
 	
 	def process_buffer(self):
-		if len(self.in_buffer) > 4:
-			length = int.from_bytes(self.in_buffer[:4], byteorder = 'big', signed = False)
-			if len(self.in_buffer) >= length:
-				data = self.in_buffer[4:4+length]
-				self.in_buffer = self.in_buffer[length+4:]
+		# RFC 4120 7.2.2: over TCP every message is preceded by a 4-byte
+		# big-endian length that does NOT count itself. The buffer still holds
+		# that prefix here, so a message is complete only once the buffer has
+		# ``length + 4`` bytes. Comparing against ``length`` alone hands over a
+		# message up to 4 bytes short whenever the first read ends inside its
+		# last 4 bytes (do not revert: locked by
+		# tests/unit/vendor/test_kerbad_tcp_packetizer_length_prefix.py).
+		if len(self.in_buffer) >= _LENGTH_PREFIX_SIZE:
+			length = int.from_bytes(self.in_buffer[:_LENGTH_PREFIX_SIZE], byteorder = 'big', signed = False)
+			if len(self.in_buffer) >= length + _LENGTH_PREFIX_SIZE:
+				data = self.in_buffer[_LENGTH_PREFIX_SIZE:_LENGTH_PREFIX_SIZE+length]
+				self.in_buffer = self.in_buffer[length+_LENGTH_PREFIX_SIZE:]
 				yield data
 				
 	async def data_out(self, data):
@@ -38,11 +71,18 @@ class KerberosPWChangePacketizer(Packetizer):
 		self.in_buffer = b''
 	
 	def process_buffer(self):
-		if len(self.in_buffer) > 4:
-			length = int.from_bytes(self.in_buffer[:4], byteorder = 'big', signed = False)
-			if len(self.in_buffer) >= length:
-				data = self.in_buffer[4:4+length]
-				self.in_buffer = self.in_buffer[length+4:]
+		# RFC 4120 7.2.2: over TCP every message is preceded by a 4-byte
+		# big-endian length that does NOT count itself. The buffer still holds
+		# that prefix here, so a message is complete only once the buffer has
+		# ``length + 4`` bytes. Comparing against ``length`` alone hands over a
+		# message up to 4 bytes short whenever the first read ends inside its
+		# last 4 bytes (do not revert: locked by
+		# tests/unit/vendor/test_kerbad_tcp_packetizer_length_prefix.py).
+		if len(self.in_buffer) >= _LENGTH_PREFIX_SIZE:
+			length = int.from_bytes(self.in_buffer[:_LENGTH_PREFIX_SIZE], byteorder = 'big', signed = False)
+			if len(self.in_buffer) >= length + _LENGTH_PREFIX_SIZE:
+				data = self.in_buffer[_LENGTH_PREFIX_SIZE:_LENGTH_PREFIX_SIZE+length]
+				self.in_buffer = self.in_buffer[length+_LENGTH_PREFIX_SIZE:]
 				yield data
 				
 	async def data_out(self, data):
@@ -73,12 +113,7 @@ class AIOKerberosPWChangeClientSocket:
 				length = len(data).to_bytes(4, byteorder = 'big', signed = False)
 				await connection.write(length + data)
 
-				read_gen = connection.read()
-				try:
-					packet = await read_gen.__anext__()
-					krb_message = packet
-				finally:
-					await read_gen.aclose()
+				krb_message = await _read_one_reply(connection, self.get_addr_str())
 
 			elif self.target.protocol == UniProto.CLIENT_UDP:
 				raise Exception('Not implemented!')
@@ -106,16 +141,16 @@ class AIOKerberosClientSocket:
 				length = len(data).to_bytes(4, byteorder = 'big', signed = False)
 				await connection.write(length + data)
 
-				# Use the async generator's __anext__ once instead of an
-				# async-for loop with break — Python 3.13 emits
-				# RuntimeWarning ("aclose was never awaited") and leaks the
-				# generator if a break exits before the loop's normal close.
-				read_gen = connection.read()
+				packet = await _read_one_reply(connection, self.get_addr_str())
 				try:
-					packet = await read_gen.__anext__()
 					krb_message = KerberosResponse.load(packet)
-				finally:
-					await read_gen.aclose()
+				except (ValueError, TypeError) as e:
+					# asn1 could not decode what the KDC sent: say so, instead
+					# of letting a bare "Insufficient data" travel upward as
+					# an unexplained failure.
+					raise KerberosReplyMalformedError(
+						'Malformed or truncated KDC reply from %s (%d bytes): %s' % (self.get_addr_str(), len(packet), e)
+					) from e
 
 			elif self.target.protocol == UniProto.CLIENT_UDP:
 				raise Exception('Not implemented!')

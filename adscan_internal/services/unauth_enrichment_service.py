@@ -859,10 +859,11 @@ def _render_intel_sheet(
                 f"  [dim]LSARPC RID Cycling: {results.rid_cycling_reason}[/dim]"
             )
         )
-    inv_lines.append(
-        Text.from_markup(
-            f"  [dim]merged → {mark_sensitive(inventory_path, 'path')}[/dim]"
-        )
+    # Where the merged inventory was written is an internal detail (and inside
+    # the container it is a container path the operator cannot open): it goes
+    # to the debug log, not the panel.
+    print_info_debug(
+        f"Unauthenticated user inventory merged into {mark_sensitive(inventory_path, 'path')}"
     )
     sections.append(Group(inv_header, *inv_lines))
 

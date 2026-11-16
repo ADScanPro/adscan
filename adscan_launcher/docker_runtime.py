@@ -744,6 +744,12 @@ def _handle_pull_failure(
     clean_stderr = strip_ansi(stderr or "")
     clean_stdout = strip_ansi(stdout or "")
     diagnosis = classify_pull_failure(clean_stderr, clean_stdout)
+    from adscan_launcher.edition import is_pro_registry_image
+
+    if is_pro_registry_image(image):
+        from adscan_launcher.docker_pull_diagnostics import refine_for_licence_registry
+
+        diagnosis = refine_for_licence_registry(diagnosis, f"{clean_stderr}\n{clean_stdout}")
     record_last_failure(diagnosis)
     timed_out = bool(timeout is not None and rc == -9)
     if timed_out and surface_failure:
@@ -785,33 +791,32 @@ def ensure_image_pulled(
     """
     if not docker_available():
         return False
-    # Pull is idempotent and simplest.
-    if stream_output:
-        rc, stdout, stderr = run_docker_stream(
-            ["docker", "pull", image], timeout=timeout
-        )
-        if rc == 0:
-            return True
-        _handle_pull_failure(
-            image=image,
-            rc=rc,
-            stdout=stdout,
-            stderr=stderr,
-            timeout=timeout,
-            surface_failure=surface_failure,
-        )
-        return False
-
-    proc = run_docker(
-        ["docker", "pull", image], check=False, capture_output=True, timeout=timeout
+    # The licence-authorised PRO registry gets a fresh installation-signed
+    # credential in a private Docker config for the length of this pull; every
+    # other image pulls exactly as before (config_dir None).
+    from adscan_launcher.pro_registry import (
+        RegistryCredentialUnavailable,
+        docker_pull_argv,
+        registry_pull_config,
     )
-    if proc.returncode == 0:
+
+    try:
+        with registry_pull_config(image) as config_dir:
+            argv = docker_pull_argv(image, config_dir)
+            if stream_output:
+                rc, stdout, stderr = run_docker_stream(argv, timeout=timeout)
+            else:
+                proc = run_docker(argv, check=False, capture_output=True, timeout=timeout)
+                rc, stdout, stderr = int(proc.returncode), proc.stdout or "", proc.stderr or ""
+    except RegistryCredentialUnavailable as exc:
+        rc, stdout, stderr = 1, "", f"unauthorized: {exc}"
+    if rc == 0:
         return True
     _handle_pull_failure(
         image=image,
-        rc=int(proc.returncode),
-        stdout=proc.stdout or "",
-        stderr=proc.stderr or "",
+        rc=rc,
+        stdout=stdout,
+        stderr=stderr,
         timeout=timeout,
         surface_failure=surface_failure,
     )
@@ -835,39 +840,51 @@ def image_exists(image: str) -> bool:
     return proc.returncode == 0
 
 
-def _read_host_machine_id() -> str | None:
-    """Return host machine-id (best effort) for container env propagation."""
-    try:
-        machine_id = Path("/etc/machine-id")
-        if not machine_id.is_file():
-            return None
-        raw = machine_id.read_text(encoding="utf-8", errors="ignore").strip()
-        if not raw:
-            return None
-        return raw
-    except Exception:
-        return None
-
-
 def _compute_host_telemetry_id() -> str | None:
-    """Compute a stable host telemetry id for container execution.
+    """Return this installation's telemetry id for the container.
 
-    This prevents container runs from deriving telemetry identity from the
-    container's `/etc/machine-id` (which is not the host's) or from a
-    non-persistent in-container ADSCAN_HOME.
+    The id is minted once on the HOST and persisted under the state dir
+    (``adscan_core.telemetry_identity``), so the container never derives an
+    identity from its own machine id or a veth MAC. Clone detection runs here,
+    on the host, where the fingerprint means something.
 
     Returns:
-        A short, stable hash string or None if it cannot be derived.
+        The installation id, or None when it cannot be resolved.
     """
     try:
-        raw = _read_host_machine_id()
-        if not raw:
-            return None
-        import hashlib
+        from adscan_core.telemetry_identity import (  # noqa: PLC0415
+            current_installation_identity,
+        )
 
-        return hashlib.sha256(raw.encode()).hexdigest()[:12]
+        return current_installation_identity().installation_id or None
     except Exception:
         return None
+
+
+def _host_telemetry_identity_env() -> list[tuple[str, str]]:
+    """Return the identity companions forwarded beside ``ADSCAN_TELEMETRY_ID``.
+
+    The keyed machine hash, the 14.0.x legacy id (only for a migrated
+    installation) and the HOST's virtualization: the container would see its
+    own (``container``), which says nothing about where ADscan runs.
+    """
+    try:
+        from adscan_core.telemetry_identity import (  # noqa: PLC0415
+            LEGACY_ID_ENV,
+            MACHINE_HASH_ENV,
+            VIRTUALIZATION_ENV,
+            current_installation_identity,
+        )
+
+        identity = current_installation_identity()
+        pairs = (
+            (MACHINE_HASH_ENV, identity.machine_hash or ""),
+            (LEGACY_ID_ENV, identity.legacy_telemetry_id or ""),
+            (VIRTUALIZATION_ENV, identity.virtualization or ""),
+        )
+        return [(key, value) for key, value in pairs if value]
+    except Exception:
+        return []
 
 
 def _collect_host_distro_context() -> dict[str, str]:
@@ -1273,6 +1290,8 @@ LAUNCHER_ONLY_ENV_KEYS: frozenset[str] = frozenset(
         # --- docker-run mechanics: which image / runtime / channel to launch ---
         "ADSCAN_DOCKER_IMAGE",  # image override (launcher image selection)
         "ADSCAN_DOCKER_CHANNEL",  # stable/dev channel selection
+        "ADSCAN_LAUNCH_EDITION",  # --lite: launcher edition choice (adscan_launcher/edition.py)
+        "ADSCAN_PRO_LEGACY_REGISTRY_FALLBACK",  # launcher pull fallback to GHCR/Docker Hub
         "ADSCAN_DOCKER_GPU",  # GPU passthrough mode (launcher wires --gpus/--device)
         "ADSCAN_DOCKER_GUI",  # X11 GUI passthrough toggle (launcher-side)
         "ADSCAN_X11_SOCKET_DIR",  # host X11 socket dir the launcher mounts
@@ -1768,7 +1787,8 @@ def build_adscan_run_command(
     # Forward key host environment variables into the container:
     # - ADSCAN_SESSION_ENV / ADSCAN_ENV: ensure CI/dev/prod detection matches host
     # - ADSCAN_TELEMETRY: respect session/global opt-out
-    # - ADSCAN_TELEMETRY_ID: stable identity from host (avoid container machine-id)
+    # - ADSCAN_TELEMETRY_ID (+ machine hash, legacy id, virtualization): the
+    #   host's installation identity, so the container never derives its own
     #
     # NOTE: some behaviour toggles should be deterministic inside the container
     # even when the host did not explicitly set them. For those, we pass an
@@ -1841,6 +1861,9 @@ def build_adscan_run_command(
         host_id = _compute_host_telemetry_id()
         if host_id:
             cmd.extend(["-e", f"{_HOST_TELEMETRY_ID_ENV}={host_id}"])
+            for env_key, env_value in _host_telemetry_identity_env():
+                if not any(arg.startswith(f"{env_key}=") for arg in cmd):
+                    cmd.extend(["-e", f"{env_key}={env_value}"])
 
     # Wildcard-forward ADscan's own configuration namespace (``ADSCAN_*``) LAST,
     # so ``already_emitted`` captures EVERY ``ADSCAN_*`` key the launcher injects
@@ -1896,12 +1919,10 @@ def emit_entrypoint_logs_from_state() -> None:
         for line in raw.splitlines():
             if not line.strip():
                 continue
-            # Emit to both debug (for local logs) and telemetry-only console so
-            # entrypoint behaviour is visible in Rich session recordings.
-            msg = f"[entrypoint] {line}"
-            print_info_debug(msg)
-            # Launcher does not have a separate telemetry-only console; emit as debug.
-            print_info_debug(msg)
+            # Debug channel only: the workspace debug log always gets it, the
+            # terminal only under --debug (the entrypoint keeps routine lines
+            # off stderr at INFO for the same reason).
+            print_info_debug(f"entrypoint: {line}")
 
         try:
             log_path.unlink()

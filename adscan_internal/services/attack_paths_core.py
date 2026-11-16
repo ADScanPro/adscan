@@ -10,13 +10,13 @@ from __future__ import annotations
 import copy
 import time
 import os
-import re
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from adscan_core.reporting.attack_path_postprocess_bound import PostprocessMemoryBound
 from adscan_core.reporting.attack_path_coverage import (
     AttackPathCoverage,
     REASON_DFS_ABORTED,
@@ -40,6 +40,7 @@ from adscan_core.reporting.unauthenticated_reach import (
 from adscan_core.reporting.well_known_principals import (
     is_structural_well_known_principal,
 )
+from adscan_core.directory_object_state import is_tombstoned
 from adscan_core.rich_output import strip_sensitive_markers
 from adscan_internal.rich_output import print_info_debug
 from adscan_internal.services.group_member_index import (  # noqa: F401
@@ -434,7 +435,29 @@ _EMPTY_GROUP_WHITELIST = {
     if item.strip()
 }
 
-_SID_PATTERN = re.compile(r"(S-1-\d+(?:-\d+)+)", re.IGNORECASE)
+
+# The membership-snapshot shaping (prepare_membership_snapshot and the node
+# helpers it reads) lives in the leaf module ``membership_snapshot_shape`` so the
+# appliance web backend, which bundles no engine, runs the SAME function. Kept
+# importable from here under their historical names.
+from adscan_internal.services.membership_snapshot_shape import (  # noqa: E402,F401
+    _SID_PATTERN,
+    _build_group_label_by_sid,
+    _build_label_to_name,
+    _canonical_node_label,
+    _canonical_principal_label_for_membership,
+    _domain_sid_from_sid,
+    _extract_node_sid,
+    _extract_sid,
+    _membership_label_to_name,
+    _merge_primary_group_memberships_from_nodes,
+    _node_kind,
+    _node_primary_group_id,
+    _primary_group_sid_for_node,
+    membership_label_to_real_name,
+    prepare_membership_snapshot,
+)
+
 _CONTEXT_RELATIONS_LOWER = {
     str(relation).strip().lower() for relation in CONTEXT_ONLY_RELATIONS.keys()
 }
@@ -447,28 +470,6 @@ _CONTEXT_RELATIONS_LOWER = {
 COVERAGE_MARKER_NOTE = attack_graph_core.COVERAGE_MARKER_NOTE
 is_coverage_marker_step = attack_graph_core.is_coverage_marker_step
 is_coverage_marker_path = attack_graph_core.is_coverage_marker_path
-
-
-def _extract_sid(value: str) -> str | None:
-    if not value:
-        return None
-    match = _SID_PATTERN.search(value)
-    if not match:
-        return None
-    return match.group(1).upper()
-
-
-def _domain_sid_from_sid(sid: str) -> str | None:
-    """Return the AD domain SID for a domain object SID or principal SID."""
-    sid = str(sid or "").strip().upper()
-    if not sid.startswith("S-1-5-21-"):
-        return None
-    parts = sid.split("-")
-    if len(parts) == 7:
-        return sid
-    if len(parts) > 7:
-        return "-".join(parts[:-1])
-    return None
 
 
 def _empty_group_whitelist(domain: str) -> set[str]:
@@ -504,386 +505,6 @@ def _is_empty_group_whitelisted(
     return normalized_raw in whitelist or canonical in whitelist
 
 
-def prepare_membership_snapshot(
-    data: dict[str, Any] | None, domain: str
-) -> dict[str, Any] | None:
-    """Normalize memberships.json into a consistent snapshot structure."""
-    if not isinstance(data, dict):
-        return None
-
-    if isinstance(data.get("user_to_groups"), dict) or isinstance(
-        data.get("group_to_parents"), dict
-    ):
-        normalized = dict(data)
-        normalized.setdefault("tier0_users", [])
-        # Ensure the label->real-name map exists on a pre-built snapshot too, so
-        # locale-sensitive names resolve losslessly regardless of which branch
-        # produced the snapshot. Merge (never clobber) any persisted map.
-        if isinstance(normalized.get("nodes"), dict):
-            derived_names = _build_label_to_name(normalized["nodes"], domain)
-            existing_names = normalized.get("label_to_name")
-            if isinstance(existing_names, dict):
-                for key, value in derived_names.items():
-                    existing_names.setdefault(key, value)
-            elif derived_names:
-                normalized["label_to_name"] = derived_names
-        # When the file also has raw BH edges (membership-1.0 schema written by
-        # persist_bloodhound_membership_snapshot), merge those MemberOf edges into
-        # the existing dicts. This prevents runtime additions (ESC13, AddMember)
-        # from shadowing real AD memberships when user_to_groups was only partially
-        # populated before the BH edges were present.
-        nodes_map = normalized.get("nodes")
-        edges = normalized.get("edges")
-        if isinstance(nodes_map, dict) and isinstance(edges, list) and edges:
-            u2g: dict[str, list[str]] = normalized.get("user_to_groups") or {}
-            if not isinstance(u2g, dict):
-                u2g = {}
-            c2g: dict[str, list[str]] = normalized.get("computer_to_groups") or {}
-            if not isinstance(c2g, dict):
-                c2g = {}
-            g2p: dict[str, list[str]] = normalized.get("group_to_parents") or {}
-            if not isinstance(g2p, dict):
-                g2p = {}
-            u2g_sets: dict[str, set[str]] = {
-                k: set(v) for k, v in u2g.items() if isinstance(v, list)
-            }
-            c2g_sets: dict[str, set[str]] = {
-                k: set(v) for k, v in c2g.items() if isinstance(v, list)
-            }
-            g2p_sets: dict[str, set[str]] = {
-                k: set(v) for k, v in g2p.items() if isinstance(v, list)
-            }
-            changed = False
-            for edge in edges:
-                if not isinstance(edge, dict):
-                    continue
-                relation = (
-                    edge.get("relation") or edge.get("label") or edge.get("kind") or ""
-                )
-                if str(relation) != "MemberOf":
-                    continue
-                from_id = edge.get("from") or edge.get("source")
-                to_id = edge.get("to") or edge.get("target")
-                if not from_id or not to_id:
-                    continue
-                from_node = nodes_map.get(str(from_id))
-                to_node = nodes_map.get(str(to_id))
-                if not isinstance(from_node, dict) or not isinstance(to_node, dict):
-                    continue
-                if _node_kind(to_node) != "Group":
-                    continue
-                from_label = _canonical_membership_label(
-                    domain, _canonical_principal_label_for_membership(from_node)
-                )
-                to_label = _canonical_membership_label(
-                    domain, _canonical_node_label(to_node)
-                )
-                if not from_label or not to_label:
-                    continue
-                from_kind = _node_kind(from_node)
-                if from_kind == "User":
-                    before = len(u2g_sets.get(from_label, set()))
-                    u2g_sets.setdefault(from_label, set()).add(to_label)
-                    changed = changed or len(u2g_sets[from_label]) != before
-                elif from_kind == "Computer":
-                    before = len(c2g_sets.get(from_label, set()))
-                    c2g_sets.setdefault(from_label, set()).add(to_label)
-                    changed = changed or len(c2g_sets[from_label]) != before
-                elif from_kind == "Group":
-                    before = len(g2p_sets.get(from_label, set()))
-                    g2p_sets.setdefault(from_label, set()).add(to_label)
-                    changed = changed or len(g2p_sets[from_label]) != before
-            primary_changed = _merge_primary_group_memberships_from_nodes(
-                domain=domain,
-                nodes_map=nodes_map,
-                user_to_groups=u2g_sets,
-                computer_to_groups=c2g_sets,
-            )
-            changed = changed or primary_changed
-            if changed:
-                normalized["user_to_groups"] = {
-                    k: sorted(v, key=str.lower) for k, v in sorted(u2g_sets.items())
-                }
-                normalized["computer_to_groups"] = {
-                    k: sorted(v, key=str.lower) for k, v in sorted(c2g_sets.items())
-                }
-                normalized["group_to_parents"] = {
-                    k: sorted(v, key=str.lower) for k, v in sorted(g2p_sets.items())
-                }
-        return normalized
-
-    nodes_map = data.get("nodes")
-    edges = data.get("edges")
-    if not isinstance(nodes_map, dict) or not isinstance(edges, list):
-        return None
-
-    user_to_groups: dict[str, set[str]] = {}
-    computer_to_groups: dict[str, set[str]] = {}
-    group_to_parents: dict[str, set[str]] = {}
-    group_labels: set[str] = set()
-    label_to_sid: dict[str, str] = {}
-    sid_to_label: dict[str, str] = {}
-    # Canonical UPPER label -> REAL sAMAccountName (lower-cased for census/display
-    # parity). Captured from the node's true samaccountname so a locale-sensitive
-    # name (Turkish dotless-i, German ß) can be recovered exactly instead of being
-    # rebuilt by lower-casing the UPPER label (which corrupts it). See
-    # ``membership_label_to_real_name`` and the KPI reconciliation it fixes.
-    label_to_name: dict[str, str] = _build_label_to_name(nodes_map, domain)
-    domain_sid: str | None = None
-    preferred_domain_sid: str | None = None
-    first_domain_sid: str | None = None
-    tier0_users: set[str] = set()
-
-    for node in nodes_map.values():
-        if not isinstance(node, dict):
-            continue
-        label = _canonical_membership_label(
-            domain, _canonical_principal_label_for_membership(node)
-        )
-        if not label:
-            continue
-        if _node_kind(node) == "Group":
-            group_labels.add(label)
-        props = (
-            node.get("properties") if isinstance(node.get("properties"), dict) else {}
-        )
-        object_id = str(
-            node.get("objectId") or props.get("objectid") or props.get("objectId") or ""
-        ).strip()
-        sid = _extract_sid(object_id)
-        if sid:
-            label_to_sid[label] = sid
-            sid_to_label.setdefault(sid, label)
-            if sid.startswith("S-1-5-21-"):
-                candidate_sid = _domain_sid_from_sid(sid)
-                if candidate_sid:
-                    if not first_domain_sid:
-                        first_domain_sid = candidate_sid
-                    if not preferred_domain_sid:
-                        label_domain = str(domain or "").strip().upper()
-                        label_match = label.endswith(f"@{label_domain}")
-                        rid = sid.split("-")[-1]
-                        preferred_rids = {
-                            "512",
-                            "513",
-                            "514",
-                            "515",
-                            "516",
-                            "517",
-                            "518",
-                            "519",
-                            "520",
-                        }
-                        if label_match and rid in preferred_rids:
-                            preferred_domain_sid = candidate_sid
-    for edge in edges:
-        if not isinstance(edge, dict):
-            continue
-        relation = edge.get("relation") or edge.get("label") or edge.get("kind") or ""
-        if str(relation) != "MemberOf":
-            continue
-        from_id = edge.get("from") or edge.get("source")
-        to_id = edge.get("to") or edge.get("target")
-        if not from_id or not to_id:
-            continue
-        from_node = nodes_map.get(str(from_id))
-        to_node = nodes_map.get(str(to_id))
-        if not isinstance(from_node, dict) or not isinstance(to_node, dict):
-            continue
-        if _node_kind(to_node) != "Group":
-            continue
-
-        from_label = _canonical_membership_label(
-            domain, _canonical_principal_label_for_membership(from_node)
-        )
-        to_label = _canonical_membership_label(domain, _canonical_node_label(to_node))
-        if not from_label or not to_label:
-            continue
-
-        from_kind = _node_kind(from_node)
-        if from_kind == "User":
-            user_to_groups.setdefault(from_label, set()).add(to_label)
-        elif from_kind == "Computer":
-            computer_to_groups.setdefault(from_label, set()).add(to_label)
-        elif from_kind == "Group":
-            group_to_parents.setdefault(from_label, set()).add(to_label)
-
-    _merge_primary_group_memberships_from_nodes(
-        domain=domain,
-        nodes_map=nodes_map,
-        user_to_groups=user_to_groups,
-        computer_to_groups=computer_to_groups,
-    )
-
-    domain_sid = preferred_domain_sid or first_domain_sid
-    return {
-        "user_to_groups": {
-            user: sorted(groups, key=str.lower)
-            for user, groups in sorted(user_to_groups.items())
-        },
-        "computer_to_groups": {
-            computer: sorted(groups, key=str.lower)
-            for computer, groups in sorted(computer_to_groups.items())
-        },
-        "group_to_parents": {
-            group: sorted(parents, key=str.lower)
-            for group, parents in sorted(group_to_parents.items())
-        },
-        "group_labels": sorted(group_labels, key=str.lower),
-        "tier0_users": sorted(tier0_users, key=str.lower),
-        "label_to_sid": label_to_sid,
-        "sid_to_label": sid_to_label,
-        "label_to_name": label_to_name,
-        "domain_sid": domain_sid,
-    }
-
-
-def _merge_primary_group_memberships_from_nodes(
-    *,
-    domain: str,
-    nodes_map: dict[str, Any],
-    user_to_groups: dict[str, set[str]],
-    computer_to_groups: dict[str, set[str]],
-) -> bool:
-    """Add effective primary-group memberships omitted from LDAP ``memberOf``.
-
-    Active Directory does not include a principal's primary group in the
-    ``memberOf`` attribute. Native graph snapshots therefore need to derive that
-    edge from ``primaryGroupID`` and the principal/domain SID so owned-scope
-    path search can inherit rights granted to groups such as Domain Users.
-    """
-    sid_to_group_label = _build_group_label_by_sid(domain, nodes_map)
-    changed = False
-    for node in nodes_map.values():
-        if not isinstance(node, dict):
-            continue
-        kind = _node_kind(node)
-        if kind not in {"User", "Computer"}:
-            continue
-        principal_label = _canonical_membership_label(
-            domain, _canonical_principal_label_for_membership(node)
-        )
-        primary_group_sid = _primary_group_sid_for_node(node)
-        if not principal_label or not primary_group_sid:
-            continue
-        group_label = sid_to_group_label.get(primary_group_sid)
-        if not group_label or group_label == principal_label:
-            continue
-        target = user_to_groups if kind == "User" else computer_to_groups
-        groups = target.setdefault(principal_label, set())
-        before = len(groups)
-        groups.add(group_label)
-        changed = changed or len(groups) != before
-    return changed
-
-
-def _build_group_label_by_sid(domain: str, nodes_map: dict[str, Any]) -> dict[str, str]:
-    """Return SID -> canonical group label for group nodes in a graph snapshot."""
-    result: dict[str, str] = {}
-    for node in nodes_map.values():
-        if not isinstance(node, dict) or _node_kind(node) != "Group":
-            continue
-        sid = _extract_node_sid(node)
-        label = _canonical_membership_label(domain, _canonical_node_label(node))
-        if sid and label:
-            result[sid] = label
-    return result
-
-
-def _primary_group_sid_for_node(node: dict[str, Any]) -> str:
-    """Return the primary group SID for a user/computer node, if derivable."""
-    principal_sid = _extract_node_sid(node)
-    if not principal_sid or not principal_sid.startswith("S-1-5-21-"):
-        return ""
-    primary_group_id = _node_primary_group_id(node)
-    if primary_group_id is None:
-        return ""
-    domain_sid, _, _rid = principal_sid.rpartition("-")
-    if not domain_sid:
-        return ""
-    return f"{domain_sid}-{primary_group_id}"
-
-
-def _node_primary_group_id(node: dict[str, Any]) -> int | None:
-    """Return a normalized ``primaryGroupID`` value from node metadata."""
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    for key in ("primarygroupid", "primaryGroupID", "primary_group_id"):
-        value = node.get(key)
-        if value is None:
-            value = props.get(key)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _extract_node_sid(node: dict[str, Any]) -> str:
-    """Extract a normalized SID from a graph node."""
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    object_id = str(
-        node.get("objectId") or props.get("objectid") or props.get("objectId") or ""
-    ).strip()
-    return _extract_sid(object_id)
-
-
-def _membership_label_to_name(label: str) -> str:
-    raw = str(label or "").strip()
-    if "@" in raw:
-        return raw.split("@", 1)[0].strip()
-    return raw
-
-
-def _build_label_to_name(nodes_map: dict[str, Any], domain: str) -> dict[str, str]:
-    """Map each User/Computer canonical label -> its REAL sAMAccountName (lower).
-
-    Captured from the node's actual ``samaccountname`` BEFORE the canonical label
-    is upper-cased, so a locale-sensitive name (Turkish dotless-i ``ı``, German
-    ``ß``) survives losslessly. Consumers use :func:`membership_label_to_real_name`
-    to recover it instead of lower-casing the UPPER canonical label, which
-    corrupts such names (``AYAZICI`` -> ``ayazici`` != real ``ayazıcı``).
-    """
-    out: dict[str, str] = {}
-    if not isinstance(nodes_map, dict):
-        return out
-    for node in nodes_map.values():
-        if not isinstance(node, dict) or _node_kind(node) not in {"User", "Computer"}:
-            continue
-        real_name = str(_canonical_principal_label_for_membership(node) or "").strip()
-        if not real_name:
-            continue
-        label = _canonical_membership_label(domain, real_name)
-        if label:
-            out.setdefault(label, real_name.lower())
-    return out
-
-
-def membership_label_to_real_name(snapshot: Any, label: str) -> str:
-    """Recover a principal's REAL sAMAccountName from its canonical label.
-
-    Uses the snapshot's ``label_to_name`` map (populated by
-    :func:`prepare_membership_snapshot` from the node's true ``samaccountname``)
-    so locale-sensitive names are exact. Falls back to the legacy
-    ``_membership_label_to_name(label).lower()`` reconstruction only when the
-    label is absent from the map (a synthetic / augmented label with no backing
-    node) — for plain ASCII names the two agree, so the fallback never regresses
-    the common case.
-
-    This is the SSOT for "canonical membership label -> real name". Never rebuild
-    a real name inline by lower-casing the UPPER label: that silently drops
-    accounts whose name contains ``ı`` / ``ß`` from every real-name-keyed set
-    (the enabled-users census, the exposure-KPI ordinary denominator).
-    """
-    lossy = _membership_label_to_name(label).strip().lower()
-    if isinstance(snapshot, dict):
-        mapping = snapshot.get("label_to_name")
-        if isinstance(mapping, dict):
-            resolved = mapping.get(label)
-            if isinstance(resolved, str) and resolved:
-                return resolved
-    return lossy
-
-
 def _normalize_account(value: str) -> str:
     name = strip_sensitive_markers(str(value or "")).strip()
     if "\\" in name:
@@ -891,75 +512,6 @@ def _normalize_account(value: str) -> str:
     if "@" in name:
         name = name.split("@", 1)[0]
     return name.strip().lower()
-
-
-def _canonical_node_label(node: dict[str, Any]) -> str:
-    label = node.get("label") or node.get("name")
-    if isinstance(label, str) and label.strip():
-        return label.strip()
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    name = props.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    return str(label or "").strip()
-
-
-def _canonical_principal_label_for_membership(node: dict[str, Any]) -> str:
-    """Return the canonical principal label used for membership snapshot keys.
-
-    Membership lookups (``_snapshot_get_direct_groups``) canonicalize the
-    incoming principal as ``<sAMAccountName>@<DOMAIN>``.  For consistency,
-    the snapshot writer must store keys in the same form.  BloodHound's
-    ``label`` field equals the sAMAccountName for User nodes but the
-    FQDN for Computer nodes (``RODC01.GARFIELD.HTB``), which would key
-    Computer entries under a form lookups never use.
-
-    Prefers ``properties.samaccountname`` (BloodHound CE / native collector
-    populate this on User and Computer nodes), then falls back to the
-    existing ``_canonical_node_label`` behaviour for non-principal node
-    kinds (Group, Domain, OU, GPO, etc.) where the label IS the canonical
-    identifier.
-    """
-    kind = _node_kind(node)
-    if kind in {"User", "Computer"}:
-        props = (
-            node.get("properties") if isinstance(node.get("properties"), dict) else {}
-        )
-        for key in ("samaccountname", "sAMAccountName", "sam_account_name"):
-            value = props.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return _canonical_node_label(node)
-
-
-def _node_kind(node: dict[str, Any]) -> str:
-    kind = node.get("kind") or node.get("labels") or node.get("type")
-    if isinstance(kind, list) and kind:
-        preferred = {
-            "User",
-            "Computer",
-            "Group",
-            "Domain",
-            "GPO",
-            "OU",
-            "Container",
-            "CertTemplate",
-            "EnterpriseCA",
-            "AIACA",
-            "RootCA",
-            "NTAuthStore",
-        }
-        for entry in kind:
-            if str(entry) in preferred:
-                return str(entry)
-        return str(kind[0])
-    if isinstance(kind, str) and kind:
-        return kind
-    props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    fallback = props.get("type") or props.get("objecttype")
-    if isinstance(fallback, str) and fallback:
-        return fallback
-    return "Unknown"
 
 
 def _node_is_high_value(node: dict[str, Any]) -> bool:
@@ -1099,16 +651,56 @@ def _ensure_group_node_id(
         existing = _find_node_id_by_label(graph, canonical)
     if existing:
         return existing
-    node_id = f"name:{canonical}"
-    nodes_map[node_id] = {
+    node_id, node = synthetic_group_node(domain, canonical)
+    nodes_map[node_id] = node
+    if node_id_by_label is not None and canonical:
+        node_id_by_label[canonical] = node_id
+    return node_id
+
+
+_SYNTHETIC_GROUP_NODE_PREFIX = "name:"
+
+
+def synthetic_group_node(domain: str, canonical: str) -> tuple[str, dict[str, Any]]:
+    """The group node the membership expansion mints for a group the graph lacks.
+
+    One definition, so a node minted during one expansion and a node rebuilt
+    from an injected edge's target id (:func:`restore_synthetic_group_nodes`)
+    are the same dict.
+    """
+    node_id = f"{_SYNTHETIC_GROUP_NODE_PREFIX}{canonical}"
+    return node_id, {
         "id": node_id,
         "label": canonical,
         "kind": "Group",
         "properties": {"name": canonical, "domain": str(domain or "").strip().upper()},
     }
-    if node_id_by_label is not None and canonical:
-        node_id_by_label[canonical] = node_id
-    return node_id
+
+
+def restore_synthetic_group_nodes(
+    graph: dict[str, Any], domain: str, edges: Iterable[dict[str, Any]]
+) -> None:
+    """Mint the group node behind any injected edge whose target is missing.
+
+    :func:`_ensure_group_node_id` records a minted group in the caller's label
+    index, so a later expansion that reuses that index finds the id and mints
+    nothing. A graph assembled fresh for that later expansion would then carry
+    an edge to a node it does not hold. This restores exactly the node the first
+    expansion minted, so the result does not depend on what ran before it.
+    """
+    nodes_map = graph.get("nodes")
+    if not isinstance(nodes_map, dict):
+        return
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        to_id = str(edge.get("to") or "")
+        if not to_id.startswith(_SYNTHETIC_GROUP_NODE_PREFIX) or to_id in nodes_map:
+            continue
+        node_id, node = synthetic_group_node(
+            domain, to_id[len(_SYNTHETIC_GROUP_NODE_PREFIX) :]
+        )
+        nodes_map[node_id] = node
 
 
 def build_group_membership_index(
@@ -1280,7 +872,9 @@ def in_scope_segment(steps: list[Any]) -> tuple[list[Any], bool]:
     """
     split = split_route_at_scope(steps)
     if split.prefix_only:
-        return list(steps[: split.boundary]), True
+        # Cut at the DOMAIN boundary: a step the asset scope kept from running
+        # before it stays in the segment, which then reads partial at most.
+        return list(steps[: split.domain_boundary]), True
     return list(steps or ()), False
 
 
@@ -1390,7 +984,11 @@ def split_routes_at_engagement_scope(
                 index_by_signature[signature] = len(out)
             out.append(record)
             continue
-        segment_steps = list(steps[: split.boundary])
+        # The route is cut where it leaves the scope's DOMAINS. An excluded
+        # host or account earlier on the route stays in the in-scope segment as
+        # a step that was not executed.
+        cut = int(split.domain_boundary or 0)
+        segment_steps = list(steps[:cut])
         if not any(
             isinstance(step, dict)
             and str(step.get("action") or "").strip().lower()
@@ -1399,13 +997,11 @@ def split_routes_at_engagement_scope(
         ):
             out.append(record)
             continue
-        segment = _truncate_record_at(
-            record, int(split.boundary or 0), label_to_node=label_to_node
-        )
+        segment = _truncate_record_at(record, cut, label_to_node=label_to_node)
         if segment is None:
             out.append(record)
             continue
-        boundary_step = steps[int(split.boundary or 0)]
+        boundary_step = steps[cut]
         from_domain = _segment_terminal_domain(segment["steps"]) or str(
             ((boundary_step.get("details") or {}) if isinstance(boundary_step, dict) else {}).get(
                 "from"
@@ -2477,7 +2073,7 @@ def apply_affected_user_metadata(
             enabled = props.get("enabled")
             if enabled is None:
                 enabled = node.get("enabled")
-            if enabled is False:
+            if enabled is False or is_tombstoned(node):
                 continue
             fine_tier = (
                 str(props.get("privilege_tier") or node.get("privilege_tier") or "")
@@ -2548,7 +2144,9 @@ def apply_affected_user_metadata(
             # Self, Default Account) all carry ``enabled=None``, so requiring a
             # definite ``True`` drops every one of them (a loose ``!= False`` walk
             # would count them and reintroduce the "10 of 2" over-count bug).
-            if enabled is not True:
+            if enabled is not True or is_tombstoned(node):
+                # A deleted account reads as enabled and keeps its domain SID,
+                # but it is not part of the population a takeover owns.
                 continue
             sid = label_sid_map.get(canonical) or str(
                 props.get("objectid") or node.get("objectId") or ""
@@ -2606,7 +2204,11 @@ def apply_affected_user_metadata(
     _unauthenticated_exposure_ceiling = max(_max_group_population + 1, 1)
 
     annotated: list[dict[str, Any]] = []
+    # Memory check per route (``attack_path_postprocess_bound``): a stop raises
+    # the attack-path stage's own exception, which every caller's seam declares.
+    memory_bound = PostprocessMemoryBound("annotating the affected users of each route")
     for record in records:
+        memory_bound.tick()
         current = record
         while True:
             nodes = current.get("nodes")
@@ -2953,7 +2555,9 @@ def minimize_display_paths(
         enabled=debug_enabled,
     )
     minimized: list[dict[str, Any]] = []
+    memory_bound = PostprocessMemoryBound("minimising redundant group memberships")
     for record in records:
+        memory_bound.tick()
         orig_nodes = record.get("nodes") or []
         updated = _minimize_display_record_by_redundant_memberof(
             record,
@@ -4835,6 +4439,108 @@ def _run_scope_compute(
     raise ValueError(f"unknown attack-path scope: {scope!r}")
 
 
+def _detach_stopped_frames(exc: BaseException) -> None:
+    """Clear the frames of ``exc``'s traceback (and its chain) and detach them.
+
+    Its own locals are the only other references to those tracebacks, and they
+    die with this call, so the frames are unreachable once it returns (see
+    :func:`release_stopped_attempt`). Never raises.
+    """
+    import traceback  # noqa: PLC0415
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        tb = current.__traceback__
+        current.__traceback__ = None
+        if tb is not None:
+            try:
+                traceback.clear_frames(tb)
+            except Exception:  # noqa: BLE001
+                pass
+        tb = None
+        current = current.__cause__ or current.__context__
+
+
+def release_stopped_attempt(exc: BaseException) -> None:
+    """Free everything a stopped attempt built, before anything else allocates.
+
+    The attempt ran in a function call (:func:`attempt_or_stop`) that has
+    returned, so its locals survive only in the finished frames of the
+    exception's traceback (and of any exception chained to it). Clear those
+    frames, detach them from the exception, collect, and hand freed heap back
+    to the system. Best-effort; never raises.
+
+    The frames must be UNREACHABLE when the collection runs, not only cleared:
+    a cleared frame still owns the function object it was running, so a frame
+    of the recursive route search keeps the search's closure alive, and with it
+    every route and signature the closure captured (the closure is a cycle, so
+    only a collection frees it). The traceback walk therefore runs in its own
+    call, :func:`_detach_stopped_frames`, which holds the last reference to the
+    traceback and drops it on return, before :func:`gc.collect`. Measured on
+    the dense ``tiny`` preset: while the walk's traceback was still held the
+    collection freed nothing, and the bounded mode was refused on memory no
+    live object used.
+    """
+    import gc  # noqa: PLC0415
+
+    _detach_stopped_frames(exc)
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from adscan_core.pal.process import release_free_heap  # noqa: PLC0415
+
+        release_free_heap()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def bounded_mode_may_start() -> bool:
+    """Whether memory is back under the resume line after a released attempt.
+
+    One reading from the product's memory guard (the cgroup limit in a
+    container, never host RAM), judged by the gate's
+    :func:`~adscan_core.reporting.attack_path_memory_gate.fallback_may_start`.
+    A blind read lets the bounded mode start: it runs under its own guard.
+    """
+    try:
+        from adscan_core.memory_guard import MemoryGuard  # noqa: PLC0415
+        from adscan_core.reporting import attack_path_memory_gate as gate  # noqa: PLC0415
+
+        reading = MemoryGuard("attack_paths", min_interval_s=0.0).sample()
+        if not reading.usable:
+            return True
+        if reading.crossed:
+            return False
+        measured = (
+            reading.measured_bytes
+            if reading.measured_bytes is not None
+            else reading.rss_bytes
+        )
+        return gate.fallback_may_start(measured, reading.ceiling_bytes)
+    except Exception:  # noqa: BLE001 - a failed read must not cost the bounded routes
+        return True
+
+
+def attempt_or_stop(
+    attempt: Callable[[], Any],
+) -> "tuple[Any, _AttackPathMemoryBudgetExceeded | None]":
+    """Run a full attack-path attempt; return ``(result, None)`` or ``(None, stop)``.
+
+    The attempt is a CALL, so everything it builds lives in its own frame, which
+    has returned by the time the caller decides what to do with a stop. The stop
+    leaves the ``except`` here at once: the recovery runs outside it, after
+    :func:`release_stopped_attempt` cleared the frames the exception holds.
+    """
+    try:
+        return attempt(), None
+    except _AttackPathMemoryBudgetExceeded as exc:
+        return None, exc
+
+
 def compute_display_paths_with_fallback(
     graph: dict[str, Any],
     domain: str,
@@ -4923,7 +4629,18 @@ def compute_display_paths_with_fallback(
                 owned_labels=owned_labels,
                 principal_count=principal_count,
             )
-        except Exception:  # noqa: BLE001 — a collapse miss must never break discovery.
+        except _AttackPathMemoryBudgetExceeded:
+            # A memory stop in the collapse's post-processing (annotation,
+            # minimisation) is a stop, never a "collapse miss": returning the
+            # uncollapsed routes here would serve an unannotated listing as if
+            # complete. The caller's boundary declares it.
+            raise
+        except Exception as exc:  # noqa: BLE001 — a collapse miss must never break discovery.
+            from adscan_core import telemetry  # noqa: PLC0415
+            from adscan_core.rich_output import print_exception  # noqa: PLC0415
+
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
             return paths
 
     # 1. Proactive — skip the DFS that would abort anyway. Routed through the
@@ -4957,34 +4674,38 @@ def compute_display_paths_with_fallback(
         )
         return _collapse_nondomain(paths), AttackPathCoverage.complete()
     except _AttackPathMemoryBudgetExceeded as exc:
-        try:
-            paths = _run_scope_compute(
-                graph,
-                domain=domain,
-                snapshot=snapshot,
-                scope=scope,
-                scope_kwargs=scope_kwargs,
-                force_perterminal=True,
-            )
-        except _AttackPathMemoryBudgetExceeded:
-            # The bounded engine itself hit the ceiling — degrade to an empty,
-            # coverage-bounded result. NEVER recurse (mirror
-            # ``attack_graph_service._recover_from_memory_abort``).
-            return [], AttackPathCoverage.fallback(
-                reason=REASON_DFS_ABORTED,
-                examined_routes=exc.examined_routes,
-                hard_stop=True,
-            )
-        return _collapse_nondomain(paths), AttackPathCoverage.fallback(
+        stop = exc
+    # 3. Outside the ``except``: release what the stopped attempt built, then
+    #    start the bounded mode only if memory came back under the resume line.
+    release_stopped_attempt(stop)
+    if not bounded_mode_may_start():
+        return [], AttackPathCoverage.fallback(
             reason=REASON_DFS_ABORTED,
-            examined_routes=exc.examined_routes,
-            exposure_source_count=exposure_source_count,
+            examined_routes=stop.examined_routes,
+            hard_stop=True,
         )
+    try:
+        paths = _run_scope_compute(
+            graph,
+            domain=domain,
+            snapshot=snapshot,
+            scope=scope,
+            scope_kwargs=scope_kwargs,
+            force_perterminal=True,
+        )
+    except _AttackPathMemoryBudgetExceeded:
+        # The bounded engine itself hit the ceiling — degrade to an empty,
+        # coverage-bounded result. NEVER recurse (mirror
+        # ``attack_graph_service._recover_from_memory_abort``).
+        return [], AttackPathCoverage.fallback(
+            reason=REASON_DFS_ABORTED,
+            examined_routes=stop.examined_routes,
+            hard_stop=True,
+        )
+    return _collapse_nondomain(paths), AttackPathCoverage.fallback(
+        reason=REASON_DFS_ABORTED,
+        examined_routes=stop.examined_routes,
+        exposure_source_count=exposure_source_count,
+    )
 
 
-# Let dependency-light readers of memberships.json (the affected-assets member
-# resolver) prepare a raw snapshot with the engine's own normaliser. See
-# ``group_member_index.set_membership_snapshot_preparer``.
-from adscan_internal.services import group_member_index as _group_member_index  # noqa: E402
-
-_group_member_index.set_membership_snapshot_preparer(prepare_membership_snapshot)

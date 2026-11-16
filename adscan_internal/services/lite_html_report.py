@@ -150,14 +150,19 @@ from adscan_core.reporting.execution_failure_explanations import (
 )
 from adscan_core.reporting.host_reach_coverage import merge_host_reach_coverage
 from adscan_core.reporting.scan_pacing_disclosure import merge_scan_pacing
-from adscan_core.scan_policy.annotate import NOTE_LABEL_KEY as POLICY_NOTE_LABEL_KEY
+from adscan_core.scan_policy.annotate import step_reason_chip
 from adscan_core.scan_policy.annotate import (
     META_UNLOCK_LINE_KEY as POLICY_META_UNLOCK_LINE_KEY,
 )
 from adscan_core.scan_policy.coverage import merge_scan_policy_coverage
+from adscan_core.reporting.resource_coverage import (
+    STAGES_DECLARED_ELSEWHERE,
+    merge_resource_coverage,
+)
 from adscan_core.reporting.operator_stop_coverage import (
     merge_operator_stop_coverage,
 )
+from adscan_core.reporting.guest_access_coverage import merge_guest_access_coverage
 from adscan_core.reporting.host_enrichment_coverage import (
     merge_host_enrichment_coverage,
 )
@@ -174,8 +179,10 @@ from adscan_core.reporting.engagement_scope import (
     beyond_scope_reach_view,
     combine_beyond_scope_blocks,
     load_engagement_scope,
+    merge_asset_scope_coverage,
 )
 from adscan_core.reporting.principal_display import (
+    declares_node_identities,
     format_graph_node_label,
     humanize_chokepoint_node_label,
     humanize_principal_for_prose,
@@ -653,6 +660,9 @@ class LiteRemediationStartHereRow:
     reach_users: int = 0
     reach_total: int = 0
     reach_pct: float = 0.0
+    #: The object kinds of the principals this fix's paths start from; the row's
+    #: sentence reads it to say where they originate.
+    source_kinds: tuple[str, ...] = ()
     #: Findings 1a: the single fix that removes the MOST attack paths, flagged even
     #: though the proven-first ordering does not rank it #1. Computed locally as the
     #: row with the largest all-status blast radius (``paths_affected``); set ONLY
@@ -1146,10 +1156,22 @@ class LiteReportModel:
     #: boundary so it never reads as exhaustive; the identity graph is always 100%.
     #: SSOT: :mod:`adscan_core.reporting.host_enrichment_coverage`.
     host_enrichment_coverage_statement: str = ""
+    #: Hosts guest SMB access was never asked of, or empty.
+    #: SSOT: :mod:`adscan_core.reporting.guest_access_coverage`.
+    guest_access_coverage_statement: str = ""
     #: Client-facing statements for every step the operator stopped, phase
     #: skipped or scan stopped early, in order. Empty when nothing was stopped.
     #: SSOT: :mod:`adscan_core.reporting.operator_stop_coverage`.
     operator_stop_statements: tuple[str, ...] = ()
+    #: Heading of that block: "Stopped by the operator", or a neutral one when
+    #: the engagement scope (not an operator) ended the run. Same SSOT.
+    operator_stop_heading: str = "Stopped by the operator"
+    #: Client-facing statement of every pipeline stage that stopped at the
+    #: memory ceiling (collection, graph build or export, the render), in the
+    #: same words as the PRO report and the platform. Attack-path discovery is
+    #: stated by ``attack_path_coverage_statement`` instead. Empty when every
+    #: stage finished. SSOT: :mod:`adscan_core.reporting.resource_coverage`.
+    resource_coverage_statement: str = ""
     #: Network reach of the assessment over the enabled computers: the report-wide
     #: view from the tier-shared SSOT, with ``scope_statement`` (always, when a
     #: block was recorded), ``has_gap`` and the per-segment rows. Empty mapping
@@ -1158,6 +1180,13 @@ class LiteReportModel:
     #: section, so it is declared here rather than left to read as clean.
     #: SSOT: :mod:`adscan_core.reporting.host_reach_coverage`.
     host_reach_coverage: Mapping[str, Any] = field(default_factory=dict)
+    #: Engagement scope: the hosts and accounts the client excluded from the
+    #: assessment, as the tier-shared view (``asset_scope_coverage_view`` /
+    #: ``merge_asset_scope_coverage``). Empty mapping when the run had no asset
+    #: scope. An excluded object was never contacted or acted on, so it is a
+    #: declared coverage gap, never a finding and never clean.
+    #: SSOT: :mod:`adscan_core.reporting.engagement_scope`.
+    asset_scope_coverage: Mapping[str, Any] = field(default_factory=dict)
     #: Scope and method: the scan policy and the assessment pace, as the shared
     #: views (adscan_core.scan_policy.coverage / scan_pacing_disclosure).
     scan_policy: Mapping[str, Any] = field(default_factory=dict)
@@ -1854,11 +1883,7 @@ def _build_path_steps(
                 narrative=_step_narrative(step),
                 status_label=label,
                 status_tone=tone,
-                not_executed_label=str(
-                    (step.get("details") or {}).get(POLICY_NOTE_LABEL_KEY) or ""
-                )
-                if isinstance(step.get("details"), dict)
-                else "",
+                not_executed_label=step_reason_chip(step.get("details")),
                 status_reason=_step_status_reason(step, relation),
             )
         )
@@ -2483,6 +2508,7 @@ def build_lite_remediation_start_here(
             reach_total=reach_total,
             reach_pct=reach_pct,
             reach_is_uniform=reach_is_uniform,
+            source_kinds=entry.source_kinds,
         )
         choke_id = entry.top_choke_point_id.strip() or None
         badge = bool(is_structural_choke(choke_id, card_map))
@@ -2501,6 +2527,7 @@ def build_lite_remediation_start_here(
                 reach_users=reach_users,
                 reach_total=reach_total,
                 reach_pct=reach_pct,
+                source_kinds=tuple(entry.source_kinds),
                 block=(
                     "containment" if _containment_kind(entry) else "exposure"
                 ),
@@ -3747,6 +3774,7 @@ def _no_framework_decision(technical_report: Any) -> bool:
     return bool(decision is not None and decision.none_declared)
 
 
+@declares_node_identities(records="raw_paths")
 def build_report_model(
     *,
     workspace_name: str,
@@ -4065,10 +4093,24 @@ def build_report_model(
         host_enrichment_coverage_statement=(
             merge_host_enrichment_coverage(domains.values()).get("statement") or ""
         ),
+        guest_access_coverage_statement=(
+            merge_guest_access_coverage(domains.values()).get("statement") or ""
+        ),
         operator_stop_statements=tuple(
             merge_operator_stop_coverage(domains.values()).get("statements") or ()
         ),
+        operator_stop_heading=str(
+            merge_operator_stop_coverage(domains.values()).get("heading")
+            or "Stopped by the operator"
+        ),
+        resource_coverage_statement=(
+            merge_resource_coverage(
+                domains, exclude_stages=STAGES_DECLARED_ELSEWHERE
+            ).get("statement")
+            or ""
+        ),
         host_reach_coverage=merge_host_reach_coverage(domains.values()),
+        asset_scope_coverage=merge_asset_scope_coverage(domains) or {},
         scan_policy=merge_scan_policy_coverage(domains.values()),
         scan_pacing=merge_scan_pacing(domains.values()),
         hardening=build_hardening_observed(domains, raw_paths),
@@ -5884,6 +5926,77 @@ ol.oblig-steps > li {
   </section>
   {% endif %}
 
+  {# ENGAGEMENT SCOPE: the hosts and accounts the client asked ADscan to leave
+     alone, or the only ones it was allowed to assess. An excluded object
+     received no traffic and no action, so it is a declared coverage gap the
+     client requested, never a finding and never clean. Lighter than the paid
+     kit (the disclosure plus a short list, no full table); the sentences are
+     the SAME, from the tier-shared SSOT. #}
+  {% if m.asset_scope_coverage and m.asset_scope_coverage.present and m.asset_scope_coverage.statement %}
+  <section class="ds-section">
+    <div class="ds-note">
+      <div class="ds-note-k">Engagement scope</div>
+      <div class="ds-note-t">{{ m.asset_scope_coverage.statement }}{% if m.asset_scope_coverage.dc_statement %} {{ m.asset_scope_coverage.dc_statement }}{% endif %}{% if m.asset_scope_coverage.routes_statement %} {{ m.asset_scope_coverage.routes_statement }}{% endif %}</div>
+    </div>
+    {% if m.asset_scope_coverage.rows %}
+    <table class="ds-table">
+      <thead>
+        <tr><th>Excluded object</th><th>Type</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {% for row in m.asset_scope_coverage.rows %}
+        <tr><td>{{ row.object }}{% if row.correlation %}<br>{{ row.correlation }}{% endif %}</td><td>{{ row.kind_label }}</td><td>{{ row.status_label }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if m.asset_scope_coverage.rows_omitted %}
+    <p class="ds-note-t">{{ m.asset_scope_coverage.rows_omitted }} further excluded object{{ '' if m.asset_scope_coverage.rows_omitted == 1 else 's' }} {{ 'is' if m.asset_scope_coverage.rows_omitted == 1 else 'are' }} counted in the figures above and not listed here.</p>
+    {% endif %}
+    {% endif %}
+    {# Objects ADscan could not confirm as within the scope and left alone: a
+       separate population from the client's exclusions, each with what would
+       settle it. #}
+    {% if m.asset_scope_coverage.unconfirmed_statement %}
+    <div class="ds-note">
+      <div class="ds-note-k">Not confirmed as within the scope</div>
+      <div class="ds-note-t">{{ m.asset_scope_coverage.unconfirmed_statement }}{% if m.asset_scope_coverage.unconfirmed_routes_statement %} {{ m.asset_scope_coverage.unconfirmed_routes_statement }}{% endif %}</div>
+    </div>
+    {% if m.asset_scope_coverage.unconfirmed_rows %}
+    <table class="ds-table">
+      <thead>
+        <tr><th>Object left alone</th><th>What was missing</th><th>What would settle it</th></tr>
+      </thead>
+      <tbody>
+        {% for row in m.asset_scope_coverage.unconfirmed_rows %}
+        <tr><td>{{ row.object }}</td><td>{{ row.cause_label }}{% if row.correlation %} {{ row.correlation }}{% endif %}</td><td>{{ row.remedy }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    {% endif %}
+    {% if m.asset_scope_coverage.unresolved_statement %}
+    <p class="ds-note-t">{{ m.asset_scope_coverage.unresolved_statement }}</p>
+    {% endif %}
+    {# What became of each entry as it was written; an exclusion that matched
+       nothing leads (engagement_scope.entry_rows_display). #}
+    {% if m.asset_scope_coverage.entry_table %}
+    <table class="ds-table">
+      <thead>
+        <tr><th>Scope entry, as written</th><th>List</th><th>What it matched</th><th>Outcome</th></tr>
+      </thead>
+      <tbody>
+        {% for row in m.asset_scope_coverage.entry_table %}
+        <tr><td>{{ row.value }}</td><td>{{ row.list_label }}</td><td>{{ row.matched_text }}</td><td><strong>{% if row.is_error %}Check this entry: {% endif %}{{ row.outcome_label }}</strong>. {{ row.statement }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if m.asset_scope_coverage.entry_rows_omitted %}
+    <p class="ds-note-t">{{ m.asset_scope_coverage.entry_rows_omitted }} further scope entr{{ 'y is' if m.asset_scope_coverage.entry_rows_omitted == 1 else 'ies are' }} not listed here.</p>
+    {% endif %}
+    {% endif %}
+  </section>
+  {% endif %}
+
   {# A domain reached over a trust but never enumerated contributes to nothing
      above, so it is stated separately rather than counted as scope. Naming it
      is the useful part: it is the surface this engagement did not measure. #}
@@ -6492,9 +6605,21 @@ ol.oblig-steps > li {
       <div class="ds-note-t">{{ m.host_enrichment_coverage_statement }}</div>
     </div>
     {% endif %}
+    {% if m.guest_access_coverage_statement %}
+    <div class="ds-note">
+      <div class="ds-note-k">Guest access scope</div>
+      <div class="ds-note-t">{{ m.guest_access_coverage_statement }}</div>
+    </div>
+    {% endif %}
+    {% if m.resource_coverage_statement %}
+    <div class="ds-note">
+      <div class="ds-note-k">Assessment not completed</div>
+      <div class="ds-note-t">{{ m.resource_coverage_statement }}</div>
+    </div>
+    {% endif %}
     {% if m.operator_stop_statements %}
     <div class="ds-note">
-      <div class="ds-note-k">Stopped by the operator</div>
+      <div class="ds-note-k">{{ m.operator_stop_heading }}</div>
       {% for _line in m.operator_stop_statements %}<div class="ds-note-t">{{ _line }}</div>{% endfor %}
     </div>
     {% endif %}

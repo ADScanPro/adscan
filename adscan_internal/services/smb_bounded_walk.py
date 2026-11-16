@@ -27,9 +27,9 @@ metadata). This module owns only the bounding. Subprocess/mount-based searches
 (rclone, manspider, CredSweeper-over-CIFS) are a different pattern and do NOT belong
 here — this is strictly an aiosmb ``list_r`` wrapper.
 
-Pure async orchestration: it imports only the vendor SMB directory interface and
-stdlib. Safe to consume from any service that already holds a logged-in
-``aiosmb.SMBConnection``.
+Pure async orchestration: it imports only the vendor SMB directory interface, the
+engagement-scope SSOT (lazily, to drop roots on an excluded host) and stdlib. Safe
+to consume from any service that already holds a logged-in ``aiosmb.SMBConnection``.
 """
 
 from __future__ import annotations
@@ -55,6 +55,9 @@ class ShareWalkOutcome:
     files_seen: int = 0
     roots_walked: list[str] = field(default_factory=list)
     roots_timed_out: list[str] = field(default_factory=list)
+    #: Roots on a host the engagement scope excludes: never walked. A coverage
+    #: gap of its own, neither a timeout nor "nothing found".
+    roots_outside_scope: list[str] = field(default_factory=list)
     max_files_reached: bool = False
     last_error: str = ""
 
@@ -63,6 +66,18 @@ class ShareWalkOutcome:
         """True when a time budget cut a root short (results are incomplete)."""
 
         return bool(self.roots_timed_out)
+
+
+def unc_root_host(root_unc: Any) -> str:
+    r"""The host a UNC root names (``\\host\SHARE\sub`` -> ``host``), ``""`` if none."""
+    text = str(root_unc or "").strip().replace("/", "\\").lstrip("\\")
+    return text.split("\\", 1)[0].strip()
+
+
+def unc_root_share(root_unc: Any) -> str:
+    r"""The share a UNC root is on (``\\host\SHARE\sub`` -> ``SHARE``), ``""`` if none."""
+    parts = str(root_unc or "").strip().replace("/", "\\").lstrip("\\").split("\\")
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
 async def bounded_share_walk(
@@ -76,8 +91,16 @@ async def bounded_share_walk(
     overall_timeout: float | None = None,
     exclude_dir: Sequence[str] = (),
     filter_cb: Any = None,
+    shell: Any | None = None,
 ) -> ShareWalkOutcome:
     r"""Walk ``roots`` on one SMB ``connection`` with per-root time budgets.
+
+    Engagement scope: a root names its own host (``\\host\SHARE``), so the roots
+    are partitioned by that host before the first one is walked. The opener of
+    ``connection`` is the primary gate; this keeps a root on another, excluded
+    host from being walked over a connection that was opened for an allowed
+    one. ``shell`` is the session whose scope applies. Skipped roots are listed
+    in ``roots_outside_scope``, never in ``roots_timed_out``.
 
     Args:
         connection: A logged-in ``aiosmb.SMBConnection`` (the caller owns its
@@ -111,8 +134,34 @@ async def bounded_share_walk(
 
     from aiosmb.commons.interfaces.directory import SMBDirectory
 
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        partition_targets_in_scope,
+        prepare_scope_targets,
+    )
+
     outcome = ShareWalkOutcome()
     exclude = list(exclude_dir)
+    # The roots name their hosts: the session is told about them once, then each
+    # root is judged for the share it tree-connects to (the scope SSOT decides
+    # what that share means; a walk below SYSVOL opens SYSVOL, nothing else).
+    prepare_scope_targets(shell, [unc_root_host(root) for root in roots])
+    by_share: dict[str, list[str]] = {}
+    for root in roots:
+        by_share.setdefault(unc_root_share(root).upper(), []).append(root)
+    allowed: set[str] = set()
+    for share, share_roots in by_share.items():
+        scope = partition_targets_in_scope(
+            shell,
+            share_roots,
+            key=unc_root_host,
+            contact=Contact("smb", share=share) if share else None,
+            surface="smb_share_walk",
+            what="SMB share walk",
+        )
+        outcome.roots_outside_scope.extend(str(root) for root in scope.refused_items)
+        allowed.update(str(root) for root in scope.allowed)
+    roots = [root for root in roots if str(root) in allowed]
 
     async def _walk_one(root_unc: str) -> None:
         try:
@@ -172,4 +221,4 @@ async def bounded_share_walk(
     return outcome
 
 
-__all__ = ["ShareWalkOutcome", "bounded_share_walk", "OnFile"]
+__all__ = ["ShareWalkOutcome", "bounded_share_walk", "OnFile", "unc_root_host"]

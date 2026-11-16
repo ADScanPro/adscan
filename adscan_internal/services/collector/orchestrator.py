@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING
 
@@ -18,6 +20,17 @@ if TYPE_CHECKING:
     from adscan_internal.services.posture_sink import PostureSink
 
 from adscan_core import telemetry
+from adscan_core.memory_guard import OUTCOME_STOPPED, memory_bounded
+from adscan_core.scan_control import ScanAbortRequested
+from adscan_core.reporting.host_enrichment_coverage import (
+    REASON_DESELECTED,
+    deselected_host_parts,
+)
+from adscan_core.reporting.resource_coverage import (
+    DIRECTORY_READ_UNIT,
+    REASON_MEMORY,
+    STAGE_COLLECTION,
+)
 from adscan_internal.rich_output import (
     mark_sensitive,
     print_info,
@@ -42,6 +55,11 @@ from adscan_internal.services.collector.models import (
 )
 from adscan_internal.services.collector.persistence import CollectorPersistence
 from adscan_internal.services.collector.smb_collector import SMBCollectorConfig
+from adscan_internal.services.collector.stage_progress import (
+    STAGE_DIRECTORY_READ,
+    STAGE_GRAPH_SAVE,
+    collection_stage_progress,
+)
 from adscan_internal.services.collector.share_collector import ShareCollectorConfig
 from adscan_internal.workspaces import domain_subpath
 from adscan_core.rich_output import print_exception
@@ -167,6 +185,28 @@ class CollectionOrchestrator:
     def __init__(self, *, ldap_collector: Any = None, persistence: Any = None) -> None:
         self._ldap_collector = ldap_collector or ADscanLDAPCollector()
         self._persistence = persistence or CollectorPersistence()
+        # Serialises every graph persist this orchestrator makes. The host
+        # sweep's mid-sweep checkpoint persists a snapshot on its own thread and
+        # the sweep does not wait for it (a stop must return in seconds), so
+        # the end-of-sweep persist takes this lock first: a running checkpoint
+        # finishes, then the complete graph is written over it, never under it.
+        self._persist_lock = threading.Lock()
+        # A "stop the scan" chosen during the host sweep, held until the domain's
+        # graph is saved so the sweep's findings are kept (see ``collect_scope``).
+        self._held_scan_abort: BaseException | None = None
+
+    def _persist(self, shell: Any, *, domain: str, result: Any, **kwargs: Any) -> Any:
+        """``persistence.persist`` under the orchestrator's persist lock."""
+        if not self._persist_lock.acquire(blocking=False):
+            print_info_verbose(
+                "Saving the collected graph: waiting for the progress checkpoint "
+                "that is still writing to finish first."
+            )
+            self._persist_lock.acquire()
+        try:
+            return self._persistence.persist(shell, domain=domain, result=result, **kwargs)
+        finally:
+            self._persist_lock.release()
 
     @staticmethod
     def _report_progress(
@@ -216,6 +256,7 @@ class CollectionOrchestrator:
         scale_gate_callback: "Callable[[int], Any] | None" = None,
         shell: Any = None,
         defer_ca_registry_rerun: bool = False,
+        host_sweep_scope: "Callable[[], Any] | None" = None,
     ) -> tuple[CollectionResult, CollectionTiming]:
         """Collect a single domain and return the raw result with per-phase timing.
 
@@ -247,14 +288,101 @@ class CollectionOrchestrator:
         checkpoints the partial graph mid-sweep, so a Ctrl+C / crash resumes from
         the remaining hosts on reload. ``None`` (default, lab scripts / tests)
         leaves collection byte-for-byte identical to the pre-resume behaviour.
+
+        ``host_sweep_scope`` is a zero-argument factory returning the context
+        manager the per-host SMB sweep runs inside (the CLI passes the
+        operator-stoppable "SMB host enrichment" step). It wraps the sweep ONLY,
+        never the directory read or the graph save, so a Ctrl+C during those
+        stages is not read as a stop of host enrichment. It is never entered
+        when both SMB sub-collections are deselected.
         """
         timing = CollectionTiming()
         print_info_verbose(
             f"Collecting domain {mark_sensitive(target_domain, 'domain')}..."
         )
 
+        if shell is not None:
+            # A new collection of the domain is judged afresh: an earlier
+            # collection stop is no longer what this run rests on.
+            from adscan_internal.services.resource_coverage_recorder import (
+                clear_stage_coverage,
+            )
+
+            clear_stage_coverage(shell, target_domain, STAGE_COLLECTION)
         _t = time.monotonic()
-        result = self._ldap_collector.collect(
+        # The directory read holds the whole result in memory until it is
+        # committed, so it runs under the collection stage's memory boundary
+        # (the paged searches and the ACL parsing watch it). A stop keeps what
+        # earlier runs committed, commits nothing partial, and is declared.
+        with memory_bounded(
+            STAGE_COLLECTION,
+            unit=DIRECTORY_READ_UNIT,
+            record=self._collection_stop_recorder(shell, target_domain),
+        ) as ldap_stage, collection_stage_progress(shell, label=STAGE_DIRECTORY_READ):
+            result = self._ldap_collect(
+                target_domain=target_domain,
+                dc_address=dc_address,
+                credential=credential,
+                use_ldaps=use_ldaps,
+                kerberos_target_hostname=kerberos_target_hostname,
+                auth_domain=auth_domain,
+                auth_kdc=auth_kdc,
+                collection_scope=collection_scope,
+                posture_sink=posture_sink,
+                posture_snapshot=posture_snapshot,
+                shell=shell,
+                defer_ca_registry_rerun=defer_ca_registry_rerun,
+            )
+        if ldap_stage.outcome == OUTCOME_STOPPED:
+            timing.ldap = time.monotonic() - _t
+            return self._memory_stopped_result(target_domain, collection_scope), timing
+        timing.adcs = result.adcs_elapsed
+        timing.ldap = time.monotonic() - _t - timing.adcs
+        # Live observability: the LDAP pass pulled the bulk of the graph nodes.
+        self._report_progress(progress_callback, result)
+        return self._collect_after_directory(
+            result,
+            timing,
+            target_domain=target_domain,
+            auth_domain=auth_domain,
+            dc_address=dc_address,
+            auth_kdc=auth_kdc,
+            credential=credential,
+            kerberos_target_hostname=kerberos_target_hostname,
+            collection_scope=collection_scope,
+            collect_smb=collect_smb,
+            collect_shares=collect_shares,
+            posture_sink=posture_sink,
+            posture_snapshot=posture_snapshot,
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+            host_progress_callback=host_progress_callback,
+            host_stage_timing_beacon=host_stage_timing_beacon,
+            host_cancellation=host_cancellation,
+            host_cap=host_cap,
+            scale_gate_callback=scale_gate_callback,
+            shell=shell,
+            host_sweep_scope=host_sweep_scope,
+        )
+
+    def _ldap_collect(
+        self,
+        *,
+        target_domain: str,
+        dc_address: str,
+        credential: _Credential,
+        use_ldaps: bool,
+        kerberos_target_hostname: str | None,
+        auth_domain: str,
+        auth_kdc: str,
+        collection_scope: str,
+        posture_sink: Optional["PostureSink"],
+        posture_snapshot: Optional["DomainPosture"],
+        shell: Any,
+        defer_ca_registry_rerun: bool,
+    ) -> CollectionResult:
+        """The directory read (one call, so a memory stop releases its frames)."""
+        return self._ldap_collector.collect(
             domain=target_domain,
             dc_address=dc_address,
             username=getattr(credential, "username", None),
@@ -272,11 +400,56 @@ class CollectionOrchestrator:
             shell=shell,
             defer_ca_registry_rerun=defer_ca_registry_rerun,
         )
-        timing.adcs = result.adcs_elapsed
-        timing.ldap = time.monotonic() - _t - timing.adcs
-        # Live observability: the LDAP pass pulled the bulk of the graph nodes.
-        self._report_progress(progress_callback, result)
 
+    @staticmethod
+    def _collection_stop_recorder(shell: Any, domain: str) -> Any:
+        """The ``record`` callback of a collection stage stopped at the ceiling."""
+        from adscan_internal.services.resource_coverage_recorder import (
+            collection_stop_recorder,
+        )
+
+        return collection_stop_recorder(shell, domain)
+
+    @staticmethod
+    def _memory_stopped_result(domain: str, collection_scope: str) -> CollectionResult:
+        """The result of a directory read stopped at the memory ceiling.
+
+        Holds nothing, and records the directory and AD CS stages as cut off, so
+        the store keeps what earlier runs committed (no stale prune, no "no AD
+        CS" stamped from an absence) and the collection reads incomplete.
+        """
+        result = CollectionResult(domain=domain, collection_scope=collection_scope)
+        result.record_stage_failure("objects_acls", REASON_MEMORY)
+        result.record_stage_failure("adcs", REASON_MEMORY)
+        return result
+
+    def _collect_after_directory(
+        self,
+        result: CollectionResult,
+        timing: CollectionTiming,
+        *,
+        target_domain: str,
+        auth_domain: str,
+        dc_address: str,
+        auth_kdc: str,
+        credential: _Credential,
+        kerberos_target_hostname: str | None,
+        collection_scope: str,
+        collect_smb: bool,
+        collect_shares: bool,
+        posture_sink: Optional["PostureSink"],
+        posture_snapshot: Optional["DomainPosture"],
+        output_dir: str | None,
+        progress_callback: Callable[[int], None] | None,
+        host_progress_callback: Any,
+        host_stage_timing_beacon: Any,
+        host_cancellation: Any,
+        host_cap: int,
+        scale_gate_callback: Any,
+        shell: Any,
+        host_sweep_scope: "Callable[[], Any] | None" = None,
+    ) -> tuple[CollectionResult, CollectionTiming]:
+        """Everything a domain collection does after the directory read."""
         _t = time.monotonic()
         result.shadow_credential_findings = analyze_shadow_credentials(result)
         result.audit_findings = analyze_audit_findings(result, result.domain_policy)
@@ -299,7 +472,13 @@ class CollectionOrchestrator:
         # Machine-account password rotation policy (audit scope): read the GPO
         # SYSVOL security templates over SMB to flag disabled/relaxed rotation — a
         # domain-wide static-machine-password (Timeroast) surface. Best-effort.
-        if collection_scope == COLLECTION_SCOPE_FULL_ASSESSMENT:
+        if collection_scope == COLLECTION_SCOPE_FULL_ASSESSMENT and self._dc_share_read_in_scope(
+            shell,
+            result,
+            target_domain=target_domain,
+            dc_address=dc_address,
+            dc_fqdn=kerberos_target_hostname,
+        ):
             self._inspect_machine_password_policy(
                 result,
                 target_domain=target_domain,
@@ -310,6 +489,31 @@ class CollectionOrchestrator:
                 credential=credential,
                 posture_sink=posture_sink,
                 posture_snapshot=posture_snapshot,
+            )
+
+        # Inventory-first persistence: the directory stages are committed to the
+        # store NOW, before the host sweep, so the graph exists (and is exported
+        # for the live view) while the long sweep runs, and a crash in the sweep
+        # loses no directory data. The end-of-domain persist in ``collect_scope``
+        # commits again and writes only what moved since (host properties learned
+        # by DNS and SMB, the host audit findings, well-known nodes added later).
+        if shell is not None:
+            with collection_stage_progress(shell, label=STAGE_GRAPH_SAVE):
+                self._persist(shell, domain=target_domain, result=result)
+            # The directory objects of this domain are committed: tell the
+            # engagement scope NOW, before the first stage that contacts a
+            # host, so the entries that waited for them (an account name, a
+            # SID, a DN, a short host name) resolve and no host is judged
+            # against a half-resolved scope.
+            self._directory_committed(shell, target_domain)
+
+        if not (collect_smb and collect_shares):
+            # A deselected SMB sub-collection is a declared coverage gap, never
+            # a silently clean one. With BOTH deselected nothing below contacts
+            # a host (no DNS resolution of the computers, no 445 gate, no sweep);
+            # with one deselected the sweep runs the other stage only.
+            timing.host_coverage = self._deselected_host_coverage(
+                result, collect_smb=collect_smb, collect_shares=collect_shares
             )
 
         if collect_smb or collect_shares:
@@ -335,7 +539,6 @@ class CollectionOrchestrator:
             from adscan_internal.services.collector.host_collector import (
                 HostCollectorConfig,
                 _percentile,
-                collect_domain_hosts,
             )
 
             smb_cfg = SMBCollectorConfig(
@@ -387,8 +590,17 @@ class CollectionOrchestrator:
             # legacy behaviour. The hooks close over ``shell`` + ``result`` +
             # ``self._persistence`` so the host_collector service itself stays
             # shell-free (it only invokes the opaque callables).
+            committer = None
             if shell is not None:
-                self._wire_collection_resume(
+                # Engagement scope: the sweep asks this once, before its 445
+                # gate, so an excluded computer receives no packet at all.
+                host_cfg.scope_partition = self._host_scope_partition(
+                    shell, target_domain
+                )
+                # And once more per computer, right before a worker contacts it:
+                # a long sweep is not held to the answer from its start.
+                host_cfg.scope_admit = self._host_scope_admit(shell, target_domain)
+                committer = self._wire_collection_resume(
                     host_cfg, shell=shell, domain=target_domain,
                     collection_scope=collection_scope, result=result,
                 )
@@ -396,7 +608,42 @@ class CollectionOrchestrator:
             # concurrent negotiate/samr/shares sums). Monotonic per the clock-step
             # doctrine. Only the surrounding timers are added; the call is unchanged.
             _host_wall_start = time.monotonic()
-            host_timing = collect_domain_hosts(result, host_cfg)
+            held: dict[str, Any] = {}
+            # The operator-stoppable step (``host_sweep_scope``) spans the sweep
+            # and nothing else. Leaving it raises ``ScanAbortRequested`` when the
+            # operator chose "stop the scan" during the sweep; that abort is held
+            # until this domain's graph is saved (``collect_scope``), so what the
+            # sweep found is kept, exactly as when the step wrapped the whole
+            # collection. An abort raised from INSIDE the sweep propagates at once.
+            sweep_scope = host_sweep_scope() if host_sweep_scope is not None else nullcontext()
+            sweep_returned = False
+            try:
+                with sweep_scope:
+                    # The per-host sweep under the collection stage's memory
+                    # boundary: its workers stop dispatching when memory crosses
+                    # the line, every host already committed stays, and the
+                    # boundary declares the hosts left out (the sweep resumes
+                    # from them on a larger machine).
+                    with memory_bounded(
+                        STAGE_COLLECTION,
+                        unit="hosts",
+                        record=self._collection_stop_recorder(shell, target_domain),
+                    ) as sweep_stage:
+                        self._run_host_sweep(
+                            sweep_stage,
+                            held,
+                            result=result,
+                            host_cfg=host_cfg,
+                            committer=committer,
+                            shell=shell,
+                            target_domain=target_domain,
+                        )
+                    sweep_returned = True
+            except ScanAbortRequested as exc:
+                if not sweep_returned:
+                    raise
+                self._held_scan_abort = exc
+            host_timing = held["timing"]
             timing.host_wall = time.monotonic() - _host_wall_start
             # Carry the share-collection abort coverage into domains_data so Phase
             # 7 (SMB Share Exposure), which runs later off the graph and cannot
@@ -435,6 +682,11 @@ class CollectionOrchestrator:
                             "reachable": _reachable,
                             "unreachable": max(0, _candidates - _reachable),
                             "budget_timeouts": int(host_timing.host_budget_timeouts),
+                            # Computers the engagement scope kept out: never a
+                            # candidate, never unreachable, never contacted.
+                            "outside_scope": int(
+                                getattr(host_timing, "skipped_out_of_scope", 0) or 0
+                            ),
                         }
                 except Exception as exc:  # noqa: BLE001 — telemetry must never abort collection
                     telemetry.capture_exception(exc)
@@ -449,6 +701,21 @@ class CollectionOrchestrator:
 
                     note_collection_hosts(
                         shell, target_domain, host_timing.examined_host_ids
+                    )
+                    # Share edges close only on hosts where every share's
+                    # security descriptor was read: an unread descriptor
+                    # (no admin for SRVSVC level 502) yields no edge, which is
+                    # not evidence that the access was removed.
+                    from adscan_internal.services.engagement.host_source_observations import (
+                        observe_share_acl_reads,
+                    )
+
+                    observe_share_acl_reads(
+                        shell,
+                        target_domain,
+                        host_timing.share_acl_examined_host_ids,
+                        host_timing.examined_host_ids,
+                        swept_hosts=int(getattr(host_timing, "candidate_count", 0) or 0) or None,
                     )
             timing.host_negotiate = host_timing.negotiate
             timing.host_samr = host_timing.samr
@@ -484,7 +751,23 @@ class CollectionOrchestrator:
             # Otherwise stays empty (full coverage) so the surfaces read "100% host
             # enrichment". The three reasons are mutually reconciled here so the CLI
             # records ONE coverage statement.
-            if host_timing.early_stopped:
+            if host_timing.early_stopped and host_timing.stop_source == "memory":
+                # Stopped at the memory ceiling: the ``resource_coverage`` block
+                # states the gap (one sentence, never also the operator-stop
+                # one); ``early_stopped`` keeps the sweep resumable.
+                timing.host_coverage = {
+                    "early_stopped": True,
+                    "reason": REASON_MEMORY,
+                    "hosts_swept": int(host_timing.swept_before_stop),
+                    "hosts_total": int(host_timing.total_dispatch),
+                    "hosts_remaining": max(
+                        0,
+                        int(host_timing.total_dispatch)
+                        - int(host_timing.swept_before_stop),
+                    ),
+                    "source": "memory",
+                }
+            elif host_timing.early_stopped:
                 timing.host_coverage = {
                     "early_stopped": True,
                     "reason": "early_stop",
@@ -523,6 +806,13 @@ class CollectionOrchestrator:
                     "hosts_remaining": max(0, reachable - swept),
                     "source": "cli",
                 }
+            # One SMB stage deselected while the other ran: whatever bounded the
+            # sweep, the deselected stage was collected on no host at all.
+            deselected = deselected_host_parts(
+                collect_smb=collect_smb, collect_shares=collect_shares
+            )
+            if deselected and timing.host_coverage.get("reason") != REASON_DESELECTED:
+                timing.host_coverage["deselected_parts"] = list(deselected)
 
             # Second-pass audit: findings that need SMB host data (signing,
             # dialect). Extends the list built by the first-pass analyze_audit_findings().
@@ -530,10 +820,297 @@ class CollectionOrchestrator:
                 analyze_host_audit_findings,
             )
             result.audit_findings.extend(analyze_host_audit_findings(result))
+            # Per-host sources a completed sweep can leave unread (the registry
+            # of a host where the account is not a local admin, an inconclusive
+            # SMBv1 probe): record, per family, on which hosts it was read, so
+            # a later run that could not read it never closes its finding.
+            if (
+                shell is not None
+                and result.collection_scope == COLLECTION_SCOPE_FULL_ASSESSMENT
+            ):
+                from adscan_internal.services.engagement.host_source_observations import (
+                    observe_host_sources,
+                )
+
+                observe_host_sources(
+                    shell,
+                    target_domain,
+                    list(result.nodes.values()),
+                    swept_hosts=int(getattr(host_timing, "candidate_count", 0) or 0) or None,
+                )
             # Live observability: SMB/share host collection added host nodes.
             self._report_progress(progress_callback, result)
 
         return result, timing
+
+    @staticmethod
+    def _deselected_host_coverage(
+        result: CollectionResult, *, collect_smb: bool, collect_shares: bool
+    ) -> dict[str, Any]:
+        """The ``host_coverage`` record of an operator-deselected SMB stage.
+
+        ``hosts_total`` is the enabled computer accounts the directory read
+        returned (the hosts the sweep would have considered); none was swept for
+        the deselected stage. The client statement is worded by
+        :mod:`adscan_core.reporting.host_enrichment_coverage`.
+        """
+        computers = 0
+        for node in result.nodes.values():
+            if str(getattr(node, "kind", "")) != "Computer":
+                continue
+            if getattr(node, "enabled", None) is False:
+                continue
+            computers += 1
+        return {
+            "reason": REASON_DESELECTED,
+            "hosts_swept": 0,
+            "hosts_total": computers,
+            "hosts_remaining": computers,
+            "deselected_parts": list(
+                deselected_host_parts(
+                    collect_smb=collect_smb, collect_shares=collect_shares
+                )
+            ),
+            "source": "operator",
+        }
+
+    def _run_host_sweep(
+        self,
+        stage: Any,
+        held: dict[str, Any],
+        *,
+        result: CollectionResult,
+        host_cfg: Any,
+        committer: Any,
+        shell: Any,
+        target_domain: str,
+    ) -> None:
+        """Run the per-host sweep; raise the stage's stop when memory ended it.
+
+        The body of the sweep's memory boundary (one call). The sweep runs on a
+        worker thread that only asks ``over_line()``; when it stopped for
+        memory, the stop is raised here, on the boundary thread, with the hosts
+        swept and the hosts it had in front of it.
+        """
+        from adscan_internal.services.collector.host_collector import (
+            collect_domain_hosts,
+        )
+
+        host_cfg.memory_guard = stage.guard
+        host_timing = None
+        sweep_exc: BaseException | None = None
+        try:
+            host_timing = collect_domain_hosts(result, host_cfg)
+        except BaseException as exc:
+            sweep_exc = exc
+            raise
+        finally:
+            if committer is not None:
+                self._finish_host_commits(
+                    shell, target_domain, committer, host_timing, sweep_exc
+                )
+        held["timing"] = host_timing
+        if host_timing.early_stopped and host_timing.stop_source == "memory":
+            stage.total = int(host_timing.total_dispatch)
+            stage.guard.progress(int(host_timing.swept_before_stop))
+            stage.guard.stop_now()
+
+    @staticmethod
+    def _directory_committed(shell: Any, domain: str) -> None:
+        """Tell the engagement scope that ``domain``'s directory objects are committed.
+
+        Called when a domain's directory stage commits, before the first stage
+        that contacts a host. The scope SSOT resolves the entries that waited
+        for the directory and reads the record of every host name learned so
+        far. Best-effort: an entry that cannot be resolved stays pending, and a
+        pending entry keeps the hosts it could name out (the verdict fails
+        closed), so a failure here never widens the scope.
+        """
+        try:
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                on_directory_committed,
+            )
+
+            on_directory_committed(shell, domain=domain)
+        except Exception as exc:  # noqa: BLE001 - pending entries stay fail-closed
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            return
+        try:
+            # The scan credential the operator supplied was let in before the
+            # scope could place it: it is judged again now that the directory
+            # can, and an excluded account ends the run.
+            from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+                stop_run_if_controller_excluded,
+                stop_run_if_operator_credential_excluded,
+            )
+
+            # The same for the controller the operator named: an entry only the
+            # directory can match may turn out to be that controller.
+            if not stop_run_if_operator_credential_excluded(shell, domain=domain):
+                stop_run_if_controller_excluded(shell, domain=domain)
+        except Exception as exc:  # noqa: BLE001 - the sign-in guard still refuses it
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+
+    @staticmethod
+    def _dc_share_read_in_scope(
+        shell: Any,
+        result: CollectionResult,
+        *,
+        target_domain: str,
+        dc_address: str,
+        dc_fqdn: str | None,
+    ) -> bool:
+        """May the collection open an SMB session to the domain controller's shares?
+
+        The GPO security templates are read from SYSVOL over SMB, and that is
+        how the read is described to the scope SSOT (an SMB tree connect to the
+        SYSVOL share, nothing written), so a domain controller the scope keeps
+        to directory reads is still read. A refused read is announced as not
+        checked, never as "no policy found".
+
+        The domain controller's own directory object (already collected) gives
+        the verdict its DN and SID, so a subtree or SID entry needs no lookup.
+        Without a session shell there is no engagement to hold the read to.
+        """
+        if shell is None:
+            return True
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            asset_scope_recorded,
+            require_host_in_scope,
+        )
+
+        if not asset_scope_recorded(shell):
+            return True
+        host = str(dc_fqdn or dc_address or "").strip()
+        wanted = host.rstrip(".").lower()
+        host_dn = host_sid = None
+        for node in result.nodes.values():
+            if getattr(node, "kind", "") != "Computer":
+                continue
+            dns = str((getattr(node, "properties", None) or {}).get("dnshostname") or "")
+            if dns.rstrip(".").lower() == wanted:
+                host_dn = str(getattr(node, "distinguished_name", "") or "") or None
+                host_sid = str(getattr(node, "object_id", "") or "") or None
+                break
+        return require_host_in_scope(
+            shell,
+            host=host,
+            connect_address=dc_address,
+            contact=Contact("smb", share="SYSVOL"),
+            surface="gpo_sysvol_read",
+            what="Machine-account password policy read",
+            domain=target_domain,
+            host_dn=host_dn,
+            host_sid=host_sid,
+        )
+
+    @staticmethod
+    def _host_scope_partition(shell: Any, domain: str) -> Any:
+        """The engagement-scope partition the host sweep asks before its 445 gate.
+
+        Bound to the session's scope SSOT. The sweep hands it its computer
+        nodes; each is judged with the identity the collector already holds
+        (name, resolved address, distinguished name, SID), so a subtree or SID
+        entry costs no directory lookup per host. Returns ``(allowed, refused)``.
+
+        SMB host collection (sessions, local groups, shares, registry) is host
+        assessment, so nothing narrower is stated about the contact: a domain
+        controller the scope keeps to directory reads is not swept.
+        """
+
+        def _partition(nodes: list[Any]) -> tuple[list[Any], list[Any]]:
+            from adscan_internal.services.collector.smb_collector import (  # noqa: PLC0415
+                resolve_target_hostname,
+                resolve_target_ip,
+            )
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                asset_scope_recorded,
+                note_host_addresses_batch,
+                partition_targets_in_scope,
+            )
+
+            if asset_scope_recorded(shell):
+                # The collection just resolved each computer's address: report
+                # it, so an entry naming a computer also covers the address a
+                # later step (or the socket-level backstop) sees on its own.
+                learned: dict[str, list[str]] = {}
+                for node in nodes:
+                    name = resolve_target_hostname(node)
+                    address = str(
+                        (getattr(node, "properties", None) or {}).get("ip_address") or ""
+                    ).strip()
+                    if name and address:
+                        learned.setdefault(name, []).append(address)
+                note_host_addresses_batch(shell, learned)
+            split = partition_targets_in_scope(
+                shell,
+                nodes,
+                key=lambda node: resolve_target_hostname(node) or resolve_target_ip(node) or "",
+                address=resolve_target_ip,
+                dn=lambda node: getattr(node, "distinguished_name", "") or "",
+                sid=lambda node: getattr(node, "object_id", "") or "",
+                surface="smb_collection",
+                what="SMB collection",
+                domain=domain,
+            )
+            return list(split.allowed), list(split.refused_items)
+
+        return _partition
+
+    @staticmethod
+    def _host_scope_admit(shell: Any, domain: str) -> Any:
+        """The per-computer scope check a sweep worker makes right before its contact.
+
+        The same verdict as :meth:`_host_scope_partition`, with the same
+        identity (name, resolved address, distinguished name, SID), asked for
+        ONE computer when it is about to be contacted. The address is reported
+        again first, so what the session knows about the host is current. A
+        computer the scope keeps out now is recorded like the ones the
+        partition left out. ``None``-safe: without an asset scope every
+        computer is admitted at the cost of one attribute read.
+        """
+
+        def _admit(node: Any) -> bool:
+            from adscan_internal.services.collector.smb_collector import (  # noqa: PLC0415
+                resolve_target_hostname,
+                resolve_target_ip,
+            )
+            from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                asset_scope_recorded,
+                host_scope_verdict,
+                note_host_addresses_batch,
+                record_scope_refusals,
+            )
+
+            if not asset_scope_recorded(shell):
+                return True
+            name = resolve_target_hostname(node) or ""
+            address = str(resolve_target_ip(node) or "")
+            if name and address:
+                note_host_addresses_batch(shell, {name: [address]})
+            verdict = host_scope_verdict(
+                shell,
+                host=name or address,
+                connect_address=address or None,
+                domain=domain,
+                host_dn=getattr(node, "distinguished_name", "") or None,
+                host_sid=getattr(node, "object_id", "") or None,
+            )
+            if verdict.allowed:
+                return True
+            record_scope_refusals(
+                shell,
+                [(node, verdict)],
+                surface="smb_collection",
+                domain=domain,
+                key=lambda item: resolve_target_hostname(item) or resolve_target_ip(item) or "",
+            )
+            return False
+
+        return _admit
 
     def _inspect_machine_password_policy(
         self,
@@ -616,37 +1193,83 @@ class CollectionOrchestrator:
         domain: str,
         collection_scope: str,
         result: "CollectionResult",
-    ) -> None:
-        """Attach the host-granular Domain-Collection crash-resume hooks to ``host_cfg``.
+    ) -> Any:
+        """Attach the host-granular store commit and the resume skip-set to ``host_cfg``.
 
-        Builds the three fan-out callbacks (sweep-start marker, per-host done
-        recorder, mid-sweep graph checkpoint) plus the resume skip-set, closing
-        over ``shell`` / ``domain`` / ``result`` / ``self._persistence`` so the pure
-        host_collector service never touches the shell/workspace SSOT. All hooks
-        are best-effort; the SSOT helpers are themselves fail-open.
+        Each swept host is committed to the domain's graph store as one unit per
+        sweep stage (``store_writer.HostUnitCommitter``), on its own thread, the
+        moment it is merged: the unit is the host's facts AND its done-mark, so a
+        Ctrl+C or a crash keeps every committed host and nothing else. The skip
+        set of a resumed sweep is the store's committed hosts
+        (``collection_progress.resumed_done_ids``). ``ADSCAN_COLLECTOR_FRESH``
+        begins the sweep's stages ``fresh``. During the sweep the graph is
+        exported on the export throttle, so the live view grows.
+
+        Returns the committer (the caller finishes it), or ``None`` when the
+        store cannot be opened: the sweep then runs without per-host commits
+        and the end-of-domain persist commits its hosts.
         """
+        del result
+        from adscan_core.graph_store import GraphStoreError
         from adscan_internal.services.collection_progress import (
-            checkpoint_collection_progress,
+            collector_fresh_requested,
             mark_collection_running,
-            mark_host_done,
+            record_hosts_done_count,
             resumed_done_ids,
         )
+        from adscan_internal.services.collector.store_writer import (
+            HostUnitCommitter,
+            LiveExporter,
+            smb_stages_for,
+            store_writer_for_shell,
+        )
+        from adscan_internal.services.graph_runtime import export_graph_if_due
 
-        # Skip-set for a reload that hit a prior interrupted sweep (empty on a
-        # fresh run — a non-``running`` record yields no skips). Also applies the
-        # ``ADSCAN_COLLECTOR_FRESH`` escape hatch, which discards the cursor so the
-        # sweep re-scans every host (and, having reset the record, suppresses the
-        # resume notice below).
-        host_cfg.resumed_host_ids = resumed_done_ids(shell, domain)
-        # A resumed sweep is silent by default: it just skips the already-enriched
-        # hosts. Surface it. The operator who returns to a workspace whose host
-        # enrichment was stopped early or interrupted deserves to know ADscan
-        # remembered their progress and what happens next — the START-of-run mirror
-        # of the END-of-run host-enrichment coverage statement. Advise, then
-        # continue automatically; a re-scan is an explicit opt-out, never a prompt.
+        stages = smb_stages_for(
+            collect_samr=bool(getattr(host_cfg, "collect_samr", True)),
+            collect_shares=bool(getattr(host_cfg, "collect_shares", True)),
+        )
+        try:
+            writer = store_writer_for_shell(shell, domain)
+        except GraphStoreError as exc:
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
+            return None
+        fresh = collector_fresh_requested()
+        # Skip-set for a resumed sweep (empty on a fresh run, after a sweep that
+        # completed, or under ``ADSCAN_COLLECTOR_FRESH``).
+        host_cfg.resumed_host_ids = resumed_done_ids(shell, domain, stages=stages)
         self._announce_resume(shell=shell, domain=domain)
         scan_type = collection_scope
         host_cap = int(getattr(host_cfg, "host_cap", 0) or 0)
+        resumed_count = len(host_cfg.resumed_host_ids or ())
+        # The live export during the sweep exists for the platform, the only
+        # reader of the file while a scan runs, so it runs only in an unattended
+        # run (``adscan ci``, the web worker). It runs throttled on its own
+        # single-flight thread: a build of a large graph takes minutes, and on
+        # the commit thread it would hold every queued host commit behind it.
+        # An interactive scan never pays its GIL contention (a build slowed the
+        # partner-shape commits to a p99 of 477 ms; BACKLOG "live graph export
+        # in a subprocess").
+        from adscan_internal.interaction import is_non_interactive
+
+        exporter = (
+            LiveExporter(lambda: export_graph_if_due(shell, domain))
+            if is_non_interactive(shell)
+            else None
+        )
+
+        def _on_commit() -> None:
+            # The record's "N of M" stays live for the resume notice and the
+            # platform; the export request returns at once.
+            record_hosts_done_count(shell, domain, resumed_count + committer.committed)
+            if exporter is not None:
+                exporter.request()
+
+        committer = HostUnitCommitter(writer, stages=stages, on_commit=_on_commit)
+        committer.resumed_count = resumed_count
+        committer.live_exporter = exporter  # None in an interactive run
+        writer.sweep_owns_smb = True
 
         def _on_sweep_start(hosts_total: int) -> None:
             mark_collection_running(
@@ -656,27 +1279,119 @@ class CollectionOrchestrator:
                 hosts_total=hosts_total,
                 host_cap=host_cap,
             )
-
-        def _mark_host_done(object_id: str) -> None:
-            mark_host_done(shell, domain, object_id)
-
-        def _checkpoint() -> None:
-            # Ordering is load-bearing: persist the partial graph FIRST so no
-            # done-id is ever flushed for a host whose edges are not yet on disk
-            # (a resume would otherwise skip it and silently drop its enrichment).
-            # Reuses the SAME ``persist`` the end-of-sweep path calls (load-then-
-            # merge, re-entrant) — no duplicate persist logic.
-            try:
-                self._persistence.persist(shell, domain=domain, result=result)
-            except Exception as exc:  # noqa: BLE001 — a failed persist must not flush the done-set
-                telemetry.capture_exception(exc)
-                print_exception(exception=exc)
-                return
-            checkpoint_collection_progress(shell, domain)
+            for stage in committer.stages:
+                writer.store.begin_stage(stage, units_total=int(hosts_total), fresh=fresh)
 
         host_cfg.collection_on_sweep_start = _on_sweep_start
-        host_cfg.collection_mark_host_done = _mark_host_done
-        host_cfg.collection_checkpoint = _checkpoint
+        host_cfg.collection_commit_host = committer.submit
+        committer.start()
+        return committer
+
+    @staticmethod
+    def _finish_host_commits(
+        shell: Any,
+        domain: str,
+        committer: Any,
+        host_timing: Any,
+        sweep_exc: BaseException | None = None,
+    ) -> None:
+        """Drain the host commits and end the sweep's stages, in a ``finally``.
+
+        ``complete`` for a sweep that ran to its end (a host cap is a coverage
+        boundary already declared in the host coverage, recorded as the
+        reason), ``stopped`` for an operator stop (``operator_stop``, with the
+        stop's source; ``abort_scan`` when the scan was aborted mid-sweep),
+        ``skipped`` when the operator declined the sweep before it started,
+        ``failed`` when the sweep raised an error.
+        Then the graph and its sidecars are exported. Never raises.
+        """
+        exporter = getattr(committer, "live_exporter", None)
+        try:
+            drained = committer.close()
+            if exporter is not None:
+                # No new live export; one already running finishes on its own.
+                exporter.stop()
+            if sweep_exc is not None and not isinstance(sweep_exc, Exception):
+                committer.end_stages(
+                    "stopped", reason="abort_scan", detail=type(sweep_exc).__name__
+                )
+            elif host_timing is None:
+                committer.end_stages(
+                    "failed",
+                    reason="sweep_error",
+                    detail=type(sweep_exc).__name__ if sweep_exc is not None else "",
+                )
+            elif getattr(host_timing, "early_stopped", False) and (
+                getattr(host_timing, "stop_source", "") == "memory"
+            ):
+                committer.end_stages("stopped", reason=REASON_MEMORY)
+            elif getattr(host_timing, "early_stopped", False):
+                committer.end_stages(
+                    "stopped",
+                    reason="operator_stop",
+                    detail=str(getattr(host_timing, "stop_source", "") or "cli"),
+                )
+            elif getattr(host_timing, "scale_gate_reason", "") == "skip":
+                committer.end_stages("skipped", reason="operator_skip")
+            elif not drained or committer.failed:
+                committer.end_stages(
+                    "failed",
+                    reason="host_commit_failed",
+                    detail=f"{committer.failed} host(s) not committed",
+                )
+            else:
+                capped = bool(getattr(host_timing, "host_capped", False)) or (
+                    getattr(host_timing, "scale_gate_reason", "") == "cap"
+                )
+                # A sweep that covered every in-scope host is complete: the
+                # computers the engagement scope excludes are a boundary the
+                # client asked for, declared in the stage record (and in
+                # ``scope.json``), never an incomplete sweep.
+                from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                    HOST_OUTSIDE_ASSET_SCOPE,
+                )
+
+                outside = int(getattr(host_timing, "skipped_out_of_scope", 0) or 0)
+                reason = "host_cap" if capped else (HOST_OUTSIDE_ASSET_SCOPE if outside else "")
+                detail = (
+                    f"{outside} computer(s) excluded from the engagement scope, not contacted"
+                    if outside
+                    else ""
+                )
+                if outside and bool(getattr(host_timing, "all_out_of_scope", False)):
+                    # Every computer was excluded: the sweep never started, so
+                    # its stages are a declared skip, not a completed read.
+                    committer.end_stages(
+                        "skipped", reason=HOST_OUTSIDE_ASSET_SCOPE, detail=detail
+                    )
+                else:
+                    committer.end_stages("complete", reason=reason, detail=detail)
+            from adscan_internal.services.collection_progress import (
+                record_hosts_done_count,
+            )
+            from adscan_internal.services.graph_runtime import export_graph_if_due
+
+            record_hosts_done_count(
+                shell, domain, int(getattr(committer, "resumed_count", 0)) + committer.committed
+            )
+            # Throttled: the one forced export of the collection runs when the
+            # last domain's last stage ends (``_persist_cross_domain_edges``).
+            # Skipped while a live export is still building, so two builds of
+            # one graph never run at once.
+            if exporter is None or not exporter.busy():
+                export_graph_if_due(shell, domain)
+            if committer.commit_seconds:
+                ordered = sorted(committer.commit_seconds)
+                print_info_debug(
+                    "collector-timing host-commit "
+                    f"hosts={committer.committed} failed={committer.failed} "
+                    f"median_ms={ordered[len(ordered) // 2] * 1000:.1f} "
+                    f"p99_ms={ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))] * 1000:.1f} "
+                    f"max_ms={ordered[-1] * 1000:.1f}"
+                )
+        except Exception as exc:  # noqa: BLE001 — finishing must never mask the sweep's outcome
+            telemetry.capture_exception(exc)
+            print_exception(exception=exc)
 
     @staticmethod
     def _announce_resume(*, shell: Any, domain: str) -> None:
@@ -740,6 +1455,12 @@ class CollectionOrchestrator:
 
             if read_collection_progress(shell, domain).get("status") != STATUS_RUNNING:
                 return
+            coverage = getattr(timing, "host_coverage", None) or {}
+            if coverage.get("reason") == REASON_DESELECTED:
+                # The sweep did not run this time (both SMB stages deselected),
+                # so an earlier interrupted sweep is still unfinished: keep its
+                # record so a later run with SMB selected resumes it.
+                return
             early_stopped = bool(
                 (getattr(timing, "host_coverage", None) or {}).get("early_stopped")
             )
@@ -773,6 +1494,7 @@ class CollectionOrchestrator:
         host_cancellation: "HostSweepCancellation | None" = None,
         host_cap: int = 0,
         scale_gate_callback: "Callable[[int], Any] | None" = None,
+        host_sweep_scope: "Callable[[], Any] | None" = None,
     ) -> tuple[
         dict[str, dict[str, int]],
         dict[str, "CollectionResult"],
@@ -785,7 +1507,12 @@ class CollectionOrchestrator:
         (graph nodes pulled so far) so the caller can surface live mid-run
         motion. It defaults to None (no-op), leaving collection byte-for-byte
         identical to a run without it.
+
+        ``host_sweep_scope`` (see :meth:`collect_domain`) wraps each domain's
+        per-host SMB sweep only. A scan stop the operator chose inside it is
+        raised here, after the domain's graph is saved.
         """
+        self._held_scan_abort = None
         results: dict[str, CollectionResult] = {}
         counters: dict[str, dict[str, int]] = {}
         timings: dict[str, CollectionTiming] = {}
@@ -815,6 +1542,7 @@ class CollectionOrchestrator:
                 # CAs without one on the LDAP pass are finished below, after the
                 # persist that lets the graph resolve roles.
                 defer_ca_registry_rerun=True,
+                host_sweep_scope=host_sweep_scope,
             )
             results[scope.domain] = result
             timings[scope.domain] = timing
@@ -831,24 +1559,23 @@ class CollectionOrchestrator:
             # Seam 7 — persist wall-clock (monotonic). Only the timer is added; the
             # persist call itself is unchanged.
             _persist_start = time.monotonic()
-            counters[scope.domain] = self._persistence.persist(
-                shell, domain=scope.domain, result=result
-            )
+            with collection_stage_progress(shell, label=STAGE_GRAPH_SAVE):
+                counters[scope.domain] = self._persist(
+                    shell, domain=scope.domain, result=result
+                )
             # AD CS registry probe, second pass: the graph just persisted now
             # resolves roles the LDAP pass could not see (a local administrator
             # of the CA host found by the SMB sweep). Every deferred CA is
-            # recorded once here; new ESC6 / ESC11 / Certighost edges go
-            # through the same persistence path as the rest of the result.
+            # recorded once here, as its own store unit.
             from adscan_internal.services.adcs.ca_registry_rerun import (
                 rerun_pending_ca_registry_probes,
             )
 
-            if rerun_pending_ca_registry_probes(
+            # The late reads commit their own ``adcs_ca_registry`` units and
+            # export; nothing is persisted again here.
+            rerun_pending_ca_registry_probes(
                 shell, domain=scope.domain, result=result, dc_ip=scope.dc_address
-            ):
-                counters[scope.domain] = self._persistence.persist(
-                    shell, domain=scope.domain, result=result
-                )
+            )
             # Patch-level CVE checks, second pass: a host the run's CVE scan left
             # not assessed (its registry refused the scan credential) is read
             # again now that the persisted graph may prove an administrator of it
@@ -876,8 +1603,16 @@ class CollectionOrchestrator:
             # ``complete`` so the reload offer stops; an early-stopped sweep stays
             # ``running`` with the full done-set so a reload resumes the remainder.
             self._finalize_collection_progress(shell, scope.domain, timing)
+            if self._held_scan_abort is not None:
+                # The operator stopped the scan during this domain's sweep: its
+                # graph is saved, so honour the stop now (no further domain).
+                break
         self._resolve_cross_domain_references(results)
-        self._persist_cross_domain_edges(shell, results, counters)
+        with collection_stage_progress(shell, label=STAGE_GRAPH_SAVE):
+            self._persist_cross_domain_edges(shell, results, counters)
+        held_abort, self._held_scan_abort = self._held_scan_abort, None
+        if held_abort is not None:
+            raise held_abort
         return counters, results, timings
 
     def _persist_cross_domain_edges(
@@ -886,59 +1621,36 @@ class CollectionOrchestrator:
         results: dict[str, "CollectionResult"],
         counters: dict[str, dict[str, int]],
     ) -> None:
-        """Re-persist every domain with the cross-domain SID registry.
+        """The collection's ONE forced export: every collected domain, at the end.
 
-        The per-scope persist ran with an empty registry (a later-collected
-        domain's nodes were not yet available), so a foreign-target edge was
-        dropped. Once ALL domains are collected we build the registry once and
-        re-persist each domain: ``persist`` is load-then-merge / upsert-based, so
-        this only ADDS the now-resolvable cross-domain edges — no duplicates and
-        no change to single-domain runs (skipped when only one domain collected).
+        Every earlier export of the collection (the directory stages, the live
+        export of the host sweep, the AD CS re-run, the sweep's end) is
+        throttled; this is where each domain's ``attack_graph.json`` and its
+        sidecars are made current, after the last stage of the last domain. A
+        domain's build also resolves a foreign endpoint through the other
+        domains' stores and derives the trust escalations
+        (``graph_build/passes/trusts``), so a domain exported before its partner
+        was collected is rewritten here; a file already current is not.
         """
-        if len(results) < 2:
-            return
-        registry = build_cross_domain_label_registry(results)
-        # Partner Domain nodes (graph id -> light Domain payload) so a trust
-        # coupling can point at a domain whose own node lives in another graph.
-        foreign_domain_nodes: dict[str, dict[str, Any]] = {}
-        for sid, ref in registry.items():
-            if str(ref.kind or "").strip().lower() == "domain":
-                foreign_domain_nodes[ref.node_id] = {
-                    "kind": "Domain",
-                    "label": ref.label,
-                    "name": ref.label,
-                    "objectId": sid,
-                    "highvalue": True,
-                    "isTierZero": True,
-                    "properties": {
-                        "name": ref.label,
-                        "objectid": sid,
-                        "cross_domain_endpoint": True,
-                    },
-                }
-        domains_data = getattr(shell, "domains_data", None)
-        for domain, result in results.items():
+        from adscan_internal.services.graph_runtime import (
+            export_graph_if_due,
+            graph_store_for,
+        )
+
+        for domain in results:
             try:
-                counters[domain] = self._persistence.persist(
-                    shell,
-                    domain=domain,
-                    result=result,
-                    foreign_sid_to_label=registry,
-                )
-                # Persist the CrossOrgTgtDelegation / RaiseChild trust escalation
-                # edges into the ORIGIN graph so their execution status survives
-                # reloads (they were previously in-memory-only virtual edges).
-                attack_graph_service.persist_cross_domain_trust_edges(
-                    shell,
-                    domain=domain,
-                    domains_data=domains_data,
-                    foreign_domain_nodes=foreign_domain_nodes,
-                )
-            except Exception as exc:  # noqa: BLE001 — a re-persist failure must not abort collection
+                export_graph_if_due(shell, domain, force=True)
+                store = graph_store_for(shell, domain, create=False)
+                record = store.last_export() if store is not None else None
+                if record is not None:
+                    counters.setdefault(domain, {}).update(
+                        {"nodes": int(record.nodes), "edges": int(record.edges)}
+                    )
+            except Exception as exc:  # noqa: BLE001 — a re-export failure must not abort collection
                 telemetry.capture_exception(exc)
                 print_exception(exception=exc)
                 print_info_debug(
-                    f"[orchestrator] cross-domain edge re-persist failed for "
+                    f"[orchestrator] cross-domain re-export failed for "
                     f"{mark_sensitive(domain, 'domain')}"
                 )
 

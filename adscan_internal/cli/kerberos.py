@@ -2035,6 +2035,17 @@ def sync_clock_with_pdc(
 
     pdc_ip = shell.domains_data[domain]["pdc"]
 
+    # Everything below hands the DC's address to another process (the host
+    # helper, ``ntpdate``, ``net time``), which the in-process socket guard
+    # cannot see. The gated path above refuses a domain controller the
+    # engagement scope keeps out; this fallback must not reach it either, so
+    # the scope is asked here, immediately before any of them starts.
+    if not legacy_clock_sync_source_in_scope(pdc_ip):
+        print_info_verbose(
+            "Clock synchronization skipped: the domain controller is outside the engagement scope."
+        )
+        return False
+
     if _is_full_adscan_container_runtime():
         # Docker runtime: perform host clock sync via the host helper socket
         sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
@@ -2436,11 +2447,35 @@ def _log_host_helper_clock_sync_response(
     )
 
 
+def legacy_clock_sync_source_in_scope(dc_ip: str, *, smb_negotiate: bool = False) -> bool:
+    """Whether the engagement scope lets the clock be read from ``dc_ip`` by a child process.
+
+    The legacy clock-sync fallbacks hand the domain controller's address to
+    ``ntpdate`` or ``net time`` (directly or through the host helper). The one
+    time-source check of the clock-sync SSOT (``dc_time._time_source_in_scope``)
+    decides: an NTP exchange, or (``smb_negotiate``) the negotiate ``net time``
+    reads the time from. Fails closed.
+    """
+    try:
+        from adscan_internal.services.dc_time import _time_source_in_scope  # noqa: PLC0415
+
+        return bool(_time_source_in_scope(str(dc_ip or ""), smb_negotiate=smb_negotiate))
+    except Exception as exc:  # noqa: BLE001 - an unknown verdict hands the host to nobody
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def _sync_clock_via_net_time(
     shell: KerberosShell, host: str, *, domain: str | None = None
 ) -> bool:
     """Attempt to sync system clock using Samba's 'net time' command."""
     from adscan import _is_full_adscan_container_runtime, _sudo_validate
+
+    # ``net time`` runs in another process (the host helper or a child): asked
+    # of the engagement scope here, immediately before it is handed the host.
+    if not legacy_clock_sync_source_in_scope(host, smb_negotiate=True):
+        return False
 
     if _is_full_adscan_container_runtime():
         sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()

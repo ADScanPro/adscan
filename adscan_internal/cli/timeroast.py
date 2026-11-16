@@ -446,6 +446,23 @@ def _get_timeroast_candidates(
         seen_rids.add(candidate.rid)
         candidates.append(candidate)
 
+    # Engagement scope: a computer account the client excluded is never a
+    # Timeroast candidate. Its RID is left out here, in the one list the table,
+    # the prompt and the request all read, so it is neither shown as a target
+    # nor offered, and no keyed time request ever names it.
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        partition_principals_in_scope,
+    )
+
+    candidates = partition_principals_in_scope(
+        shell,
+        candidates,
+        domain=domain,
+        key=lambda item: item.samaccountname,
+        dnshostname=lambda item: item.fqdn,
+        what="Timeroasting",
+    ).allowed
+
     candidates.sort(
         key=lambda item: (
             0 if item.is_tier_zero else 1 if item.is_high_value else 2,

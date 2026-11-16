@@ -9,7 +9,8 @@ file in the execution workspace) change its course with ONE vocabulary
 * ``skip_phase`` stops the current step and skips the rest of the phase;
 * ``abort_scan`` stops the scan cleanly and returns to the prompt.
 
-Scopes, outermost first: :meth:`ScanControl.scan` (one scan),
+Scopes, outermost first: :meth:`ScanControl.command` (one REPL command, so a
+Ctrl+C outside a scan still opens the menu), :meth:`ScanControl.scan` (one scan),
 :meth:`ScanControl.enter_phase` (a boundary marker, the pipeline is sequential),
 :meth:`ScanControl.step` / :meth:`ScanControl.run_step` (one step).
 
@@ -170,6 +171,14 @@ class ScanControl:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._scan_depth = 0
+        # REPL command scope: every command the interactive shell runs opens
+        # one, so a Ctrl+C outside a scan opens the operator menu ("Stop this
+        # command and return to the prompt" / "Keep going") instead of
+        # cancelling the command at an arbitrary bytecode.
+        self._command_depth = 0
+        self._command_label = ""
+        self._command_generation = 0
+        self._hard_cancel = False
         self._scan_kind = ""
         self._workspace_dir: str | None = None
         self._interactive: bool | None = None
@@ -185,10 +194,15 @@ class ScanControl:
         self._event_emitter: Callable[[dict[str, Any]], None] | None = None
         self._last_scan_aborted = False
         self._signal_count = 0
+        #: Monotonic time of this scan's first SIGINT (``None`` before one).
+        self._first_signal_at: float | None = None
         # (domain, phase_id) the operator cut short in this scan. Keyed by
         # domain too: the pipeline re-enters the same phase for every domain of
         # a multi-domain scan, and a stop in one is not a stop in the next.
         self._stopped_phases: set[tuple[str, str]] = set()
+        # (domain, phase_id) whose skip_phase already has its own record, so the
+        # phase-boundary fallback never writes a second one.
+        self._phase_skip_recorded: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     # Wiring (installed once by the engine; tests use their own instance)
@@ -207,9 +221,63 @@ class ScanControl:
     # State
     # ------------------------------------------------------------------
     def active(self) -> bool:
-        """Whether a scan or a step scope is open (Ctrl+C belongs to us)."""
+        """Whether a command, scan or step scope is open (Ctrl+C belongs to us)."""
         with self._lock:
-            return self._scan_depth > 0 or bool(self._steps)
+            return self._scan_depth > 0 or self._command_depth > 0 or bool(self._steps)
+
+    def in_command(self) -> bool:
+        """Whether a REPL command scope is open."""
+        with self._lock:
+            return self._command_depth > 0
+
+    @property
+    def command_label(self) -> str:
+        """Display name of the running REPL command (``""`` outside one)."""
+        return self._command_label
+
+    @property
+    def command_generation(self) -> int:
+        """Counter bumped each time an outermost command scope opens or closes."""
+        return self._command_generation
+
+    def command_stop_pending(self) -> bool:
+        """Whether the running command (outside a scan) was asked to stop."""
+        with self._lock:
+            return (
+                self._command_depth > 0
+                and self._scan_depth == 0
+                and self._abort is not None
+            )
+
+    def request_hard_cancel(self, *, generation: int) -> bool:
+        """Mark the command ``generation`` for an immediate stop.
+
+        Used when a command the operator stopped has no cooperative checkpoint
+        left to reach: the next SIGINT the main thread handles raises
+        :class:`ScanAbortRequested` there. Refused when that command already
+        ended (a stale watchdog) or a scan scope owns the stop.
+        """
+        with self._lock:
+            if (
+                self._command_depth == 0
+                or self._scan_depth > 0
+                or self._command_generation != generation
+            ):
+                return False
+            self._hard_cancel = True
+            return True
+
+    def consume_hard_cancel(self) -> ControlRequest | None:
+        """Return (and clear) a pending immediate command stop, if any."""
+        with self._lock:
+            if not self._hard_cancel:
+                return None
+            self._hard_cancel = False
+            if self._command_depth == 0 or self._scan_depth > 0:
+                return None
+            return self._abort or ControlRequest(
+                ControlAction.ABORT_SCAN, source=SOURCE_OPERATOR_MENU
+            )
 
     def in_scan(self) -> bool:
         """Whether a scan scope is open."""
@@ -248,12 +316,22 @@ class ScanControl:
         """Whether an ``abort_scan`` is pending."""
         return self._abort is not None
 
+    def abort_request(self) -> ControlRequest | None:
+        """The pending ``abort_scan`` request (who asked), ``None`` when none."""
+        return self._abort
+
     def stop_pending(self) -> bool:
         """Whether any stop (step, phase or scan) is waiting to be honoured."""
         with self._lock:
             return self._abort is not None or self._pending is not None or bool(
                 self._phase_skip
             )
+
+    @property
+    def scan_kind(self) -> str:
+        """``kind`` of the OUTERMOST open scan scope (``""`` outside a scan)."""
+        with self._lock:
+            return self._scan_kind if self._scan_depth > 0 else ""
 
     @property
     def last_scan_aborted(self) -> bool:
@@ -391,6 +469,40 @@ class ScanControl:
     # Scopes
     # ------------------------------------------------------------------
     @contextlib.contextmanager
+    def command(self, command_id: str, *, label: str = "") -> Iterator["ScanControl"]:
+        """Open a REPL command scope (the interactive shell's dispatch opens one).
+
+        Inside it a Ctrl+C opens the operator menu with "Stop this command and
+        return to the prompt" (an ``abort_scan`` that unwinds at the next
+        boundary as :class:`ScanAbortRequested`) and "Keep going", plus the
+        step and phase choices when a scan or a long step runs inside the
+        command. Nothing is swallowed: an abort propagates to the REPL, which
+        reports the command as stopped. Nested commands share the outermost.
+        """
+        with self._lock:
+            outermost = self._command_depth == 0
+            self._command_depth += 1
+            if outermost:
+                self._command_label = str(label or command_id or "")
+                self._command_generation += 1
+                self._hard_cancel = False
+                if self._scan_depth == 0 and not self._steps:
+                    # A request left from an earlier command is not this one's.
+                    self._reset_requests()
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._command_depth = max(0, self._command_depth - 1)
+                if outermost:
+                    self._command_label = ""
+                    self._command_generation += 1
+                    self._hard_cancel = False
+                    if self._scan_depth == 0 and not self._steps:
+                        # Whatever the operator asked of this command is spent.
+                        self._reset_requests()
+
+    @contextlib.contextmanager
     def scan(
         self,
         *,
@@ -430,6 +542,14 @@ class ScanControl:
             aborted = True
             self._record_scan_abort(exc.request)
         finally:
+            if outermost:
+                # The last phase has no "next phase entry" to settle its skip.
+                self._settle_phase_skip()
+                # A stop that landed where no boundary was left to raise it (the
+                # end of the scan, a finalisation step) still stopped this run:
+                # declare it like one that unwound, so the coverage names it.
+                if not aborted and self._abort is not None:
+                    self._record_scan_abort(self._abort)
             with self._lock:
                 self._scan_depth = max(0, self._scan_depth - 1)
                 if outermost:
@@ -452,6 +572,7 @@ class ScanControl:
         phase for the next domain of a multi-domain scan) is not that phase.
         """
         self.checkpoint()
+        self._settle_phase_skip()
         with self._lock:
             self._phase_id = str(phase_id or "")
             if domain is not None:
@@ -512,7 +633,9 @@ class ScanControl:
             with self._lock:
                 # A step outside any scan (a REPL command) is its own outermost
                 # scope: once it closes, nothing it was asked must outlive it.
-                standalone_done = self._scan_depth == 0 and not self._steps
+                standalone_done = (
+                    self._scan_depth == 0 and self._command_depth == 0 and not self._steps
+                )
                 pending_abort = self._abort
                 if standalone_done:
                     self._reset_requests()
@@ -580,6 +703,8 @@ class ScanControl:
             parts.append(label)
         elif self._phase_id:
             parts.append(_phase_title(self._phase_id) or self._phase_id)
+        elif self._command_label:
+            parts.append(self._command_label)
         if self.stop_pending():
             parts.append("a stop is already pending")
         return " · ".join(parts)
@@ -590,6 +715,37 @@ class ScanControl:
             self._signal_count += 1
             return self._signal_count
 
+    def note_first_signal(self, now: float) -> bool:
+        """Record a SIGINT seen at monotonic ``now``; True when it is the scan's first.
+
+        The SIGINT handler can run NESTED inside itself: CPython runs a Python
+        signal handler at the next bytecode boundary of the main thread, and that
+        includes the bytecode of a handler already running. One Ctrl+C reaching
+        the engine twice (the TTY plus a signal-forwarding parent such as a
+        onefile bootloader) therefore lands the second delivery INSIDE the first
+        handler, before it has finished deciding. The time of the first signal is
+        stored here, before anything else the handler does, so the nested one
+        reads it and is absorbed instead of escalating to the immediate shutdown.
+        Two calls interleaved inside this method can both return True; the clean
+        stop they request is idempotent.
+        """
+        with self._lock:
+            first = self._first_signal_at is None
+            if first:
+                self._first_signal_at = float(now)
+            self._signal_count += 1
+            return first
+
+    def seconds_since_first_signal(self, now: float) -> float | None:
+        """Seconds between the scan's first SIGINT and ``now`` (``None`` before one).
+
+        Negative when ``now`` was read before a nested handler recorded the first
+        signal: the caller treats that as "right behind it".
+        """
+        with self._lock:
+            first = self._first_signal_at
+        return None if first is None else float(now) - first
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -599,7 +755,49 @@ class ScanControl:
         self._abort_recorded = False
         self._phase_skip = ""
         self._signal_count = 0
+        self._first_signal_at = None
         self._stopped_phases = set()
+        self._phase_skip_recorded = set()
+
+    def _settle_phase_skip(self) -> None:
+        """Record a requested ``skip_phase`` that no step recorded, once.
+
+        A step records the skip only when it opened with ``record_gap=True``; an
+        operation that declares its own early-stop gap (SMB host enrichment) opens
+        with ``record_gap=False`` and so recorded nothing about the PHASE the
+        operator cut short, nor did a skip that landed between steps. The phase
+        boundary (the next ``enter_phase`` or the end of the scan) is the one place
+        that sees every case, so the fallback lives here, mirroring how
+        ``_record_scan_abort`` backs up an abort no step recorded.
+
+        The entry names the phase only (no step, no counts): the operation's own
+        gap keeps describing what it left unexamined, and this one says the
+        operator cut the phase short. Keyed by (domain, phase) so a step that
+        already recorded the skip is never doubled.
+        """
+        with self._lock:
+            phase = self._phase_skip
+            if not phase:
+                return
+            domain = self._domain
+            key = (_domain_key(domain), phase)
+            if key in self._phase_skip_recorded:
+                return
+            self._phase_skip_recorded.add(key)
+            source = (
+                self._pending.source
+                if self._pending is not None
+                and self._pending.action == ControlAction.SKIP_PHASE
+                else SOURCE_OPERATOR_MENU
+            )
+        self._record(
+            OperatorStop(
+                action=ControlAction.SKIP_PHASE.value,
+                source=source,
+                domain=domain,
+                phase_id=phase,
+            )
+        )
 
     def _record_step_stop(self, scope: StepScope) -> None:
         action = scope.stop_action
@@ -607,6 +805,9 @@ class ScanControl:
             return
         if action == ControlAction.ABORT_SCAN:
             self._abort_recorded = True
+        elif action == ControlAction.SKIP_PHASE and scope.phase_id:
+            with self._lock:
+                self._phase_skip_recorded.add((_domain_key(scope.domain), scope.phase_id))
         self._record(
             OperatorStop(
                 action=action.value,

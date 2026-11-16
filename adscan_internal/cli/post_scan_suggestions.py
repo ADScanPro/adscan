@@ -140,19 +140,20 @@ def _format_scan_delta(shell: Any, attr: str) -> str | None:
         return None
 
 
-def _mark_recap_node(name: str) -> str:
-    """Domain-suffix-strip + ``mark_sensitive`` a path node label.
+def _mark_recap_node(name: str, domain: str, entry: Any = None) -> str:
+    """Humanize + ``mark_sensitive`` a path node label for the recap.
 
-    Mirrors ``attack_graph_reports._mark_node`` so the recap and the interactive
-    attack-paths view label nodes identically (cleartext on screen, scrubbed in
-    telemetry).
+    Goes through the CLI node SSOT (``format_cli_node``) so the recap and the
+    interactive attack-paths view name a node identically, through the shared
+    humanization (``CastelblackAdmins`` for a group, as its directory writes it,
+    never ``CASTELBLACKADMINS``), cleartext on screen and scrubbed in telemetry.
+    ``entry`` is the route the node belongs to: it carries each node's kind.
     """
-    from adscan_internal.rich_output import mark_sensitive
+    from adscan_core.output._attack_paths import format_cli_node
+    from adscan_core.reporting.principal_display import node_identity_scope
 
-    display = name.split("@")[0] if "@" in name else name
-    if "." in display or display.endswith("$"):
-        return mark_sensitive(display, "hostname")
-    return mark_sensitive(display, "user")
+    with node_identity_scope(records=[entry] if entry else None):
+        return format_cli_node(name, domain)
 
 
 def _build_headline_path(shell: Any, domain: str) -> "Any | None":
@@ -201,9 +202,9 @@ def _build_headline_path(shell: Any, domain: str) -> "Any | None":
     if not isinstance(raw_edges, list):
         raw_edges = []
 
-    nodes = tuple(_mark_recap_node(str(node)) for node in raw_nodes)
+    nodes = tuple(_mark_recap_node(str(node), domain, entry) for node in raw_nodes)
     edges = tuple(str(edge) for edge in raw_edges)
-    source = _mark_recap_node(str(entry.get("source") or raw_nodes[0]))
+    source = _mark_recap_node(str(entry.get("source") or raw_nodes[0]), domain, entry)
     klass = str(entry.get("compromise_class") or entry.get("outcome_class") or "")
     return RecapPath(
         nodes=nodes,
@@ -365,6 +366,41 @@ def _phase_titles(phase_ids: tuple[str, ...]) -> tuple[str, ...]:
     return phase_titles(phase_ids)
 
 
+def _asset_scope_recap(shell: Any) -> tuple[tuple[str, ...], str]:
+    """The engagement-scope lines for the terminal recap.
+
+    Returns ``(lines, fallback)``: one line per population (excluded by the
+    client; not confirmed as within the scope) from the per-domain blocks the
+    scan stamped into ``technical_report.json``, read through the tier-shared
+    view so the operator lines match the report. When no block was stamped, the
+    record-only disclosure is the fallback. Best-effort.
+    """
+    try:
+        import json  # noqa: PLC0415
+
+        from adscan_core.reporting.engagement_scope import (
+            format_asset_scope_note,
+            load_engagement_scope,
+            merge_asset_scope_coverage,
+        )
+        from adscan_core.reporting.technical_report import _get_technical_report_path
+
+        workspace_dir = str(getattr(shell, "current_workspace_dir", "") or "")
+        if not workspace_dir:
+            return (), ""
+        try:
+            with open(_get_technical_report_path(shell), encoding="utf-8") as handle:
+                domains = (json.load(handle) or {}).get("domains") or {}
+        except (OSError, ValueError):
+            domains = {}
+        view = merge_asset_scope_coverage(domains) if isinstance(domains, dict) else None
+        if view:
+            return tuple(view.get("recap_lines") or ()), ""
+        return (), format_asset_scope_note(load_engagement_scope(workspace_dir))
+    except Exception:  # noqa: BLE001 - a recap line never breaks the scan
+        return (), ""
+
+
 def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     """Resolve the end-of-scan recap model from live scan artifacts.
 
@@ -473,6 +509,8 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
     except Exception:  # noqa: BLE001
         fanout = ()
 
+    asset_scope_lines, asset_scope_fallback = _asset_scope_recap(shell)
+
     return ScanRecapModel(
         domain=domain,
         outcome=outcome,  # type: ignore[arg-type]
@@ -500,6 +538,8 @@ def build_scan_recap_model(shell: Any, verb: str) -> "ScanRecapModel | None":
         verdict_sentence=(
             verdict.sentence() if verdict is not None and outcome == "findings" else ""
         ),
+        asset_scope_lines=asset_scope_lines,
+        asset_scope_statement=asset_scope_fallback,
     )
 
 

@@ -155,6 +155,28 @@ def require_credential_material(
     )
 
 
+def ntlm_secret_available(
+    *,
+    password: Optional[str],
+    nt_hash: Optional[str] = None,
+) -> bool:
+    """True when NTLM has something to send: a non-empty password or an NT hash.
+
+    A ticket (a ccache path, often carried in the password slot by sweeps that
+    pre-mint a TGT) and an AES key are not NTLM secrets. Every transport plan
+    uses this to decide whether a Kerberos-to-NTLM fallback may run: without
+    it the fallback would sign in with an empty password, which the lockout
+    guard refuses, and the Kerberos error that actually happened would be
+    replaced by that refusal.
+    """
+    if str(nt_hash or "").strip():
+        return True
+    text = str(password or "").strip()
+    if not text:
+        return False
+    return not text.lower().endswith(".ccache")
+
+
 def nt_hash_of_password(password: Optional[str]) -> str:
     """Return the NT hash of a cleartext password, or ``""`` when undecidable.
 

@@ -1187,6 +1187,27 @@ def _maybe_emit_roast_progress(
         pass
 
 
+def _roast_targets_in_scope(usernames: list[str], *, domain: str, what: str) -> list[str]:
+    """``usernames`` minus the accounts the engagement scope excludes.
+
+    The ONE seam every roast passes (the listing roast, the per-user attack
+    step, the no-preauth variant): the scope SSOT judges each account, through
+    the shared account-list seam, against the registered session. The list
+    comes back untouched when the session has no asset scope. A check that
+    cannot run leaves nothing to roast (fail closed).
+    """
+    try:
+        from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+            filter_principals_for_session,
+        )
+
+        return filter_principals_for_session(list(usernames or ()), domain=domain, what=what)
+    except Exception as exc:  # noqa: BLE001 - an unreadable scope is never a permission
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return []
+
+
 async def kerberoast_users(
     config: KerberosConfig,
     usernames: list[str],
@@ -1217,6 +1238,12 @@ async def kerberoast_users(
 
     url = _build_kerberos_url(config, use_auth_kdc=True)
     domain = target_domain or config.domain
+    # Engagement scope: no service ticket is ever requested for an account the
+    # client excluded. A TGS-REQ is not a sign-in, so the sign-in guard cannot
+    # see it; this list is the gate.
+    usernames = _roast_targets_in_scope(usernames, domain=domain, what="Kerberoasting")
+    if not usernames:
+        return []
     # override_etype now controls ONLY the TGS-REQ (the roasted service ticket) —
     # kerbad's kerberoast generator decouples the TGT (which uses the credential's
     # own AES-first preference so it authenticates against AES-only KDCs) from the
@@ -1354,6 +1381,11 @@ async def asreproast_users(
     # Fall back to AES-128 then AES-256 if the KDC rejects RC4.
     override_etype = etypes or [23, 17, 18]
     target = KerberosTarget(host=kdc_ip)
+    # Engagement scope: no AS-REQ is ever sent for an account the client
+    # excluded (it carries no secret, so the sign-in guard never sees it).
+    usernames = _roast_targets_in_scope(usernames, domain=domain, what="AS-REP roasting")
+    if not usernames:
+        return []
 
     print_info_debug(
         f"[kerberos_transport] asreproast_users: {len(usernames)} users "
@@ -1408,3 +1440,82 @@ async def asreproast_users(
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
         _raise_translated_kerbad_error(exc)
+
+
+#: KDC answers to a pre-authentication-free AS-REQ that prove an account carries
+#: the name (it exists and must pre-authenticate, is disabled or locked out, has
+#: an expired password or account, or is restricted by policy).
+_PRINCIPAL_EXISTS_CODES = frozenset(
+    {
+        "KDC_ERR_PREAUTH_REQUIRED",
+        "KDC_ERR_CLIENT_REVOKED",
+        "KDC_ERR_KEY_EXPIRED",
+        "KDC_ERR_NAME_EXP",
+        "KDC_ERR_POLICY",
+    }
+)
+
+
+async def probe_principal_existence(
+    *,
+    kdc_ip: str,
+    realm: str,
+    username: str,
+    port: int = 88,
+    timeout: int = 10,
+) -> Optional[bool]:
+    """Whether an account in ``realm`` carries ``username``, asked without a secret.
+
+    Sends ONE AS-REQ without pre-authentication data, which the KDC answers
+    before any secret is involved, so no failed sign-in is counted on any
+    account (the same exchange AS-REP roasting sends):
+
+    * ``KDC_ERR_C_PRINCIPAL_UNKNOWN`` -> ``False``: no account carries the name.
+    * ``KDC_ERR_PREAUTH_REQUIRED``, a revoked, expired or policy-restricted
+      principal, or an AS-REP -> ``True``: an account exists.
+    * anything else (no answer, wrong realm, network or clock trouble) ->
+      ``None``: existence was not established either way.
+
+    Never raises. An AS-REP is discarded unread (no hash is kept).
+    """
+    import asyncio  # noqa: PLC0415
+
+    from kerbad.aioclient import AIOKerberosClient  # noqa: PLC0415
+    from kerbad.common.creds import KerberosCredential  # noqa: PLC0415
+    from kerbad.common.target import KerberosTarget  # noqa: PLC0415
+
+    from adscan_internal.rich_output import mark_sensitive  # noqa: PLC0415
+
+    name = str(username or "").strip()
+    domain = str(realm or "").strip()
+    if not name or not domain or not str(kdc_ip or "").strip():
+        return None
+    try:
+        credential = KerberosCredential()
+        credential.domain = domain
+        credential.username = name
+        credential.nopreauth = True
+        client = AIOKerberosClient(
+            credential, KerberosTarget(host=kdc_ip, port=int(port), timeout=int(timeout))
+        )
+        await asyncio.wait_for(
+            client.get_TGT(override_etype=[23, 17, 18], decrypt_tgt=False),
+            timeout=float(timeout) + 1.0,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - classified below; never raised
+        current: Optional[BaseException] = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            code = getattr(getattr(current, "errorcode", None), "name", "")
+            if code == "KDC_ERR_C_PRINCIPAL_UNKNOWN":
+                return False
+            if code in _PRINCIPAL_EXISTS_CODES:
+                return True
+            current = current.__cause__ or current.__context__
+        print_info_debug(
+            "principal-existence probe inconclusive: "
+            f"principal={mark_sensitive(name, 'user')} {type(exc).__name__}"
+        )
+        return None

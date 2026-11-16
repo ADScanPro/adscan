@@ -237,6 +237,12 @@ def shell_connector(
         dc_ip = str(resolve_dc_ip(data) or "").strip()
         if not dc_ip:
             raise DomainUnavailable("no_domain_controller")
+        # Engagement scope, before the first packet of this domain's reads: the
+        # domain controller they go to and the account they run as must both be
+        # inside it. Kept out is "not re-checked", never "fixed".
+        _require_reads_in_engagement_scope(
+            shell, domain=domain, dc_ip=dc_ip, account=user, account_domain=auth_domain or domain
+        )
         try:
             shell.do_check_dns(domain, dc_ip)
         except Exception as exc:  # noqa: BLE001 - DNS setup is best-effort
@@ -287,6 +293,57 @@ def shell_connector(
             connection.__exit__(None, None, None)
 
     return _connect
+
+
+def _require_reads_in_engagement_scope(
+    shell: Any, *, domain: str, dc_ip: str, account: str, account_domain: str
+) -> None:
+    """Raise :class:`DomainUnavailable` when the engagement scope keeps the reads out.
+
+    Two questions, both put to the scope SSOT and neither answered here: may
+    this domain controller be contacted for a directory read
+    (``require_host_in_scope``, which also tells the operator and records the
+    refusal), and may the reads sign in as this account (the same check the
+    sign-in guard applies, ``sign_in_scope_refusal``, asked here so the outcome
+    is worded as a scope refusal and not as a rejected credential). Every item
+    whose read was kept out is reported "not re-checked: outside the engagement
+    scope". Without an asset scope both answer at once and nothing changes.
+    """
+    from adscan_core.engagement.recheck import REASON_OUTSIDE_SCOPE  # noqa: PLC0415
+    from adscan_core.rich_output import print_info  # noqa: PLC0415
+    from adscan_internal.models.domain import resolve_dc_fqdn  # noqa: PLC0415
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        asset_scope_recorded,
+        require_host_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_principals import (  # noqa: PLC0415
+        sign_in_scope_refusal,
+    )
+
+    if not asset_scope_recorded(shell):
+        return
+    try:
+        dc_host = str(
+            resolve_dc_fqdn(shell.domains_data.get(domain) or {}, target_domain=domain) or ""
+        ).strip()
+    except Exception:  # noqa: BLE001 - the address alone still identifies the host
+        dc_host = ""
+    if not require_host_in_scope(
+        shell,
+        host=dc_host or dc_ip,
+        connect_address=dc_ip,
+        # A re-check observer re-reads the directory over LDAP.
+        contact=Contact("ldap"),
+        surface="recheck",
+        what="Re-check read",
+        domain=domain,
+    ):
+        raise DomainUnavailable(REASON_OUTSIDE_SCOPE)
+    refusal = sign_in_scope_refusal(shell, realm=account_domain, principal=account)
+    if refusal:
+        print_info(refusal)
+        raise DomainUnavailable(REASON_OUTSIDE_SCOPE)
 
 
 def _collect_control_observations(

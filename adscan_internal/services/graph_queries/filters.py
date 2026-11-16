@@ -14,7 +14,10 @@ exists to keep them apart:
 
 ``tombstoned``
     The object is deleted and sitting in the AD Recycle Bin. Stamped by
-    ``collector/ldap_collector._deleted_entry_to_node``.
+    ``collector/ldap_collector._deleted_entry_to_node``. The predicate lives in
+    ``adscan_core.directory_object_state`` (stdlib-only, so the membership
+    snapshot and the attack-path engine ask the same function) and is
+    re-exported here.
 
 From them, the two populations the rest of the product means:
 
@@ -38,39 +41,18 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from adscan_core.directory_object_state import (  # noqa: F401 - re-exported
+    is_live,
+    is_tombstoned,
+    resolve_properties,
+)
+
 STALE_DAYS_DEFAULT: int = 180
 _WIN_EPOCH_OFFSET = 116444736000000000
 
 
 def _props(node: dict[str, Any]) -> dict[str, Any]:
     return node.get("properties") or {}
-
-
-def resolve_properties(subject: Any) -> dict[str, Any]:
-    """Return the properties of a node, a bare properties dict, or a node object.
-
-    Three shapes circulate in this codebase and every one of them reaches these
-    predicates, so accepting only one is how half the call sites silently keep
-    the old behaviour:
-
-    * a graph **node dict** -- ``{"kind": "User", "properties": {...}}``;
-    * a bare **properties dict** -- what ``inventories._nodes_props`` and the
-      flattened ``inventory/*.json`` records hand around;
-    * a **node object** (``collector.models.CollectorNode``) carrying
-      ``.properties`` plus its own ``.enabled`` field.
-
-    A node dict is distinguished from a properties dict by carrying a
-    ``properties`` key; a properties dict is returned as itself.
-    """
-    if isinstance(subject, dict):
-        nested = subject.get("properties")
-        if isinstance(nested, dict):
-            return nested
-        if "properties" in subject:
-            return {}
-        return subject
-    nested = getattr(subject, "properties", None)
-    return nested if isinstance(nested, dict) else {}
 
 
 def _resolve_enabled(subject: Any) -> Any:
@@ -99,16 +81,6 @@ def is_enabled(node: Any) -> bool:
     """
     value = _resolve_enabled(node)
     return bool(value) if value is not None else True
-
-
-def is_tombstoned(node: Any) -> bool:
-    """Return whether the object is deleted (sitting in the AD Recycle Bin)."""
-    return bool(resolve_properties(node).get("tombstoned"))
-
-
-def is_live(node: Any) -> bool:
-    """Return whether the object exists in the directory (``not tombstoned``)."""
-    return not is_tombstoned(node)
 
 
 def is_active(node: Any) -> bool:

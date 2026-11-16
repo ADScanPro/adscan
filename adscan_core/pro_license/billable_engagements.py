@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from adscan_core.pro_license.run_size import normalize_domain_sizes, normalize_run_status
+
 RUN_KIND_FULL_SCAN = "full_scan"
 RUN_KIND_RECHECK = "recheck"
 RUN_KINDS = frozenset({RUN_KIND_FULL_SCAN, RUN_KIND_RECHECK})
@@ -116,6 +118,12 @@ class AssessmentRecord:
         parent_run_id: For a recheck, the scan it re-checked.
         band: Identity band of the domain at that assessment (``pending`` until counted).
         window_days: Retest window of the licence in force (full scans only).
+        run_status: How the run ended (:data:`adscan_core.pro_license.run_size.RUN_STATUSES`):
+            ``interrupted`` from admission until the scan end records it; empty
+            on a recheck and on a line written before the field existed.
+        domain_sizes: The counts of each domain of this code the run assessed
+            (:func:`adscan_core.pro_license.run_size.normalize_domain_sizes`),
+            or ``None`` when the run recorded none.
     """
 
     domain_code: str
@@ -125,6 +133,8 @@ class AssessmentRecord:
     parent_run_id: str = ""
     band: str = ""
     window_days: int | None = None
+    run_status: str = ""
+    domain_sizes: tuple[Mapping[str, int | None], ...] | None = None
 
     def __post_init__(self) -> None:
         if self.run_kind not in RUN_KINDS:
@@ -134,6 +144,9 @@ class AssessmentRecord:
         object.__setattr__(self, "assessed_at", _utc(self.assessed_at))
         if self.window_days is not None:
             validate_retest_window_days(self.window_days)
+        object.__setattr__(self, "run_status", normalize_run_status(self.run_status) or "")
+        sizes = normalize_domain_sizes(self.domain_sizes) if self.domain_sizes is not None else None
+        object.__setattr__(self, "domain_sizes", tuple(sizes) if sizes is not None else None)
 
     @property
     def is_recheck(self) -> bool:
@@ -147,6 +160,8 @@ class AssessmentRecord:
             "run_id": self.run_id,
             "parent_run_id": self.parent_run_id or None,
             "band": self.band or None,
+            "run_status": self.run_status or None,
+            "domain_sizes": [dict(size) for size in self.domain_sizes] if self.domain_sizes is not None else None,
         }
         if self.window_days is not None:
             data["retest_window_days"] = self.window_days
@@ -176,6 +191,8 @@ class AssessmentRecord:
                 parent_run_id=str(data.get("parent_run_id") or ""),
                 band=str(data.get("band") or ""),
                 window_days=window if window is not None else None,
+                run_status=str(data.get("run_status") or ""),
+                domain_sizes=normalize_domain_sizes(data.get("domain_sizes")),
             )
         except ValueError:
             return None

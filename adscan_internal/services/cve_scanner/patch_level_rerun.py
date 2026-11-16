@@ -92,7 +92,8 @@ def needs_administrative_rerun(result: Any) -> bool:
     """Whether a result is not assessed and an administrator read could change that.
 
     ``SKIPPED`` / ``ERROR`` only; not a reachability gap (no credential opens a
-    closed port); not a result already produced with administrative access.
+    closed port); not a host the engagement scope kept out; not a result already
+    produced with administrative access.
     """
     from adscan_internal.services.cve_scanner.checks._os_patch_level import (  # noqa: PLC0415
         ACCESS_ADMINISTRATIVE,
@@ -102,6 +103,11 @@ def needs_administrative_rerun(result: Any) -> bool:
     if getattr(result, "status", None) not in (CVEStatus.SKIPPED, CVEStatus.ERROR):
         return False
     if str(getattr(result, "error", "") or "").startswith(_UNREACHABLE_PREFIX):
+        return False
+    from adscan_internal.services.cve_scanner.runner import is_scope_excluded_result  # noqa: PLC0415
+
+    if is_scope_excluded_result(result):
+        # The engagement scope kept the host out: no credential changes that.
         return False
     evidence = getattr(result, "evidence", None)
     payload = getattr(evidence, "payload", None) or {}
@@ -190,6 +196,10 @@ def _rerun(shell: Any, *, domain: str, dc_ip: str | None) -> int:
         cves=cves,
         scan_id=records[-1].scan_id or "latest",
         workspace_dir=workspace_dir,
+        # The re-run starts long after the phase judged these hosts: the context
+        # carries the engagement scope's per-host check over them, asked right
+        # before each check.
+        targets=[target for hosts in pending.values() for target in hosts.values()],
     )
     cache = ctx.patch_level
     if cache is None:

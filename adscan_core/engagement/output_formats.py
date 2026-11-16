@@ -30,9 +30,12 @@ both families name their schema with the same identifier,
 ``adscan.<name>/<major>`` (:attr:`OutputFormat.schema_id`), which is the
 schema's ``$id``.
 
-One registered format is not a workspace file: ``license_register`` is the
+Two registered formats are not workspace files: ``license_register`` is the
 output of ``adscan license register export`` (the PRO licence reconciliation
-file a partner reads), versioned the same way.
+file a partner reads), ``license_status`` the output of ``adscan license
+status --json`` (what a partner platform reads to know when a machine's
+licence ends) and ``license_check`` the output of ``adscan license check
+--json`` (the route to the licence server, step by step), versioned the same way.
 
 Every change to a format bumps its version here, updates its schema in the same
 change, and adds a line to the ``### Output format`` subsection of the release
@@ -112,13 +115,13 @@ class OutputFormat:
 OUTPUT_FORMATS: dict[str, OutputFormat] = {
     fmt.name: fmt
     for fmt in (
-        OutputFormat("technical_report", 2, 4, ("technical_report.json",)),
-        OutputFormat("attack_graph", 1, 2, ("domains/*/attack_graph.json",)),
-        OutputFormat("attack_paths_snapshot", 1, 1, ("domains/*/attack_paths_snapshot.json",)),
-        OutputFormat("environment_changes", 1, 1, ("environment_changes.json",)),
+        OutputFormat("technical_report", 2, 13, ("technical_report.json",)),
+        OutputFormat("attack_graph", 2, 1, ("domains/*/attack_graph.json",)),
+        OutputFormat("attack_paths_snapshot", 1, 2, ("domains/*/attack_paths_snapshot.json",)),
+        OutputFormat("environment_changes", 1, 2, ("environment_changes.json",)),
         OutputFormat("scan_summary", 1, 0, ("scan_summary.json",)),
         OutputFormat(
-            "inventory", 1, 0, ("domains/*/inventory/*.json",), marker_prefix="inventory-"
+            "inventory", 1, 2, ("domains/*/inventory/*.json",), marker_prefix="inventory-"
         ),
         OutputFormat(
             "memberships", 1, 0, ("domains/*/memberships.json",), marker_prefix="membership-"
@@ -126,9 +129,26 @@ OUTPUT_FORMATS: dict[str, OutputFormat] = {
         OutputFormat(
             "license_register",
             1,
-            0,
+            2,
             ("license register export",),
             display="adscan license register export",
+        ),
+        OutputFormat(
+            "license_status",
+            1,
+            1,
+            ("license status --json",),
+            display="adscan license status --json",
+        ),
+        OutputFormat(
+            "license_check",
+            1,
+            0,
+            ("license check --json",),
+            display="adscan license check --json",
+        ),
+        OutputFormat(
+            "engagement_scope", 1, 2, ("scope.json",), marker_prefix="scope-"
         ),
         OutputFormat(
             "unauth_users",
@@ -143,6 +163,16 @@ OUTPUT_FORMATS: dict[str, OutputFormat] = {
 
 #: Schema names of the output contract, in declaration order.
 OUTPUT_SCHEMA_NAMES: tuple[str, ...] = tuple(OUTPUT_FORMATS)
+
+#: The previous major of a format still inside its deprecation window
+#: (:data:`DEPRECATION_WINDOW`), as ``(major, last minor)``. Readers accept every
+#: minor of it, and its schema file stays in the package. ``attack_graph`` 1.x:
+#: format 2.0 moved the per-edge ``knowledge`` text to the root
+#: ``technique_knowledge`` block; a workspace written by an engine before that
+#: keeps loading, and ``ADSCAN_ATTACK_GRAPH_FORMAT=1`` still writes 1.2 on request.
+PREVIOUS_MAJORS: dict[str, tuple[int, int]] = {
+    "attack_graph": (1, 2),
+}
 
 
 def output_format(name: str) -> OutputFormat:
@@ -162,28 +192,56 @@ def output_marker(name: str) -> str:
     return fmt.marker
 
 
-def is_readable_marker(name: str, value: object) -> bool:
-    """Whether a persisted ``schema_version`` is a format this build reads.
+def previous_major_marker(name: str) -> str:
+    """The marker of the last version of ``name``'s previous major (still readable).
+
+    Raises:
+        KeyError: ``name`` has no previous major in its deprecation window.
+    """
+    fmt = OUTPUT_FORMATS[name]
+    major, minor = PREVIOUS_MAJORS[name]
+    return f"{fmt.marker_prefix}{major}.{minor}"
+
+
+def marker_major(name: str, value: object) -> int | None:
+    """The major of a persisted ``schema_version`` this build reads, else ``None``.
 
     Every minor of the current major is readable: a minor only adds fields, so
     a reader that rejected a newer or older minor would throw away a valid file
-    (for a ledger, a session's record of what it changed). A different major,
-    a foreign prefix or a missing marker is not.
+    (for a ledger, a session's record of what it changed). So is every minor of
+    a previous major still in its deprecation window (:data:`PREVIOUS_MAJORS`).
+    A different major, a foreign prefix or a missing marker is not.
     """
     fmt = OUTPUT_FORMATS[name]
     if not isinstance(value, str) or not value.startswith(fmt.marker_prefix):
-        return False
+        return None
     major, _, minor = value[len(fmt.marker_prefix) :].partition(".")
-    return major == str(fmt.major) and minor.isdigit()
+    if not minor.isdigit():
+        return None
+    readable = {fmt.major}
+    if name in PREVIOUS_MAJORS:
+        readable.add(PREVIOUS_MAJORS[name][0])
+    return int(major) if major.isdigit() and int(major) in readable else None
+
+
+def is_readable_marker(name: str, value: object) -> bool:
+    """Whether a persisted ``schema_version`` is a format this build reads.
+
+    See :func:`marker_major` for which versions that is.
+    """
+    return marker_major(name, value) is not None
 
 
 __all__ = (
     "DEPRECATION_WINDOW",
     "is_readable_marker",
+    "marker_major",
     "OUTPUT_FORMATS",
     "OUTPUT_SCHEMA_NAMES",
     "OutputFormat",
+    "PREVIOUS_MAJORS",
     "SCHEMA_VERSION_KEY",
     "output_format",
     "output_marker",
+    "previous_major_marker",
 )

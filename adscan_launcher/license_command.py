@@ -55,17 +55,38 @@ def add_license_subparser(sub: Any) -> None:
         help="Activate and manage the ADscan PRO licence.",
         description=(
             "Activate the ADscan PRO licence once, with the activation key from your onboarding "
-            "email. After that the licence is checked on this machine without connecting on every run. "
+            "email. After that the licence is checked on this machine, and every online launch "
+            "checks in with the licence server (about two seconds at most, never blocking a scan) so "
+            "an extension or a change reaches this machine on its own. The check-in sends only the "
+            "installation id and public key, the licence id, a request id, a sequence number, the "
+            "time and the engine version, and never any scan data. Offline mode (--offline, ADSCAN_OFFLINE=1) "
+            "does not turn off the licence check-in or domain registration: they send only licence "
+            "identifiers, the keyed domain code and its size band, never client data. A partner licence "
+            "also sends, for each run, how many accounts, computers (by server or workstation, and by the "
+            "tier their membership or role gives them), domain controllers and certificate authorities it "
+            "counted, never a name, an address or a finding. An offline engagement "
+            "licence never connects. "
             + _RELAY_HELP
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     lsub = lic.add_subparsers(dest="license_command", metavar="subcommand", required=True)
 
-    act = lsub.add_parser("activate", help="Activate this machine (once).")
+    act = lsub.add_parser(
+        "activate",
+        help="Activate this machine (once) and offer the ADscan PRO download.",
+    )
+    act.add_argument(
+        "key",
+        nargs="?",
+        default=None,
+        help="The activation key. Accepted for convenience; --key-file or --key-stdin keep it out of "
+        "your shell history.",
+    )
     src = act.add_mutually_exclusive_group()
     src.add_argument("--key-file", help="Read the activation key from this file.")
     src.add_argument("--key-stdin", action="store_true", help="Read the activation key from standard input.")
+    add_pull_choice_arguments(act)
     act.add_argument("--seat-label", help="A name for this seat, shown to your account (no hostname is sent).")
     act.add_argument(
         "--relay-out",
@@ -73,14 +94,41 @@ def add_license_subparser(sub: Any) -> None:
         help="Do not connect. Write the activation request to FILE for your platform to forward.",
     )
 
-    st = lsub.add_parser("status", help="Show the licence, its expiry and the domains waiting to be registered.")
-    st.add_argument("--json", action="store_true", help="Machine-readable output.")
+    for name, aliases in (("status", ["show"]),):
+        st = lsub.add_parser(
+            name,
+            aliases=aliases,
+            help="Show the licence, when the contract ends and the domains waiting to be registered.",
+        )
+        st.add_argument("--json", action="store_true", help="Machine-readable output (versioned).")
+        st.add_argument(
+            "--no-check-in",
+            action="store_true",
+            help="Do not check in with the licence server first (the local state only).",
+        )
 
     de = lsub.add_parser("deactivate", help="Release this machine's seat and remove its licence.")
     de.add_argument("--relay-out", metavar="FILE", help="Write the release request to FILE instead of connecting.")
 
-    lsub.add_parser("renew", help="Ask for a fresh licence document now.")
+    lsub.add_parser(
+        "renew",
+        help="Fetch a fresh licence document now (only needed when this machine cannot reach "
+        "ADscan on its own launches).",
+    )
     lsub.add_parser("sync", help="Send every queued request (new domains, band updates, renewal) now.")
+
+    chk = lsub.add_parser(
+        "check",
+        help="Find what blocks the connection to the licence server, then send what is waiting.",
+        description=(
+            "Tests the route to the ADscan licence server step by step (proxy, DNS, TCP 443, TLS, the "
+            "server's health endpoint, and this machine's clock against the server's) and names the step "
+            "that fails. When the server answers, it then does what `sync` and `renew` do: sends every "
+            "queued request and asks for a fresh licence document. Exit code 0 when the licence server "
+            "answered, 1 when it did not."
+        ),
+    )
+    chk.add_argument("--json", action="store_true", help="Machine-readable output (versioned).")
 
     relay = lsub.add_parser("relay", help="Exchange requests and answers through a file (no direct route).")
     rsub = relay.add_subparsers(dest="relay_command", metavar="direction", required=True)
@@ -122,9 +170,26 @@ def _transport():
 
 
 def _offline() -> bool:
+    """Offline mode with no licence to open the channel (activation, or nothing installed)."""
     from adscan_core.offline import offline_mode_enabled
 
     return offline_mode_enabled()
+
+
+def _channel_closed(store: Any) -> bool:
+    """True when offline mode keeps this machine's licence channel closed (:mod:`.channel` SSOT).
+
+    An online licence (trial, partner, paid) connects even under offline mode,
+    so ``sync``, ``renew`` and ``deactivate`` still work; the first contact
+    prints one line saying so.
+    """
+    from adscan_core.pro_license.channel import licence_channel_offline, note_offline_contact
+
+    licence, _error = store.load_licence()
+    if licence_channel_offline(licence):
+        return True
+    note_offline_contact(licence)
+    return False
 
 
 def _offline_refusal() -> int:
@@ -135,7 +200,41 @@ def _offline_refusal() -> int:
     return 1
 
 
+def add_pull_choice_arguments(parser: Any) -> None:
+    """``--pull`` / ``--no-pull`` for the download offered after activation."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--pull",
+        "--yes",
+        dest="pull",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Download ADscan PRO right after activation without asking.",
+    )
+    group.add_argument(
+        "--no-pull",
+        dest="pull",
+        action="store_const",
+        const=False,
+        help="Activate only; download ADscan PRO later with `adscan update`.",
+    )
+
+
+_KEY_ON_ARGV_WARNING = (
+    "The activation key on the command line stays in your shell history and the process list. "
+    "--key-file or --key-stdin avoid that."
+)
+
+
 def _read_activation_key(ns: argparse.Namespace) -> str | None:
+    positional = str(getattr(ns, "key", "") or "").strip()
+    if positional:
+        if ns.key_file or ns.key_stdin:
+            print_error("Give the activation key once: as an argument, --key-file or --key-stdin.")
+            return None
+        print_warning(_KEY_ON_ARGV_WARNING)
+        return positional
     if ns.key_file:
         try:
             return Path(ns.key_file).read_text(encoding="utf-8").strip()
@@ -172,89 +271,125 @@ def _print_status_lines(status: Any, store: Any) -> None:
         print_info(f"Installation: {installation.installation_id}")
 
 
+def _print_activation_disclosure(store: Any = None) -> None:
+    """Tell a newly activated PRO user what ADscan sends: telemetry, and the licence check-in."""
+    from rich.console import Group
+    from rich.table import Table
+    from rich.text import Text
+
+    from adscan_core.rich_output import print_panel
+    from adscan_core.telemetry import _is_telemetry_enabled
+    from adscan_core.telemetry_disclosure import (
+        ACTIVATION_PANEL_TITLE,
+        LICENCE_ACTIVATION_ROWS,
+        LICENCE_ACTIVATION_TITLE,
+        TELEMETRY_ACTIVATION_ROWS,
+        TELEMETRY_ACTIVATION_TITLE,
+    )
+
+    def _block(title: str, rows: tuple[tuple[str, str], ...]) -> list[Any]:
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
+        grid.add_column(justify="left", ratio=1)
+        for label, value in rows:
+            grid.add_row(label, value)
+        return [Text(title, style="bold"), grid]
+
+    try:
+        blocks: list[Any] = []
+        if _is_telemetry_enabled():
+            blocks += _block(TELEMETRY_ACTIVATION_TITLE, TELEMETRY_ACTIVATION_ROWS)
+        needs_server = True
+        try:
+            licence, _error = store.load_licence()
+            needs_server = licence is None or bool(licence.needs_server)
+        except Exception:  # noqa: BLE001 - unknown licence: state the channel
+            pass
+        if needs_server:
+            if blocks:
+                blocks.append(Text(""))
+            blocks += _block(LICENCE_ACTIVATION_TITLE, LICENCE_ACTIVATION_ROWS)
+        if blocks:
+            print_panel(Group(*blocks), title=ACTIVATION_PANEL_TITLE, border_style="cyan")
+    except Exception:  # noqa: BLE001 - a disclosure must never fail an activation
+        return
+
+
 # ── Subcommands ──────────────────────────────────────────────────────────────
 
 
 def _cmd_activate(ns: argparse.Namespace) -> int:
-    from adscan_core.pro_license import client
-
     key = _read_activation_key(ns)
     if not key:
         return 1
+    rc = activate_with_key(key, seat_label=ns.seat_label, relay_out=ns.relay_out)
+    if rc != 0 or ns.relay_out:
+        return rc
+    from adscan_launcher.pro_download import offer_pro_download
+
+    return 0 if offer_pro_download(pull=getattr(ns, "pull", None)) else 1
+
+
+def activate_with_key(key: str, *, seat_label: str | None = None, relay_out: str | None = None) -> int:
+    """Activate this machine with ``key``; return the exit code (shared by ``install --license``)."""
+    from adscan_core.pro_license import client
+
     store = _store()
-    if ns.relay_out:
-        result = client.activate(store, key, transport=None, seat_label=ns.seat_label)
+    if relay_out:
+        result = client.activate(store, key, transport=None, seat_label=seat_label)
         if not result.queued:
             print_error(result.message)
             return 1
-        client.write_relay_batch(client.export_relay(store), ns.relay_out)
+        client.write_relay_batch(client.export_relay(store), relay_out)
         print_success(
-            f"Activation request written to {ns.relay_out}. It contains your activation key, so keep it "
+            f"Activation request written to {relay_out}. It contains your activation key, so keep it "
             "private. Send it through your platform, then run `adscan license relay import --in <answers file>`."
         )
         return 0
     if _offline():
         return _offline_refusal()
-    result = client.activate(store, key, transport=_transport(), seat_label=ns.seat_label)
+    result = client.activate(store, key, transport=_transport(), seat_label=seat_label)
     if not result.ok:
         (print_warning if result.queued else print_error)(result.message)
         return 1
     from adscan_core.pro_license.evaluation import check_pro_license
+    from adscan_launcher.edition import clear_cache
 
+    clear_cache()
     status = check_pro_license(store)
     print_success(f"This machine is activated. {status.message}")
     _print_status_lines(status, store)
-    if store.registry_credential():
-        print_info("A read-only image registry credential was saved with the licence.")
+    _print_activation_disclosure(store)
     return 0
 
 
 def _cmd_status(ns: argparse.Namespace) -> int:
-    from adscan_core.pro_license import evaluation
-    from adscan_core.pro_license.state import STATUS_PENDING, STATUS_REFUSED, STATUS_REGISTERED
+    from adscan_core.pro_license import client, evaluation
+    from adscan_core.pro_license.status_view import render_status_panel, status_document
 
     store = _store()
-    status = evaluation.check_pro_license(store)
     required = evaluation.enforcement_required(store)
-    entries = store.register_entries().values()
-    counts = {
-        "registered": sum(1 for e in entries if e.get("status") == STATUS_REGISTERED),
-        "pending": sum(1 for e in entries if e.get("status") == STATUS_PENDING),
-        "refused": sum(1 for e in entries if e.get("status") == STATUS_REFUSED),
-    }
+    result = None
+    if not getattr(ns, "no_check_in", False) and store.has_licence_file():
+        result = client.launch_check_in(store)
+        if result is not None and result.error is not None:
+            from adscan_core import telemetry
+            from adscan_core.rich_output import print_exception
+
+            telemetry.capture_exception(result.error)
+            print_exception(exception=result.error)
+    status = evaluation.check_pro_license(store)
+    doc = status_document(store, status, enforced=required, check_in=result)
     if ns.json:
-        installation = store.existing_installation()
-        data = status.to_dict()
-        data.update(
-            {
-                "enforcement": "required" if required else "dormant",
-                "installation_id": installation.installation_id if installation else None,
-                "domains": counts,
-                "queued_requests": len(store.pending()),
-                "last_contact": store.last_contact(),
-            }
-        )
-        sys.stdout.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
         return 0
     if status.state == evaluation.STATE_MISSING and not required:
-        print_info(
-            "No ADscan PRO licence is installed on this machine. This build does not require one yet; "
-            "activate with `adscan license activate` when you receive an activation key."
-        )
+        print_info(evaluation.DORMANT_MESSAGE)
         return 0
-    (print_success if status.scans_allowed and not status.warning else print_warning)(status.message)
-    _print_status_lines(status, store)
-    print_info(
-        f"Domains: {counts['registered']} registered, {counts['pending']} waiting to be registered"
-        + (f", {counts['refused']} refused" if counts["refused"] else "")
-        + "."
-    )
-    queued = len(store.pending())
-    if queued:
-        print_info(
-            f"{queued} request{'s' if queued != 1 else ''} queued. Send with `adscan license sync`, "
-            "or through your platform with `adscan license relay export`."
-        )
+    from adscan_core.output._state import get_console
+
+    console = get_console()
+    console.print(render_status_panel(doc))
     return 0 if status.scans_allowed or not required else 1
 
 
@@ -267,13 +402,25 @@ def _cmd_deactivate(ns: argparse.Namespace) -> int:
         if not result.queued:
             print_error(result.message)
             return 1
-        client.write_relay_batch(client.export_relay(store), ns.relay_out)
-        print_success(f"Release request written to {ns.relay_out}. Send it through your platform.")
+        batch = client.export_relay(store)
+        client.write_relay_batch(batch, ns.relay_out)
+        others = len(batch["items"]) - 1
+        print_success(
+            f"Release request written to {ns.relay_out}"
+            + (f", after the {others} queued request{'s' if others != 1 else ''} this machine still owes" if others > 0 else "")
+            + ". Send it through your platform."
+        )
         return 0
-    if _offline():
+    if _channel_closed(store):
         return _offline_refusal()
     result = client.deactivate(store, transport=_transport())
     (print_success if result.ok else print_error)(result.message)
+    if result.ok:
+        from adscan_launcher.edition import clear_cache, resolve_edition
+
+        clear_cache()
+        if not resolve_edition().is_pro:
+            print_info("This machine now runs ADscan LITE. Your workspaces stay available.")
     return 0 if result.ok else 1
 
 
@@ -297,33 +444,210 @@ def _report_sync(summary: Any) -> int:
 
 
 def _cmd_renew(ns: argparse.Namespace) -> int:
-    from adscan_core.pro_license import client, documents
+    from adscan_core.pro_license import client
 
     store = _store()
     licence, error = store.load_licence()
     if licence is None:
         print_error(str(error) if error else "No PRO licence is active on this machine.")
         return 1
-    if _offline():
+    if _channel_closed(store):
         return _offline_refusal()
-    if store.pending_of_kind(documents.KIND_RENEWAL, license_id=licence.license_id) is None:
-        store.add_pending(
-            documents.build_request(
-                store.installation(),
-                documents.KIND_RENEWAL,
-                engine_version=client.engine_version(),
-                license_id=licence.license_id,
-            )
+    result = client.check_in(store, _transport(), force=True)
+    if result.outcome == client.CHECK_IN_REFRESHED:
+        from adscan_core.pro_license.evaluation import check_pro_license
+
+        print_success(f"Licence refreshed. {check_pro_license(store).message}")
+        return 0
+    if result.outcome == client.CHECK_IN_UNREACHABLE:
+        print_warning(
+            "ADscan could not reach the licence server"
+            + (f" ({result.message})" if result.message else "")
+            + ". Try again later, or use `adscan license relay export`."
         )
-    return _report_sync(client.sync(store, _transport()))
+        return 1
+    (print_error if result.outcome == client.CHECK_IN_REVOKED else print_warning)(
+        result.message or "The licence server's answer could not be accepted."
+    )
+    return 1
 
 
 def _cmd_sync(ns: argparse.Namespace) -> int:
     from adscan_core.pro_license import client
 
-    if _offline():
+    store = _store()
+    if _channel_closed(store):
         return _offline_refusal()
-    return _report_sync(client.sync(_store(), _transport()))
+    return _report_sync(client.sync(store, _transport()))
+
+
+_STEP_LABELS = {
+    "proxy": "Proxy",
+    "dns": "DNS",
+    "tcp": "Connection",
+    "tls": "TLS",
+    "health": "Server",
+    "clock": "Clock",
+}
+
+
+def _check_document(store: Any, report: Any, *, sent: Any, requeued: int, check_in: Any) -> dict[str, Any]:
+    """The ``license_check`` document (``adscan license check --json``)."""
+    from adscan_core.engagement.output_formats import SCHEMA_VERSION_KEY, output_marker
+    from adscan_core.pro_license import evaluation
+    from adscan_core.pro_license.connection import licence_notice, notice_block
+    from adscan_core.pro_license.route_check import fix_for
+
+    licence_part = None
+    notice_part = None
+    if store.has_licence_file():
+        status = evaluation.check_pro_license(store)
+        notice = licence_notice(store, status, check_in=check_in)
+        notice_part = notice_block(notice)
+        lic = status.licence
+        licence_part = {
+            "state": status.state,
+            "scans_allowed": status.scans_allowed,
+            "contract_ends_on": lic.contract_ends_on.isoformat() if lic and lic.contract_ends_on else None,
+            "works_offline_until": notice.offline_last_day.isoformat()
+            if notice and notice.offline_last_day
+            else None,
+            "offline_days_left": notice.offline_days_left if notice else None,
+            "registered_domains": notice.registered if notice else 0,
+            "pending_domains": len(notice.waiting) if notice else 0,
+        }
+    return {
+        SCHEMA_VERSION_KEY: output_marker("license_check"),
+        "reachable": report.reachable,
+        "cause": report.cause,
+        "fix": fix_for(report) or None,
+        "route": report.to_dict(),
+        "sent": None
+        if sent is None
+        else {"requests": int(sent.sent), "answered": int(sent.applied), "requeued_after_clock": requeued},
+        "licence": licence_part,
+        "licence_notice": notice_part,
+    }
+
+
+def _render_check(doc: dict[str, Any], report: Any) -> None:
+    from rich import box
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    from adscan_core.output._state import get_console
+    from adscan_core.pro_license.connection import human_date as _human
+
+    table = Table(box=None, show_header=False, padding=(0, 2, 0, 0), expand=False)
+    table.add_column(no_wrap=True)
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column()
+    for step in report.steps:
+        mark = Text("–", style="dim") if step.ok is None else (
+            Text("✓", style="green") if step.ok else Text("✗", style="bold red")
+        )
+        table.add_row(mark, _STEP_LABELS.get(step.name, step.name), Text(step.detail))
+    parts: list[Any] = [table]
+    if doc.get("fix"):
+        parts += [Text(""), Text(str(doc["fix"]), style="bold")]
+    if report.container_proxy_hint:
+        parts += [
+            Text(""),
+            Text(
+                "This machine uses a proxy from HTTPS_PROXY. Scans run in a container that does not "
+                "inherit it, so set ADSCAN_LICENSE_PROXY to the same proxy for every launch to check in.",
+                style="yellow",
+            ),
+        ]
+    sent = doc.get("sent")
+    if sent:
+        line = f"Sent {sent['requests']} request{'s' if sent['requests'] != 1 else ''}, {sent['answered']} answered."
+        if sent.get("requeued_after_clock"):
+            line += (
+                f" {sent['requeued_after_clock']} domain registration(s) refused earlier for a wrong clock "
+                "were sent again."
+            )
+        parts += [Text(""), Text(line)]
+    lic = doc.get("licence")
+    if lic:
+        summary = Table(box=None, show_header=False, padding=(0, 2, 0, 0), expand=False)
+        summary.add_column(style="dim", no_wrap=True)
+        summary.add_column()
+        if lic.get("contract_ends_on"):
+            from datetime import date
+
+            summary.add_row("Licence valid until", _human(date.fromisoformat(lic["contract_ends_on"])))
+        if lic.get("works_offline_until"):
+            from datetime import date
+
+            days = lic.get("offline_days_left")
+            when = _human(date.fromisoformat(lic["works_offline_until"]))
+            summary.add_row("Works offline until", f"{when} ({days} day{'s' if days != 1 else ''} left)")
+        summary.add_row(
+            "Domains", f"{lic.get('registered_domains', 0)} registered, {lic.get('pending_domains', 0)} waiting"
+        )
+        parts += [Text(""), summary]
+    from adscan_core.pro_license.evaluation import licence_contact_email
+
+    parts += [Text(""), Text(f"Need help? Write to {licence_contact_email()}.", style="dim")]
+    reachable = bool(doc.get("reachable"))
+    get_console().print(
+        Panel(
+            Group(*parts),
+            title="[bold]Licence server[/bold] · " + ("reachable" if reachable else "not reachable"),
+            title_align="left",
+            border_style="green" if reachable else "red",
+            box=box.ROUNDED,
+            padding=(1, 2),
+            expand=False,
+        )
+    )
+
+
+def _cmd_check(ns: argparse.Namespace) -> int:
+    from adscan_core.pro_license import client
+    from adscan_core.pro_license.route_check import diagnose
+
+    store = _store()
+    licence, _error = store.load_licence()
+    if licence is not None and not licence.needs_server:
+        print_info(
+            "This is an offline engagement licence. It never contacts the licence server, "
+            "so there is nothing to check."
+        )
+        return 0
+    if licence is None and _offline():
+        return _offline_refusal()
+    if licence is not None and not ns.json:
+        _channel_closed(store)  # prints the one offline-mode line when offline mode is on
+    report = diagnose(licence_dir=store.directory)
+    sent = None
+    requeued = 0
+    check_in = None
+    if licence is not None:
+        if report.reachable:
+            requeued = client.requeue_clock_refused_registrations(store, licence)
+            transport = _transport()
+            check_in = client.check_in(store, transport, force=True)
+            sent = client.sync(store, transport)
+            # The renewal and what it flushed count too.
+            sent.sent += 1 + check_in.flushed
+            sent.applied += check_in.flushed + (0 if check_in.outcome == client.CHECK_IN_UNREACHABLE else 1)
+        else:
+            failed = report.failed
+            store.record_check_in(client.CHECK_IN_UNREACHABLE, error=failed.detail if failed else "")
+            check_in = client.CHECK_IN_UNREACHABLE
+    doc = _check_document(store, report, sent=sent, requeued=requeued, check_in=check_in)
+    if ns.json:
+        sys.stdout.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    else:
+        _render_check(doc, report)
+        if sent is not None:
+            for _code, message in sent.notices:
+                print_warning(message)
+    return 0 if report.reachable else 1
 
 
 def _cmd_relay(ns: argparse.Namespace) -> int:
@@ -342,6 +666,9 @@ def _cmd_relay(ns: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         print_error(f"The answers file cannot be read: {exc}.")
         return 1
+    from adscan_core.pro_license.evaluation import check_pro_license
+
+    had_licence = check_pro_license(store).licence is not None
     summary = client.import_relay(store, batch)
     for code, message in summary.notices:
         print_warning(message or code)
@@ -351,6 +678,8 @@ def _cmd_relay(ns: argparse.Namespace) -> int:
         reasons = sorted({reason for _rid, reason in real_rejections})
         print_warning(f"{len(real_rejections)} answer(s) rejected ({', '.join(reasons)}).")
         return 1
+    if not had_licence and summary.applied and check_pro_license(store).licence is not None:
+        _print_activation_disclosure(store)
     return 0
 
 
@@ -420,9 +749,11 @@ def _cmd_install(ns: argparse.Namespace) -> int:
 _HANDLERS = {
     "activate": _cmd_activate,
     "status": _cmd_status,
+    "show": _cmd_status,
     "deactivate": _cmd_deactivate,
     "renew": _cmd_renew,
     "sync": _cmd_sync,
+    "check": _cmd_check,
     "relay": _cmd_relay,
     "register": _cmd_register,
     "install": _cmd_install,
@@ -447,4 +778,10 @@ def run_license_command(ns: argparse.Namespace) -> int:
         return 1
 
 
-__all__ = ["ACTIVATION_KEY_ENV", "add_license_subparser", "run_license_command"]
+__all__ = [
+    "ACTIVATION_KEY_ENV",
+    "activate_with_key",
+    "add_license_subparser",
+    "add_pull_choice_arguments",
+    "run_license_command",
+]

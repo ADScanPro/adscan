@@ -31,7 +31,6 @@ from adscan_internal.rich_output import (
     strip_sensitive_markers,
 )
 from adscan_internal.services.attack_graph_service import (
-    add_bloodhound_path_edges,
     get_owned_attack_path_summaries_to_target,
     get_owned_domain_usernames_for_attack_paths,
     get_rodc_prp_control_paths,
@@ -39,8 +38,8 @@ from adscan_internal.services.attack_graph_service import (
     rodc_followup_state_label,
     resolve_user_sid,
     update_edge_status_by_labels,
-    save_attack_graph,
 )
+from adscan_internal.services.graph_runtime_edits import record_path_edges
 from adscan_internal.services.pivot_opportunity_service import (
     maybe_offer_pivot_opportunity_for_host_viability,
 )
@@ -843,8 +842,9 @@ def _refresh_rodc_prp_control_edges(
         if not isinstance(nodes, list) or not isinstance(rels, list):
             continue
         added_edges += int(
-            add_bloodhound_path_edges(
-                graph,
+            record_path_edges(
+                shell,
+                domain,
                 nodes=[node for node in nodes if isinstance(node, dict)],
                 relations=[str(rel) for rel in rels],
                 status="discovered",
@@ -854,14 +854,12 @@ def _refresh_rodc_prp_control_edges(
                     if isinstance(entry.get("notes_by_relation_index"), dict)
                     else None
                 ),
-                log_creation=False,
-                shell=shell,
+                origin="rodc_prp_refresh",
             )
             or 0
         )
 
     if added_edges:
-        save_attack_graph(shell, domain, graph)
         print_info_debug(
             f"[rodc-prp] refreshed delegated RODC PRP edges for {mark_sensitive(domain, 'domain')}: "
             f"added_edges={added_edges}"

@@ -11,8 +11,8 @@ from typing import Any
 
 from adscan_internal.services.base_service import BaseService
 from adscan_internal.services.smb_guest_auth_service import (
-    is_guest_alias,
-    resolve_smb_guest_username,
+    build_smb_guest_config,
+    is_credential_less_reader_identity,
 )
 from adscan_internal.services.smb_transport import (
     SMBConfig,
@@ -162,7 +162,12 @@ class SMBByteReaderService(BaseService):
         is_hash = bool(
             has_hash_detector and shell.is_hash(password)
         ) or _looks_like_nt_hash(password)
-        is_guest_context = domain_auth_mode == "guest" or is_guest_alias(username)
+        # A guest alias or the engagement's guest transport name (non-empty)
+        # reads as guest; an empty username is a missing credential, not guest.
+        is_guest_context = domain_auth_mode == "guest" or (
+            bool(username)
+            and is_credential_less_reader_identity(username, shell=shell, domain=domain)
+        )
         if is_hash:
             auth_mode = "hash"
         elif password:
@@ -171,9 +176,6 @@ class SMBByteReaderService(BaseService):
             auth_mode = "guest"
         else:
             auth_mode = "missing"
-
-        if auth_mode == "guest" and (not username or is_guest_alias(username)):
-            username = resolve_smb_guest_username(shell=shell, domain=domain)
 
         self.logger.debug(
             (
@@ -230,16 +232,27 @@ class SMBByteReaderService(BaseService):
                 source_path=effective_source_path,
             )
 
-        config = SMBConfig(
-            target_ip=host,
-            target_hostname=host,
-            domain=domain or resolved_domain_key or active_domain or None,
-            username=username or None,
-            password=password if auth_mode == "password" else None,
-            nt_hash=password if auth_mode == "hash" else None,
-            auth_domain=resolved_auth_domain or None,
-            timeout=timeout_seconds,
-        )
+        if auth_mode == "guest":
+            # The one guest builder: establishes the guest name and declares it.
+            config = build_smb_guest_config(
+                shell,
+                domain=resolved_auth_domain,
+                target_ip=host,
+                target_hostname=host,
+                timeout=timeout_seconds,
+            )
+            username = config.username or ""
+        else:
+            config = SMBConfig(
+                target_ip=host,
+                target_hostname=host,
+                domain=domain or resolved_domain_key or active_domain or None,
+                username=username or None,
+                password=password if auth_mode == "password" else None,
+                nt_hash=password if auth_mode == "hash" else None,
+                auth_domain=resolved_auth_domain or None,
+                timeout=timeout_seconds,
+            )
         context = _SMBReadContext(
             config=config,
             unc_file_path=f"\\{share}\\{normalized_path}",

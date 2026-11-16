@@ -29,6 +29,7 @@ from adscan_core.engagement.model import (
     RunCoverage,
     Transition,
 )
+from adscan_core.engagement.detectors import gap_basis_for_check
 from adscan_core.engagement.specs import ObservationSpec, spec_for
 
 SpecLookup = Callable[[str, str], Optional[ObservationSpec]]
@@ -41,6 +42,13 @@ REASON_COVERAGE_UNKNOWN = "coverage_unknown"
 #: The artifact that would show the item as present could not be read, so its
 #: absence from this run means nothing.
 REASON_ARTIFACT_UNREADABLE = "artifact_unreadable"
+#: The graph file on disk is not this run's: the build stopped and the previous
+#: export was kept (``export_state.current`` false), so nothing absent from it
+#: is evidence about this run.
+REASON_GRAPH_NOT_CURRENT = "graph_not_current"
+#: The platform stopped loading the run's graph at its memory ceiling: what was
+#: not loaded is not evidence of absence.
+REASON_INGESTION_INCOMPLETE = "ingestion_incomplete"
 REASON_NO_SPEC = "no_spec"
 REASON_NEVER_AUTO = "never_auto"
 REASON_CHECK_SKIPPED = "check_skipped"
@@ -64,33 +72,100 @@ def _coverage_for(
     return None, elsewhere
 
 
+def _with_basis(reason: str, check_id: str) -> str:
+    """Name the unread source when the failing check is a detector family's.
+
+    Only for a check the run RECORDED as not complete: the basis states a read
+    that was attempted and not obtained. A check with no record did not run.
+
+    ``check_skipped:host_registry_not_read`` says which read was not obtained,
+    in the same token a recheck verdict uses (``basis_not_read:<token>``); the
+    copy for both lives in ``adscan_core.engagement.sources``.
+    """
+    basis = gap_basis_for_check(check_id)
+    return f"{reason}:{basis}" if basis else reason
+
+
+def _status_failure(item: PriorItem, spec: ObservationSpec, check: CheckCoverage) -> Optional[str]:
+    """Why one recorded check cannot vouch for the item's absence, else None."""
+    if check.status is CheckStatus.RAN:
+        return None
+    if check.status is CheckStatus.PARTIAL:
+        covered = (
+            spec.scope in {"object", "host"}
+            and item.object_id is not None
+            and check.examined_ids is not None
+            and item.object_id in check.examined_ids
+        )
+        return None if covered else REASON_CHECK_PARTIAL
+    if check.status is CheckStatus.FAILED:
+        return REASON_CHECK_FAILED
+    return REASON_CHECK_SKIPPED
+
+
 def _check_failure(
     item: PriorItem, spec: ObservationSpec, coverage: RunCoverage
 ) -> Optional[str]:
-    """Return the first reason the item's absence cannot be trusted, else None."""
+    """Return a reason the item's absence cannot be trusted, else None.
+
+    When more than one check blocks the closure, a reason that NAMES the unread
+    source (the instrumented detector family's own gap, carrying a ``basis``)
+    wins over a generic phase-check gap. Otherwise a host-read finding whose
+    coarse ``domain_collection.hosts`` check went partial would report
+    ``check_partial`` with no source, masking the specific ``host_registry_not_read``
+    its registry family recorded (gate finding R53): the AD CS findings already
+    name their read because no coarse host check precedes it in their spec, and
+    this makes every family read the same way.
+    """
     needed = max(spec.requires_vantage, item.last_vantage)
     if coverage.vantage < needed:
         return REASON_VANTAGE
+    first_failure: Optional[str] = None
+    basis_failure: Optional[str] = None
+
+    def _consider(reason: Optional[str]) -> None:
+        nonlocal first_failure, basis_failure
+        if reason is None:
+            return
+        if first_failure is None:
+            first_failure = reason
+        if basis_failure is None and reason_basis(reason):
+            basis_failure = reason
+
     for check_id in spec.observed_by:
         check, elsewhere = _coverage_for(coverage, check_id, item.domain_id)
         if check is None:
-            return REASON_SCOPE_MISMATCH if elsewhere else REASON_CHECK_SKIPPED
-        if check.status is CheckStatus.RAN:
+            # No record at all: the check did not run on this scope (a phase
+            # left out, a CVE scope narrowed to the domain controllers). That
+            # is not a read the run attempted and could not obtain, so it is
+            # never qualified with the family's source basis, which would tell
+            # the client "a host did not answer" about a host never probed.
+            _consider(REASON_SCOPE_MISMATCH if elsewhere else REASON_CHECK_SKIPPED)
             continue
-        if check.status is CheckStatus.PARTIAL:
-            covered = (
-                spec.scope in {"object", "host"}
-                and item.object_id is not None
-                and check.examined_ids is not None
-                and item.object_id in check.examined_ids
-            )
-            if covered:
-                continue
-            return REASON_CHECK_PARTIAL
-        if check.status is CheckStatus.FAILED:
-            return REASON_CHECK_FAILED
-        return REASON_CHECK_SKIPPED
-    return None
+        failure = _status_failure(item, spec, check)
+        if failure is not None:
+            _consider(_with_basis(failure, check_id))
+    # A family that recorded a gap on its own source in this run blocks the
+    # closure too; one that recorded nothing is not required.
+    for check_id in spec.recorded_gap_checks:
+        check, _elsewhere = _coverage_for(coverage, check_id, item.domain_id)
+        if check is None:
+            continue
+        failure = _status_failure(item, spec, check)
+        if failure is not None:
+            _consider(_with_basis(failure, check_id))
+    return basis_failure or first_failure
+
+
+def reason_code(reason: Optional[str]) -> str:
+    """The base reason code of a (possibly basis-qualified) reason."""
+    return str(reason or "").split(":", 1)[0]
+
+
+def reason_basis(reason: Optional[str]) -> str:
+    """The basis token of a ``<code>:<basis>`` reason; ``""`` when it has none."""
+    _code, _sep, basis = str(reason or "").partition(":")
+    return basis
 
 
 def _absent(

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from adscan_core.reporting.principal_display import declares_node_identities
+
 #: ``context`` key: one entry per offered route option, in option order.
 OFFERED_PATHS_KEY = "offered_paths"
 #: ``context`` key: the mapped routes shown in the listing that are NOT a choice.
@@ -64,6 +66,7 @@ def _not_offered_reason(summary: Mapping[str, Any]) -> str:
     return str((meta or {}).get("execution_support_reason") or "").strip()
 
 
+@declares_node_identities(records="summaries")
 def build_path_offer_context(
     summaries: Sequence[Mapping[str, Any]],
     offer_indices: Iterable[int],

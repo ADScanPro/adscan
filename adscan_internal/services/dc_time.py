@@ -217,6 +217,49 @@ async def _do_smb_negotiate_read(
         ) from exc
 
 
+# ----- Engagement scope -------------------------------------------------------
+#
+# A clock read is a contact with the time source (the pre-auth SMB2 NEGOTIATE,
+# or an NTP / ``net time`` query the HOST HELPER sends from its own process,
+# which no in-process check can see). So each channel asks the engagement-scope
+# SSOT first, describing what it opens: an excluded domain controller is
+# never read, and the caller falls back to the in-memory Kerberos offset.
+
+_SCOPE_REFUSAL = "the time source is excluded from the engagement scope"
+
+#: Time sources whose refusal was already announced (plain strings: no loop- or
+#: session-bound object is kept).
+_SCOPE_REFUSALS_ANNOUNCED: set[str] = set()
+
+
+def _time_source_in_scope(dc_ip: str, *, smb_negotiate: bool = False) -> bool:
+    """Whether the engagement scope lets the clock be read from ``dc_ip`` (quiet).
+
+    The channel says what it opens and the scope SSOT derives the rest: an NTP
+    exchange, or (``smb_negotiate``) an SMB negotiate that never opens a
+    session. Fails closed: a verdict that cannot be computed reads the clock
+    from nobody.
+    """
+    try:
+        from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+            Contact,
+            session_host_verdict,
+        )
+
+        contact = Contact("smb", negotiate_only=True) if smb_negotiate else Contact("ntp")
+        return bool(session_host_verdict(host=dc_ip, contact=contact).allowed)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
+def _require_time_source_in_scope(dc_ip: str, *, smb_negotiate: bool = False) -> None:
+    """Raise :class:`DCTimeChannelError` when ``dc_ip`` may not be read for time."""
+    if not _time_source_in_scope(dc_ip, smb_negotiate=smb_negotiate):
+        raise DCTimeChannelError(_SCOPE_REFUSAL)
+
+
 async def get_dc_time_via_smb_negotiate(
     dc_ip: str,
     *,
@@ -247,8 +290,10 @@ async def get_dc_time_via_smb_negotiate(
 
     Raises:
         DCTimeChannelError: When every attempt fails. The message includes
-            the last exception type and detail for diagnostics.
+            the last exception type and detail for diagnostics. Also when the
+            engagement scope excludes ``dc_ip``: nothing is sent to it.
     """
+    _require_time_source_in_scope(dc_ip, smb_negotiate=True)
     last_exc: Exception | None = None
     backoff = 0.5
     for attempt in range(1, max_attempts + 1):
@@ -398,13 +443,15 @@ async def get_dc_time_via_ntp(
         timeout: Soft timeout for the helper call.
 
     Raises:
-        DCTimeChannelError: When the helper fails or output cannot be parsed.
+        DCTimeChannelError: When the helper fails or output cannot be parsed,
+            or the engagement scope excludes ``dc_ip`` (the helper is never asked).
     """
     from adscan_internal.host_privileged_helper import (
         HostHelperError,
         host_helper_client_request,
     )
 
+    _require_time_source_in_scope(dc_ip)
     start = time.monotonic()
     try:
         resp = await asyncio.to_thread(
@@ -540,8 +587,12 @@ async def get_dc_time_via_net_time(
 
     Raises:
         DCTimeChannelError: When either helper call fails, output cannot
-            be parsed, or the timezone query is unavailable.
+            be parsed, or the timezone query is unavailable. Also when the
+            engagement scope excludes ``dc_ip`` (the helper is never asked).
     """
+    # `net time` reads the server time from the SMB negotiate reply and opens no
+    # session, so it is the same contact as the pre-authentication read.
+    _require_time_source_in_scope(dc_ip, smb_negotiate=True)
     start = time.monotonic()
     local_raw = await _query_net_time_local(dc_ip, sock_path)
     naive_local = _parse_net_time_local_output(local_raw)
@@ -602,10 +653,35 @@ async def get_dc_time(
 
     Raises:
         DCTimeUnavailable: When every channel failed. The exception message
-            chains the per-channel failure reasons for diagnostics.
+            chains the per-channel failure reasons for diagnostics. Also when
+            the engagement scope excludes ``dc_ip``: no channel is tried, and
+            the refusal is recorded once in the scope record.
     """
     marked_dc = mark_sensitive(dc_ip, "ip")
     failures: list[str] = []
+
+    if not _time_source_in_scope(dc_ip):
+        # Announced and recorded ONCE per source here (the channels below stay
+        # quiet): the transports ask for a clock sync on every Kerberos
+        # connection, and a refused read is never memoised as fresh.
+        if dc_ip not in _SCOPE_REFUSALS_ANNOUNCED:
+            _SCOPE_REFUSALS_ANNOUNCED.add(dc_ip)
+            try:
+                from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+                    Contact,
+                    require_session_host_in_scope,
+                )
+
+                require_session_host_in_scope(
+                    host=dc_ip,
+                    contact=Contact("ntp"),
+                    surface="clock_read",
+                    what="Clock read",
+                )
+            except Exception as exc:  # noqa: BLE001 - the refusal stands either way
+                telemetry.capture_exception(exc)
+                print_exception(exception=exc)
+        raise DCTimeUnavailable(f"No DC time channel was tried: {_SCOPE_REFUSAL}")
 
     for channel in channels:
         print_info_debug(f"[clock-sync] trying channel={channel.value} dc={marked_dc}")
@@ -869,7 +945,27 @@ async def _read_offset_seconds(
         return (None, None)
     now_utc = datetime.now(timezone.utc)
     offset = (reading.when_utc - now_utc).total_seconds()
+    _record_licence_dc_witness(reading.when_utc)
     return (offset, reading)
+
+
+def _record_licence_dc_witness(dc_now: datetime) -> None:
+    """Hand the DC time just measured to the PRO licence as an expiry witness.
+
+    No new network call: this is the reading the clock guard already took. The
+    licence uses it only to notice that its offline document expired by the
+    client DC's clock (beyond a 72-hour drift tolerance); it never extends
+    validity. Best-effort and silent: a licence concern never affects clock sync.
+    """
+    try:
+        from adscan_core.pro_license.state import ProLicenseStore
+
+        store = ProLicenseStore()
+        if store.has_licence_file():
+            store.record_dc_time_witness(dc_now)
+    except Exception as exc:  # noqa: BLE001 — never affects the clock guard
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
 
 
 def _seed_kerbad_offset(realm: str, offset: float) -> None:

@@ -29,7 +29,7 @@ import csv
 import ipaddress
 import time
 from datetime import datetime, timezone
-from typing import Literal, Protocol
+from typing import Any, Callable, Iterable, Literal, Protocol
 import json
 
 from rich.prompt import Confirm
@@ -112,6 +112,142 @@ def _nmap_timing_flags() -> str:
 def _important_port_scan_timeout_seconds() -> int:
     """Whole-scan wall budget for the important-port scan (scales with pacing)."""
     return int(component_pacing(active_pacing(), "portscan.nmap")["whole_scan_timeout_s"])
+
+
+# --- Engagement scope ----------------------------------------------------------
+# The engagement scope SSOT (services/engagement_scope.py) decides which hosts
+# may be contacted. Two things are needed for a port scan: the TARGET LIST is
+# (requested and allowed) minus denied, built before anything is launched, and
+# the scanner itself also gets an exclude file, because nmap is a child process
+# no in-process check can see (it resolves names and expands ranges on its own).
+
+_SCOPE_EXCLUDE_FILENAME = "engagement_scope_exclude.txt"
+
+
+def _scope_workdir(shell: "NmapShell", preferred: str | None = None) -> str:
+    """Where a scan's scope files go: always inside the workspace."""
+    if preferred:
+        return preferred
+    return str(getattr(shell, "current_workspace_dir", "") or "") or os.getcwd()
+
+
+def _scope_contact_for_ports(ports: Iterable[int] | None) -> Any:
+    """What a probe of ``ports`` opens on a host, for the engagement scope.
+
+    The scope SSOT derives everything from the description, so the description
+    is taken from the ports themselves and never stated by a caller. A probe is
+    a directory contact only when EVERY port is a directory-plane protocol
+    (LDAP, the global catalogue, Kerberos, DNS, NTP); one other port (445,
+    3389, 5985...) makes it an ordinary host contact. Among directory ports a
+    non-DNS one is the description, so a server that only answers DNS is not
+    probed on the Kerberos and LDAP ports.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        Contact,
+        contact_for_port,
+    )
+
+    contacts = [contact_for_port(port) for port in ports or ()]
+    if not contacts or any(not contact.protocol for contact in contacts):
+        return Contact()
+    for contact in contacts:
+        if contact.protocol != "dns":
+            return contact
+    return contacts[0]
+
+
+def _nmap_scope_flags(
+    shell: "NmapShell",
+    *,
+    workdir: str | None = None,
+    ports: Iterable[int] | None = None,
+    domain: str | None = None,
+) -> str:
+    """Return the nmap flags that keep the child process off excluded hosts.
+
+    The one place every nmap command gets its exclusions, beside
+    :func:`_nmap_timing_flags`. Writes the session's excluded networks and
+    addresses to an exclude file in the workspace and returns
+    ``" --excludefile <path>"`` (leading space included), or ``""`` when no
+    asset scope is recorded, so a scan without a scope builds the same command
+    as before.
+
+    Under a recorded scope the flag is always there, even when the scope
+    excludes no address yet (nmap reads an empty exclude file as "nothing
+    excluded"): the file is written again right before every run of the scan,
+    a retry included, so the child reads the exclusions as they stand when it
+    starts and not as they stood when the command was first built.
+
+    Args:
+        shell: The active shell.
+        workdir: Directory for the exclude file (the workspace by default).
+        ports: The ports the scan probes (what it opens on each host).
+        domain: The domain the targets were listed for, when known.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+        scanner_exclusions,
+    )
+
+    if not asset_scope_recorded(shell):
+        return ""
+    # A failure here propagates: a scan is never launched with a half-built
+    # exclude list (every caller reports the failure and scans nothing).
+    exclusions = scanner_exclusions(
+        shell, contact=_scope_contact_for_ports(ports), domain=domain
+    )
+    # The scans here are IPv4 (no -6): an IPv6 line would not parse as a target.
+    lines = [line for line in exclusions if ":" not in line]
+    directory = _scope_workdir(shell, workdir)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, _SCOPE_EXCLUDE_FILENAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("".join(f"{line}\n" for line in lines))
+    return f" --excludefile {shlex.quote(path)}"
+
+
+def _split_scan_targets_by_scope(
+    shell: "NmapShell",
+    hosts: str,
+    *,
+    ports: Iterable[int] | None,
+    surface: str,
+    what: str,
+    domain: str | None = None,
+) -> object:
+    """Split a scanner target expression by the engagement scope (network arithmetic)."""
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        partition_address_space_in_scope,
+        prepare_scope_targets,
+    )
+
+    tokens = [token for token in re.split(r"[\s,]+", str(hosts or "").strip()) if token]
+    # A host NAME in the expression is judged from what the session knows about
+    # it, so the session is told once for all of them (addresses, networks and
+    # ranges need nothing).
+    names = [
+        token
+        for token in tokens
+        if re.search(r"[A-Za-z]", token) and not re.search(r"[/:*]", token)
+    ]
+    if names:
+        prepare_scope_targets(shell, names, domain=domain)
+    return partition_address_space_in_scope(
+        shell,
+        tokens,
+        contact=_scope_contact_for_ports(ports),
+        surface=surface,
+        what=what,
+        domain=domain,
+    )
+
+
+def _write_scoped_target_file(path: str, targets: list[str]) -> str:
+    """Write the in-scope targets for ``-iL`` and return the quoted flag."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(targets) + "\n")
+    return f"-iL {shlex.quote(path)}"
 
 
 class NmapShell(Protocol):
@@ -274,6 +410,67 @@ def discover_dc_candidates_with_nmap_details(
             workspace_dir = shell.current_workspace_dir or os.getcwd()
             output_path = os.path.join(workspace_dir, "dc_candidates.gnmap")
 
+        # Engagement scope: the range is (requested and allowed) minus denied,
+        # computed as networks before anything is sent. The probes are the
+        # directory plane (Kerberos, LDAP, DNS), which is what finding a domain
+        # controller needs. Without an asset scope the expression is untouched.
+        setattr(shell, "_last_dc_discovery_excluded_by_scope", False)
+        scope_split = _split_scan_targets_by_scope(
+            shell,
+            hosts,
+            ports=target_ports,
+            surface="dc_discovery",
+            what="DC candidate discovery",
+        )
+        def _scope_emptied_discovery() -> dict[str, set[int]]:
+            setattr(shell, "_last_dc_discovery_excluded_by_scope", True)
+            # The recovery that follows words the remedy from the same
+            # vocabulary (start.py reads the flag set above).
+            from adscan_core.engagement_scope_cli import (  # noqa: PLC0415
+                SCOPE_EMPTIED_DISCOVERY_HEADLINE,
+            )
+
+            print_warning(f"{SCOPE_EMPTIED_DISCOVERY_HEADLINE} Range: {marked_hosts}")
+            return {}
+
+        if scope_split.scoped and scope_split.empty:
+            return _scope_emptied_discovery()
+
+        def _dc_scan_command(prefix: str, scan_type: str, split: object | None = None) -> str | None:
+            """The scan command, with its targets and exclusions as the scope stands NOW.
+
+            nmap is a child process: nothing checks what it is handed once it
+            runs. So the range is split and the target file and the exclude
+            file are written here, immediately before each run (a retry is a
+            run), never from an earlier answer. ``None``: nothing is left to
+            scan. ``split`` is a split made this instant by the caller.
+            """
+            if split is None:
+                split = _split_scan_targets_by_scope(
+                    shell,
+                    hosts,
+                    ports=target_ports,
+                    surface="dc_discovery",
+                    what="DC candidate discovery",
+                )
+            scope_flags = ""
+            target = shlex.quote(hosts)
+            if split.scoped:
+                if split.empty:
+                    return None
+                # The nmap child gets the in-scope targets as a file and the
+                # exclusions as an exclude file (Windows scans in-process).
+                scope_dir = os.path.dirname(output_path) or _scope_workdir(shell)
+                scope_flags = _nmap_scope_flags(shell, workdir=scope_dir, ports=target_ports)
+                target = _write_scoped_target_file(
+                    os.path.join(scope_dir, "dc_candidates_targets.txt"),
+                    split.targets,
+                )
+            return (
+                f"{prefix}nmap --open -n {_nmap_timing_flags()}{scope_flags} -Pn {scan_type} -p{port_list} "
+                f"-oG {shlex.quote(output_path)} {target}"
+            )
+
         print_info(
             "Running a lightweight DC candidate scan (Kerberos/LDAP/DNS) "
             f"on {marked_hosts}..."
@@ -284,65 +481,113 @@ def discover_dc_candidates_with_nmap_details(
             # nmap is not bundled on Windows and a SYN scan needs Npcap + admin
             # (impossible on a hardened install-nothing host) — use the
             # in-process TCP connect scan instead. Linux keeps nmap -sS below.
-            open_ports_by_host = _windows_connect_scan(hosts, target_ports)
+            open_ports_by_host = _windows_connect_scan(
+                hosts, target_ports, scope=scope_split
+            )
             return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
 
-        scan_cmd = (
-            f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -p{port_list} "
-            f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
-        )
-        print_info_debug(f"[nmap][dc-discovery] {scan_cmd}")
-        result = shell.run_command(scan_cmd, timeout=timeout_seconds)
-        if result is None:
-            print_error("Nmap DC candidate scan did not return a result.")
-            return {}
+        # The DC-candidate scan can run for minutes on a large range, so it is a
+        # long scan-control step: Ctrl+C offers "stop this step and keep what it
+        # found". The nmap run is streamed in its own session (isolate by
+        # default), so the key press does not kill it; the step's should_stop
+        # stops it cleanly, keeping the candidates found so far. A range stop is
+        # declared as a coverage gap (the whole range was not scanned).
+        from adscan_core.scan_control import scan_control  # noqa: PLC0415
 
-        output_text = (result.stdout or "") + "\n" + (result.stderr or "")
-        if _nmap_output_indicates_invalid_target(output_text):
-            # Nothing was scanned, so the zero-candidate result below would be
-            # a lie. Flag it for the recovery prompt, which then asks for a
-            # corrected expression instead of advising a wider range.
-            setattr(shell, "_last_dc_discovery_invalid_target", True)
-            print_error(
-                f"The target expression {marked_hosts} could not be parsed, so no host "
-                "was scanned. Provide a valid IP, CIDR, host range, or hostname."
+        with scan_control().step(
+            "dc_candidate_discovery",
+            label="DC candidate discovery",
+            long=True,
+            unit="hosts",
+            domain="",
+        ) as _dc_step:
+            scan_cmd = _dc_scan_command("", "-sS", scope_split)
+            if scan_cmd is None:
+                return _scope_emptied_discovery()
+            print_info_debug(f"[nmap][dc-discovery] {scan_cmd}")
+            result = _stream_dc_discovery_scan(
+                shell,
+                command=scan_cmd,
+                timeout_seconds=timeout_seconds,
+                should_cancel=_dc_step.should_stop,
             )
-            return {}
-        if _nmap_output_indicates_missing_privileges(output_text):
-            sudo_scan_cmd = (
-                f"sudo -n nmap --open -n {_nmap_timing_flags()} -Pn -sS -p{port_list} "
-                f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
-            )
-            print_warning(
-                "Nmap needs elevated privileges for SYN scan; retrying via sudo."
-            )
-            print_info_debug(f"[nmap][dc-discovery] {sudo_scan_cmd}")
-            result = shell.run_command(sudo_scan_cmd, timeout=timeout_seconds)
             if result is None:
                 print_error("Nmap DC candidate scan did not return a result.")
                 return {}
+            if getattr(result, "cancelled", False):
+                # Stopped by the operator: return the candidates scanned so far.
+                gnmap_text = _read_text_file_best_effort(output_path)
+                print_warning(
+                    "DC candidate discovery was stopped by the operator; the whole "
+                    "range was not scanned. Keeping the candidates found so far."
+                )
+                return _report_dc_candidates(
+                    _parse_gnmap_open_ports(gnmap_text), marked_ports=marked_ports
+                )
 
             output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+            if _nmap_output_indicates_invalid_target(output_text):
+                # Nothing was scanned, so the zero-candidate result below would be
+                # a lie. Flag it for the recovery prompt, which then asks for a
+                # corrected expression instead of advising a wider range.
+                setattr(shell, "_last_dc_discovery_invalid_target", True)
+                print_error(
+                    f"The target expression {marked_hosts} could not be parsed, so no host "
+                    "was scanned. Provide a valid IP, CIDR, host range, or hostname."
+                )
+                return {}
             if _nmap_output_indicates_missing_privileges(output_text):
+                sudo_scan_cmd = _dc_scan_command("sudo -n ", "-sS")
+                if sudo_scan_cmd is None:
+                    return _scope_emptied_discovery()
                 print_warning(
-                    "sudo -n failed or is not permitted; falling back to TCP connect scan."
+                    "Nmap needs elevated privileges for SYN scan; retrying via sudo."
                 )
-                scan_cmd = (
-                    f"nmap --open -n {_nmap_timing_flags()} -Pn -sT -p{port_list} "
-                    f"-oG {shlex.quote(output_path)} {shlex.quote(hosts)}"
+                print_info_debug(f"[nmap][dc-discovery] {sudo_scan_cmd}")
+                result = _stream_dc_discovery_scan(
+                    shell,
+                    command=sudo_scan_cmd,
+                    timeout_seconds=timeout_seconds,
+                    should_cancel=_dc_step.should_stop,
                 )
-                print_warning(
-                    "Nmap still lacks privileges; retrying in TCP connect mode."
-                )
-                print_info_debug(f"[nmap][dc-discovery] {scan_cmd}")
-                result = shell.run_command(scan_cmd, timeout=timeout_seconds)
                 if result is None:
                     print_error("Nmap DC candidate scan did not return a result.")
                     return {}
+                if getattr(result, "cancelled", False):
+                    gnmap_text = _read_text_file_best_effort(output_path)
+                    print_warning(
+                        "DC candidate discovery was stopped by the operator; the whole "
+                        "range was not scanned. Keeping the candidates found so far."
+                    )
+                    return _report_dc_candidates(
+                        _parse_gnmap_open_ports(gnmap_text), marked_ports=marked_ports
+                    )
 
-        gnmap_text = _read_text_file_best_effort(output_path)
-        open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
-        return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
+                output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+                if _nmap_output_indicates_missing_privileges(output_text):
+                    print_warning(
+                        "sudo -n failed or is not permitted; falling back to TCP connect scan."
+                    )
+                    scan_cmd = _dc_scan_command("", "-sT")
+                    if scan_cmd is None:
+                        return _scope_emptied_discovery()
+                    print_warning(
+                        "Nmap still lacks privileges; retrying in TCP connect mode."
+                    )
+                    print_info_debug(f"[nmap][dc-discovery] {scan_cmd}")
+                    result = _stream_dc_discovery_scan(
+                        shell,
+                        command=scan_cmd,
+                        timeout_seconds=timeout_seconds,
+                        should_cancel=_dc_step.should_stop,
+                    )
+                    if result is None:
+                        print_error("Nmap DC candidate scan did not return a result.")
+                        return {}
+
+            gnmap_text = _read_text_file_best_effort(output_path)
+            open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
+            return _report_dc_candidates(open_ports_by_host, marked_ports=marked_ports)
     except Exception as exc:  # noqa: BLE001
         telemetry.capture_exception(exc)
         print_error("Failed to run DC candidate discovery with Nmap.")
@@ -350,23 +595,73 @@ def discover_dc_candidates_with_nmap_details(
         return {}
 
 
-def _windows_connect_scan(hosts_expr: str, ports: list[int]) -> dict[str, set[int]]:
+def _stream_dc_discovery_scan(
+    shell: NmapShell,
+    *,
+    command: str,
+    timeout_seconds: int | None,
+    should_cancel: "callable | None" = None,
+) -> "_StreamingScanResult | None":
+    """Run a DC-candidate nmap scan through the streaming runner (stoppable).
+
+    The streaming runner isolates nmap in its own session by default, so the
+    terminal's Ctrl+C does not kill it; ``should_cancel`` (the scan-control
+    step's stop) ends it cleanly instead, and the partial ``-oG`` file holds the
+    candidates scanned so far. Returns a ``CompletedProcess``-shaped result (with
+    ``.cancelled``), or ``None`` when the process could not be spawned.
+    """
+    def _on_timeout() -> None:
+        setattr(shell, "_last_run_command_error", ("timeout", command))
+
+    return stream_command_lines(
+        shell.spawn_command,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        on_line=lambda _line: None,
+        on_timeout=_on_timeout,
+        should_cancel=should_cancel,
+    )
+
+
+def _windows_connect_scan(
+    hosts_expr: str,
+    ports: list[int],
+    *,
+    should_stop: "callable | None" = None,
+    coverage: "object | None" = None,
+    scope: "object | None" = None,
+) -> dict[str, set[int]]:
     """Windows nmap replacement: in-process async TCP connect scan.
 
     Expands the nmap host expression, runs the bounded connect scan at the
     measured Windows sweet spot, and returns the same ``{host: {open_port}}``
     shape ``_parse_gnmap_open_ports`` produces. Shared by all three scan sites.
+
+    ``should_stop`` is the scan control plane's cooperative stop: once set, no
+    new host is contacted and the hosts not reached are recorded in ``coverage``
+    (a ``SweepCoverage``) as not-checked. The pacing is untouched.
+
+    ``scope`` is the engagement-scope split of the same expression (an
+    ``AddressSpacePartition``): an expanded target it does not allow is dropped
+    before the scan, so an excluded host is never contacted.
     """
     print_info(
         "Windows: in-process TCP connect scan, no nmap/Npcap needed."
     )
+    targets = expand_host_expression(hosts_expr)
+    if scope is not None and getattr(scope, "scoped", False):
+        targets = [target for target in targets if scope.allows(target)]
+        if not targets:
+            return {}
     # Safe-by-default pacing (production-polite, ~nmap -T3 posture, adaptive
     # backoff). Env overrides (ADSCAN_PORTSCAN_CONCURRENCY / _PER_HOST) let an
     # operator who owns the network opt into speed; the default never hammers.
     return connect_scan_open_ports_sync(
-        expand_host_expression(hosts_expr),
+        targets,
         list(ports),
         pacing=ScanPacing.safe(),
+        should_stop=should_stop,
+        coverage=coverage,
     )
 
 
@@ -421,12 +716,19 @@ def probe_host_reachability_with_nmap(
     ports: list[int] | None = None,
     timeout_seconds: int = 20,
     report_label: str = "trusted_dc",
+    scope_domain: str | None = None,
 ) -> dict[str, object]:
     """Probe one host with Nmap and classify current-vantage reachability.
 
     This is a lightweight reusable pre-check intended for targeted validation
     of one already-known host, such as a trusted domain controller discovered
     during trust enumeration.
+
+    A host the engagement scope excludes is not probed: the result carries
+    ``status = "excluded_by_engagement_scope"`` (never "no response").
+    What the probe opens is read from ``ports`` (a pre-check on the Kerberos,
+    LDAP and DNS ports of a domain controller is a directory contact; any other
+    port makes it an ordinary host contact).
     """
     target_host = str(host or "").strip()
     target_ports = ports or [88, 389, 53]
@@ -439,6 +741,32 @@ def probe_host_reachability_with_nmap(
             "open_ports": [],
             "status": "invalid_target",
             "method": "nmap_single_host_probe",
+        }
+
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        require_host_in_scope,
+    )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        prepare_targets_for_scope,
+    )
+
+    # One host, possibly known by its name: told to the session, then judged.
+    prepare_targets_for_scope(shell, [target_host], domain=scope_domain)
+    if not require_host_in_scope(
+        shell,
+        host=target_host,
+        contact=_scope_contact_for_ports(target_ports),
+        surface="host_reachability_probe",
+        what="Reachability probe",
+        domain=scope_domain,
+    ):
+        return {
+            "host": target_host,
+            "reachable": False,
+            "open_ports": [],
+            "status": "excluded_by_engagement_scope",
+            "method": "nmap_single_host_probe",
+            "ports_scanned": target_ports,
         }
 
     output_path = None
@@ -458,23 +786,47 @@ def probe_host_reachability_with_nmap(
         # exactly when it answered on at least one probed port.
         up_hosts = {h for h, p in open_ports_by_host.items() if p}
     else:
-        if output_path:
-            scan_cmd = (
-                f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
-                f"-oG {shlex.quote(output_path)} {shlex.quote(target_host)}"
+        def _probe_command(recheck: bool = True) -> str | None:
+            """The probe command as the scope stands NOW (``None``: the host is out).
+
+            Built right before each run of the child, a retry included: the
+            host is asked about again and the exclusions are written again. The
+            child also gets the exclusions because it resolves a name on its
+            own, and one of its addresses may be excluded.
+            """
+            if recheck:
+                prepare_targets_for_scope(shell, [target_host], domain=scope_domain)
+                if not require_host_in_scope(
+                    shell,
+                    host=target_host,
+                    contact=_scope_contact_for_ports(target_ports),
+                    surface="host_reachability_probe",
+                    what="Reachability probe",
+                    domain=scope_domain,
+                ):
+                    return None
+            scope_flags = _nmap_scope_flags(
+                shell,
+                workdir=os.path.dirname(output_path) if output_path else None,
+                ports=target_ports,
+                domain=scope_domain,
             )
-        else:
-            scan_cmd = (
-                f"nmap --open -n {_nmap_timing_flags()} -Pn -sS -PS{ports_csv} -PA{ports_csv} -p{ports_csv} "
-                f"{shlex.quote(target_host)}"
+            output_arg = f"-oG {shlex.quote(output_path)} " if output_path else ""
+            return (
+                f"nmap --open -n {_nmap_timing_flags()}{scope_flags} -Pn -sS -PS{ports_csv} -PA{ports_csv} "
+                f"-p{ports_csv} {output_arg}{shlex.quote(target_host)}"
             )
 
+        # The host was asked about a few lines above: the first run is built
+        # from that answer; a later run asks again.
+        scan_cmd = _probe_command(recheck=False)
         print_info_debug(f"[nmap][single-host-probe] {scan_cmd}")
         completed = _run_nmap_command_with_optional_sudo_retry(
             shell,
             command=scan_cmd,
             domain=target_host,
             timeout_seconds=timeout_seconds,
+            command_for_run=_probe_command,
         )
         if completed is None:
             return {
@@ -540,11 +892,18 @@ def _run_nmap_port_scan_with_timeout_recovery(
     command: str,
     domain: str,
     timeout_seconds: int,
+    command_for_run: "Callable[[], str | None] | None" = None,
 ) -> any:
     """Run Nmap port scan and offer timeout recovery UX when applicable.
 
     If the command fails specifically due to subprocess timeout, the user can
     choose to retry the same scan without timeout limits.
+
+    ``command`` was built by the caller this instant, from the engagement scope
+    as it stood then. The retry starts after the timeout and a prompt, which can
+    be much later, so it is a run of its own: ``command_for_run`` builds the
+    command again (target list and exclusions written again) and returns
+    ``None`` when the scope leaves nothing to scan.
     """
     result = shell.run_command(command, timeout=timeout_seconds)
     if result is not None:
@@ -577,6 +936,13 @@ def _run_nmap_port_scan_with_timeout_recovery(
     if not retry_without_timeout:
         return None
 
+    if command_for_run is not None:
+        command = command_for_run()
+        if not command:
+            print_info(
+                "The scan was not retried: the engagement scope leaves no target of it to scan."
+            )
+            return None
     print_info(
         f"Retrying Nmap port scan for domain {marked_domain} without timeout. "
         "This may take a long time."
@@ -1290,27 +1656,43 @@ def _run_nmap_command_with_optional_sudo_retry(
     _sudo_validate: callable | None = None,
     retry_notice: str | None = None,
     retry_debug_context: str = "scan",
+    command_for_run: "Callable[[], str | None] | None" = None,
 ) -> any:
     """Run an Nmap command and retry with sudo when a SYN scan lacks privileges.
 
     Args:
         shell: Active shell instance with command execution support.
-        command: Full Nmap command to execute.
+        command: Full Nmap command to execute, built by the caller this instant.
         domain: Domain used for timeout recovery helpers.
         timeout_seconds: Maximum execution time for the command.
         _is_full_adscan_container_runtime: Optional container runtime detector.
         _sudo_validate: Optional sudo validation callback.
         retry_notice: Optional user-facing warning before retrying with sudo.
         retry_debug_context: Short label used in debug logs.
+        command_for_run: Builds the command again from the engagement scope as
+            it stands (target list and exclusions written again), or ``None``
+            when nothing is left to scan. Used for every run after the first.
 
     Returns:
         The final command result, or None if execution failed unexpectedly.
     """
+
+    def _prefixed(prefix: str) -> "Callable[[], str | None] | None":
+        if command_for_run is None:
+            return None
+
+        def _build() -> str | None:
+            rebuilt = command_for_run()
+            return f"{prefix}{rebuilt}" if rebuilt else None
+
+        return _build
+
     result = _run_nmap_port_scan_with_timeout_recovery(
         shell,
         command=command,
         domain=domain,
         timeout_seconds=timeout_seconds,
+        command_for_run=command_for_run,
     )
     if result is None or result.returncode == 0:
         return result
@@ -1328,20 +1710,27 @@ def _run_nmap_command_with_optional_sudo_retry(
         print_info_debug(
             f"Nmap {retry_debug_context} requires privileges in container runtime; retrying via sudo -n."
         )
-        privileged_command = f"sudo -n {command}"
+        sudo_prefix = "sudo -n "
     else:
         print_info_debug(
             f"Nmap {retry_debug_context} requires privileges; retrying via sudo."
         )
         if _sudo_validate and not _sudo_validate():
             return result
-        privileged_command = f"sudo {command}"
+        sudo_prefix = "sudo "
 
+    # The retry is a run of its own: its command is built again.
+    rebuild = _prefixed(sudo_prefix)
+    privileged_command = rebuild() if rebuild is not None else f"{sudo_prefix}{command}"
+    if not privileged_command:
+        print_info("The scan was not retried: the engagement scope leaves no target of it to scan.")
+        return result
     return _run_nmap_port_scan_with_timeout_recovery(
         shell,
         command=privileged_command,
         domain=domain,
         timeout_seconds=timeout_seconds,
+        command_for_run=rebuild,
     )
 
 
@@ -1481,6 +1870,8 @@ def _stream_nmap_scan_into_dashboard(
     domain: str = "",
     total_hosts: int | None = None,
     emit_terminal_done: bool = True,
+    should_cancel: "callable | None" = None,
+    spawn_kwargs: dict | None = None,
 ) -> _StreamingScanResult | None:
     """Spawn an Nmap scan and drive the dashboard from its live stdout.
 
@@ -1629,12 +2020,21 @@ def _stream_nmap_scan_into_dashboard(
         # Mirror run_command's timeout signalling so the recovery prompt fires.
         setattr(shell, "_last_run_command_error", ("timeout", command))
 
+    def _on_cancel() -> None:
+        # The operator (or the platform control file) stopped the scan: mark it
+        # so the recovery prompt never fires (a cancel is not a timeout) and the
+        # caller keeps the hosts scanned so far, declaring the rest not checked.
+        setattr(shell, "_last_run_command_error", ("cancelled", command))
+
     result = stream_command_lines(
         shell.spawn_command,
         command=command,
         timeout_seconds=timeout_seconds,
         on_line=_on_line,
         on_timeout=_on_timeout,
+        should_cancel=should_cancel,
+        on_cancel=_on_cancel if should_cancel is not None else None,
+        spawn_kwargs=spawn_kwargs,
     )
 
     # The scan loop has ended — emit one TERMINAL done tick so the platform's
@@ -1714,8 +2114,16 @@ def _run_important_port_scan_with_dashboard(
     total_hosts: int | None = None,
     _is_full_adscan_container_runtime: "callable | None" = None,
     _sudo_validate: "callable | None" = None,
+    should_cancel: "callable | None" = None,
+    spawn_kwargs: dict | None = None,
+    command_for_run: "Callable[[], str | None] | None" = None,
 ) -> any:
     """Run the important-port Nmap scan LIVE under a streaming dashboard.
+
+    ``command`` was built by the caller this instant. Every later run (the sudo
+    re-spawn, the retry without timeout) is built again by ``command_for_run``,
+    which writes the scan's target list and exclusions from the engagement scope
+    as it stands then and returns ``None`` when nothing is left to scan.
 
     Streams the scan via ``shell.spawn_command`` and parses its stdout in real
     time so the dashboard's host counter and percent advance DURING the scan
@@ -1771,6 +2179,8 @@ def _run_important_port_scan_with_dashboard(
             domain=domain,
             total_hosts=total_hosts,
             emit_terminal_done=emit_terminal_done,
+            should_cancel=should_cancel,
+            spawn_kwargs=spawn_kwargs,
         )
 
     def _emit_terminal_done(dash: "ProgressDashboard") -> None:
@@ -1804,12 +2214,17 @@ def _run_important_port_scan_with_dashboard(
             # No retry will happen: the first attempt was final — emit its tick.
             _emit_terminal_done(dash)
             return result
+        rerun = _command_for_rerun()
+        if rerun is None:
+            # The scope leaves nothing to scan now: the first attempt stands.
+            _emit_terminal_done(dash)
+            return result
         if _is_full_adscan_container_runtime and _is_full_adscan_container_runtime():
             print_info_debug(
                 "Nmap important port scan requires privileges in container "
                 "runtime; retrying via sudo -n."
             )
-            retry = _stream_once(f"sudo -n {command}", budget, dash, emit_terminal_done=True)
+            retry = _stream_once(f"sudo -n {rerun}", budget, dash, emit_terminal_done=True)
             if retry is not None:
                 return retry
             # Sudo re-spawn could not start — the first attempt is the result we
@@ -1820,7 +2235,7 @@ def _run_important_port_scan_with_dashboard(
             print_info_debug(
                 "Nmap important port scan requires privileges; retrying via sudo."
             )
-            retry = _stream_once(f"sudo {command}", budget, dash, emit_terminal_done=True)
+            retry = _stream_once(f"sudo {rerun}", budget, dash, emit_terminal_done=True)
             if retry is not None:
                 return retry
             _emit_terminal_done(dash)
@@ -1828,6 +2243,18 @@ def _run_important_port_scan_with_dashboard(
         # Sudo validation declined — no retry; the first attempt is final.
         _emit_terminal_done(dash)
         return result
+
+    def _command_for_rerun() -> str | None:
+        """The command of a run after the first (``None``: nothing left in scope)."""
+        if command_for_run is None:
+            return command
+        rebuilt = command_for_run()
+        if not rebuilt:
+            print_info(
+                "The scan was not retried: the engagement scope leaves no target of it to scan."
+            )
+            return None
+        return rebuilt
 
     def _streamed_out() -> bool:
         last_error = getattr(shell, "_last_run_command_error", None)
@@ -1879,9 +2306,12 @@ def _run_important_port_scan_with_dashboard(
             retry_dashboard = _build_important_port_scan_dashboard()
         except Exception:  # noqa: BLE001
             return run_scan_fallback()
+        retry_command = _command_for_rerun()
+        if retry_command is None:
+            return result
         try:
             with retry_dashboard.live_session():
-                retry_result = _stream_once(command, None, retry_dashboard, emit_terminal_done=False)
+                retry_result = _stream_once(retry_command, None, retry_dashboard, emit_terminal_done=False)
                 if retry_result is None:
                     raise _StreamingSpawnFailed()
                 retry_result = _maybe_sudo_retry(retry_result, None, retry_dashboard)
@@ -1963,6 +2393,50 @@ def _parse_gnmap_up_hosts(text: str) -> set[str]:
         if not line.startswith("Host:"):
             continue
         if "Status: Up" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        candidate = str(parts[1]).strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        results.add(candidate)
+    return results
+
+
+def _important_port_scan_result_line(
+    *, stopped: bool, hosts_with_open_ports: int, open_tcp_ports: int
+) -> str:
+    """Operator line summarising the important-port scan result.
+
+    A step the operator stopped never reads as completed: the line reports what
+    was found among the hosts examined and says the scan was stopped. The
+    counts are identical either way.
+    """
+    counts = (
+        f"hosts_with_open_ports={hosts_with_open_ports}, "
+        f"open_tcp_ports={open_tcp_ports}"
+    )
+    if stopped:
+        return f"Important port scan for the domain stopped early; partial result ({counts})."
+    return f"Important port scan for the domain completed ({counts})."
+
+
+def _parse_gnmap_scanned_hosts(text: str) -> set[str]:
+    """Parse `nmap -oG` output and return every host Nmap finished scanning.
+
+    Nmap writes one ``Host:`` line per target it has processed (``Status: Up``
+    or ``Status: Down``), so after an operator stop a host WITHOUT a line was
+    never reached. The caller uses this to mark the unscanned hosts "not
+    checked" rather than letting them fall into the "no response" bucket, which
+    later phases would read as "unreachable" (a false negative).
+    """
+    results: set[str] = set()
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("Host:"):
             continue
         parts = line.split()
         if len(parts) < 2:
@@ -2427,10 +2901,32 @@ def _show_network_reachability_summary(
         )
 
 
+def _service_host_in_scope(shell: NmapShell, host: str, domain: str | None = None) -> bool:
+    """Whether ``host`` may be written to a per-service target file.
+
+    Every later sweep reads those files as its target list, so an address the
+    engagement scope excludes is never written there. Quiet (the scan that
+    found the host already announced what it skipped); one cached verdict.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        host_scope_verdict,
+    )
+
+    if host_scope_verdict(shell, host=str(host or "").strip(), domain=domain).allowed:
+        return True
+    print_info_debug(
+        "[nmap] service target file: "
+        f"{mark_sensitive(str(host), 'ip')} left out (outside the engagement scope)"
+    )
+    return False
+
+
 def save_domain_host_to_file(
     shell: NmapShell, host: str, service_dir: str, domain: str
 ) -> None:
     """Save the host's IP to the corresponding domain file, avoiding duplicates.
+
+    A host the engagement scope excludes is never written.
 
     Args:
         shell: The active shell instance with workspace and domain data.
@@ -2438,6 +2934,8 @@ def save_domain_host_to_file(
         service_dir: Service directory name (e.g., "smb", "rdp").
         domain: Domain name.
     """
+    if not _service_host_in_scope(shell, host, domain):
+        return
     workspace_cwd = shell.current_workspace_dir or os.getcwd()
     domain_service_dir = domain_subpath(
         workspace_cwd, shell.domains_dir, domain, service_dir
@@ -2465,11 +2963,15 @@ def save_domain_host_to_file(
 def save_host_to_file(shell: NmapShell, host: str, service_dir: str) -> None:
     """Save the host IP to the corresponding file for the service, avoiding duplicates.
 
+    A host the engagement scope excludes is never written.
+
     Args:
         shell: The active shell instance with workspace data.
         host: Host IP address to save.
         service_dir: Service directory path.
     """
+    if not _service_host_in_scope(shell, host):
+        return
     if not os.path.exists(service_dir):
         os.makedirs(service_dir)
 
@@ -2585,6 +3087,29 @@ def _write_capped_service_ips(
     active_universe = [
         ip for ip, ports in open_ports_by_host.items() if ports & targeted_ports
     ]
+    # Engagement scope, before the cap: the cap then counts in-scope hosts only
+    # and an excluded address never reaches a service file (the scan above never
+    # targeted one, so this refuses nothing unless a result names a host the
+    # scope learned about since).
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        partition_targets_in_scope,
+    )
+
+    scope_split = partition_targets_in_scope(
+        shell,
+        active_universe,
+        surface="service_target_files",
+        what="Service target lists",
+        domain=domain,
+    )
+    if scope_split.refused:
+        out_of_scope = set(scope_split.refused_items)
+        active_universe = list(scope_split.allowed)
+        open_ports_by_host = {
+            ip: ports
+            for ip, ports in open_ports_by_host.items()
+            if ip not in out_of_scope
+        }
 
     host_cap = _resolve_active_host_cap(shell)
     computers_props = _load_domain_computer_props(shell, domain) if host_cap > 0 else []
@@ -2714,6 +3239,71 @@ def _resolve_normalized_host_to_ips(
         if normalized:
             normalized_host_to_ips[normalized] = list(ips)
     return normalized_host_to_ips, True
+
+
+def _port_scan_targets_in_scope(
+    shell: NmapShell,
+    domain: str,
+    hostnames: list[str],
+    hostname_ip_map: dict[str, list[str]],
+    unique_ips: list[str],
+) -> tuple[list[str], list[str]]:
+    """Apply the engagement scope to the important-port scan's target list.
+
+    The scan is handed (requested and allowed) minus denied. A computer is one
+    identity with every address it resolves to, so the addresses are reported to
+    the scope first (an excluded name then excludes each of its addresses, and
+    an excluded address excludes the host it belongs to), and the computers are
+    judged in ONE partition call. An address a refused computer resolves to is
+    never scanned, even when an allowed name shares it.
+
+    Returns:
+        ``(in-scope addresses in the original order, excluded hostnames)``.
+        Without an asset scope the address list is returned untouched.
+    """
+    from adscan_internal.services.engagement_scope import (  # noqa: PLC0415
+        asset_scope_recorded,
+        note_host_addresses_batch,
+        partition_targets_in_scope,
+        prepare_scope_targets,
+    )
+
+    if not asset_scope_recorded(shell):
+        return unique_ips, []
+    # Only a computer that resolved is a scan target; one with no address is
+    # not contacted either way and stays "not resolved", never "excluded".
+    resolved = [host for host in hostnames if hostname_ip_map.get(host)]
+    # Every address each name resolved to is reported, then the session is told
+    # what else it needs to judge the names: once for the whole list, because a
+    # verdict looks nothing up.
+    note_host_addresses_batch(shell, {host: hostname_ip_map[host] for host in resolved})
+    prepare_scope_targets(shell, resolved, domain=domain)
+    split = partition_targets_in_scope(
+        shell,
+        resolved,
+        surface="port_scan",
+        what="Important port scan",
+        domain=domain,
+    )
+    excluded_hosts = [str(host) for host in split.refused_items]
+    excluded_ips = {ip for host in excluded_hosts for ip in hostname_ip_map.get(host) or []}
+    named_ips = {ip for host in split.allowed for ip in hostname_ip_map.get(host) or []}
+    kept = [ip for ip in unique_ips if ip not in excluded_ips]
+    # An address tied to no listed computer (the persisted-PDC fallback) is
+    # judged on its own.
+    loose = [ip for ip in kept if ip not in named_ips]
+    if loose:
+        refused = set(
+            partition_targets_in_scope(
+                shell,
+                loose,
+                surface="port_scan",
+                what="Important port scan",
+                domain=domain,
+            ).refused_items
+        )
+        kept = [ip for ip in kept if ip not in refused]
+    return kept, excluded_hosts
 
 
 def convert_hostnames_to_ips_and_scan(
@@ -2938,11 +3528,47 @@ def convert_hostnames_to_ips_and_scan(
         print_info_debug(
             f"Resolved {resolved_count} hostname(s) into {len(unique_ips)} IP(s) out of {total_hosts} host(s)."
         )
+        # Engagement scope: the scan's target list is (requested and allowed)
+        # minus denied, decided BEFORE the address file is written, so every
+        # consumer of that file starts from in-scope addresses. The DNS
+        # resolution report above keeps every computer: it is directory data.
+        resolved_ip_count = len(unique_ips)
+        unique_ips, scope_excluded_hosts = _port_scan_targets_in_scope(
+            shell, domain, cleaned_hosts, hostname_ip_map, unique_ips
+        )
+        scope_excluded_set = set(scope_excluded_hosts)
+        scan_hosts = [host for host in cleaned_hosts if host not in scope_excluded_set]
         # Write the unique IP addresses to enabled_computers_ips.txt
         with open(ip_file, "w", encoding="utf-8") as f:
             for ip in unique_ips:
                 f.write(f"{ip}\n")
         shell.consolidate_domain_computers("")
+        if resolved_ip_count and not unique_ips:
+            # Nothing is left to contact: not a scan with no answers, a scan
+            # that was not run. Stale results of an earlier run must not stand,
+            # and the report states who was left out and why.
+            _remove_file_if_exists(reachable_ip_file)
+            _remove_file_if_exists(no_response_ip_file)
+            empty_payload = _build_network_reachability_report(
+                [],
+                {},
+                discovery_up_ips=set(),
+                ports_scanned=[],
+                domain=domain,
+                generated_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            )
+            empty_payload["excluded_by_engagement_scope"] = {
+                "count": len(scope_excluded_hosts),
+                "hostnames": sorted(scope_excluded_hosts, key=str.lower),
+            }
+            _write_network_reachability_report(reachability_report_file, empty_payload)
+            _stamp_host_reach_coverage(shell, domain)
+            print_info(
+                "Important port scan contacted no host: every resolved computer of "
+                f"{mark_sensitive(domain, 'domain')} is outside the engagement scope. "
+                "Reachability and service exposure were not assessed for them."
+            )
+            return
         important_ports = [21, 22, 53, 80, 88, 389, 443, 445, 1433, 3389, 5900, 5985, 8080, 8443]
         important_ports_csv = ",".join(str(port) for port in important_ports)
         ip_count = len(unique_ips)
@@ -3065,41 +3691,134 @@ def convert_hostnames_to_ips_and_scan(
                 # Best-effort; nmap will still run and we can parse stdout as fallback.
                 pass
 
+            _port_scan_stopped = False
             if is_windows():
                 # nmap is not bundled on Windows and a SYN scan needs Npcap +
                 # admin (impossible on a hardened install-nothing host) — use
                 # the in-process TCP connect scan. Linux keeps nmap -sS below.
+                # The connect scan runs inside the same long scan-control step as
+                # the Linux nmap run, so Ctrl+C offers "stop this step": a stop
+                # contacts no new host and the hosts not reached are reported not
+                # checked, never as no open ports.
+                from adscan_core.scan_control import scan_control  # noqa: PLC0415
+                from adscan_core.scan_control.fanout import SweepCoverage  # noqa: PLC0415
+
                 marked_domain = mark_sensitive(domain, "domain")
                 print_info(
                     f"Executing combined reachability and important-port scan in domain {marked_domain}..."
                 )
-                open_ports_by_host = _windows_connect_scan(
-                    "\n".join(str(ip) for ip in unique_ips), important_ports
-                )
+                _win_coverage = SweepCoverage()
+                with scan_control().step(
+                    "important_port_scan",
+                    label="Important port scan",
+                    long=True,
+                    unit="hosts",
+                    total=ip_count or None,
+                    domain=domain,
+                ) as _win_step:
+                    open_ports_by_host = _windows_connect_scan(
+                        "\n".join(str(ip) for ip in unique_ips),
+                        important_ports,
+                        should_stop=_win_step.should_stop,
+                        coverage=_win_coverage,
+                    )
+                    if _win_coverage.stopped:
+                        _win_step.progress(
+                            done=_win_coverage.checked, total=len(unique_ips)
+                        )
                 # A connect scan has no separate host-discovery pass; a host is
                 # "up" exactly when it answered on at least one probed port.
                 discovery_up_ips = {h for h, p in open_ports_by_host.items() if p}
                 # No gnmap file on the Windows path; label the artifact source.
                 gnmap_path = "windows_connect_scan"
+                # On a stop the hosts never contacted are not checked: keep them
+                # out of no-response (which later phases read as unreachable).
+                # The same holds for a host the engagement scope kept out at the
+                # probe itself.
+                _win_not_checked = {str(h) for h in _win_coverage.not_checked}
+                _port_scan_stopped = bool(
+                    _win_coverage.stopped or _win_not_checked
+                )
+                _win_outside_scope = {
+                    str(h) for h in getattr(_win_coverage, "outside_scope", None) or ()
+                }
                 reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
                 no_response_ips = [
-                    ip for ip in unique_ips if ip not in discovery_up_ips
+                    ip
+                    for ip in unique_ips
+                    if ip not in discovery_up_ips
+                    and ip not in _win_not_checked
+                    and ip not in _win_outside_scope
                 ]
                 _write_ip_list_file(reachable_ip_file, reachable_ips)
                 _write_ip_list_file(no_response_ip_file, no_response_ips)
+                if _win_not_checked:
+                    print_warning(
+                        f"Important port scan stopped by the operator after "
+                        f"{_win_coverage.checked} of {len(unique_ips)} hosts. "
+                        f"{len(_win_not_checked)} host(s) were not checked."
+                    )
                 if not open_ports_by_host:
                     print_info_debug(
                         "[DEBUG] Windows connect scan found no open ports."
                     )
             else:
-                port_scan_command = (
-                    f"nmap -sS -PS{important_ports_csv} "
-                    f"-PA{important_ports_csv} "
-                    f"-p{important_ports_csv} "
-                    f"-n {_nmap_timing_flags()} -vvv --stats-every 2s -iL {shlex.quote(str(ip_file))} "
-                    f"-oN {shlex.quote(str(scan_output_path))} "
-                    f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
-                )
+                scan_targets_file = os.path.join(nmap_dir, "imp_ports_scan_targets.txt")
+
+                def _port_scan_command() -> str | None:
+                    """The scan command as the engagement scope stands NOW.
+
+                    nmap is a child process, and nothing checks the list it is
+                    handed once it runs. The address file above was written
+                    before the operator was asked whether to scan, so it is not
+                    what the child reads: the computers are judged again here
+                    and the scan's own target file and exclude file are written
+                    immediately before each run (a retry is a run). ``None``:
+                    nothing is left to scan.
+                    """
+                    nonlocal unique_ips, scan_hosts, scope_excluded_hosts
+                    kept, left_out = _port_scan_targets_in_scope(
+                        shell, domain, scan_hosts, hostname_ip_map, unique_ips
+                    )
+                    if left_out or len(kept) != len(unique_ips):
+                        # Left out since the list was built: not scanned, so
+                        # reported with the excluded computers, never as
+                        # "no response".
+                        dropped = set(left_out)
+                        scope_excluded_hosts = sorted(
+                            {*scope_excluded_hosts, *left_out}, key=str.lower
+                        )
+                        scan_hosts = [host for host in scan_hosts if host not in dropped]
+                        unique_ips = kept
+                    if not unique_ips:
+                        return None
+                    scope_flags = _nmap_scope_flags(shell, workdir=nmap_dir, domain=domain)
+                    if scope_flags:
+                        # Under a recorded scope the child reads a list written
+                        # this instant (a failed write stops the scan: it never
+                        # runs on a list that could not be written).
+                        target_arg = _write_scoped_target_file(scan_targets_file, unique_ips)
+                    else:
+                        # No asset scope: the command is the one it always was.
+                        target_arg = f"-iL {shlex.quote(str(ip_file))}"
+                    return (
+                        f"nmap -sS -PS{important_ports_csv} "
+                        f"-PA{important_ports_csv} "
+                        f"-p{important_ports_csv} "
+                        f"-n {_nmap_timing_flags()}{scope_flags} -vvv --stats-every 2s {target_arg} "
+                        f"-oN {shlex.quote(str(scan_output_path))} "
+                        f"-oG {shlex.quote(str(scan_output_path))}.gnmap"
+                    )
+
+                port_scan_command = _port_scan_command()
+                if port_scan_command is None:
+                    print_info(
+                        "Important port scan contacted no host: every resolved computer of "
+                        f"{mark_sensitive(domain, 'domain')} is outside the engagement scope. "
+                        "Reachability and service exposure were not assessed for them."
+                    )
+                    return
+                ip_count = len(unique_ips)
                 marked_domain = mark_sensitive(domain, "domain")
                 print_info(
                     f"Executing combined reachability and important-port scan in domain {marked_domain}..."
@@ -3140,56 +3859,104 @@ def convert_hostnames_to_ips_and_scan(
                         _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
                         _sudo_validate=_sudo_validate,
                         retry_debug_context="combined reachability/port scan",
+                        command_for_run=_port_scan_command,
                     )
 
-                completed_scan_process = _run_important_port_scan_with_dashboard(
-                    shell,
-                    command=port_scan_command,
+                # One long scan-control step covers the nmap run: Ctrl+C offers
+                # "stop this step and keep what it found". The streaming runner
+                # launches nmap in its own session by default, so the key press
+                # does not kill it; the step's should_stop ends it cleanly
+                # instead, keeping the hosts scanned so far. "Skip the phase" and
+                # "stop the scan" reach it through the same check, and so does the
+                # platform control file.
+                from adscan_core.scan_control import scan_control  # noqa: PLC0415
+
+                with scan_control().step(
+                    "important_port_scan",
+                    label="Important port scan",
+                    long=True,
+                    unit="hosts",
+                    total=ip_count or None,
                     domain=domain,
-                    timeout_seconds=_important_port_scan_timeout_seconds(),
-                    run_scan_fallback=_run_port_scan_buffered,
-                    # Drive the platform's "X of Y hosts" port-scan bar off the
-                    # queued IP count (enabled_computers_ips.txt line count).
-                    total_hosts=ip_count,
-                    _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
-                    _sudo_validate=_sudo_validate,
-                )
-
-                if completed_scan_process is None:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_error(
-                        f"Failed to run Nmap port scan for domain {marked_domain} (timeout or execution error)."
+                ) as _scan_step:
+                    completed_scan_process = _run_important_port_scan_with_dashboard(
+                        shell,
+                        command=port_scan_command,
+                        domain=domain,
+                        timeout_seconds=_important_port_scan_timeout_seconds(),
+                        run_scan_fallback=_run_port_scan_buffered,
+                        # Drive the platform's "X of Y hosts" port-scan bar off the
+                        # queued IP count (enabled_computers_ips.txt line count).
+                        total_hosts=ip_count,
+                        _is_full_adscan_container_runtime=_is_full_adscan_container_runtime,
+                        _sudo_validate=_sudo_validate,
+                        should_cancel=_scan_step.should_stop,
+                        command_for_run=_port_scan_command,
                     )
-                    return
 
-                if completed_scan_process.returncode != 0:
-                    marked_domain = mark_sensitive(domain, "domain")
-                    print_error(f"Nmap port scan for domain {marked_domain} failed.")
-                    if completed_scan_process.stderr:
-                        print_error(f"Error details: {completed_scan_process.stderr}")
-                    return
+                    if completed_scan_process is None:
+                        marked_domain = mark_sensitive(domain, "domain")
+                        print_error(
+                            f"Failed to run Nmap port scan for domain {marked_domain} (timeout or execution error)."
+                        )
+                        return
 
-                marked_domain = mark_sensitive(domain, "domain")
-                print_info_verbose(f"Nmap scan stdout for domain {marked_domain}:")
-                gnmap_path = f"{scan_output_path}.gnmap"
-                gnmap_text = _read_text_file_best_effort(gnmap_path)
-                normal_text = _read_text_file_best_effort(scan_output_path)
-                discovery_up_ips = _parse_gnmap_up_hosts(gnmap_text)
-                reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
-                no_response_ips = [
-                    ip for ip in unique_ips if ip not in discovery_up_ips
-                ]
-                _write_ip_list_file(reachable_ip_file, reachable_ips)
-                _write_ip_list_file(no_response_ip_file, no_response_ips)
-
-                open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
-                if not open_ports_by_host:
-                    print_info_debug(
-                        f"[DEBUG] Nmap completed with rc=0 but no open ports parsed from gnmap (len={len(gnmap_text)})."
+                    _scan_cancelled = bool(
+                        getattr(completed_scan_process, "cancelled", False)
                     )
-                    if verbose_mode and normal_text:
-                        for line in normal_text.splitlines():
-                            shell.console.print(line)
+                    if not _scan_cancelled and completed_scan_process.returncode != 0:
+                        marked_domain = mark_sensitive(domain, "domain")
+                        print_error(f"Nmap port scan for domain {marked_domain} failed.")
+                        if completed_scan_process.stderr:
+                            print_error(f"Error details: {completed_scan_process.stderr}")
+                        return
+
+                    marked_domain = mark_sensitive(domain, "domain")
+                    print_info_verbose(f"Nmap scan stdout for domain {marked_domain}:")
+                    gnmap_path = f"{scan_output_path}.gnmap"
+                    gnmap_text = _read_text_file_best_effort(gnmap_path)
+                    normal_text = _read_text_file_best_effort(scan_output_path)
+                    discovery_up_ips = _parse_gnmap_up_hosts(gnmap_text)
+                    if _scan_cancelled:
+                        _port_scan_stopped = True
+                        # Stopped by the operator: nmap wrote a gnmap "Host:" line
+                        # only for the targets it finished. A host WITHOUT one was
+                        # never reached, so it is "not checked" -- never swept into
+                        # the no-response bucket (which later phases read as
+                        # unreachable). Keep the scanned hosts; name the rest.
+                        _scanned = _parse_gnmap_scanned_hosts(gnmap_text)
+                        reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
+                        no_response_ips = [
+                            ip
+                            for ip in unique_ips
+                            if ip not in discovery_up_ips and ip in _scanned
+                        ]
+                        _not_checked = [ip for ip in unique_ips if ip not in _scanned]
+                        _scan_step.progress(done=len(_scanned), total=len(unique_ips))
+                        if _not_checked:
+                            print_warning(
+                                f"Important port scan stopped by the operator after "
+                                f"{len(_scanned)} of {len(unique_ips)} hosts. "
+                                f"{len(_not_checked)} host(s) were not checked, so no "
+                                "reachability or service result is recorded for them."
+                            )
+                    else:
+                        reachable_ips = [ip for ip in unique_ips if ip in discovery_up_ips]
+                        no_response_ips = [
+                            ip for ip in unique_ips if ip not in discovery_up_ips
+                        ]
+                    _write_ip_list_file(reachable_ip_file, reachable_ips)
+                    _write_ip_list_file(no_response_ip_file, no_response_ips)
+
+                    open_ports_by_host = _parse_gnmap_open_ports(gnmap_text)
+                    if not open_ports_by_host:
+                        print_info_debug(
+                            f"[DEBUG] Nmap completed with rc={completed_scan_process.returncode} "
+                            f"but no open ports parsed from gnmap (len={len(gnmap_text)})."
+                        )
+                        if verbose_mode and normal_text:
+                            for line in normal_text.splitlines():
+                                shell.console.print(line)
 
             # Per-service {service}/ips.txt, bounded by the active-host cap.
             # The port scan above already ran on ALL hosts (cheap, complete
@@ -3201,20 +3968,29 @@ def convert_hostnames_to_ips_and_scan(
 
             discovered_hosts = len(open_ports_by_host)
             discovered_ports = sum(len(p) for p in open_ports_by_host.values())
-            print_success(
-                f"Important port scan for the domain completed (hosts_with_open_ports={discovered_hosts}, open_tcp_ports={discovered_ports})."
+            _result_line = _important_port_scan_result_line(
+                stopped=_port_scan_stopped,
+                hosts_with_open_ports=discovered_hosts,
+                open_tcp_ports=discovered_ports,
             )
+            if _port_scan_stopped:
+                print_info(_result_line)
+            else:
+                print_success(_result_line)
             generated_at = (
                 datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             )
+            # Computers the engagement scope excludes were not scanned: they are
+            # left out of the measurement (never "no response") and named in
+            # their own block.
             reachability_payload = _build_network_reachability_report(
-                cleaned_hosts,
+                scan_hosts,
                 {
                     hostname: normalized_host_to_ips.get(
                         str(hostname or "").strip().rstrip(".").lower(),
                         [],
                     )
-                    for hostname in cleaned_hosts
+                    for hostname in scan_hosts
                 },
                 discovery_up_ips=discovery_up_ips,
                 ports_scanned=important_ports,
@@ -3228,6 +4004,11 @@ def convert_hostnames_to_ips_and_scan(
                 port_scan_output_file=gnmap_path,
                 generated_at=generated_at,
             )
+            if scope_excluded_hosts:
+                reachability_payload["excluded_by_engagement_scope"] = {
+                    "count": len(scope_excluded_hosts),
+                    "hostnames": sorted(scope_excluded_hosts, key=str.lower),
+                }
             wrote_report = _write_network_reachability_report(
                 reachability_report_file,
                 reachability_payload,

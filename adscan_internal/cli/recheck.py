@@ -313,6 +313,17 @@ def _run_recheck_command(args: argparse.Namespace, deps: Any) -> int:
     exit_code = 1
     try:
         shell = _prepare_shell(deps, workspace, non_interactive=non_interactive)
+        # The workspace is loaded (and with it the recorded engagement scope). A
+        # record that cannot be used, or a credential the scope excludes, ends
+        # the re-check here with exit 2, before anything is read from a host:
+        # the same check `ci` and `execute` make.
+        from adscan_internal.cli.asset_scope_cmd import (  # noqa: PLC0415
+            scope_stops_unattended_run,
+        )
+
+        if scope_stops_unattended_run(shell):
+            exit_code = 2
+            return exit_code
         exit_code = _run(shell, workspace, args, target, depth, defaulted, run_id, emit_event,
                          credential=credential)
         return exit_code

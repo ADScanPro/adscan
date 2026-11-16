@@ -883,6 +883,7 @@ def build_winrm_plan(
     requested_auth_mode: str,
     posture: "DomainPosture | None",
     kerberos_viable: bool = True,
+    ntlm_secret_available: bool = True,
 ) -> WinRMAuthPlan:
     """Build a posture-aware WinRM auth-mode plan.
 
@@ -951,6 +952,13 @@ def build_winrm_plan(
             "Kerberos-first policy selected WinRM Kerberos; NTLM fallback is a transport-level infra retry."
         )
 
+    # An NTLM fallback needs an NTLM secret (a password or an NT hash). With a
+    # ticket only, the fallback would be an empty-password sign-in that the
+    # lockout guard refuses, hiding the Kerberos error that really happened.
+    if not ntlm_secret_available:
+        ntlm_fallback_allowed = False
+        notes.append("No password or NT hash: no NTLM fallback after a Kerberos failure.")
+
     if posture is None:
         return WinRMAuthPlan(
             attempt=WinRMAttempt(auth_mode=auth_mode, rationale=rationale),
@@ -994,6 +1002,9 @@ def build_winrm_plan(
             "KERBEROS_RC4 disabled per posture — etype selection handled by "
             "build_kerberos_plan; WinRM auth_mode unchanged."
         )
+
+    if not ntlm_secret_available:
+        ntlm_fallback_allowed = False
 
     return WinRMAuthPlan(
         attempt=WinRMAttempt(auth_mode=auth_mode, rationale=rationale),

@@ -352,13 +352,26 @@ _DEFINITIVE_CREDENTIAL_REJECTION_MARKERS: tuple[str, ...] = (
 
 #: ``KerberosTGTResult.error_kind`` for a sign-in the lockout guard withheld.
 LOCKOUT_REFUSED_ERROR_KIND = "lockout_guard_refused"
+#: The same, for a sign-in the ENGAGEMENT SCOPE withheld (the account, or the
+#: host it is local to, is excluded). Never worded as lockout protection.
+SCOPE_REFUSED_ERROR_KIND = "outside_engagement_scope"
+#: Prefix of the reason ``ensure_user_ccache`` hands back as text for that
+#: kind, so a caller that only receives the text can still tell the two causes.
+SCOPE_REFUSED_NOTE = "sign-in withheld by the engagement scope:"
 
 
 def _lockout_refusal_kind(exc: BaseException | None) -> Optional[str]:
-    """``LOCKOUT_REFUSED_ERROR_KIND`` when the lockout guard refused, else ``None``."""
+    """The kind of a sign-in the guard withheld, else ``None``.
+
+    ``SCOPE_REFUSED_ERROR_KIND`` when the engagement scope is the cause,
+    ``LOCKOUT_REFUSED_ERROR_KIND`` for lockout protection.
+    """
     from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
 
-    return LOCKOUT_REFUSED_ERROR_KIND if refusal_in_chain(exc) is not None else None
+    refusal = refusal_in_chain(exc)
+    if refusal is None:
+        return None
+    return SCOPE_REFUSED_ERROR_KIND if refusal.outside_scope else LOCKOUT_REFUSED_ERROR_KIND
 
 
 def _is_definitive_credential_rejection(exc: BaseException | str | None) -> bool:
@@ -1159,9 +1172,11 @@ class KerberosTicketService(BaseService):
                 success=True,
             )
         except Exception as exc:
-            if _lockout_refusal_kind(exc):
-                # The lockout guard withheld the sign-in; the credential was never
-                # judged. kinit would send the same secret again, so do not retry.
+            refused_kind = _lockout_refusal_kind(exc)
+            if refused_kind:
+                # The guard withheld the sign-in (lockout protection, or the
+                # engagement scope); the credential was never judged. kinit
+                # would send the same secret again, so do not retry.
                 return KerberosTGTResult(
                     username=username,
                     domain=domain,
@@ -1169,7 +1184,7 @@ class KerberosTicketService(BaseService):
                     method="kerberos_password",
                     success=False,
                     error_message=str(exc),
-                    error_kind=LOCKOUT_REFUSED_ERROR_KIND,
+                    error_kind=refused_kind,
                 )
             if _is_definitive_credential_rejection(exc):
                 # The KDC already judged this secret for this account. A kinit
@@ -1814,6 +1829,21 @@ class KerberosTicketService(BaseService):
             )
             return bool(step.stepped)
 
+        # Everything below hands the DC's address to another process (the host
+        # helper, ``ntpdate``, ``net time``), which the in-process socket guard
+        # cannot see: the engagement scope is asked here, immediately before
+        # any of them starts, with the clock-sync SSOT's own time-source check.
+        from adscan_internal.services.dc_time import _time_source_in_scope  # noqa: PLC0415
+
+        if not _time_source_in_scope(str(pdc_ip or "")):
+            self._emit_progress(
+                scan_id=scan_id,
+                phase="clock_sync",
+                progress=1.0,
+                message="Clock sync skipped: the domain controller is outside the engagement scope",
+            )
+            return False
+
         # Container runtime path
         if is_full_container_runtime():
             sock_path = os.getenv("ADSCAN_HOST_HELPER_SOCK", "").strip()
@@ -2205,7 +2235,12 @@ def ensure_user_ccache(
             f"error={result.error_message!r}"
         )
         if error_out is not None:
-            error_out.append(result.error_message or "TGT mint failed")
+            reason = result.error_message or "TGT mint failed"
+            if result.error_kind == SCOPE_REFUSED_ERROR_KIND:
+                # The cause travels with the text: the caller words a sign-in
+                # the scope withheld as that, never as lockout protection.
+                reason = f"{SCOPE_REFUSED_NOTE} {reason}"
+            error_out.append(reason)
         return None
 
     # Update the legacy registry so other code paths that consult

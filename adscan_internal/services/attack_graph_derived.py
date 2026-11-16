@@ -33,7 +33,6 @@ Design notes:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,7 +41,6 @@ from adscan_core import telemetry
 from adscan_core.rich_output import print_error, print_info_verbose
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.edge_kind import EdgeKind, classify_edge_kind
-from adscan_internal.workspaces import domain_subpath
 from adscan_core.rich_output import print_exception
 
 
@@ -93,29 +91,6 @@ _ALLOWED_DERIVED_RELATIONS = ALLOWED_DERIVED_RELATIONS
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _attack_graph_path(shell: object, domain: str) -> Path:
-    workspace_dir = getattr(shell, "current_workspace_dir", "") or ""
-    domains_dir = getattr(shell, "domains_dir", "domains")
-    return Path(domain_subpath(workspace_dir, domains_dir, domain, "attack_graph.json"))
-
-
-def _load_graph(graph_path: Path) -> dict[str, Any]:
-    # ``nodes`` defaults to a MAPPING, the shape every persisted attack graph
-    # uses (``upsert_nodes`` keys it by node id) and the shape the canonical save
-    # path reads when it prunes Tier-0-source edges.
-    if not graph_path.exists():
-        return {"nodes": {}, "edges": []}
-    try:
-        data = json.loads(graph_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return {"nodes": {}, "edges": []}
-    if not isinstance(data, dict):
-        return {"nodes": {}, "edges": []}
-    data.setdefault("nodes", {})
-    data.setdefault("edges", [])
-    return data
 
 
 def _edge_signature(edge: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -193,15 +168,17 @@ def insert_derived_edge(
     if not source_clean or not target_clean:
         raise ValueError("insert_derived_edge: source and target must be non-empty")
 
-    graph_path = _attack_graph_path(shell, domain)
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    graph = _load_graph(graph_path)
+    from adscan_internal.services import graph_runtime  # noqa: PLC0415
+    from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
+        load_attack_graph,
+    )
 
     new_edge: dict[str, Any] = {
         "source": source_clean,
         "target": target_clean,
         "relation": relation,
         "kind": EdgeKind.DERIVED.value,
+        "edge_type": "derived",
         "evidence": {
             "technique_id": str(technique_id or ""),
             "evidence_path": str(evidence_path) if evidence_path is not None else "",
@@ -210,39 +187,31 @@ def insert_derived_edge(
     }
     if extra:
         new_edge["evidence"]["extra"] = dict(extra)
-
     new_sig = _edge_signature(new_edge)
-    edges_list = graph.get("edges")
-    if not isinstance(edges_list, list):
-        edges_list = []
-        graph["edges"] = edges_list
 
-    for existing in edges_list:
-        if isinstance(existing, dict) and _edge_signature(existing) == new_sig:
-            print_info_verbose(
-                f"[attack_graph_derived] derived edge already present "
-                f"({mark_sensitive(source_clean, 'host')} -{relation}-> "
-                f"{mark_sensitive(target_clean, 'user')}); no-op"
-            )
-            return False
-
-    edges_list.append(new_edge)
-
-    # Persist through the canonical seam, never a raw write: it is what stamps
-    # ``category`` / ``vuln_key`` onto the new edge (without which the finding
-    # derivation cannot see it), invalidates the materialized attack-path
-    # artifacts, and syncs technical findings. A raw ``write_text`` here is
-    # exactly how noPac and PrintNightmare stayed out of the client's report.
+    # Recorded through the runtime overlay (the store is created when missing),
+    # never a raw write: the build stamps ``category`` / ``vuln_key`` (without
+    # which the finding derivation cannot see the edge) and the export syncs the
+    # technical findings. A raw write is how noPac and PrintNightmare once
+    # stayed out of the client's report.
     try:
-        from adscan_internal.services.attack_graph_service import (  # noqa: PLC0415
-            save_attack_graph,
-        )
-
-        save_attack_graph(shell, domain, graph)
+        with graph_runtime.write_scope(shell, origin="insert_derived_edge"):
+            graph = load_attack_graph(shell, domain)
+            for existing in graph.get("edges") or ():
+                if isinstance(existing, dict) and _edge_signature(existing) == new_sig:
+                    print_info_verbose(
+                        f"[attack_graph_derived] derived edge already present "
+                        f"({mark_sensitive(source_clean, 'host')} -{relation}-> "
+                        f"{mark_sensitive(target_clean, 'user')}); no-op"
+                    )
+                    return False
+            if not graph_runtime.record_edge_exactly(graph, new_edge):
+                # A frozen workspace: nothing is written there.
+                return False
     except Exception as exc:  # noqa: BLE001 — telemetry sink
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
-        print_error(f"[attack_graph_derived] failed to write attack_graph.json: {exc}")
+        print_error(f"[attack_graph_derived] failed to record the derived edge: {exc}")
         return False
 
     print_info_verbose(

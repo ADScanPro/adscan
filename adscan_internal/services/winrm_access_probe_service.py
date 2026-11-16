@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import ipaddress
 from pathlib import Path
@@ -10,6 +9,7 @@ import threading
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
 from adscan_internal import print_info_debug
+from adscan_core.scan_control.fanout import SweepCoverage, run_stoppable_thread_fanout
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_consumers import consumer as _pacing_consumer
 from adscan_core.scan_pacing.pacing_runtime import active_runtime
@@ -17,6 +17,7 @@ from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.current_vantage_reachability_service import (
     load_current_vantage_reachability_report,
 )
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
 from adscan_internal.services.kerberos_hostname_inventory import (
     choose_hostname_for_kerberos_spn,
     load_workspace_ip_hostname_inventory,
@@ -31,6 +32,7 @@ from adscan_internal.services.winrm_psrp_service import (
     is_clock_skew_error,
 )
 from adscan_internal.services.posture_sink import PostureSink
+from adscan_internal.services.sweep_stop import note_outside_scope
 
 if TYPE_CHECKING:  # pragma: no cover
     from adscan_internal.services.domain_posture import DomainPosture
@@ -320,6 +322,16 @@ def resolve_winrm_probe_targets(
 
 def _classify_probe_exception(exc: BaseException) -> tuple[ServiceAccessCategory, str]:
     """Normalize PSRP exceptions into service-access categories."""
+    from adscan_core.auth_attempt_guard import refusal_in_chain  # noqa: PLC0415
+
+    refusal = refusal_in_chain(exc)
+    if refusal is not None:
+        # Nothing was sent: the guard withheld the sign-in. Access is
+        # undetermined, and the reason is the guard's, not a server's answer.
+        # One wording per cause: the engagement scope is not lockout protection.
+        if refusal.outside_scope:
+            return "ambiguous", f"sign-in withheld by the engagement scope: {refusal.reason}"
+        return "ambiguous", f"sign-in withheld by lockout protection: {refusal.reason}"
     message = str(exc or "").strip()
     lowered = message.lower()
     if any(
@@ -467,8 +479,21 @@ def run_winrm_access_probe_sweep(
     sync_clock_with_pdc: Callable[[str], bool] | None = None,
     posture_sink: Optional[PostureSink] = None,
     posture_snapshot: Optional["DomainPosture"] = None,
+    should_stop: Callable[[], bool] | None = None,
+    coverage: SweepCoverage | None = None,
+    shell: Any | None = None,
 ) -> list[ServiceAccessFinding]:
-    """Probe WinRM access concurrently using the reusable PSRP backend."""
+    """Probe WinRM access concurrently using the reusable PSRP backend.
+
+    Honours the scan control plane: after a stop (``should_stop``, default the
+    running step's) no new host is contacted and only the CHECKED hosts are
+    returned; ``coverage`` records which hosts were left unchecked.
+
+    Engagement scope: the resolved targets are partitioned once, before the
+    fan-out, so a host the scope excludes never reaches a worker. ``shell`` is
+    the session whose scope applies; excluded hosts go to
+    ``coverage.outside_scope``.
+    """
     probe_targets = resolve_winrm_probe_targets(
         targets=targets,
         domain=domain,
@@ -476,6 +501,29 @@ def run_winrm_access_probe_sweep(
         domains_dir=domains_dir,
         domain_data=domain_data,
     )
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        fanout_scope_gate,
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(
+        shell,
+        probe_targets,
+        key=lambda target: target.kerberos_spn_host or target.host,
+        address=lambda target: target.host,
+        domain=domain,
+    )
+    scope = partition_targets_in_scope(
+        shell,
+        probe_targets,
+        key=lambda target: target.kerberos_spn_host or target.host,
+        address=lambda target: target.host,
+        surface="winrm_access_sweep",
+        what="WinRM access sweep",
+        domain=domain,
+    )
+    note_outside_scope(coverage, scope.refused_items, key=lambda target: target.host)
+    probe_targets = scope.allowed
     if not probe_targets:
         return []
 
@@ -517,33 +565,47 @@ def run_winrm_access_probe_sweep(
         runtime.before_op_sync(kwargs["target"].host)
         return _probe_one_target(**kwargs)
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(
-                _paced_probe,
-                target=target,
-                domain=domain,
-                username=username,
-                password=password,
-                auth_mode=auth_mode,
-                kdc_ip=sweep_kdc_ip,
-                workspace_dir=workspace_dir,
-                clock_skew_retry=clock_skew_retry,
-                posture_sink=posture_sink,
-                posture_snapshot=posture_snapshot,
-            ): target
-            for target in probe_targets
-        }
-        for future in as_completed(future_map):
-            finding = future.result()
-            findings.append(finding)
-            if finding.category == "confirmed":
-                print_info_debug(
-                    "[winrm_probe] confirmed access: "
-                    f"host={mark_sensitive(finding.host, 'hostname')} "
-                    f"backend={mark_sensitive(finding.backend, 'detail')} "
-                    f"reason={mark_sensitive(finding.reason, 'text')}"
-                )
+    def _probe(target: Any) -> ServiceAccessFinding:
+        return _paced_probe(
+            target=target,
+            domain=domain,
+            username=username,
+            password=password,
+            auth_mode=auth_mode,
+            kdc_ip=sweep_kdc_ip,
+            workspace_dir=workspace_dir,
+            clock_skew_retry=clock_skew_retry,
+            posture_sink=posture_sink,
+            posture_snapshot=posture_snapshot,
+        )
+
+    outcome = run_stoppable_thread_fanout(
+        probe_targets,
+        _probe,
+        max_workers=worker_count,
+        should_stop=should_stop,
+        # A long sweep: each chunk is prepared and each host judged again right
+        # before its contact (the partition above is from the sweep's start).
+        before_item=fanout_scope_gate(
+            shell,
+            probe_targets,
+            surface="winrm_access_sweep",
+            key=lambda target: target.kerberos_spn_host or target.host,
+            address=lambda target: target.host,
+            domain=domain,
+        ),
+    )
+    if coverage is not None:
+        coverage.absorb(outcome, [target.host for target in probe_targets])
+    for finding in outcome.completed_results():
+        findings.append(finding)
+        if finding.category == "confirmed":
+            print_info_debug(
+                "[winrm_probe] confirmed access: "
+                f"host={mark_sensitive(finding.host, 'hostname')} "
+                f"backend={mark_sensitive(finding.backend, 'detail')} "
+                f"reason={mark_sensitive(finding.reason, 'text')}"
+            )
 
     order = {target.host.lower(): index for index, target in enumerate(probe_targets)}
     findings.sort(key=lambda finding: order.get(finding.host.lower(), len(order)))

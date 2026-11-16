@@ -21,6 +21,7 @@ from adscan_core.output._log import (
 )
 from adscan_core.output._panels import print_panel
 from adscan_core.output._tables import print_table
+from adscan_core.output._responsive_table import ResponsiveColumn, ResponsiveTable
 from adscan_core.smb_exclusion_policy import (
     is_globally_excluded_smb_share,
 )
@@ -29,6 +30,7 @@ from adscan_core.reporting.unauthenticated_reach import (
     UNAUTHENTICATED_ENTRY_AFFECTED_SOURCE,
 )
 from adscan_core.reporting.folded_route_count import folded_route_count
+from adscan_core.reporting.principal_display import declares_node_identities
 
 
 _SHARE_ACCESS_RELATION_KEYS = {
@@ -54,7 +56,29 @@ __all__ = [
     "_build_attack_steps_table",
     "_format_effective_target_basis_compact",
     "render_smb_exposed_resources_panel",
+    "ATTACK_PATH_TABLE_COLUMNS",
 ]
+
+
+#: The attack-path listing's columns. ``priority`` 0 is always shown; below the
+#: fit width the highest number is dropped first and its value is stacked under
+#: the route, so a narrow terminal never prints an empty or ellipsis-only column.
+#: "Cred" not "Exec": the column reports whether a usable CREDENTIAL was
+#: resolved for the path's steps, nothing more. Header-level actionability also
+#: depends on the path's status and execution support, so a row can read
+#: "Ready" while the panel reports "Actionable: 0/N"; under an "Exec" header
+#: those two read as a contradiction.
+ATTACK_PATH_TABLE_COLUMNS: tuple[ResponsiveColumn, ...] = (
+    ResponsiveColumn("#", priority=0, justify="right"),
+    ResponsiveColumn("Path", priority=0, min_width=24, style="cyan"),
+    ResponsiveColumn("Affected", priority=4, stack_label="Affected"),
+    ResponsiveColumn("Target", priority=5, stack_label="Target"),
+    ResponsiveColumn("Type", priority=1, min_width=12, max_width=22),
+    ResponsiveColumn("State", priority=5, stack_label="State"),
+    ResponsiveColumn("Cred", priority=3, stack_label="Cred"),
+    ResponsiveColumn("Status", priority=2, stack_label="Status", style="magenta"),
+    ResponsiveColumn("Len", priority=6, stack_label="Steps", justify="right"),
+)
 
 
 def _format_effective_target_basis_compact(
@@ -819,6 +843,7 @@ def order_attack_paths_for_display(
     return sorted(displayable, key=_canonical_attack_path_sort_key)
 
 
+@declares_node_identities(records="paths")
 def print_attack_paths_summary(
     domain: str,
     paths: List[Dict[str, object]],
@@ -1052,32 +1077,40 @@ def print_attack_paths_summary(
             ),
             reverse=True,
         )
-        summary = Text()
-        summary.append("Top choke points: ", style="bold white")
+        # A short numbered list, one choke point per entry: the transition on
+        # its own line (names through the humanization SSOT), the badge and the
+        # counts on the line under it. A run-on paragraph wrapped mid-name at
+        # 80 columns and buried the three items in each other.
+        summary = Table.grid(padding=(0, 1))
+        summary.add_column(justify="right", no_wrap=True, style="dim")
+        summary.add_column(overflow="fold")
         for idx, item in enumerate(ranked_items[:3], start=1):
-            if idx > 1:
-                summary.append("   ", style="dim")
             details = item["details"]
-            summary.append(f"{idx}. ", style="dim")
-            summary.append_text(_format_choke_point_badge(details))
-            summary.append("  ", style="dim")
-            summary.append(
-                _mark_path_node(str(item.get("source") or "")),
+            transition = Text()
+            transition.append(
+                format_cli_node(str(item.get("source") or ""), domain),
                 style=BRAND_COLORS["info"],
             )
-            summary.append(" → ", style="dim")
-            summary.append(
-                _mark_path_node(str(item.get("target") or "")),
+            transition.append(" → ", style="dim")
+            transition.append(
+                format_cli_node(str(item.get("target") or ""), domain),
                 style=BRAND_COLORS["warning"],
             )
+            meta = _format_choke_point_badge(details)
             blast_radius = int(item.get("max_blast_radius") or 0)
             occurrences = int(item.get("occurrences") or 0)
             if blast_radius > 0:
-                summary.append(
-                    f"  blast {blast_radius}", style=f"bold {BRAND_COLORS['warning']}"
+                meta.append(" · ", style="dim")
+                meta.append(
+                    f"blast radius {blast_radius}",
+                    style=f"bold {BRAND_COLORS['warning']}",
                 )
             if occurrences > 1:
-                summary.append(f"  seen in {occurrences} path(s)", style="dim")
+                meta.append(" · ", style="dim")
+                meta.append(f"in {occurrences} paths", style="dim")
+            transition.append("\n")
+            transition.append_text(meta)
+            summary.add_row(f"{idx}.", transition)
         print_panel(
             summary,
             title="⚠ Choke Point Priorities",
@@ -1089,28 +1122,21 @@ def print_attack_paths_summary(
 
     _render_top_choke_points_panel(visible)
 
-    table = Table(
-        title=f"Attack Paths ({show_count})",
-        title_style=f"bold {BRAND_COLORS['success']}",
-        border_style=BRAND_COLORS["success"],
-        show_header=True,
-        header_style=f"bold {BRAND_COLORS['success']}",
-        padding=(0, 1),
+    # The listing degrades by design below its fit width: low-priority columns
+    # are dropped and their values stacked under the route, which is the one
+    # column that always shows in full (see ``ResponsiveTable``).
+    table = ResponsiveTable(
+        columns=ATTACK_PATH_TABLE_COLUMNS,
+        primary=1,
+        table_kwargs={
+            "title": f"Attack Paths ({show_count})",
+            "title_style": f"bold {BRAND_COLORS['success']}",
+            "border_style": BRAND_COLORS["success"],
+            "show_header": True,
+            "header_style": f"bold {BRAND_COLORS['success']}",
+            "padding": (0, 1),
+        },
     )
-    table.add_column("#", justify="right", width=3)
-    table.add_column("Path", style="cyan", no_wrap=False)
-    table.add_column("Affected", style="white", no_wrap=False, width=10)
-    table.add_column("Target", style="white", no_wrap=False, width=10)
-    table.add_column("Type", style="white", no_wrap=False, width=18)
-    table.add_column("State", style="white", no_wrap=False, width=10)
-    # "Cred" not "Exec": this column reports whether a usable CREDENTIAL was
-    # resolved for the path's steps — nothing more. Header-level actionability
-    # also depends on the path's status and execution support, so a row can
-    # legitimately read "Ready" while the panel reports "Actionable: 0/N". Under
-    # the old "Exec" header those two read as a contradiction.
-    table.add_column("Cred", style="white", no_wrap=False, width=10)
-    table.add_column("Status", style="magenta", no_wrap=False, width=10)
-    table.add_column("Len", justify="right", width=4)
     format_node_label, _, format_relation_display, _ = (
         _get_attack_path_narrative_formatters()
     )
@@ -1453,41 +1479,39 @@ def _wellknown_context_domain(node_label: str, partner_label: str) -> str | None
 def _fallback_format_attack_path_node_label(
     label: str, domain: str, context_domain: str | None = None
 ) -> str:
-    """Best-effort node label formatter when reporting narratives are unavailable.
+    """The CLI's node label: the shared humanization SSOT, unmarked.
 
-    Kept in lockstep with the PRO SSOT ``format_node_label``: a well-known
-    principal (label ends ``@WELLKNOWN``) has its effective domain rebound to
-    the adjacent node's ``context_domain`` so the same-domain strip below
-    produces a bare ``Authenticated Users`` intra-domain or
-    ``Authenticated Users@<partner-domain>`` cross-domain. Display-only — the
-    graph node identity is never touched.
+    Every terminal surface that names an attack-graph node (the attack-path
+    listing, the choke-point panel, the step detail, the scan recap) renders it
+    through this one function, which delegates to
+    :func:`adscan_core.reporting.principal_display.format_graph_node_label`:
+    ``JON.SNOW@NORTH.SEVENKINGDOMS.LOCAL`` reads ``jon.snow`` intra-domain, a
+    well-known group in its canonical case (``Domain Admins``), a host is
+    its short name, a client-created group keeps the directory's own casing
+    (``CastelblackAdmins``, resolved from the records the calling printer
+    declared), the domain terminal is lower case, a ``@WELLKNOWN`` sentinel
+    is rebound to the edge partner's domain, and a principal from another
+    domain keeps its ``@domain``. The operator and the client read the same
+    name for the same object; relations stay technical (``AdminTo``).
+    Display-only: the graph node identity is never touched.
     """
-    value = str(label or "").strip()
-    if not value:
-        return "N/A"
-    domain_value = str(domain or "").strip().lower()
+    from adscan_core.reporting.principal_display import format_graph_node_label
 
-    if "\\" in value:
-        value = value.split("\\", 1)[1].strip()
+    return format_graph_node_label(label, domain, context_domain)
 
-    if "@" in value:
-        left, _, right = value.partition("@")
-        if right.strip().lower() == "wellknown" and left.strip():
-            partner_domain = str(context_domain or "").strip()
-            if partner_domain:
-                right = partner_domain
-                value = f"{left}@{partner_domain}"
-        if right and right.strip().lower() == domain_value:
-            return left.strip() or value
-        # A UPN carrying a cross-domain '@domain' keeps its full NAME@DOMAIN —
-        # matching the PRO SSOT's `return node_value`. Never fall through to the
-        # host-suffix strip below (which would truncate a cross-forest UPN).
-        return value
-    if domain_value and value.lower().endswith(f".{domain_value}"):
-        host = value[: -(len(domain_value) + 1)].split(".", 1)[0].strip()
-        return host or value
 
-    return value
+def format_cli_node(label: str, domain: str, context_domain: str | None = None) -> str:
+    """Return the CLI node label, ``mark_sensitive``-wrapped for telemetry.
+
+    Cleartext on screen; the marker tells the export sanitizer to pseudonymize
+    it. A dotted name or a machine account is a host, anything else a principal.
+    """
+    display = _fallback_format_attack_path_node_label(label, domain, context_domain)
+    if not display or display == "N/A":
+        return display or "N/A"
+    if "." in display or display.endswith("$"):
+        return mark_sensitive(display, "hostname")
+    return mark_sensitive(display, "user")
 
 
 def _fallback_format_attack_path_relation_label(relation: str) -> str:
@@ -1712,15 +1736,12 @@ def _get_attack_path_narrative_formatters() -> tuple[
 ]:
     """Resolve attack-path label formatters with a LITE-safe fallback.
 
-    NODE labels always use the technical :func:`_fallback_format_attack_path_node_label`,
-    NEVER the reporting module's ``format_node_label``. The CLI/TUI attack-path
-    display stays BloodHound-technical (``DOMAIN USERS@ESSOS.LOCAL`` compacts to
-    ``DOMAIN USERS``), per the nomenclature standard: only the CLIENT report
-    surfaces (report graph / prose / writeup / web CTEM) humanize a principal, and
-    they call ``format_node_label`` directly. Pinning the CLI to the technical
-    formatter also keeps the CLI display byte-identical between LITE (fallback) and
-    PRO (reporting module present), instead of diverging by tier. RELATION
-    formatting still prefers the reporting module when present.
+    NODE labels always use :func:`_fallback_format_attack_path_node_label`, which
+    delegates to the ``adscan_core`` humanization SSOT, so the CLI names a
+    principal exactly as the report and the web CTEM do (``jon.snow``, never the
+    shouting ``JON.SNOW@NORTH.SEVENKINGDOMS.LOCAL``) and stays byte-identical
+    between LITE and PRO. Edge names stay technical (``AdminTo``, ``DCSync``):
+    RELATION formatting still prefers the reporting module when present.
     """
     global _ATTACK_PATH_NARRATIVE_FALLBACK_LOGGED
     try:
@@ -1772,6 +1793,7 @@ def _get_attack_path_narrative_formatters() -> tuple[
         )
 
 
+@declares_node_identities(records="path")
 def print_attack_path_detail(
     domain: str,
     path: Dict[str, object],
@@ -1798,9 +1820,7 @@ def print_attack_path_detail(
     def _mark_node(name: str) -> str:
         if not name:
             return "N/A"
-        if "." in name or name.endswith("$"):
-            return mark_sensitive(name, "hostname")
-        return mark_sensitive(name, "user")
+        return format_cli_node(name, domain)
 
     def _format_status(value: object) -> Text:
         status = str(value or "discovered").strip().lower()
@@ -2335,6 +2355,7 @@ def print_attack_path_detail(
     print_info("No graph nodes/relations or steps recorded for this path.", icon="")
 
 
+@declares_node_identities(records="steps")
 def print_attack_steps_summary(
     domain: str,
     steps: List[Dict[str, object]],

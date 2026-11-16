@@ -41,22 +41,33 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
-from adscan_core.reporting.attack_path_execution_events import NOT_NEEDED_REASONS
+from adscan_core.reporting.attack_path_execution_events import (
+    DECLINED_REASONS,
+    NOT_NEEDED_REASONS,
+)
 from adscan_core.reporting.engagement_scope import (
     DEPENDS_ON_OUTSIDE_SCOPE_STEP_LABEL,
     NOT_EXECUTED_DEPENDS_ON_OUTSIDE_SCOPE,
     NOT_EXECUTED_OUTSIDE_SCOPE,
     NOTE_SCOPE_DOMAIN_KEY,
     OUTSIDE_SCOPE_REASONS,
-    OUTSIDE_SCOPE_STEP_LABEL,
     continuation_sentence,
     crossing_sentence,
+    outside_scope_step_label,
     split_route_at_scope,
     step_target_domain,
 )
 from adscan_core.scan_policy.execution import (
+    AWAITING_APPROVAL_NOT_ASKED_LABEL,
+    DEPENDS_ON_INCOMPLETE_STEP_LABEL,
+    DEPENDS_ON_POLICY_EXCLUDED_LABEL,
+    INHERITED_STEP_REASONS,
     MAP_ONLY_STEP_LABEL,
+    NOT_RUN_IN_ASSESSMENT_LABEL,
     REASON_AWAITING_APPROVAL,
+    REASON_DEPENDS_ON_INCOMPLETE_STEP,
+    REASON_DEPENDS_ON_POLICY_EXCLUDED,
+    REASON_NOT_RUN_IN_ASSESSMENT,
     REASON_OPERATOR_DECLINED,
     awaiting_approval_label,
     dependent_step_label,
@@ -75,6 +86,11 @@ NOTE_AWAITING_TIMEOUT_KEY = "awaiting_timeout_seconds"
 #: workspace written before it existed) is read from the route: a step whose
 #: route already carries the same decision on an earlier step is a dependent.
 NOTE_DECISION_DEPENDENT_KEY = "operator_decision_dependent"
+#: Step-note key the ANNOTATION writes on a step of an attended run that no
+#: operator was asked about (reason 2 by the map-only rule). It keeps the
+#: wording apart from a relayed request that got no answer, and marks the note
+#: as one the annotation derives again on every pass.
+NOTE_NOT_ASKED_KEY = "operator_not_asked"
 #: ``meta`` key listing a route's steps left unexecuted by an operator decision
 #: (declined, or awaiting an answer that never came). Read by the verdict.
 META_OPERATOR_DECISION_KEY = "operator_decision_steps"
@@ -187,6 +203,19 @@ def _relation_index(
     return index
 
 
+class ExcludedRelations(dict):
+    """``{relation: {"check_id", "label"}}`` plus what the block says of the run.
+
+    ``attended`` is True when the run's policy left each attack step to an
+    operator, False when it ran unattended, ``None`` when the block does not
+    say. The annotation reads it to word a step nobody was asked about. Kept on
+    the mapping so the four seams that pass the block's relations through
+    (engine disclosure, report, web listing, web snapshot) carry it for free.
+    """
+
+    attended: bool | None = None
+
+
 def excluded_relations_from_block(block: Any) -> dict[str, dict[str, str]]:
     """``{relation: {"check_id", "label"}}`` from a persisted coverage block.
 
@@ -197,6 +226,10 @@ def excluded_relations_from_block(block: Any) -> dict[str, dict[str, str]]:
     """
     if not isinstance(block, Mapping):
         return {}
+    out = ExcludedRelations()
+    mode = str(block.get("execution_mode") or "").strip().lower()
+    if mode:
+        out.attended = mode == "attended"
     labels = block.get("excluded_relation_labels")
     # The block lists a per-relation label only for a step a map-only run left
     # to an operator (``coverage.build_scan_policy_coverage``). The wording is
@@ -210,7 +243,6 @@ def excluded_relations_from_block(block: Any) -> dict[str, dict[str, str]]:
         else {}
     )
     mapping = block.get("excluded_relation_checks")
-    out: dict[str, dict[str, str]] = {}
     if isinstance(mapping, Mapping) and mapping:
         for relation, check_id in mapping.items():
             out[str(relation)] = {
@@ -334,7 +366,9 @@ def _label_operator_decision(
         step["details"] = details
         return details[NOTE_REASON_KEY]
     if reason == NOT_EXECUTED_OUTSIDE_SCOPE:
-        label = OUTSIDE_SCOPE_STEP_LABEL
+        # Excluded by the client, or not confirmed as within the scope: the
+        # same fourth reason, each worded for what happened (shared SSOT).
+        label = outside_scope_step_label(details)
     elif reason == NOT_EXECUTED_DEPENDS_ON_OUTSIDE_SCOPE:
         label = DEPENDS_ON_OUTSIDE_SCOPE_STEP_LABEL
     elif reason == REASON_OPERATOR_DECLINED:
@@ -389,8 +423,19 @@ def _mark_scope_continuation(steps: list[Any]) -> str:
             details[NOTE_REASON_KEY] = NOT_EXECUTED_DEPENDS_ON_OUTSIDE_SCOPE
         step["details"] = details
     if split.prefix_only:
-        return continuation_sentence(split.out_domains[0] if split.out_domains else "")
-    return crossing_sentence(split.out_domains)
+        continuation = continuation_sentence(split.out_domains[0] if split.out_domains else "")
+        if (split.out_objects or split.unconfirmed_objects) and (
+            split.boundary != split.domain_boundary
+        ):
+            # An excluded or unconfirmed object stopped the route before it
+            # left the scope's domains: both facts are stated, in that order.
+            return (
+                crossing_sentence((), split.out_objects, split.unconfirmed_objects)
+                + " "
+                + continuation
+            )
+        return continuation
+    return crossing_sentence(split.out_domains, split.out_objects, split.unconfirmed_objects)
 
 
 def policy_unlock_line(check_titles: Iterable[str]) -> str:
@@ -428,6 +473,111 @@ def _check_titles(entries: Iterable[Mapping[str, Any]]) -> list[str]:
     return titles
 
 
+#: Step statuses that mean the step ran to completion.
+_COMPLETED_STATUSES = frozenset({"success", "succeeded", "exploited", "domain_compromised"})
+
+
+def reason_draws_chip(reason: Any) -> bool:
+    """Whether a step's not-executed reason is drawn as a chip beside its status.
+
+    The ONE render decision, for both report tiers and the web. All three draw
+    the chip from the label served on the step (``details.not_executed_label``),
+    and the annotation writes that label only when this says so. A chip is
+    drawn when it tells the reader something the status chip does not: excluded
+    by the policy, declined, awaiting approval, timed out, outside the scope,
+    not needed, and every "depends on" form. A step that was simply mapped and
+    not run (``REASON_NOT_RUN_IN_ASSESSMENT``) keeps its reason in the data and
+    draws nothing: its Theoretical chip already says it, and a second chip on
+    every step of every route is noise in a paid report.
+    """
+    token = str(reason or "").strip().lower()
+    return bool(token) and token != REASON_NOT_RUN_IN_ASSESSMENT
+
+
+def step_reason_chip(details: Any) -> str:
+    """The chip a renderer draws beside a not-run step, or ``""`` for none."""
+    if not isinstance(details, Mapping):
+        return ""
+    if not reason_draws_chip(details.get(NOTE_REASON_KEY)):
+        return ""
+    return str(details.get(NOTE_LABEL_KEY) or "").strip()
+
+
+def _label_declined_step(step: dict[str, Any], details: dict[str, Any]) -> bool:
+    """Label a step the engine declined because its change could not be shown undoable.
+
+    The engine writes the reason on the edge (``reversal_not_proven`` for a
+    certificate nobody was confirmed able to revoke, ``revert_not_permitted``
+    for a directory change the cleanup account could not be confirmed to undo)
+    and leaves the status as it was. Without a label the step reads as a bare
+    Theoretical, with nothing saying it was withheld on purpose. The chip is the
+    one worded in ``DECLINED_REASONS``. A stale note on a step that ran since
+    is removed. Returns True when the step carried such a note.
+    """
+    reason = str(details.get(NOTE_REASON_KEY) or "").strip().lower()
+    entry = DECLINED_REASONS.get(reason)
+    if entry is None:
+        return False
+    if _step_status(step) not in _NOT_RUN_STATUSES:
+        details.pop(NOTE_REASON_KEY, None)
+        details.pop(NOTE_LABEL_KEY, None)
+        return True
+    details[NOTE_LABEL_KEY] = str(entry.get("label") or "")
+    step["details"] = details
+    return True
+
+
+def _drop_derived_reason(details: dict[str, Any]) -> None:
+    """Remove a reason an earlier annotation pass derived (never an engine note)."""
+    reason = str(details.get(NOTE_REASON_KEY) or "").strip().lower()
+    if reason in INHERITED_STEP_REASONS or details.get(NOTE_NOT_ASKED_KEY) is True:
+        for key in (
+            NOTE_REASON_KEY,
+            NOTE_LABEL_KEY,
+            NOTE_DECISION_DEPENDENT_KEY,
+            NOTE_NOT_ASKED_KEY,
+        ):
+            details.pop(key, None)
+
+
+def _stamp_inherited_reason(details: dict[str, Any], behind: str, attended: bool | None) -> str:
+    """Give an un-noted, not-run step its one reason; return the token.
+
+    ``behind`` is the reason of the nearest earlier step that did not run or
+    did not complete. The step takes that reason's "depends on" form. With
+    nothing before it, it was simply not run: awaiting approval when the run
+    left each step to an operator, mapped and not executed otherwise.
+    """
+    if behind == NOT_EXECUTED_REASON or behind == REASON_DEPENDS_ON_POLICY_EXCLUDED:
+        reason, label = REASON_DEPENDS_ON_POLICY_EXCLUDED, DEPENDS_ON_POLICY_EXCLUDED_LABEL
+    elif behind == REASON_DEPENDS_ON_INCOMPLETE_STEP:
+        reason, label = REASON_DEPENDS_ON_INCOMPLETE_STEP, DEPENDS_ON_INCOMPLETE_STEP_LABEL
+    elif behind in _OPERATOR_DECISION_REASONS:
+        reason, label = behind, dependent_step_label(behind)
+        details[NOTE_DECISION_DEPENDENT_KEY] = True
+        details[NOTE_NOT_ASKED_KEY] = True
+    elif behind in OUTSIDE_SCOPE_REASONS:
+        reason, label = NOT_EXECUTED_DEPENDS_ON_OUTSIDE_SCOPE, DEPENDS_ON_OUTSIDE_SCOPE_STEP_LABEL
+    elif behind == REASON_NOT_RUN_IN_ASSESSMENT:
+        reason, label = REASON_NOT_RUN_IN_ASSESSMENT, NOT_RUN_IN_ASSESSMENT_LABEL
+    elif behind:
+        # A not-needed step or any other noted stop: the step waits on it.
+        reason, label = REASON_DEPENDS_ON_INCOMPLETE_STEP, DEPENDS_ON_INCOMPLETE_STEP_LABEL
+    elif attended:
+        reason, label = REASON_AWAITING_APPROVAL, AWAITING_APPROVAL_NOT_ASKED_LABEL
+        details[NOTE_DECISION_DEPENDENT_KEY] = False
+        details[NOTE_NOT_ASKED_KEY] = True
+    else:
+        reason, label = REASON_NOT_RUN_IN_ASSESSMENT, NOT_RUN_IN_ASSESSMENT_LABEL
+    details[NOTE_REASON_KEY] = reason
+    if reason_draws_chip(reason):
+        details[NOTE_LABEL_KEY] = label
+    else:
+        # The reason stays in the data; no chip is served for it.
+        details.pop(NOTE_LABEL_KEY, None)
+    return reason
+
+
 def _strip_note(details: dict[str, Any]) -> None:
     if details.get(NOTE_REASON_KEY) == NOT_EXECUTED_REASON:
         details.pop(NOTE_REASON_KEY, None)
@@ -452,6 +602,7 @@ def annotate_policy_exclusions(
         malformed record; it is skipped.
     """
     index = _relation_index(excluded_relations)
+    attended = getattr(excluded_relations, "attended", None)
     annotated = 0
     for record in records or ():
         if not isinstance(record, dict):
@@ -470,6 +621,10 @@ def annotate_policy_exclusions(
         #: that carries one (the step the operator was asked about).
         gate: tuple[str, str, str] | None = None
         gate_reason = ""
+        #: What the nearest earlier step that did not run (or did not complete)
+        #: was: the reason a later, un-noted step inherits in its "depends on"
+        #: form. ``""`` while every earlier step ran.
+        behind = ""
         for position, step in enumerate(steps, start=1):
             if not isinstance(step, dict):
                 continue
@@ -479,12 +634,23 @@ def annotate_policy_exclusions(
             details = dict(raw_details) if isinstance(raw_details, dict) else {}
             if isinstance(raw_details, dict):
                 step["details"] = details
+            # A reason this annotation derived on an earlier pass is derived
+            # again from the route as it stands now, never replayed.
+            _drop_derived_reason(details)
             if _label_not_needed_step(step, details):
+                behind = behind or REASON_DEPENDS_ON_INCOMPLETE_STEP
                 continue
             relation = _step_relation(step)
             hit = index.get(_norm(relation)) if index else None
             if hit is None and index:
                 hit = index.get(_compact(relation))
+            if hit is None and _label_declined_step(step, details):
+                # Withheld before any change (reversal not proven): the chip
+                # says why, and the steps after it wait on it. A step the
+                # policy also excludes keeps the policy's label.
+                if _step_status(step) in _NOT_RUN_STATUSES:
+                    behind = behind or REASON_DEPENDS_ON_INCOMPLETE_STEP
+                continue
             noted = str(details.get(NOTE_REASON_KEY) or "").strip().lower()
             if (
                 noted in _OPERATOR_DECISION_REASONS
@@ -512,6 +678,7 @@ def annotate_policy_exclusions(
                 details[NOTE_DECISION_DEPENDENT_KEY] = True
             decision = _label_operator_decision(step, details, gate)
             if decision:
+                behind = decision
                 if decision in _OPERATOR_DECISION_REASONS and gate is None:
                     gate = _decision_identity(details)
                     gate_reason = gate[0]
@@ -536,8 +703,36 @@ def annotate_policy_exclusions(
                 # call it "not executed", and drop a stale engine note.
                 if engine_noted:
                     _strip_note(details)
+                if relation.strip().lower() not in _STRUCTURAL_RELATIONS and (
+                    _step_status(step) != "structural"
+                ):
+                    # A step that completed opens the way; one that ran and did
+                    # not complete (or was withheld) is what later steps wait on.
+                    behind = (
+                        ""
+                        if _step_status(step) in _COMPLETED_STATUSES
+                        else REASON_DEPENDS_ON_INCOMPLETE_STEP
+                    )
                 continue
             if not engine_noted and check_id is None:
+                if (
+                    relation.strip().lower() not in _STRUCTURAL_RELATIONS
+                    and not str(details.get(NOTE_REASON_KEY) or "").strip()
+                ):
+                    # No reason of its own: it inherits the earlier step's, or,
+                    # when everything before it ran, says it was mapped and not
+                    # run (awaiting approval where an operator decides).
+                    stamped = _stamp_inherited_reason(details, behind, attended)
+                    step["details"] = details
+                    if stamped == REASON_AWAITING_APPROVAL and not behind:
+                        decided.append(
+                            {
+                                "step": int(step.get("step") or position),
+                                "relation": relation,
+                                "reason": stamped,
+                            }
+                        )
+                    behind = behind or stamped
                 continue
             resolved_check = str(details.get(NOTE_CHECK_KEY) or check_id or "")
             details[NOTE_REASON_KEY] = NOT_EXECUTED_REASON
@@ -555,6 +750,10 @@ def annotate_policy_exclusions(
             excluded_steps.append(entry)
             if details.get(NOTE_LABEL_KEY) != MAP_ONLY_STEP_LABEL:
                 unlockable.append(entry)
+                behind = NOT_EXECUTED_REASON
+            else:
+                # A map-only stop: the step waits for an operator.
+                behind = REASON_AWAITING_APPROVAL
         meta = record.get("meta")
         if decided:
             if not isinstance(meta, dict):
@@ -635,6 +834,10 @@ def route_not_executed_cause(record: Any) -> str:
             unnoted_not_run = unnoted_not_run or not structural
             continue
         reason = str(details.get(NOTE_REASON_KEY) or "").strip().lower()
+        if reason in INHERITED_STEP_REASONS:
+            # Completed by the annotation, never a cause of its own: read as the
+            # un-noted step it was.
+            reason = ""
         if reason in OUTSIDE_SCOPE_REASONS:
             # The scope stopped the route only when everything before the
             # boundary ran; an earlier step that simply did not run in this

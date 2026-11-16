@@ -49,6 +49,10 @@ from adscan_core.rich_output import (
 from adscan_core.theme import ADSCAN_PRIMARY, ADSCAN_PRIMARY_DIM
 from adscan_internal.rich_output import mark_sensitive
 from adscan_core.rich_output import print_exception
+from adscan_internal.services.auth_error_classification import (
+    SCOPE_EGRESS_REFUSAL_LABEL,
+    is_scope_egress_refusal,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +60,9 @@ from adscan_core.rich_output import print_exception
 # ---------------------------------------------------------------------------
 
 
-ProbeStatus = Literal["pending", "running", "open", "denied", "timeout", "error"]
+ProbeStatus = Literal["pending", "running", "open", "denied", "timeout", "error", "excluded"]
+"""``excluded``: the engagement scope kept the probe off this host. Nothing was
+sent, so it says nothing about the host: never read it as "denied"."""
 
 
 @dataclass
@@ -69,6 +75,15 @@ class UnauthProbeConfig:
     smb_guest_targets: list[str]
     timeout: int = 20
     smb_port: int = 445
+    smb_guest_username: str = ""
+    """The engagement's guest transport name, declared to the lockout guard by
+    the caller (``smb_guest_auth_service.authorize_smb_guest_identity``). Empty
+    keeps the legacy built-in ``Guest`` sign-in."""
+    skip_smb_null: bool = False
+    """The caller's engagement-scope check kept the null session probe off the
+    domain controller: no row, no connection, no result."""
+    skip_ldap_anonymous: bool = False
+    """Same for the anonymous LDAP bind."""
 
 
 @dataclass
@@ -90,6 +105,9 @@ class SMBProbeResult:
     shares: list[SMBShareInfo] = field(default_factory=list)
     signing_required: bool | None = None
     error: str | None = None
+    #: The host never answered (connection refused, unreachable, timed out):
+    #: nothing was learned about the session policy, so this is never a denial.
+    unreachable: bool = False
 
 
 @dataclass
@@ -102,6 +120,8 @@ class LDAPAnonResult:
     used_ldaps: bool = False
     naming_contexts: list[str] = field(default_factory=list)
     error: str | None = None
+    #: Neither LDAPS nor LDAP answered: the bind policy was never observed.
+    unreachable: bool = False
 
 
 @dataclass
@@ -156,6 +176,9 @@ async def _probe_smb_session(
     auth_label: Literal["null", "guest"],
     timeout: int,
     port: int,
+    *,
+    guest_username: str = "",
+    realm: str = "",
 ) -> SMBProbeResult:
     """Probe a single SMB target with empty (null) or guest credentials.
 
@@ -178,8 +201,15 @@ async def _probe_smb_session(
     *before* connecting. Once asyauth/badauth ships the upstream fix, the
     flag-strip line below becomes a no-op and can be removed.
 
-    Guest auth (``Guest:`` + empty password) is plain NTLMv2 — no flag
-    surgery needed.
+    Guest auth is plain NTLMv2 with an empty password — no flag surgery
+    needed. With ``guest_username`` (the engagement's declared guest name) the
+    sign-in goes through rule 6 of the lockout guard and the server's
+    SESSION_SETUP flags must confirm a guest (or null) session before the host
+    is reported open; a session granted without that confirmation is closed
+    unused and reported denied, and a refusal is applied to the guard's guest
+    ledger exactly as the SMB transport does (``_record_guest_outcome``). A
+    guest probe needs a domain: without one the server would check its own
+    local accounts, so rule 6 refuses it before the wire.
     """
     from aiosmb.commons.connection.factory import SMBConnectionFactory
     from aiosmb.commons.interfaces.machine import SMBMachine
@@ -189,6 +219,30 @@ async def _probe_smb_session(
         # anything non-empty avoids the URL parser short-circuiting on the
         # missing user. We then flip is_guest and strip NEGOTIATE_VERSION.
         url = f"smb+ntlm-password://Guest:@{target}:{port}/?timeout={timeout}"
+    elif guest_username:
+        from urllib.parse import quote  # noqa: PLC0415
+
+        from adscan_core.auth_attempt_guard import (  # noqa: PLC0415
+            AuthAttemptRefused,
+            check_guest_attempt,
+        )
+
+        try:
+            check_guest_attempt(realm, guest_username, target=target)
+        except AuthAttemptRefused as refused:
+            return SMBProbeResult(
+                target=target,
+                auth_label=auth_label,
+                status="error",
+                error=str(refused),
+            )
+        # Same user part as smb_transport: each component quoted, literal backslash.
+        principal = (
+            f"{quote(realm, safe='')}\\{quote(guest_username, safe='')}"
+            if realm
+            else quote(guest_username, safe="")
+        )
+        url = f"smb+ntlm-password://{principal}:@{target}:{port}/?timeout={timeout}"
     else:
         url = f"smb+ntlm-password://Guest:@{target}:{port}/?timeout={timeout}"
 
@@ -230,9 +284,33 @@ async def _probe_smb_session(
     shares: list[SMBShareInfo] = []
     try:
         async with conn:
-            _, err = await asyncio.wait_for(conn.login(), timeout=timeout)
+            if guest_username:
+                from adscan_core.auth_attempt_guard import guest_sign_in  # noqa: PLC0415
+                from adscan_internal.services.smb_transport import (  # noqa: PLC0415
+                    _record_guest_outcome,
+                )
+
+                with guest_sign_in(realm, guest_username):
+                    _, err = await asyncio.wait_for(conn.login(), timeout=timeout)
+                _record_guest_outcome(realm, guest_username, err)
+            else:
+                _, err = await asyncio.wait_for(conn.login(), timeout=timeout)
             if err is not None:
                 raise err
+            if (
+                guest_username
+                and not getattr(conn, "session_is_guest", False)
+                and not getattr(conn, "session_is_null", False)
+            ):
+                return SMBProbeResult(
+                    target=target,
+                    auth_label=auth_label,
+                    status="denied",
+                    error=(
+                        "the server granted a session but did not confirm it is a guest "
+                        "session; it was closed without being used"
+                    ),
+                )
 
             machine = SMBMachine(conn)
             async with machine:
@@ -272,8 +350,18 @@ async def _probe_smb_session(
             auth_label=auth_label,
             status="timeout",
             error=f"login/list_shares timed out after {timeout}s",
+            unreachable=True,
         )
     except Exception as exc:  # noqa: BLE001
+        if is_scope_egress_refusal(exc):
+            # The engagement scope stopped the connection before any packet
+            # left: the host was not checked, so this is no fact about it.
+            return SMBProbeResult(
+                target=target,
+                auth_label=auth_label,
+                status="excluded",
+                error=SCOPE_EGRESS_REFUSAL_LABEL,
+            )
         msg = str(exc)
         lower = msg.lower()
         if any(
@@ -297,6 +385,20 @@ async def _probe_smb_session(
                 auth_label=auth_label,
                 status="timeout",
                 error=msg,
+                unreachable=True,
+            )
+        from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+            is_transport_loss_error,
+        )
+
+        if is_transport_loss_error(exc):
+            # The host did not answer: an expected outcome, not a tool fault.
+            return SMBProbeResult(
+                target=target,
+                auth_label=auth_label,
+                status="error",
+                error=msg,
+                unreachable=True,
             )
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -411,6 +513,12 @@ async def _probe_ldap_anonymous(
             continue
 
     if conn is None:
+        if last_exc is not None and is_scope_egress_refusal(last_exc):
+            # Stopped by the engagement scope before any packet left: the
+            # directory was not asked, so the bind is neither allowed nor refused.
+            return LDAPAnonResult(
+                target=dc_ip, status="excluded", error=SCOPE_EGRESS_REFUSAL_LABEL
+            )
         telemetry.capture_exception(last_exc) if last_exc else None
         # Both transports were exhausted. A timeout on the final attempt is an
         # inferred-by-absence signal (we ran out of time; the DC told us
@@ -424,8 +532,15 @@ async def _probe_ldap_anonymous(
                     f"LDAP anonymous probe timed out after {timeout}s on both "
                     "LDAPS/636 and LDAP/389"
                 ),
+                unreachable=True,
             )
+        from adscan_internal.services.auth_error_classification import (  # noqa: PLC0415
+            is_transport_loss_error,
+        )
+
         msg = str(last_exc) if last_exc else "Anonymous LDAP bind failed"
+        if last_exc is not None and is_transport_loss_error(last_exc):
+            return LDAPAnonResult(target=dc_ip, status="error", error=msg, unreachable=True)
         lower = msg.lower()
         status: ProbeStatus = (
             "denied"
@@ -573,6 +688,7 @@ _PROBE_ICONS: dict[ProbeStatus, tuple[str, str]] = {
     "denied": ("✗", "yellow"),
     "timeout": ("⏱", "yellow"),
     "error": ("✗", "red"),
+    "excluded": ("–", "dim"),
 }
 
 _STATUS_LABEL: dict[ProbeStatus, str] = {
@@ -582,6 +698,7 @@ _STATUS_LABEL: dict[ProbeStatus, str] = {
     "denied": "denied",
     "timeout": "timeout",
     "error": "error",
+    "excluded": "not checked",
 }
 
 
@@ -695,6 +812,8 @@ async def run_unauth_probes_async(config: UnauthProbeConfig) -> UnauthProbeResul
     null_targets = [t for t in config.smb_null_targets if t]
     if not null_targets and config.dc_ip:
         null_targets = [config.dc_ip]
+    if config.skip_smb_null:
+        null_targets = []
     for target in null_targets:
         _add_row(f"smb_null::{target}", "SMB Null Session", target, config.smb_port)
 
@@ -705,7 +824,8 @@ async def run_unauth_probes_async(config: UnauthProbeConfig) -> UnauthProbeResul
         _add_row(f"smb_guest::{target}", "SMB Guest Session", target, config.smb_port)
 
     # LDAP anonymous
-    if config.dc_ip:
+    probe_ldap = bool(config.dc_ip) and not config.skip_ldap_anonymous
+    if probe_ldap:
         _add_row("ldap_anon::root", "LDAP Anonymous Bind", config.dc_ip, 389)
 
     header = {
@@ -730,7 +850,12 @@ async def run_unauth_probes_async(config: UnauthProbeConfig) -> UnauthProbeResul
         row = row_index[f"smb_guest::{target}"]
         row.status = "running"
         result = await _probe_smb_session(
-            target, "guest", config.timeout, config.smb_port
+            target,
+            "guest",
+            config.timeout,
+            config.smb_port,
+            guest_username=config.smb_guest_username,
+            realm=config.domain,
         )
         results.smb_guest.append(result)
         row.status = result.status
@@ -748,7 +873,7 @@ async def run_unauth_probes_async(config: UnauthProbeConfig) -> UnauthProbeResul
     drivers: list[Any] = []
     drivers.extend(_drive_smb_null(t) for t in null_targets)
     drivers.extend(_drive_smb_guest(t) for t in guest_targets if t not in null_set or t)
-    if config.dc_ip:
+    if probe_ldap:
         drivers.append(_drive_ldap_anon())
 
     # Guard: nothing to do
@@ -774,6 +899,27 @@ async def run_unauth_probes_async(config: UnauthProbeConfig) -> UnauthProbeResul
         results.duration_seconds = time.monotonic() - start
 
     return results
+
+
+def drop_scope_excluded_probes(results: UnauthProbeResults) -> int:
+    """Remove the probes the engagement scope stopped at the wire; return how many.
+
+    Such a probe was never sent, so it is no answer about its host. It leaves
+    the results before any summary, flag or finding reads them, so none of them
+    can state a refused session nobody observed.
+    """
+    dropped = 0
+    for attribute in ("smb_null", "smb_guest"):
+        probed = list(getattr(results, attribute, None) or ())
+        kept = [r for r in probed if getattr(r, "status", "") != "excluded"]
+        if len(kept) != len(probed):
+            dropped += len(probed) - len(kept)
+            setattr(results, attribute, kept)
+    ldap = getattr(results, "ldap_anonymous", None)
+    if ldap is not None and getattr(ldap, "status", "") == "excluded":
+        results.ldap_anonymous = None
+        dropped += 1
+    return dropped
 
 
 def run_unauth_probes(config: UnauthProbeConfig) -> UnauthProbeResults:
@@ -853,6 +999,31 @@ def render_smb_share_table(
     console.print(panel)
 
 
+def _closed_session_row(label: str, results: list[SMBProbeResult]) -> Text:
+    """Summary row for a session type no target opened.
+
+    A target that did not answer was never asked, so it is counted apart from
+    the targets that refused: "denied on all" over an unreachable host would
+    state a hardening nobody observed.
+    """
+    total = len(results)
+    unreachable = sum(1 for r in results if r.unreachable)
+    denied = sum(1 for r in results if r.status == "denied")
+    if unreachable == total:
+        return Text.from_markup(
+            f"[yellow]○[/] {label} not checked: {total} target(s) did not answer"
+        )
+    if denied == total:
+        return Text.from_markup(f"[yellow]✗[/] {label} denied on all {total} target(s)")
+    parts = [f"denied on {denied} of {total} target(s)"]
+    if unreachable:
+        parts.append(f"{unreachable} did not answer")
+    other = total - denied - unreachable
+    if other:
+        parts.append(f"{other} could not be checked")
+    return Text.from_markup(f"[yellow]✗[/] {label} " + ", ".join(parts))
+
+
 def render_unauth_summary(results: UnauthProbeResults, *, domain: str) -> None:
     """Print a short summary panel after probes complete."""
     rows: list[Text] = []
@@ -869,12 +1040,7 @@ def render_unauth_summary(results: UnauthProbeResults, *, domain: str) -> None:
                 )
             )
         else:
-            rows.append(
-                Text.from_markup(
-                    f"[yellow]✗[/] SMB null session denied on all "
-                    f"{len(results.smb_null)} target(s)"
-                )
-            )
+            rows.append(_closed_session_row("SMB null session", results.smb_null))
 
     if results.smb_guest:
         guest_open = [r for r in results.smb_guest if r.status == "open"]
@@ -888,12 +1054,7 @@ def render_unauth_summary(results: UnauthProbeResults, *, domain: str) -> None:
                 )
             )
         else:
-            rows.append(
-                Text.from_markup(
-                    f"[yellow]✗[/] SMB guest session denied on all "
-                    f"{len(results.smb_guest)} target(s)"
-                )
-            )
+            rows.append(_closed_session_row("SMB guest session", results.smb_guest))
 
     if results.ldap_anonymous is not None:
         ldap = results.ldap_anonymous
@@ -904,6 +1065,13 @@ def render_unauth_summary(results: UnauthProbeResults, *, domain: str) -> None:
                 Text.from_markup(
                     f"[bold green]✓[/] LDAP anonymous bind [bold]ALLOWED[/] "
                     f"via {transport}{base}"
+                )
+            )
+        elif ldap.unreachable:
+            rows.append(
+                Text.from_markup(
+                    "[yellow]○[/] LDAP anonymous bind not checked: the domain "
+                    "controller did not answer"
                 )
             )
         else:

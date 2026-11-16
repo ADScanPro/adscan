@@ -32,9 +32,10 @@ import asyncio
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from adscan_core import telemetry
+from adscan_core.scan_control.fanout import SweepCoverage, run_stoppable_fanout
 from adscan_core.scan_pacing import active_pacing, component_pacing
 from adscan_core.scan_pacing.pacing_runtime import active_runtime
 from adscan_core.rich_output import print_info_debug
@@ -45,7 +46,9 @@ from adscan_internal.services.domain_posture import (
     SignalConfidence,
     TriState,
 )
+from adscan_internal.services.engagement_scope import partition_targets_in_scope
 from adscan_internal.services.posture_sink import PostureSink
+from adscan_internal.services.sweep_stop import note_outside_scope
 from adscan_core.rich_output import print_exception
 
 RDPLoginVerdict = Literal["TRUE", "FALSE", "MAYBE", "ERROR"]
@@ -514,8 +517,20 @@ async def scan_rdp_hosts(
     posture_snapshot: Optional[DomainPosture] = None,
     posture_sink: Optional[PostureSink] = None,
     domain_for_posture: Optional[str] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    coverage: Optional[SweepCoverage] = None,
+    shell: Any | None = None,
 ) -> list[RDPLoginResult]:
-    """Probe a list of hosts concurrently and return one result per host.
+    """Probe a list of hosts concurrently and return one result per CHECKED host.
+
+    Honours the scan control plane: after a stop (``should_stop``, default the
+    running step's) no new host is contacted; ``coverage`` records which hosts
+    were left unchecked, so none of them reads as "no access".
+
+    Engagement scope: the hosts are partitioned once, before the fan-out (and
+    before the clock sync), so a host the scope excludes never reaches a worker.
+    ``shell`` is the session whose scope applies; excluded hosts go to
+    ``coverage.outside_scope`` and get no result at all.
 
     Args:
         hosts: List of IP addresses or hostnames to probe.
@@ -539,6 +554,23 @@ async def scan_rdp_hosts(
             Defaults to ``domain``. Pass explicitly for cross-domain scenarios
             where the auth domain differs from the target domain.
     """
+    from adscan_internal.services.engagement_scope_targets import (  # noqa: PLC0415
+        fanout_scope_gate,
+        prepare_targets_for_scope,
+    )
+
+    prepare_targets_for_scope(shell, hosts)
+    scope = partition_targets_in_scope(
+        shell,
+        hosts,
+        surface="rdp_access_sweep",
+        what="RDP access sweep",
+    )
+    note_outside_scope(coverage, scope.refused_items)
+    hosts = scope.allowed
+    if not hosts:
+        return []
+
     # Transversal PROACTIVE clock sync at the RDP auth seam, ONCE before the
     # per-host fan-out (mirror of smb_transport / ldap_transport). RDP is the one
     # transport NOT covered by the sweep-premint SSOT (aardwolf is CredSSP+NTLM/PtH
@@ -579,4 +611,16 @@ async def scan_rdp_hosts(
                 domain_for_posture=domain_for_posture,
             )
 
-    return list(await asyncio.gather(*[_guarded(h) for h in hosts]))
+    host_list = list(hosts)
+    outcome = await run_stoppable_fanout(
+        host_list,
+        _guarded,
+        concurrency=int(pacing["max_workers"]) if max_workers is None else max(1, int(max_workers)),
+        should_stop=should_stop,
+        # A long sweep: each chunk is prepared and each host judged again right
+        # before its contact (the partition above is from the sweep's start).
+        before_item=fanout_scope_gate(shell, host_list, surface="rdp_access_sweep"),
+    )
+    if coverage is not None:
+        coverage.absorb(outcome, host_list)
+    return outcome.completed_results()

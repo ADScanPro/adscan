@@ -31,6 +31,7 @@ from adscan_launcher.docker_pull_diagnostics import (
     PullFailureDiagnosis,
     consume_last_failure,
     get_presentation,
+    TERMINAL_KINDS,
     peek_last_failure,
     record_last_failure,
 )
@@ -106,9 +107,13 @@ from adscan_core.host_resource_thresholds import (  # noqa: E402
     MIN_DOCKER_INSTALL_FREE_GB as _MIN_DOCKER_INSTALL_FREE_GB,
 )
 from adscan_core.interaction import is_non_interactive  # noqa: E402
+from adscan_core.memory_guard import SUPPORTED_MEMORY_FLOOR_BYTES  # noqa: E402
+from adscan_launcher.memory_stop_notice import report_memory_stop_if_any  # noqa: E402
 
 _DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3600
-_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = 1.0
+# The supported minimum (``adscan_core.memory_guard.SUPPORTED_MEMORY_FLOOR_BYTES``):
+# below it the engine's last-resort memory sentinel cannot be relied on.
+_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB = SUPPORTED_MEMORY_FLOOR_BYTES / (1024**3)
 _LOW_MEMORY_WARNING_THRESHOLD_GB = 1.5
 _ALLOW_LOW_MEMORY_ENV = "ADSCAN_ALLOW_LOW_MEMORY"
 _ALLOW_LOW_MEMORY_FLAG = "--allow-low-memory"
@@ -139,7 +144,9 @@ def _infer_runtime_license_mode_from_image(image: str) -> str | None:
     normalized_image = _strip_default_docker_io_prefix(str(image or "")).strip().lower()
     if not normalized_image:
         return None
-    if "adscan-pro" in normalized_image:
+    from adscan_launcher.edition import is_pro_registry_image
+
+    if "adscan-pro" in normalized_image or is_pro_registry_image(normalized_image):
         return "PRO"
     if "adscan-lite" in normalized_image:
         return "LITE"
@@ -208,6 +215,22 @@ def _extract_workspace_from_passthrough_args(adscan_args: list[str]) -> str | No
             return workspace_name or None
     return None
 
+
+
+def _run_container_and_report_stop(cmd: list[str]) -> int:
+    """Run the ADscan container; on exit 3 explain a memory stop on the host terminal.
+
+    The sentinel cannot print safely from inside the container, so the launcher, which
+    sees the exit code once nothing else is drawing, reads the marker it left. The exit
+    code is returned unchanged.
+    """
+    started = time.time()
+    proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
+    code = int(proc.returncode)
+    report_memory_stop_if_any(
+        code, workspaces_dir=get_workspaces_dir(), since_epoch=started
+    )
+    return code
 
 def _print_workspace_lock_conflict(
     *,
@@ -440,6 +463,43 @@ def _prepare_runtime_session_dir(*, command_name: str) -> Path:
     return _runtime_session.create_session_dir(command_name=command_name)
 
 
+def large_download_notice_lines(*, image: str, pull_timeout: int | None) -> list[str]:
+    """The body of the "Large Docker Download" panel, for the image being pulled.
+
+    The last lines say how to retry by hand, and that depends on the image. A
+    plain ``docker pull`` fetches the free image. It cannot fetch the PRO image:
+    ADscan's registry answers only to the licence credential the launcher signs
+    for each pull, and Docker holds none, so the command would be refused. For
+    that image the panel names what does work.
+    """
+    from adscan_launcher.edition import is_pro_registry_image  # noqa: PLC0415
+
+    timeout_label = "disabled" if pull_timeout is None else f"{pull_timeout}s"
+    lines = [
+        "This step downloads multiple GB of container images and may take a while.",
+        "VPNs / proxies / flaky Wi-Fi can throttle or stall Docker pulls.",
+        "If possible, run the installation on a faster connection (or temporarily outside the VPN).",
+        f"Current pull timeout: {timeout_label}",
+        "",
+        "Adjust it if needed:",
+        f"  adscan install --pull-timeout {max(_DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS, 7200)}",
+        "Disable it entirely:",
+        "  adscan install --pull-timeout 0",
+        "",
+    ]
+    if is_pro_registry_image(image):
+        lines += [
+            "If the download stalls, run the install again, or `adscan update`. Layers",
+            "already downloaded are kept. ADscan pulls this image with your licence, so",
+            "a plain `docker pull` of it is refused.",
+            "To check that this machine reaches the licence server and the registry:",
+            "  adscan license check",
+        ]
+    else:
+        lines.append(f"Manual pull (to test connectivity): docker pull {image}")
+    return lines
+
+
 def _maybe_warn_about_slow_network_before_pull(
     *, image: str, pull_timeout: int | None
 ) -> bool:
@@ -455,22 +515,8 @@ def _maybe_warn_about_slow_network_before_pull(
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
 
-    timeout_label = "disabled" if pull_timeout is None else f"{pull_timeout}s"
-    lines = [
-        "This step downloads multiple GB of container images and may take a while.",
-        "VPNs / proxies / flaky Wi-Fi can throttle or stall Docker pulls.",
-        "If possible, run the installation on a faster connection (or temporarily outside the VPN).",
-        f"Current pull timeout: {timeout_label}",
-        "",
-        "Adjust it if needed:",
-        f"  adscan install --pull-timeout {max(_DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS, 7200)}",
-        "Disable it entirely:",
-        "  adscan install --pull-timeout 0",
-        "",
-        f"Manual pull (to test connectivity): docker pull {image}",
-    ]
     print_panel(
-        "\n".join(lines),
+        "\n".join(large_download_notice_lines(image=image, pull_timeout=pull_timeout)),
         title="Large Docker Download",
         border_style="yellow",
     )
@@ -687,7 +733,9 @@ def _enforce_host_memory_gate(*, command_name: str, allow_low_memory: bool) -> b
         print_warning(
             f"Continuing with critically low memory "
             f"({_format_free_memory(free_gb)} free) because the low-memory "
-            "override was set. The container may be OOM-killed."
+            "override was set. This is below the supported minimum of "
+            f"{_LOW_MEMORY_HARD_BLOCK_THRESHOLD_GB:.0f} GB: the run may be killed "
+            "for memory without recording where it stopped."
         )
         return True
 
@@ -770,6 +818,9 @@ def _get_docker_image_candidates() -> list[str]:
     """
     explicit = os.getenv("ADSCAN_DOCKER_IMAGE", "").strip()
     if explicit:
+        from adscan_launcher.edition import announce_legacy_override_once
+
+        announce_legacy_override_once(explicit)
         return [explicit]
 
     allow_legacy_fallback = str(
@@ -780,6 +831,18 @@ def _get_docker_image_candidates() -> list[str]:
         if allow_legacy_fallback:
             return [DEFAULT_DEV_DOCKER_IMAGE, LEGACY_DEFAULT_DEV_DOCKER_IMAGE]
         return [DEFAULT_DEV_DOCKER_IMAGE]
+
+    # The licence decides the edition (adscan_launcher/edition.py is the SSOT).
+    from adscan_launcher.edition import (
+        announce_fallback_once,
+        pro_image_candidates,
+        resolve_edition,
+    )
+
+    decision = resolve_edition()
+    announce_fallback_once(decision)
+    if decision.is_pro:
+        return pro_image_candidates()
 
     if allow_legacy_fallback:
         return [DEFAULT_DOCKER_IMAGE, LEGACY_DEFAULT_DOCKER_IMAGE]
@@ -850,6 +913,10 @@ def _registry_label_for_host(host: str) -> str:
         return "Docker Hub"
     if normalized == "ghcr.io":
         return "GitHub Container Registry (ghcr.io)"
+    from adscan_launcher.edition import PRO_REGISTRY_HOST
+
+    if normalized == PRO_REGISTRY_HOST:
+        return f"the ADscan registry ({PRO_REGISTRY_HOST})"
     return str(host).strip()
 
 
@@ -866,6 +933,12 @@ def _docker_login_command_for_image(image: str) -> str:
     host = _registry_host_for_image(image)
     if str(host or "").strip().lower() == _DOCKER_PULL_DNS_PREFLIGHT_HOST:
         return "docker logout && docker login"
+    from adscan_launcher.edition import PRO_REGISTRY_HOST
+
+    if str(host or "").strip().lower() == PRO_REGISTRY_HOST:
+        # No docker login: the launcher signs a fresh credential from this
+        # machine's activated licence for every pull.
+        return "adscan license status"
     return f"docker login {host}"
 
 
@@ -1594,10 +1667,19 @@ def _ensure_image_pulled_with_legacy_fallback(
     for idx, candidate in enumerate(candidates):
         candidate_to_pull = _normalize_image_reference_for_runtime(candidate)
         if idx > 0:
-            print_info(
-                "[dim]Primary image unavailable — trying legacy naming[/dim] "
-                f"[dim]·[/dim] {candidate_to_pull}"
-            )
+            from adscan_launcher.edition import LEGACY_PRO_SUNSET, is_pro_registry_image
+
+            if is_pro_registry_image(preferred):
+                print_info(
+                    "[dim]ADscan's registry could not be reached; trying the previous PRO registry "
+                    f"this host is signed in to (available until {LEGACY_PRO_SUNSET})[/dim] "
+                    f"[dim]·[/dim] {candidate_to_pull}"
+                )
+            else:
+                print_info(
+                    "[dim]Primary image unavailable — trying legacy naming[/dim] "
+                    f"[dim]·[/dim] {candidate_to_pull}"
+                )
         # First attempt: classify on failure but do NOT surface guidance
         # — the retry path below decides whether to recover quietly or
         # promote the failure to the caller.
@@ -1620,6 +1702,11 @@ def _ensure_image_pulled_with_legacy_fallback(
             # guarantee even if a future path records the diagnosis without
             # raising, and re-raises so the launcher unwinds cleanly.
             raise KeyboardInterrupt
+        if first_failure is not None and first_failure.kind in TERMINAL_KINDS:
+            # The licence said no, this machine's clock is off, or the token
+            # service is limiting this host: retrying or falling back to another
+            # registry would only hide that. The caller renders the panel.
+            return None
         daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
             run_docker_command_func=_run_docker_status_command
         )
@@ -1660,6 +1747,9 @@ def _ensure_image_pulled_with_legacy_fallback(
                     preferred_image=preferred,
                     first_failure=first_failure,
                 )
+            retry_failure = peek_last_failure()
+            if retry_failure is not None and retry_failure.kind in TERMINAL_KINDS:
+                return None
             daemon_running, daemon_diagnostic = _is_docker_daemon_running_internal(
                 run_docker_command_func=_run_docker_status_command
             )
@@ -3391,17 +3481,20 @@ def _print_docker_install_summary() -> None:
     telemetry_enabled = _is_telemetry_enabled()
     if telemetry_enabled:
         tele_status = Text("  ON", style="bold green")
-        tele_status.append(" -- anonymous, sanitized usage analytics", style="dim")
+        from adscan_core.telemetry_disclosure import (
+            TELEMETRY_DETAIL_ROWS,
+            TELEMETRY_ON_SUMMARY,
+        )
+
+        tele_status.append(f" -- {TELEMETRY_ON_SUMMARY}", style="dim")
         renderables.append(tele_status)
         renderables.append(Text(""))
 
         tele_detail = Table.grid(padding=(0, 1))
         tele_detail.add_column(justify="right", style="dim", no_wrap=True, min_width=12)
         tele_detail.add_column(justify="left", style="dim")
-        tele_detail.add_row("What", "Commands run, feature usage, errors")
-        tele_detail.add_row("Not sent", "IPs, domains, credentials, paths")
-        tele_detail.add_row("Session off", "export ADSCAN_TELEMETRY=0")
-        tele_detail.add_row("Permanent", "telemetry off  (inside ADscan)")
+        for _label, _value in TELEMETRY_DETAIL_ROWS:
+            tele_detail.add_row(_label, _value)
         tele_detail.add_row("Details", cta_markup("telemetry_notice"))
         renderables.append(tele_detail)
     else:
@@ -3484,6 +3577,7 @@ def handle_install_docker(
     *,
     pull_timeout_seconds: int | None = None,
     allow_low_memory: bool = False,
+    image_preloaded: bool = False,
 ) -> bool:
     """Install ADscan via Docker (pull image)."""
     _emit_docker_runtime_context(command_name="install")
@@ -3497,12 +3591,12 @@ def handle_install_docker(
     if install_lock is None:
         return False
     try:
-        return _do_install_docker(pull_timeout_seconds=pull_timeout_seconds)
+        return _do_install_docker(pull_timeout_seconds=pull_timeout_seconds, image_preloaded=image_preloaded)
     finally:
         _runtime_session.release_lock(install_lock)
 
 
-def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
+def _do_install_docker(*, pull_timeout_seconds: int | None, image_preloaded: bool = False) -> bool:
     """Install body that runs while the install lock is held."""
     telemetry.capture(
         "docker_install_started",
@@ -3560,14 +3654,16 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
         print_info_debug(f"[install] Free RAM at install: {free_mem_gb:.2f} GB")
         return False
 
-    print_info(f"Pulling image: {image}")
+    # `install --image-archive` already verified and loaded the image offline.
+    preloaded = bool(image_preloaded and image_exists(image))
+    print_info(f"Using the verified image loaded from the archive: {image}" if preloaded else f"Pulling image: {image}")
     image_pull_start = time.monotonic()
     telemetry.capture("docker_install_pull_adscan_image_started", {"image": image})
 
     pull_timeout = _normalize_pull_timeout_seconds(pull_timeout_seconds)
     timeout_label = "disabled" if pull_timeout is None else f"{pull_timeout}s"
     print_info_debug(f"[docker] pull timeout: {timeout_label}")
-    if not _maybe_warn_about_slow_network_before_pull(
+    if not preloaded and not _maybe_warn_about_slow_network_before_pull(
         image=image, pull_timeout=pull_timeout
     ):
         telemetry.capture(
@@ -3579,7 +3675,7 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
         )
         print_warning("Installation cancelled before Docker image download.")
         return False
-    resolved_image = _ensure_image_pulled_with_legacy_fallback(
+    resolved_image = image if preloaded else _ensure_image_pulled_with_legacy_fallback(
         pull_timeout=pull_timeout,
         stream_output=True,
     )
@@ -3625,6 +3721,23 @@ def _do_install_docker(*, pull_timeout_seconds: int | None) -> bool:
 
     _print_docker_install_summary()
 
+    # A successful install is a recorded state: `adscan --version` and
+    # `adscan check` read it, so neither says "no update recorded yet" after it.
+    try:
+        from adscan_launcher.update_manager import record_successful_install  # noqa: PLC0415
+
+        record_successful_install(str(_get_state_dir()), docker_image=str(image or ""))
+    except Exception as exc:  # noqa: BLE001 - never fail an install on bookkeeping
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+
+    # TELEMETRY IS ALREADY DISCLOSED HERE: `_print_docker_install_summary()` above
+    # renders a "Telemetry" section on EVERY install (status, what is collected,
+    # sanitization, the PRO licence link, and how to turn it off), with its text
+    # from `adscan_core/telemetry_disclosure.py` (the SSOT for that wording). Do not
+    # read the TODO below as "install does not mention telemetry": it only concerns
+    # an optional, separate thank-you note.
+    #
     # SHOW-ONCE onboarding: the thank-you-for-installing / welcome note goes here,
     # gated on `should_show_once(NOTICE_WELCOME_INSTALL)` so a re-install / repeated
     # `adscan install` does not re-print it. The flag persists in the mounted state
@@ -3804,6 +3917,8 @@ def handle_start_docker(
     allow_low_memory: bool = False,
     tui: bool = False,
     extra_env: Sequence[tuple[str, str]] = (),
+    extra_args: Sequence[str] = (),
+    extra_mounts: Sequence[tuple[str, str]] = (),
 ) -> int:
     """Start ADscan inside Docker and return the docker exit code.
 
@@ -3811,6 +3926,10 @@ def handle_start_docker(
         extra_env: Additional container environment pairs (the engagement
             posture toggles ``--offline`` / ``--no-telemetry``, translated at
             the launcher seam).
+        extra_args: Extra ``adscan start`` arguments for the container (the
+            validated ``--scope-*`` flags, file paths already rewritten).
+        extra_mounts: Read-only ``(host_file, container_path)`` mounts (the
+            engagement-scope files).
     """
     _emit_docker_runtime_context(command_name="start")
     _emit_docker_host_resources_context(command_name="start")
@@ -3892,6 +4011,7 @@ def handle_start_docker(
             ),
             run_host_dir=acq.session_dir,
             deliverables_host_dir=_prepare_deliverables_mount(),
+            extra_mounts=tuple(extra_mounts),
         )
 
         adscan_args: list[str] = []
@@ -3902,6 +4022,7 @@ def handle_start_docker(
             adscan_args.append("--debug")
         if tui:
             adscan_args.append("--tui")
+        adscan_args.extend(extra_args)
 
         # Non-blocking: warn (premium panel) if the runtime is rootless/userns,
         # so the operator sees what's degraded instead of a cryptic kernel EPERM.
@@ -3909,8 +4030,7 @@ def handle_start_docker(
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
         print_info_debug(f"[docker] start: {shell_quote_cmd(cmd)}")
         try:
-            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-            return int(proc.returncode)
+            return _run_container_and_report_stop(cmd)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -4170,8 +4290,7 @@ def handle_ci_docker(
         cmd = build_adscan_run_command(cfg, adscan_args=adscan_args)
         print_info_debug(f"[docker] ci: {shell_quote_cmd(cmd)}")
         try:
-            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-            return int(proc.returncode)
+            return _run_container_and_report_stop(cmd)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)
@@ -4378,8 +4497,7 @@ def run_adscan_passthrough_docker(
         cmd = build_adscan_run_command(cfg, adscan_args=container_args)
         print_info_debug(f"[docker] passthrough: {shell_quote_cmd(cmd)}")
         try:
-            proc = run_docker(cmd, check=False, capture_output=False, timeout=None)
-            return int(proc.returncode)
+            return _run_container_and_report_stop(cmd)
         except subprocess.SubprocessError as exc:
             telemetry.capture_exception(exc)
             print_exception(exception=exc)

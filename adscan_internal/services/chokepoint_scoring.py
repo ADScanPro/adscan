@@ -393,11 +393,45 @@ def _build_forward_adjacency(
     return forward
 
 
+#: The most severe rank :func:`severity_rank` can return. Once a choke's best
+#: protected edge reaches it, no later edge can replace it (the walk keeps the
+#: first STRICTLY more severe edge), so the walk stops there.
+_BEST_POSSIBLE_RANK: int = min(severity_rank(sev) for sev in Severity)
+
+#: Per-node severity grades of its outbound edges, aligned with ``forward[node]``.
+EdgeGrades = dict[str, list[tuple[Severity, int]]]
+
+
+def _edge_grades_of(
+    node_id: str,
+    *,
+    nodes_map: Mapping[str, Any],
+    forward: Mapping[str, list[tuple[str, str]]],
+    grades: EdgeGrades,
+) -> list[tuple[Severity, int]]:
+    """The ``(severity, rank)`` of each edge leaving ``node_id``, graded once.
+
+    An edge's grade depends only on its two endpoints and its relation, so it is
+    the same whichever choke's walk reaches it. Shared across the walks of one
+    ranking, every edge is graded at most once instead of once per choke.
+    """
+    cached = grades.get(node_id)
+    if cached is None:
+        source = nodes_map.get(node_id)
+        cached = []
+        for to_id, relation in forward.get(node_id, ()):
+            sev = _severity_for_edge_into(source, nodes_map.get(to_id), relation)
+            cached.append((sev, severity_rank(sev)))
+        grades[node_id] = cached
+    return cached
+
+
 def _best_protected_terminal(
     choke_id: str,
     *,
     nodes_map: Mapping[str, Any],
     forward: Mapping[str, list[tuple[str, str]]],
+    grades: EdgeGrades | None = None,
 ) -> tuple[Severity, int, str, str] | None:
     """Find the highest-severity value-terminal a choke protects.
 
@@ -409,32 +443,39 @@ def _best_protected_terminal(
     the DC. The choke's OWN inbound edge is not the finding — the outbound reach
     to the protected asset is.
 
+    The walk keeps the FIRST edge of the most severe grade it meets, so it stops
+    as soon as that grade is the most severe one possible: nothing later can
+    replace it. Edge grades come from ``grades`` (shared by every choke of one
+    ranking) so a walk over the same region never grades an edge twice.
+
     Args:
         choke_id: The choke node id.
         nodes_map: node-id → node-dict map.
         forward: Forward adjacency ``from_id -> [(to_id, relation), ...]``.
+        grades: Shared per-node edge grades (see :func:`_edge_grades_of`).
 
     Returns:
         A ``(severity, severity_rank, terminal_id, relation)`` tuple for the
         best-protected terminal, or ``None`` when the choke reaches nothing.
     """
+    if grades is None:
+        grades = {}
     best: tuple[Severity, int, str, str] | None = None
     best_rank: int | None = None
     seen: set[str] = {choke_id}
     pending: list[str] = [choke_id]
-    from_node = nodes_map.get(choke_id)
     expanded = 0
     while pending and expanded < _FORWARD_BFS_NODE_CAP:
         current = pending.pop()
-        current_node = nodes_map.get(current)
-        for to_id, relation in forward.get(current, ()):
-            edge_source = current_node if current != choke_id else from_node
-            to_node = nodes_map.get(to_id)
-            sev = _severity_for_edge_into(edge_source, to_node, relation)
-            rank = severity_rank(sev)
+        edge_grades = _edge_grades_of(
+            current, nodes_map=nodes_map, forward=forward, grades=grades
+        )
+        for (to_id, relation), (sev, rank) in zip(forward.get(current, ()), edge_grades):
             if best_rank is None or rank < best_rank:
                 best_rank = rank
                 best = (sev, rank, to_id, relation)
+                if rank <= _BEST_POSSIBLE_RANK:
+                    return best
             if to_id not in seen:
                 seen.add(to_id)
                 pending.append(to_id)
@@ -447,6 +488,7 @@ def _enrich_node_choke(
     *,
     nodes_map: Mapping[str, Any],
     forward: Mapping[str, list[tuple[str, str]]],
+    grades: EdgeGrades | None = None,
 ) -> dict[str, Any]:
     """Enrich one H3 node-choke entry with its protected-terminal severity.
 
@@ -462,7 +504,9 @@ def _enrich_node_choke(
     node_id = str(entry.get("node_id") or "")
     cardinality = int(entry.get("cardinality") or 0)
     node = nodes_map.get(node_id)
-    best = _best_protected_terminal(node_id, nodes_map=nodes_map, forward=forward)
+    best = _best_protected_terminal(
+        node_id, nodes_map=nodes_map, forward=forward, grades=grades
+    )
     if best is None:
         # A choke that reaches no forward target has no protected terminal — grade
         # it at the floor (INFO) so it sorts last but is never dropped.
@@ -562,11 +606,12 @@ def rank_chokepoints(
         and the shared ``ranked_edges`` secondary list.
     """
     forward = _build_forward_adjacency(graph)
+    grades: EdgeGrades = {}
 
     raw_nodes = summary.get("top_node_chokepoints")
     node_entries = raw_nodes if isinstance(raw_nodes, list) else []
     ranked_nodes = [
-        _enrich_node_choke(entry, nodes_map=nodes_map, forward=forward)
+        _enrich_node_choke(entry, nodes_map=nodes_map, forward=forward, grades=grades)
         for entry in node_entries
         if isinstance(entry, Mapping)
         and not _node_is_structural_well_known(

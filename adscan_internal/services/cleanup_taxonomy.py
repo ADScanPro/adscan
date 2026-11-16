@@ -126,6 +126,14 @@ _MANUAL_REASON_LABELS: dict[str, str] = {
 }
 
 
+def scheduled_revert_label(kind: str | None, reverted_by: str) -> str:
+    """Operator line for a change whose revert is scheduled for the end of the run."""
+    who = str(reverted_by or "").strip() or "the best credential available then"
+    if str(kind or "") == KIND_ISSUED_CERTIFICATE:
+        return f"will be revoked at the end of the run by {who}"
+    return f"will be reverted at the end of the run by {who}"
+
+
 def manual_reason_label(reason: str | None) -> str:
     """Return a humanized, client-safe label for a manual_reason discriminator."""
     return _MANUAL_REASON_LABELS.get(
@@ -1360,6 +1368,9 @@ def remediation_for_entry(entry: dict) -> str:
         return template.replace("TARGET", _bare_name(account) or account)
     if kind == KIND_OBJECT_RESTORED:
         return object_restored_remediation(object_dn or target)
+    if kind == _cleanup_commands.KIND_MSSQL_XP_CMDSHELL_ENABLED:
+        # Both settings the enable changed, each to its recorded value.
+        return _cleanup_commands.mssql_xp_cmdshell_instruction(target, detail)
     if kind in HOST_ARTIFACT_KINDS:
         return remote_artifact_remediation(
             remote_path=str(detail.get("remote_path") or detail.get("path") or "") or None,

@@ -7,12 +7,15 @@ deployment is not Enterprise, at the same three seams:
   ``execute``, ``start``, ``recheck``).
 * :func:`ensure_pro_domain_admitted` — where assessment of a domain begins:
   computes the per-partner domain code, shows it, and registers the forest
-  under the licence's policy (trial: queued, never blocks; partner and paid:
-  registered, 14 days of grace for a new code; offline engagement: the
-  environment ledger).
+  under the licence's policy (trial, partner and paid: registered, with the
+  grace the licence states for a new code, 7 days by default; offline
+  engagement: the environment ledger).
 * :func:`record_pro_scan_bands` — at scan end: the identity band of each
   admitted forest, queued as a band report when it changed, and written on
-  this run's usage line.
+  this run's usage line with the run's size counts and run status
+  (:mod:`adscan_internal.services.licence_run_size`). A partner licence also
+  reports those counts on the band report; every other edition keeps them in
+  its local register.
 * :func:`record_pro_recheck_usage` — after ``adscan recheck``: a usage line
   ``run_kind=recheck`` with its parent scan for each code that scan assessed.
   Nothing is queued for the server: a recheck is never billable.
@@ -29,18 +32,30 @@ an installed licence behaves exactly as before. Never raises: an unexpected
 failure on a REQUIRED licence refuses ("could not verify" never reads as
 "licensed"); on a dormant one it changes nothing.
 
-Network: only a direct registration attempt (short timeout) when a new domain
-is admitted, and never under ``ADSCAN_OFFLINE`` / ``ADSCAN_NO_EXTERNAL``
-(relay mode then). Telemetry carries the state and outcome only, never a
-licence id, an activation key or a domain code.
+Network: the launch check-in (about two seconds at most,
+:func:`adscan_core.pro_license.client.launch_check_in`) and a direct
+registration attempt (short timeout) when a new domain is admitted; each
+contact that reaches the server also sends the queued registrations and
+reports (:func:`adscan_core.pro_license.client.flush_pending`), inside its
+budget. Whether the channel may connect is
+:func:`adscan_core.pro_license.channel.licence_channel_allowed`: every online
+licence connects even under ``ADSCAN_OFFLINE`` / ``ADSCAN_NO_EXTERNAL`` (the
+first such contact of a run prints one line); an offline engagement licence
+and an Enterprise process never do. Offline mode never relaxes a local check.
+Telemetry carries the state and outcome only, never a licence id, an
+activation key or a domain code.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import time as _time
+
 from adscan_core.offline import offline_mode_enabled
+from adscan_core.pro_license import channel as pro_channel
 from adscan_core.pro_license import client as pro_client
+from adscan_core.pro_license import documents as pro_docs
 from adscan_core.pro_license import evaluation as pro_eval
 from adscan_core.pro_license.billable_engagements import RUN_KIND_FULL_SCAN, RUN_KIND_RECHECK
 from adscan_core.pro_license.model import POLICY_OFFLINE, ProLicense
@@ -53,6 +68,8 @@ PRO_LICENSE_MARKER = pro_eval.PRO_LICENSE_MARKER
 
 _MEMO_ATTR = "_pro_domain_admissions"
 _DIRECT_TIMEOUT_SECONDS = 5.0
+#: Budget of the queue flush that follows a successful admission or scan-end contact.
+_FLUSH_BUDGET_SECONDS = 5.0
 
 
 def _is_pro() -> bool:
@@ -99,13 +116,63 @@ def _write_refusal(shell: Any, reason_code: str, message: str) -> None:
     _write_refusal_marker(shell, reason_code, message)
 
 
+def _check_in(store: ProLicenseStore) -> tuple[str, pro_client.CheckInResult | None]:
+    """The launch check-in (bounded, never blocks on an unreachable server); its outcome and result."""
+    result = pro_client.launch_check_in(store)
+    if result is None:
+        # Telemetry label only: the channel itself was decided by licence_channel_allowed.
+        return ("offline" if offline_mode_enabled() else "skipped"), None
+    if result.error is not None:
+        telemetry.capture_exception(result.error)
+        print_exception(exception=result.error)
+    return result.outcome, result
+
+
+def _announce_licence_notice(store: ProLicenseStore, status: Any, result: Any) -> bool:
+    """Tell the operator and the run's event stream what the licence needs. True when printed.
+
+    One derivation (:func:`adscan_core.pro_license.connection.licence_notice`)
+    feeds the terminal and the ``licence_notice`` event an integrator's platform
+    reads. Only when a check-in ran: a closed channel keeps its own wording.
+    Never raises.
+    """
+    if result is None:
+        return False
+    try:
+        from adscan_core.pro_license import connection
+        from adscan_internal.cli.ci_events import emit_event
+        from adscan_internal.interaction import is_non_interactive
+
+        notice = connection.licence_notice(store, status, check_in=result)
+        block = connection.notice_block(notice)
+        if block is not None:
+            emit_event("licence_notice", licence_notice=block)
+        return connection.print_notice(notice, interactive=not is_non_interactive())
+    except Exception as exc:  # noqa: BLE001 - a notice never decides a launch
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
+        return False
+
+
 def ensure_pro_license_allows_new_scan(command_name: str, *, workspace_dir: str | None = None) -> bool:
-    """True when a new assessment may start under the PRO licence."""
+    """True when a new assessment may start under the PRO licence.
+
+    Checks in with the licence server first (online only, bounded to about two
+    seconds), so a revocation or a changed grant applies to THIS launch, then
+    decides from the local signed document exactly as before: offline mode
+    skips the check-in, never the local checks. The decision reads the wall
+    clock here, before any clock step, and pins the session clock that every
+    later decision of this run reads.
+    """
     try:
         store = _store()
         if not _required(store):
             return True
-        status = pro_eval.check_pro_license(store, record=True)
+        check_in, check_in_result = _check_in(store)
+        now = pro_docs.utc_now()
+        status = pro_eval.check_pro_license(store, record=True, now=now)
+        if status.scans_allowed:
+            pro_eval.anchor_session_clock(now)
     except Exception as exc:  # noqa: BLE001 - a verifier crash must not pass silently
         telemetry.capture_exception(exc)
         print_exception(exception=exc)
@@ -116,8 +183,15 @@ def ensure_pro_license_allows_new_scan(command_name: str, *, workspace_dir: str 
         return False
     telemetry.capture(
         "pro_license_checked",
-        properties={"command": command_name, "state": status.state, "scans_allowed": status.scans_allowed},
+        properties={
+            "command": command_name,
+            "state": status.state,
+            "scans_allowed": status.scans_allowed,
+            "check_in": check_in,
+            "notice_level": status.notice_level,
+        },
     )
+    announced = _announce_licence_notice(store, status, check_in_result)
     if not status.scans_allowed:
         print_error(status.message)
         if workspace_dir:
@@ -125,18 +199,55 @@ def ensure_pro_license_allows_new_scan(command_name: str, *, workspace_dir: str 
 
             _write_refusal_marker_in(workspace_dir, f"pro_license_{status.state}", status.message)
         return False
-    if status.warning:
-        print_warning(status.message)
+    try:
+        from adscan_core.pro_license.status_view import print_launch_notice
+        from adscan_internal.interaction import is_non_interactive
+
+        # The connection notice already covers a document this machine could not refresh.
+        if not (announced and status.refresh_notice):
+            print_launch_notice(status, interactive=not is_non_interactive())
+    except Exception as exc:  # noqa: BLE001 - a notice never blocks an allowed launch
+        telemetry.capture_exception(exc)
+        print_exception(exception=exc)
     return True
 
 
-def _send_callable():
-    if offline_mode_enabled():
+class _ChannelSender:
+    """The licence channel's direct sender for one admission or scan end.
+
+    Prints the offline-mode line on the first real contact of the run, and
+    remembers whether the server answered, so the caller flushes the queue
+    after a successful contact.
+    """
+
+    def __init__(self, licence: ProLicense, transport: pro_client.HttpTransport) -> None:
+        self.licence = licence
+        self.transport = transport
+        self.reached = False
+
+    def __call__(self, document: Any) -> Any:
+        pro_channel.note_offline_contact(self.licence, emit=print_info)
+        answer = self.transport.send(document)
+        if answer is not None:
+            self.reached = True
+        return answer
+
+    def flush(self, store: ProLicenseStore) -> int:
+        """Send every queued registration and report, within the flush budget."""
+        pro_channel.note_offline_contact(self.licence, emit=print_info)
+        summary = pro_client.flush_pending(
+            store, self.transport, deadline=_time.monotonic() + _FLUSH_BUDGET_SECONDS
+        )
+        if summary.applied:
+            self.reached = True
+        return summary.applied
+
+
+def _channel_sender(licence: ProLicense | None) -> _ChannelSender | None:
+    transport = pro_client.channel_transport(licence, timeout=_DIRECT_TIMEOUT_SECONDS)
+    if transport is None or licence is None:
         return None
-    try:
-        return pro_client.HttpTransport(timeout=_DIRECT_TIMEOUT_SECONDS).send
-    except ValueError:
-        return None
+    return _ChannelSender(licence, transport)
 
 
 def _admit_offline(shell: Any, store: ProLicenseStore, licence: ProLicense, identity: Any) -> tuple[bool, str, str]:
@@ -172,7 +283,16 @@ def ensure_pro_domain_admitted(shell: Any, domain_norm: str, *, dc_ip: str | Non
             not previous.get("allowed") or phase != PHASE_AUTH or previous.get("auth_retried")
         ):
             return bool(previous.get("allowed"))
-        status = pro_eval.check_pro_license(store)
+        # What the workspace held before this run assessed the domain, so the
+        # scan end counts only what this run produced (first admission only).
+        size_baseline = (previous or {}).get("size_baseline")
+        if size_baseline is None:
+            from adscan_internal.services.licence_run_size import capture_size_baseline
+
+            size_baseline = capture_size_baseline(shell, domain_norm)
+        # The session clock: the launch instant plus elapsed time, immune to
+        # the clock steps ADscan makes for Kerberos during the run.
+        status = pro_eval.check_pro_license(store, session_clock=True)
         if not status.scans_allowed or status.licence is None:
             print_error(status.message)
             memo[domain_norm] = {"allowed": False}
@@ -193,18 +313,25 @@ def ensure_pro_domain_admitted(shell: Any, domain_norm: str, *, dc_ip: str | Non
             code, basis = code_for_identity(licence.domain_code_key, identity)
             outcome = "offline_admitted" if allowed else "offline_refused"
         else:
+            sender = _channel_sender(licence) if run_kind != RUN_KIND_RECHECK else None
             result = pro_eval.admit_domain(
                 store,
                 licence,
                 identity,
+                now=pro_eval.session_now(),
                 engine_version=pro_client.engine_version(),
-                send=_send_callable(),
+                send=sender,
                 supersedes=supersedes,
                 run_kind=run_kind,
                 run_id=run_id,
             )
             allowed, message, reason = result.allowed, result.message, result.reason_code
             code, basis, outcome = result.domain_code, result.code_basis, result.outcome
+            if result.receipt_problem:
+                print_warning(result.receipt_problem)
+            if sender is not None and sender.reached:
+                # The server answered: send whatever else is queued (older domains, reports).
+                sender.flush(store)
         if allowed and run_kind == RUN_KIND_FULL_SCAN:
             pro_eval.record_assessment(
                 store,
@@ -231,6 +358,7 @@ def ensure_pro_domain_admitted(shell: Any, domain_norm: str, *, dc_ip: str | Non
         "domain_code": code,
         "code_basis": basis,
         "auth_retried": phase == PHASE_AUTH,
+        "size_baseline": size_baseline,
     }
     telemetry.capture("pro_domain_admission", properties={"phase": phase, "outcome": outcome, "basis": basis})
     print_info(
@@ -254,8 +382,41 @@ def _identity_count(shell: Any, domain: str) -> int | None:
     return int(count) if count is not None else None
 
 
+def _record_run_sizes(shell: Any, store: ProLicenseStore, licence: ProLicense) -> list[str]:
+    """Write this run's size counts and run status on each admitted code's line.
+
+    One line per code (a forest): its ``domain_sizes`` lists the counts of each
+    domain of that forest this run assessed. Returns the codes whose line
+    changed. Never raises.
+    """
+    from adscan_internal.services.licence_run_size import domain_size_counts, run_completion_status
+
+    by_code: dict[str, list[dict[str, Any]]] = {}
+    baselines: list[Any] = []
+    for domain, entry in pro_admission_memo(shell).items():
+        if not entry.get("allowed") or not entry.get("domain_code"):
+            continue
+        baseline = entry.get("size_baseline")
+        baselines.append(baseline)
+        by_code.setdefault(entry["domain_code"], []).append(domain_size_counts(shell, domain, baseline))
+    if not by_code:
+        return []
+    status = run_completion_status(shell, baseline=next((b for b in baselines if b), None))
+    run_id = _run_id()
+    return [
+        code
+        for code, sizes in by_code.items()
+        if store.set_assessment_size(run_id, code, domain_sizes=sizes, run_status=status)
+    ]
+
+
 def record_pro_scan_bands(shell: Any) -> None:
-    """Queue a band report for each admitted forest whose band changed. Never raises."""
+    """At scan end: the band, the size counts and the run status of each admitted forest. Never raises.
+
+    Every edition records them on its local usage line. A band report is
+    queued when the band changed; a partner licence also reports the run's
+    counts (:func:`adscan_core.pro_license.client.queue_run_size_report`).
+    """
     try:
         store = _store()
         if not _required(store):
@@ -268,6 +429,7 @@ def record_pro_scan_bands(shell: Any) -> None:
                 count = _identity_count(shell, domain) if entry.get("allowed") and entry.get("domain_code") else None
                 if count is not None:
                     store.set_assessment_band(_run_id(), entry["domain_code"], licence.band_for(int(count)))
+            _record_run_sizes(shell, store, licence)
             return
         queued = 0
         for domain, entry in pro_admission_memo(shell).items():
@@ -279,17 +441,25 @@ def record_pro_scan_bands(shell: Any) -> None:
             store.set_assessment_band(_run_id(), entry["domain_code"], licence.band_for(int(count)))
             if pro_client.queue_band_report(store, licence, entry["domain_code"], count):
                 queued += 1
-        send = _send_callable() if queued else None
-        if send is not None:
-            entries = store.register_entries()
-            for item in store.pending():
-                code = item.get("document", {}).get("payload", {}).get("domain_code")
-                # A band follows its registration; an unregistered code keeps its band queued.
-                if item.get("kind") == "band_report" and (entries.get(code) or {}).get("status") == "registered":
-                    answer = send(item["document"])
-                    if answer is None:
-                        break
-                    store.apply_answer(answer)
+        for code in _record_run_sizes(shell, store, licence):
+            line = next(
+                (r for r in store.assessment_records() if r.run_id == _run_id() and r.domain_code == code), None
+            )
+            if line is not None and pro_client.queue_run_size_report(
+                store,
+                licence,
+                domain_code=code,
+                run_id=line.run_id,
+                band=line.band,
+                run_status=line.run_status,
+                domain_sizes=list(line.domain_sizes or ()),
+            ):
+                queued += 1
+        sender = _channel_sender(licence) if queued else None
+        if sender is not None:
+            # Registrations first; a band follows its registration, and an
+            # unregistered code keeps its band queued (flush_pending's rule).
+            sender.flush(store)
     except Exception as exc:  # noqa: BLE001 - a band report never breaks a scan
         telemetry.capture_exception(exc)
         print_exception(exception=exc)

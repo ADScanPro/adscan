@@ -61,7 +61,17 @@ class _ReportShell:
     generation). An empty dict is the correct "no live credential state" for a
     report-only shell — every reader treats a missing-domain lookup as empty, so
     ``{}`` yields the same result while never raising.
+
+    That dict is scratch space, not a build context: an engine helper may cache
+    a value into it (the domain SID) mid-compute. The class therefore declares
+    itself a reader without a context of its own
+    (``graph_runtime.CONTEXT_FREE_READER_ATTR``), so it reads the live graph the
+    session built and never rebuilds the graph from that scratch map.
     """
+
+    #: ``graph_runtime.CONTEXT_FREE_READER_ATTR`` (a literal here: this module
+    #: must stay importable without the graph runtime; a test locks the name).
+    graph_reader_without_context = True
 
     def __init__(self, workspace_dir: str) -> None:
         self.current_workspace_dir = str(workspace_dir)

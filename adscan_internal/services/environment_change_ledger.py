@@ -54,6 +54,12 @@ CLEANUP_BUCKET_KEPT = _tax.CLEANUP_BUCKET_KEPT
 CLEANUP_BUCKET_IN_PROGRESS = _tax.CLEANUP_BUCKET_IN_PROGRESS
 cleanup_bucket = _tax.cleanup_bucket
 
+#: Entry key: when a revert that has not run yet is scheduled (absent or null
+#: when none is). Additive in ``environment_changes`` 1.2.
+_REVERT_SCHEDULED_KEY = "revert_scheduled"
+#: The revert runs in the final pass of this run.
+REVERT_SCHEDULED_END_OF_RUN = "end_of_run"
+
 # Maximum bounded retries before a transient revert failure becomes manual.
 MAX_REVERT_ATTEMPTS = 3
 
@@ -74,6 +80,45 @@ CHANGE_CLASS_OPERATOR_CONFIRMED = "operator_confirmed"
 _VALID_CHANGE_CLASSES = (CHANGE_CLASS_AUTO_REVERT, CHANGE_CLASS_OPERATOR_CONFIRMED)
 
 
+#: Change ids registered by THIS process. A record whose id is not here was
+#: read from disk: it was made by an earlier session of the workspace. Kept at
+#: module level because a ledger object is rebuilt each time its workspace is
+#: activated, and a change of the running session must never read as inherited.
+_REGISTERED_IN_PROCESS: set[str] = set()
+
+#: Statuses of a record whose revert has not settled.
+_NON_TERMINAL_STATUSES = frozenset(
+    {
+        STATUS_PENDING,
+        STATUS_REVERT_IN_PROGRESS,
+        STATUS_REVERT_FAILED_RETRYING,
+    }
+)
+
+
+def change_is_inherited(entry: Any) -> bool:
+    """Whether a ledger record was made by an EARLIER session of the workspace.
+
+    A session that ends without its exit cleanup (killed, crashed) leaves its
+    records on disk, and the next run of the workspace loads them. Those are
+    still ADscan's changes, so that run retries their revert; what tells them
+    apart from the running session's own records is that this process never
+    registered them.
+    """
+    if not isinstance(entry, dict):
+        return False
+    change_id = str(entry.get("change_id") or "").strip()
+    return bool(change_id) and change_id not in _REGISTERED_IN_PROCESS
+
+
+def change_is_inherited_unsettled(entry: Any) -> bool:
+    """An inherited record whose revert never settled (pending or mid-revert)."""
+    if not change_is_inherited(entry):
+        return False
+    status = str(entry.get("revert_status") or "").strip().lower()
+    return status in _NON_TERMINAL_STATUSES or status == _tax.STATUS_LEGACY_FAILED
+
+
 def _utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -83,8 +128,11 @@ class EnvironmentChangeLedger:
 
     Persists every change to {workspace_dir}/environment_changes.json after
     each mutation. Emits structured events via ci_events for web UI consumption.
-    Safe to instantiate even when the workspace directory does not exist yet —
-    flush() will simply fail silently and capture via telemetry.
+    Safe to instantiate even when the workspace directory does not exist yet:
+    flush() creates it. The ledger is activated before the workspace's first
+    save on a new workspace (a validation job's throwaway one, a first scan),
+    and writing into the missing directory used to print a FileNotFoundError
+    traceback and leave the empty ledger unwritten until a later change.
     """
 
     def __init__(self, workspace_dir: str) -> None:
@@ -131,6 +179,7 @@ class EnvironmentChangeLedger:
             change_class if change_class in _VALID_CHANGE_CLASSES else CHANGE_CLASS_AUTO_REVERT
         )
         change_id = str(uuid.uuid4())
+        _REGISTERED_IN_PROCESS.add(change_id)
         entry: dict[str, Any] = {
             "change_id": change_id,
             "kind": str(kind),
@@ -254,6 +303,16 @@ class EnvironmentChangeLedger:
         # Clearing any prior failure context on a confirmed revert.
         entry["revert_error"] = None
         entry["manual_reason"] = None
+        # The instructions written while the change was still in place ("ADscan
+        # did not revoke it ...") are false from this moment: a reverted record
+        # never keeps the way to remove it by hand. A note the revert itself
+        # stamped afterwards (what a revoked certificate still needs) is a
+        # different string and stays.
+        stale = entry.get("manual_cleanup_instructions")
+        if stale and entry.get("remediation_command") == stale:
+            entry["remediation_command"] = None
+        entry["manual_cleanup_instructions"] = None
+        entry.pop(_REVERT_SCHEDULED_KEY, None)
         self._recompute_summary()
         self.flush()
         emit_event(
@@ -350,11 +409,94 @@ class EnvironmentChangeLedger:
             entry["manual_cleanup_instructions"] = str(instructions)
         self._recompute_summary()
         self.flush()
+        if entry.get(_REVERT_SCHEDULED_KEY):
+            # Its revert is still scheduled: it is announced as manual by
+            # ``settle_scheduled_reverts`` if that revert does not happen.
+            return
+        self._announce_manual(entry, error=error)
+
+    def mark_revert_scheduled(
+        self,
+        change_id: str,
+        *,
+        remediation_command: str,
+        remediation_object_dn: str,
+        reverted_by: str,
+        scheduled_for: str = REVERT_SCHEDULED_END_OF_RUN,
+    ) -> None:
+        """Record a change whose revert WILL be attempted later in this run.
+
+        The record on disk is the same floor a manual change gets
+        (``manual_required`` with the native instruction), so a session killed
+        before the scheduled revert still leaves the client a complete,
+        actionable entry. What differs is what is SAID: the change is announced
+        as pending reversal, the ``environment_change_revert_scheduled`` event
+        is emitted, and the entry carries ``revert_scheduled`` until it is
+        settled. "Manual cleanup required" is announced only by
+        :meth:`settle_scheduled_reverts`, for a scheduled revert that did not
+        happen.
+
+        Args:
+            change_id: ID returned by register_change.
+            remediation_command: Client-safe native command (the floor).
+            remediation_object_dn: The exact object the client would act on.
+            reverted_by: Who is expected to undo it, in operator words (for
+                example ``"the cleanup account"``).
+            scheduled_for: When (``REVERT_SCHEDULED_*``).
+        """
+        entry = self._find(change_id)
+        if entry is None:
+            return
+        entry["revert_status"] = STATUS_MANUAL_REQUIRED
+        entry["manual_reason"] = _tax.MANUAL_REASON_NOT_ATTEMPTED
+        if remediation_command:
+            entry["remediation_command"] = str(remediation_command)
+            entry["manual_cleanup_instructions"] = str(remediation_command)
+        if remediation_object_dn:
+            entry["remediation_object_dn"] = str(remediation_object_dn)
+        entry[_REVERT_SCHEDULED_KEY] = str(scheduled_for)
+        self._recompute_summary()
+        self.flush()
+        emit_event(
+            "environment_change_revert_scheduled",
+            change_id=change_id,
+            kind=entry["kind"],
+            scheduled_for=str(scheduled_for),
+        )
+        print_info(
+            f"Pending reversal · {entry['kind']} · {mark_sensitive(entry['target'], 'text')} · "
+            f"{_tax.scheduled_revert_label(entry['kind'], reverted_by)}"
+        )
+
+    def settle_scheduled_reverts(self) -> int:
+        """Announce as manual every scheduled revert that did not happen.
+
+        Called once the pass a revert was scheduled for has run (and again at
+        finalize, where it finds nothing left). A record still carrying
+        ``revert_scheduled`` and still in place was not reverted: only now is
+        it announced as manual, with the event an integrator reads. Returns the
+        number of records announced.
+        """
+        announced = 0
+        for entry in self._state["changes"]:
+            if not entry.get(_REVERT_SCHEDULED_KEY):
+                continue
+            entry.pop(_REVERT_SCHEDULED_KEY, None)
+            if _tax.cleanup_bucket(entry.get("revert_status")) != CLEANUP_BUCKET_MANUAL:
+                continue
+            announced += 1
+            self._announce_manual(entry, error=entry.get("revert_error"))
+        if announced:
+            self.flush()
+        return announced
+
+    def _announce_manual(self, entry: dict[str, Any], *, error: Any = None) -> None:
+        """The one place a change is announced as needing manual cleanup."""
         emit_event(
             "environment_change_failed",
-            change_id=change_id,
+            change_id=str(entry.get("change_id") or ""),
             revert_status=STATUS_MANUAL_REQUIRED,
-            error=error or _tax.manual_reason_label(reason),
+            error=error or _tax.manual_reason_label(entry.get("manual_reason")),
         )
         print_warning(
             f"Manual cleanup required · {entry['kind']} · "
@@ -730,6 +872,7 @@ class EnvironmentChangeLedger:
         half-state and the client always gets a complete manual checklist. A
         change ADscan could not PROVE it reverted is always reported as manual.
         """
+        self.settle_scheduled_reverts()
         non_terminal = {
             STATUS_PENDING,
             STATUS_REVERT_IN_PROGRESS,
@@ -818,6 +961,8 @@ class EnvironmentChangeLedger:
         """Write current state to disk. Called automatically by mutating methods."""
         try:
             self._state[SCHEMA_VERSION_KEY] = _SCHEMA_VERSION
+            # The ledger can be the first file of a new workspace.
+            os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
             write_json_file(self._path, self._state)
         except Exception as exc:  # pylint: disable=broad-except
             telemetry.capture_exception(exc)
@@ -1016,6 +1161,11 @@ def _remediation_steps(command: str) -> list[dict[str, Any]]:
 def _normalize_change(entry: dict[str, Any]) -> dict[str, Any]:
     """Project one ledger record into the normalized render-ready shape."""
     status = str(entry.get("revert_status") or _tax.STATUS_PENDING)
+    # The status bucket, on purpose: a report is written with no engine running,
+    # so a revert still marked as scheduled here was never run and the record
+    # stays the complete manual entry it was stored as. The platform, which
+    # knows whether the scan is running or can be resumed, shows that state as
+    # pending (``adscan_core.reporting.cleanup_outcome.surface_bucket``).
     bucket = _tax.cleanup_bucket(status)
     detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
     detail = detail or {}

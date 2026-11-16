@@ -39,6 +39,7 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 from adscan_core import telemetry
+from adscan_core.auth_attempt_guard import probe_sign_in
 from adscan_core.rich_output import print_info_debug
 from adscan_internal.rich_output import mark_sensitive
 from adscan_internal.services.domain_posture import (
@@ -1275,9 +1276,11 @@ async def _probe_ldap_signing(
         f"(timeout={timeout}s, sign=False, bind_only=True, disable_self_heal=True)"
     )
     try:
-        conn, _ = await asyncio.wait_for(
-            async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
-        )
+        # Rule 8: ADscan's own throwaway probe name, declared to the guard.
+        with probe_sign_in(domain, cfg.username):
+            conn, _ = await asyncio.wait_for(
+                async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
+            )
         # Bind ACCEPTED over an unsigned channel -> signing NOT required.
         # This is the definitive not-required signal (bind-only never ran a
         # post-bind search, so no RestrictAnonymous operationsError to mask it).
@@ -1841,9 +1844,11 @@ async def _probe_ldaps_channel_binding(
             f"null_cbt={getattr(cfg, 'null_channel_binding', False)})"
         )
         try:
-            conn, _ = await asyncio.wait_for(
-                async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
-            )
+            # Rule 8: ADscan's own throwaway probe name, declared to the guard.
+            with probe_sign_in(domain, cfg.username):
+                conn, _ = await asyncio.wait_for(
+                    async_connect_with_ldap_fallback(cfg, bind_only=True), timeout=timeout
+                )
             try:
                 disc = getattr(conn, "disconnect", None)
                 if disc is not None:
@@ -2796,9 +2801,11 @@ async def _probe_ntlm_authentication(
     )
 
     try:
-        outcome = await asyncio.wait_for(
-            smb_probe_ntlm_session_setup(cfg), timeout=timeout
-        )
+        # Rule 8: ADscan's own throwaway probe name, declared to the guard.
+        with probe_sign_in(domain, cfg.username):
+            outcome = await asyncio.wait_for(
+                smb_probe_ntlm_session_setup(cfg), timeout=timeout
+            )
     except asyncio.TimeoutError as exc:
         telemetry.capture_exception(exc)
         return ProbeResult(
