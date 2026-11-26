@@ -117,7 +117,7 @@ cli = [
     # were installed by hand in the Linux images only, so the Windows bundle
     # (built from this extra) shipped without them and the two features were off
     # there. Pins match Dockerfile.runtime and dockerfile.
-    "pykeepass==4.1.1.post1",
+    "pykeepass==4.2.0",
     "gpp-decrypt==2.0.0",
     "playwright==1.62.0",
     "jinja2>=3.0",
